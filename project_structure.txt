@@ -1,0 +1,122 @@
+.
+├── CHANGELOG.md
+├── CLAUDE.md                       (cross-cutting rules; subtree CLAUDE.md files load on demand)
+├── LICENSE
+├── README.md
+├── .env.example                   (online-provider API-key template; never commit real keys)
+├── .gitignore
+├── app.py                         (Flask app factory; registers blueprints)
+├── launch.py                      (PyWebView entry point; logging, .env loading, HF_HUB_OFFLINE)
+├── conftest.py                    (pytest session config; pins CHATEKLD_BASE_DIR to a temp dir)
+├── requirements.txt
+├── install_and_build.sh           (macOS installer + PyInstaller .app builder)
+├── create_app_icon.py
+├── macos_entitlements.plist
+├── pdf_extractor.py               (subprocess PDF text extraction; markitdown + OCR tiers)
+├── project_structure.txt          (this file)
+│
+├── api/
+│   ├── security.py                (local-origin checks, sanitise_error_msg)
+│   ├── validators.py              (coerce_* request-body helpers; canonical clamp logic)
+│   └── routes/
+│       ├── about.py
+│       ├── audit.py               (/api/audit/* blueprint)
+│       ├── config.py              (/api/config; per-key LLM config validation)
+│       ├── deck.py                (/api/deck/* blueprint; SSE deck generation)
+│       ├── paper.py               (/api/summarise, /api/upload — single paper)
+│       ├── status.py              (/api/status, /api/models, /api/pull, …)
+│       ├── usage.py               (/api/usage, /api/pricing)
+│       └── vault.py               (/api/obsidian/* incl. chat SSE)
+│
+├── core/
+│   ├── config.py                  (config + report-type persistence)
+│   ├── constants.py               (BASE_DIR, paths, limits, extension policy)
+│   ├── database.py                (SQLite setup + DB_LOCK)
+│   ├── feedback.py
+│   ├── utils.py                   (locks, atomic writes, parsers)
+│   ├── providers/                 (LOCAL Ollama / LM Studio adapters — embeddings + legacy chat)
+│   │   ├── base.py
+│   │   ├── lms.py
+│   │   ├── ollama.py
+│   │   └── server.py
+│   ├── llm/                       (provider-agnostic chat layer)
+│   │   ├── base.py · factory.py · policy.py · usage.py · retry.py
+│   │   ├── prompt.py · redact.py · tool_schema.py · types.py
+│   │   ├── CLAUDE.md
+│   │   └── adapters/
+│   │       └── local.py · openai.py · anthropic.py · google.py
+│   └── agent/                     (opt-in ReAct agent for vault chat)
+│       ├── protocol.py · tools.py · vault_tools.py · budget.py · loop.py
+│       └── CLAUDE.md
+│
+├── rag/
+│   ├── vault.py                   (vault indexing, status messages, chat entrypoints)
+│   ├── engine.py                  (LlamaIndex query engine; hybrid retrieval + rerank)
+│   ├── summarizer.py              (summarise_stream, build_prompt)
+│   ├── lancedb_store.py           (optional binary Apache-Arrow vector backend)
+│   └── CLAUDE.md
+│
+├── services/
+│   ├── pdf_service.py             (upload extraction + database insertion)
+│   └── vision.py                  (VisionManager / GLMOCRManager singletons)
+│
+├── audit/                         (Library Audit subsystem; vendored from kb_harmonizer)
+│   ├── __init__.py
+│   ├── __main__.py                (python -m audit --check ...)
+│   ├── config.py                  (papermind config -> Settings adapter)
+│   ├── manager.py                 (audit_manager singleton; manual-only scans)
+│   ├── scan.py                    (developer CLI)
+│   ├── serialize.py               (engine dataclasses -> JSON dicts)
+│   ├── CLAUDE.md
+│   ├── core/                      (read-only connectors)
+│   │   ├── bib.py · finder_tags.py · hashing.py · naming.py
+│   │   └── obsidian.py · pdf_annotations.py · zotero.py
+│   └── engine/
+│       ├── bridge.py · duplicates.py · inventory.py
+│       └── reports/
+│           ├── note_tag_drift.py · read_unzoterod.py · unread_unzoterod.py
+│           └── zotero_no_pdf.py · zotero_unread.py
+│
+├── deckgen/                       (Beamer deck generator; core is app-independent + requests-free)
+│   ├── template.py · outline.py · sections.py · prompts.py
+│   ├── assemble.py · scaffold.py · result.py
+│   ├── client.py                  (HTTP/SSE driver for the CLI)
+│   ├── __main__.py                (deckgen CLI)
+│   ├── inprocess.py               (in-app runner over core.agent — the only app-coupled module)
+│   ├── requirements.txt
+│   ├── README.md
+│   └── tests/                     (app-independent: no server, no requests)
+│       └── test_cli_integration.py · test_deckgen.py · test_template.py
+│
+├── scripts/                       (maintenance-only; run with the app closed, back up app data first)
+│   ├── migrate_vector_store.py    (SimpleVectorStore -> LanceDB, no re-embedding)
+│   ├── prune_storage_to_vector_store.py
+│   └── repair_simple_vector_store.py
+│
+├── static/
+│   ├── css/styles.css
+│   ├── img/daphne.png
+│   └── js/                        (ui.js + api.js are leaves; app.js is the root)
+│       ├── api.js · app.js · ui.js
+│       ├── audit.js · config.js · deck.js · settings.js
+│       ├── summarizer.js · vault.js
+│       └── vendor/marked.min.js   (v15.0.12, MIT — never loaded from a CDN)
+│
+├── templates/
+│   └── index.html                 (single-page app shell)
+│
+├── resources/                     (.gitkeep — PyInstaller --add-data target)
+│
+└── Tests (run from the project virtualenv)
+    ├── smoke_test.py
+    ├── test_agent.py · test_audit.py · test_concurrency.py
+    ├── test_deck.py · test_lancedb_migration.py · test_llm.py
+    ├── test_validators.py · test_vault_regressions.py
+    └── tests/audit/               (ported kb_harmonizer unit tests)
+        ├── conftest.py
+        ├── test_bib.py · test_bridge_filename.py · test_bridge_mapping.py
+        ├── test_hashing.py · test_inventory.py · test_naming.py
+        └── test_obsidian.py · test_pdf_annotations.py
+
+The project virtual environment lives OUTSIDE the repo (default ~/venvs/papermind2026,
+overridable via PAPERMIND_VENV_DIR) and is never committed.

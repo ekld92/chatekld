@@ -1,0 +1,3 @@
+# deckgen runtime dependency — kept separate from the app's requirements.txt so the
+# orchestrator stays decoupled. Everything else it needs is in the Python stdlib.
+requests>=2.31,<3

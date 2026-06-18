@@ -1,0 +1,105 @@
+# Core
+pydantic>=2.10,<3.0
+flask>=3.1,<4.0
+PyMuPDF>=1.25.2,<2.0
+ollama>=0.4,<1.0
+pywebview>=5.3,<6.0
+Pillow>=11.1,<12.0
+
+# LlamaIndex (RAG)
+# Pinned to compatible versions to prevent pip resolver from backtracking through
+# 100+ version combinations (was: >=0.12,<1.0 etc., caused indefinite hangs).
+# Versions confirmed working: core 0.14.18, llms 0.10.0, embeddings 0.9.0, readers 0.6.0.
+llama-index-core>=0.14.18,<0.15
+llama-index-llms-ollama>=0.10.0,<0.11
+llama-index-embeddings-ollama>=0.9.0,<0.10
+openai>=2.36.0,<3.0
+llama-index-llms-openai>=0.7.7,<0.8
+llama-index-embeddings-openai>=0.6.0,<0.7
+
+# Online LLM providers (OpenAI / Anthropic / Google Gemini)
+# OpenAI uses the openai SDK above. Anthropic + Google use httpx directly
+# (no extra deps).  The user supplies API keys via OPENAI_API_KEY,
+# ANTHROPIC_API_KEY, GOOGLE_API_KEY environment variables.  See README's
+# "Online provider setup" section.
+#
+# python-dotenv lets launch.py load those keys from a .env file at startup.
+# A Finder-launched .app does NOT inherit the shell environment, so keys set
+# in ~/.zshrc are invisible to the bundle; reading BASE_DIR/.env is how the
+# packaged app gets them. The import is optional (guarded in launch.py) so a
+# missing install only disables .env loading, never blocks startup.
+python-dotenv>=1.0,<2.0
+
+# Hybrid retrieval (BM25 + dense) + cross-encoder reranking.
+# llama-index-retrievers-bm25 0.7.x is compatible with the LlamaIndex 0.14.x
+# core line below. BM25 is still import-guarded in rag/engine.py so vault chat
+# falls back to dense-only retrieval if the optional package is unavailable.
+# llama-index-postprocessor-sbert-rerank wraps sentence-transformers' CrossEncoder
+# via its "model_name_or_path" constructor keyword, which requires
+# sentence-transformers >=4.0.0.
+llama-index-retrievers-bm25>=0.7.0,<0.8
+# bm25s is the backend behind llama-index-retrievers-bm25, which itself only
+# requires ">=0.2.7.post1" (unbounded above).  The BM25 sidecar persisted under
+# obsidian_storage/bm25_index/ is written in bm25s' on-disk format and reloaded
+# with mmap=True, so pin the minor line the persist → mmap-load round trip was
+# verified against; bump deliberately alongside the round-trip test.
+bm25s>=0.3.9,<0.4
+llama-index-postprocessor-sbert-rerank>=0.5.0,<0.6
+sentence-transformers>=4.0.0,<6.0
+
+# Binary vector store (Batch 4 — replaces the JSON SimpleVectorStore on disk).
+# The 0.4.1+ integration line is the first that supports the LlamaIndex 0.14.x
+# core line (<0.15,>=0.13.0); 0.2.x/0.3.x cap core at <0.13 and would silently
+# downgrade core, breaking every other llama-index integration above — verified.
+# That same line requires lancedb>=0.21.1 (NOT the <0.10 the early plan drafted).
+# lancedb writes Apache-Arrow .lance files; ijson streams the legacy
+# default__vector_store.json during the one-time offline migration so peak RSS
+# stays ~100 MB on a multi-GB index. Versions verified: lancedb 0.33.0,
+# integration 0.5.0, ijson 3.5.0, pyarrow 24.0.0 against core 0.14.22.
+lancedb>=0.21.1,<1.0
+llama-index-vector-stores-lancedb>=0.4.1,<0.6
+ijson>=3.3.0,<4.0
+
+# Tokenizer — required by LlamaIndex text splitter (was pre-cached by install script only)
+tiktoken>=0.7,<1.0
+
+# Missing Dependencies / PyInstaller Collection Targets
+anyio>=4.0,<5.0
+httpcore>=1.0,<2.0
+httpx>=0.27,<1.0
+tenacity>=8.0,<10.0
+
+# macOS Bundle requirements
+pyobjc-framework-Cocoa>=11.1,<12.0
+pyobjc-framework-WebKit>=11.1,<12.0
+# Pin core + transitives to the same major/minor line as Cocoa/WebKit to
+# reduce pip resolver backtracking across 11.x/12.x variants during install.
+pyobjc-core>=11.1,<12.0
+pyobjc-framework-Quartz>=11.1,<12.0
+pyobjc-framework-security>=11.1,<12.0
+pyinstaller>=6.11,<7.0
+
+# Phase 3 Enhancements
+waitress>=3.0.0,<4.0
+setuptools>=70.0,<81
+
+# MarkItDown: Microsoft's Markdown conversion library, used as a text-extraction
+# tier in pdf_extractor.py (pdfminer.six backend for .pdf). The app indexes only
+# .md and .pdf — .docx is excluded by design (core/constants.py::VAULT_BINARY_EXTS)
+# — so MarkItDown's other converters (.docx/.pptx/.xlsx) are not exercised here.
+# [all] installs every optional converter; absent = pdf_extractor.py degrades to
+# its OCR-only path. Privacy note: the app never passes cloud API keys. Vision
+# callbacks are routed through the locally configured OCR/vision provider.
+markitdown[all]>=0.1.0,<2.0
+
+# Library Audit subsystem (audit/ — vendored from kb_harmonizer).
+# pikepdf is used only for read-only PDF annotation counting (no /Annots
+# decoding, just header walk).  ruamel.yaml parses Obsidian frontmatter
+# while preserving quoting.  bibtexparser handles Better BibTeX exports.
+# beautifulsoup4 strips HTML out of Zotero child-note bodies; it is
+# already pulled in transitively by markitdown but pinned here so an
+# upstream change does not silently break the audit.
+pikepdf>=8.15,<10.0
+ruamel.yaml>=0.18,<0.19
+bibtexparser>=1.4,<2.0
+beautifulsoup4>=4.12,<5.0

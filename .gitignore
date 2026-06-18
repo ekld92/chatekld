@@ -1,0 +1,63 @@
+# macOS
+*.DS_Store
+.DS_Store
+
+.vscode/
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+AppIcon.icns
+
+# Built app bundles (dated builds)
+ChatEKLD_*.app/
+
+# User data — contains API keys, personal library paths, and indexed vectors.
+# These live in ~/Library/Application Support/ChatEKLD/ when the app runs
+# normally, but during development they may be written to the project root.
+config.json
+feedback.jsonl
+report_types.json
+llamaindex_storage/
+uploads.db
+
+# Log files (written to ~/Library/Logs/ChatEKLD/ in production,
+# but may land in the project root during development)
+*.log
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Temporary files
+*.tmp
+
+# test pdf
+*.pdf
+*.png
+!static/img/daphne.png
+*.heic
+
+# LaTeX — deckgen emits Beamer decks (<out_dir>/<slug>/<slug>.tex) and their
+# build artifacts outside the repo; the repo tracks no .tex, so keep stray
+# generated decks and compile by-products (e.g. from a CLI --out run) out of git.
+# Use `git add -f` if a template ever needs to live in the repo.
+*.tex
+*.aux
+*.nav
+*.snm
+*.toc
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk

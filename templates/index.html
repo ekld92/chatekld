@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChatEKLD</title>
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/daphne.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+    <!-- Vendored (marked v15.0.12, MIT). Served locally so chat rendering
+         never depends on CDN reachability inside the PyWebView renderer. -->
+    <script src="{{ url_for('static', filename='js/vendor/marked.min.js') }}"></script>
+</head>
+<body>
+    <!-- Visually-hidden assertive live region. ui.js::announceError writes
+         here so screen readers hear errors that are otherwise only shown
+         as inline text. -->
+    <div id="sr-error-announcer" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></div>
+    <a href="#main-content" class="skip-link">Skip to main content</a>
+
+    <!-- Sidebar -->
+    <div class="sidebar" id="app-sidebar">
+        <div class="brand">
+            <img src="{{ url_for('static', filename='img/daphne.png') }}" class="brand-icon" alt="ChatEKLD Logo">
+            <h1>ChatEKLD</h1>
+        </div>
+
+        <div class="sidebar-section">
+            <span class="sidebar-label">Model Settings</span>
+            <div class="control-group">
+                <label for="provider-select">Provider</label>
+                <select id="provider-select" onchange="onProviderChange()">
+                    <optgroup label="Local (offline)">
+                        <option value="ollama">Ollama</option>
+                        <option value="lm_studio">LM Studio</option>
+                    </optgroup>
+                    <optgroup label="Online (requires API key)">
+                        <option value="openai">OpenAI</option>
+                        <option value="anthropic">Anthropic</option>
+                        <option value="google">Google Gemini</option>
+                    </optgroup>
+                </select>
+            </div>
+            <div class="control-group">
+                <label for="model-select">Active Model</label>
+                <select id="model-select"></select>
+            </div>
+            <div class="control-group">
+                <label for="embed-provider-select">Embedding Provider</label>
+                <select id="embed-provider-select">
+                    <option value="ollama">Ollama</option>
+                    <option value="lm_studio">LM Studio</option>
+                </select>
+                <small class="control-hint">Local provider used for embeddings when the chat provider is online.</small>
+            </div>
+            <div class="control-group">
+                <label for="embed-select">Embedding Model</label>
+                <select id="embed-select"></select>
+            </div>
+            
+            <div id="provider-badge" class="badge">
+                <span id="provider-badge-dot" aria-hidden="true"></span>
+                <span id="provider-badge-label">Ollama</span>
+            </div>
+            <button id="pull-model-btn" class="btn btn-outline" onclick="openModal('pull-modal')">&#8595; Pull New Model</button>
+        </div>
+
+        <div class="sidebar-section">
+            <span class="sidebar-label">System Status</span>
+            <div class="status-card">
+                <div class="status-row">
+                    <span>Provider</span>
+                    <span id="rs-provider-dot" class="dot" role="img" aria-label="Status unknown"></span>
+                </div>
+            </div>
+            <div id="runtime-warning" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
+        </div>
+
+        <div class="sidebar-spacer"></div>
+        <button class="btn btn-outline" onclick="openModal('settings-modal')">&#9881; LLM Settings</button>
+        <button class="btn btn-outline" onclick="openModal('howto-modal')">How to Use</button>
+        <button class="btn btn-danger" onclick="openModal('reset-modal')">Reset App Data</button>
+
+        <div id="activity-bar">
+            <span class="activity-dot"></span>
+            <span id="activity-label-text"></span>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <main class="main" id="main-content">
+        <div class="header">
+            <div class="tabs" role="tablist" aria-label="Main views">
+                <button id="tab-obsidian" class="tab active" role="tab" aria-selected="true" aria-controls="obsidian-tab" tabindex="0" onclick="showTab('obsidian')">Obsidian Agent</button>
+                <button id="tab-document" class="tab" role="tab" aria-selected="false" aria-controls="document-tab" tabindex="-1" onclick="showTab('document')">Single Paper</button>
+                <button id="tab-audit" class="tab" role="tab" aria-selected="false" aria-controls="audit-tab" tabindex="-1" onclick="showTab('audit')">Library Audit</button>
+                <button id="tab-deck" class="tab" role="tab" aria-selected="false" aria-controls="deck-tab" tabindex="-1" onclick="showTab('deck')">Deck Generator</button>
+            </div>
+        </div>
+
+        <!-- Obsidian Tab -->
+        <div id="obsidian-tab" class="content-area active" role="tabpanel" aria-labelledby="tab-obsidian" tabindex="0">
+            <div class="pane-view">
+                <div class="card">
+                    <div class="header">
+                        <span>Obsidian Agent</span>
+                        <div class="actions">
+                            <button id="vault-index-btn"  class="btn btn-primary" onclick="indexVault()">Index Vault</button>
+                            <button id="vault-pause-btn"  class="btn btn-outline" onclick="pauseVaultIndex()"  style="display:none">Pause</button>
+                            <button id="vault-resume-btn" class="btn btn-outline" onclick="resumeVaultIndex()" style="display:none">Resume</button>
+                            <button id="vault-cancel-btn" class="btn btn-outline" onclick="cancelVaultIndex()" style="display:none">Cancel</button>
+                            <button class="btn btn-outline" onclick="openModal('excl-modal')">Exclusions</button>
+                            <button class="btn btn-outline" onclick="openImageExtsModal()">Image Extensions</button>
+                        </div>
+                    </div>
+                    <div class="vault-info">
+                        <span>Vault:</span>
+                        <span id="vault-path-display">Not configured</span>
+                        <button class="btn btn-sm" onclick="pickVaultFolder()">Change…</button>
+                    </div>
+                    <div class="materials-panel">
+                        <div class="materials-panel-header">
+                            <span>Indexed Materials</span>
+                            <div class="actions">
+                                <button class="btn btn-outline btn-sm" onclick="refreshVaultMaterials()">Refresh</button>
+                                <button id="materials-toggle-btn" class="btn btn-outline btn-sm" onclick="toggleVaultMaterials()">Show</button>
+                            </div>
+                        </div>
+                        <div id="materials-list-container" class="materials-list collapsed"></div>
+                    </div>
+                    <div id="vault-warning" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
+                    <details class="advanced-controls">
+                        <summary>System Prompt Override</summary>
+                        <div class="control-group">
+                            <textarea id="vault-system-prompt" rows="4" maxlength="4000" placeholder="Optional. Prepended to the selected Answer Mode template; the retrieval safety preamble and context block remain in place."></textarea>
+                            <small class="control-hint">Retrieval &amp; generation knobs (Top K, reranker, agent mode, temperature…) live in <strong>&#9881; LLM Settings</strong> in the sidebar.</small>
+                        </div>
+                    </details>
+                    <div id="obsidian-chat" class="chat-history"></div>
+                    <div id="obsidian-status-msg"></div>
+                    <div id="prewarm-banner" class="prewarm-banner" hidden></div>
+                    <div id="vault-error-boundary" class="task-error-boundary"></div>
+                    <div class="input-bar">
+                        <input type="text" id="obsidian-input" aria-label="Ask about your vault" placeholder="Ask about your vault..." onkeydown="if(event.key==='Enter') chatWithVault()">
+                        <button id="vault-send-btn" class="btn btn-primary" onclick="chatWithVault()">Send</button>
+                        <button id="vault-clear-chat-btn" class="btn btn-outline" onclick="clearVaultChat()" title="Clear the chat window">Clear</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Document Tab -->
+        <div id="document-tab" class="content-area" role="tabpanel" aria-labelledby="tab-document" tabindex="0">
+            <div class="pane-config">
+                <span class="sidebar-label">Paper Settings</span>
+                <div class="control-group">
+                    <label for="preset-select">Summary Style</label>
+                    <select id="preset-select">
+                        <option value="concise">Concise</option>
+                        <option value="detailed">Detailed</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="report-type-select">Document Type</label>
+                    <select id="report-type-select"></select>
+                </div>
+                <div class="control-group">
+                    <label for="audience-select">Target Audience</label>
+                    <select id="audience-select">
+                        <option value="Researcher / Clinician">Researcher / Clinician</option>
+                        <option value="Student / Trainee">Student / Trainee</option>
+                        <option value="General public">General public</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="language-select">Language</label>
+                    <select id="language-select">
+                        <option value="English">English</option>
+                        <option value="French">French</option>
+                        <option value="German">German</option>
+                        <option value="Spanish">Spanish</option>
+                        <option value="Italian">Italian</option>
+                        <option value="Portuguese">Portuguese</option>
+                        <option value="Arabic">Arabic</option>
+                        <option value="Chinese (Simplified)">Chinese (Simplified)</option>
+                        <option value="Japanese">Japanese</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="doc-focus-question">Focus Question</label>
+                    <input type="text" id="doc-focus-question" placeholder="Optional targeted question">
+                </div>
+                <details class="advanced-controls">
+                    <summary>System Prompt Override</summary>
+                    <div class="control-group">
+                        <textarea id="doc-system-prompt" rows="4" placeholder="Leave blank to use the selected document type."></textarea>
+                        <small class="control-hint">Temperature, context, max tokens, Top P and repeat penalty live in <strong>&#9881; LLM Settings</strong> in the sidebar.</small>
+                    </div>
+                </details>
+                <div class="paper-actions">
+                    <button id="summarise-btn" class="btn btn-primary" onclick="summarisePDF()" disabled>Summarise</button>
+                    <button id="export-summary-btn" class="btn btn-outline" onclick="exportSummary('txt')" disabled>Export TXT</button>
+                    <button id="export-summary-md-btn" class="btn btn-outline" onclick="exportSummary('md')" disabled>Export MD</button>
+                    <button class="btn btn-outline" onclick="resetUpload()">New Paper</button>
+                </div>
+            </div>
+            <div class="pane-view">
+                <div id="upload-overlay" role="button" tabindex="0"
+                     aria-label="Upload a PDF. Click, press Enter, or drop a PDF file here.">
+                    <div class="upload-target">
+                        <div class="upload-icon" aria-hidden="true">PDF</div>
+                        <span>Click or drop a PDF to upload</span>
+                    </div>
+                    <input type="file" id="pdf-upload" accept=".pdf" tabindex="-1" aria-hidden="true" style="display:none;" onchange="uploadPDF()">
+                </div>
+                <div id="summary-view" class="card" style="display:none;">
+                    <div id="doc-error-boundary" class="task-error-boundary"></div>
+                    <div id="document-summary-content" class="summary-content"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Library Audit Tab -->
+        <div id="audit-tab" class="content-area" role="tabpanel" aria-labelledby="tab-audit" tabindex="0">
+            <div class="pane-view">
+                <div class="card">
+                    <div class="header">
+                        <span>Library Audit</span>
+                        <div class="actions">
+                            <button id="audit-run-btn" class="btn btn-primary" onclick="runAuditScan()">Run Scan</button>
+                            <button id="audit-cancel-btn" class="btn btn-outline" onclick="cancelAuditScan()" style="display:none">Cancel</button>
+                            <button class="btn btn-outline" onclick="openModal('audit-settings-modal')">Settings</button>
+                        </div>
+                    </div>
+                    <div class="vault-info">
+                        <span>Vault:</span>
+                        <span id="audit-vault-path-display">Set the Obsidian vault path on the Obsidian Agent tab first.</span>
+                    </div>
+                    <div id="audit-status-banner" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
+                    <div id="audit-empty-state" class="modal-copy" style="padding:16px;">
+                        No scan yet — click <strong>Run Scan</strong> to audit your vault against Zotero, BibTeX, PDFs and Finder tags.
+                        The scan reads only; no data is written back. It runs only when you click Run Scan — never at app startup.
+                    </div>
+                    <div id="audit-summary" class="audit-summary" style="display:none;"></div>
+                    <div id="audit-report-tabs" class="audit-report-tabs" role="tablist" aria-label="Audit reports" style="display:none;">
+                        <button class="audit-report-tab active" role="tab" aria-selected="true" aria-controls="audit-report-body" tabindex="0" data-report="inventory" onclick="selectAuditReport('inventory')">Inventory</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="note_tag_drift" onclick="selectAuditReport('note_tag_drift')">Tag Drift</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="unread_unzoterod" onclick="selectAuditReport('unread_unzoterod')">Unread PDFs</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="zotero_unread" onclick="selectAuditReport('zotero_unread')">Zotero Queue</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="read_unzoterod" onclick="selectAuditReport('read_unzoterod')">Read PDFs Missing Zotero</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="zotero_no_pdf" onclick="selectAuditReport('zotero_no_pdf')">Bib Entries Without PDFs</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="duplicates" onclick="selectAuditReport('duplicates')">Duplicate PDFs</button>
+                    </div>
+                    <div id="audit-report-meta" class="audit-report-meta" style="display:none;"></div>
+                    <div id="audit-report-body" class="audit-report-body" role="tabpanel" tabindex="0"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Deck Generator Tab -->
+        <div id="deck-tab" class="content-area" role="tabpanel" aria-labelledby="tab-deck" tabindex="0">
+            <div class="pane-view">
+                <div class="card">
+                    <div class="header">
+                        <span>Deck Generator</span>
+                        <div class="actions">
+                            <button id="deck-generate-btn" class="btn btn-primary" onclick="deckGenerate()">Generate Deck</button>
+                        </div>
+                    </div>
+                    <div class="vault-info">
+                        <span>Builds a Beamer <code>.tex</code> deck from your indexed vault, in your own template's house style. Emit-only — it writes a <code>&lt;name&gt;/</code> project folder you compile with <code>make</code>.</span>
+                    </div>
+                    <div id="deck-status" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
+
+                    <div class="deck-body">
+                        <div class="control-group">
+                            <label for="deck-template-path">Beamer template (.tex / .sty)</label>
+                            <div class="input-row">
+                                <input type="text" id="deck-template-path" placeholder="…/presentations_slides_writings_teaching/template/presentation.tex">
+                                <button class="btn btn-outline" onclick="deckPickTemplateFile()">Browse…</button>
+                                <button class="btn btn-outline" onclick="deckLoadTemplate()">Load</button>
+                            </div>
+                            <small class="control-hint">Its preamble (document class, theme, packages, custom macros) is reused verbatim. Load it, then edit below before generating.</small>
+                            <div id="deck-template-hint" class="deck-template-hint"></div>
+                        </div>
+
+                        <div class="control-group">
+                            <label for="deck-template-editor">Template / preamble (editable)</label>
+                            <textarea id="deck-template-editor" class="deck-tex-output" rows="12" spellcheck="false" placeholder="Load a template above — its contents appear here for editing. Generated slides are injected between the title/outline frames and \end{document}."></textarea>
+                        </div>
+
+                        <div class="control-group">
+                            <label for="deck-topic">Topic</label>
+                            <input type="text" id="deck-topic" placeholder="e.g. Digital psychotherapies for depression">
+                        </div>
+
+                        <div class="control-group">
+                            <label for="deck-instructions">Instructions (free-form)</label>
+                            <textarea id="deck-instructions" rows="4" maxlength="8000" placeholder="Optional. Steer scope, tone, structure, what to emphasise or avoid. e.g. 'Audience are psychiatry residents; focus on methods; keep each slide to 4 bullets.'"></textarea>
+                        </div>
+
+                        <div class="control-group">
+                            <label for="deck-audience">Audience</label>
+                            <input type="text" id="deck-audience" placeholder="e.g. medical students">
+                        </div>
+
+                        <div class="control-group">
+                            <label for="deck-name">Deck name (folder + file)</label>
+                            <input type="text" id="deck-name" placeholder="Defaults to a slug of the topic">
+                        </div>
+
+                        <div class="control-group">
+                            <label for="deck-out-dir">Output folder (your LaTeX suite root)</label>
+                            <div class="input-row">
+                                <input type="text" id="deck-out-dir" placeholder="Auto-filled from the template's suite root (the folder containing common/)">
+                                <button class="btn btn-outline" onclick="deckPickOutDir()">Browse…</button>
+                            </div>
+                            <small class="control-hint">A <code>&lt;name&gt;/</code> folder is created here with <code>&lt;name&gt;.tex</code> + a <code>Makefile</code>. Must sit beside your <code>common/</code> dir so <code>../common/…</code> and <code>../_master.bib</code> resolve.</small>
+                        </div>
+
+                        <div class="control-row">
+                            <label class="checkbox-row"><input type="checkbox" id="deck-citations" checked> Use <code>\citefoot{key}</code> from the bibliography when it matches</label>
+                            <label class="checkbox-row"><input type="checkbox" id="deck-overwrite"> Overwrite if a deck of this name already exists</label>
+                        </div>
+
+                        <small class="control-hint">Max sections, agent iterations and temperature for deck generation live in <strong>&#9881; LLM Settings</strong> in the sidebar.</small>
+
+                        <div id="deck-activity" class="deck-activity" aria-live="polite"></div>
+                        <div id="deck-result" class="deck-result"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- LLM Settings Modal -->
+    <div id="settings-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
+        <div class="modal" style="max-width:760px; max-height:86vh; overflow-y:auto;">
+            <h2 id="settings-modal-title">LLM Settings</h2>
+            <p class="modal-copy">
+                Every LLM / RAG parameter in one place, grouped by function. Prompts and
+                instructions stay on their own tabs. Provider, model and embeddings are in the
+                sidebar. Changes save automatically and apply to the next run.
+            </p>
+
+            <span class="sidebar-label">Global · request limits &amp; fallback</span>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="set-online-timeout">Request timeout (seconds)</label>
+                    <input type="number" id="set-online-timeout" min="5" max="600" step="5" value="60">
+                    <small class="control-hint">Per-call timeout for online providers. Local models are bound by the agent's wall-clock cap instead.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-online-retries">Max retries</label>
+                    <input type="number" id="set-online-retries" min="0" max="10" step="1" value="3">
+                    <small class="control-hint">Retry attempts on transient errors (online providers).</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-online-max-tokens">Max output tokens</label>
+                    <input type="number" id="set-online-max-tokens" min="64" max="32768" step="64" value="4096">
+                    <small class="control-hint">Caps each reply for vault chat &amp; deck generation.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-agent-wall-clock">Agent wall-clock cap (seconds)</label>
+                    <input type="number" id="set-agent-wall-clock" min="30" max="1800" step="30" value="300">
+                    <small class="control-hint">Max time for one vault-chat agent turn / each deck section. The stream stall guard and the chat fetch abort derive from this.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-local-timeout">Local request timeout (seconds)</label>
+                    <input type="number" id="set-local-timeout" min="0" max="3600" step="30" value="0">
+                    <small class="control-hint">Per-call HTTP timeout for Ollama / LM Studio. 0 = leave the SDK default (a hung call is then bounded only by the wall-clock cap). For streaming it acts as a max-time-between-tokens guard.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-fallback-provider">Fallback provider</label>
+                    <select id="set-fallback-provider">
+                        <option value="">None (fail fast)</option>
+                        <option value="ollama">Ollama</option>
+                        <option value="lm_studio">LM Studio</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="anthropic">Anthropic</option>
+                        <option value="google">Google Gemini</option>
+                    </select>
+                    <small class="control-hint">Used only before the first token, only on the transient errors below.</small>
+                </div>
+            </div>
+            <div class="control-group">
+                <label>Fall back on</label>
+                <label class="checkbox-row"><input type="checkbox" id="set-fallback-on-timeout"> Timeout</label>
+                <label class="checkbox-row"><input type="checkbox" id="set-fallback-on-network"> Network error</label>
+                <label class="checkbox-row"><input type="checkbox" id="set-fallback-on-rate_limit"> Rate limit</label>
+                <label class="checkbox-row"><input type="checkbox" id="set-fallback-on-server_error"> Server error</label>
+            </div>
+
+            <span class="sidebar-label">Global · OCR &amp; Vision</span>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="ocr-provider-select">OCR Provider</label>
+                    <select id="ocr-provider-select">
+                        <option value="ollama">Ollama</option>
+                        <option value="lm_studio">LM Studio</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="ocr-model-select">OCR Model</label>
+                    <select id="ocr-model-select"></select>
+                </div>
+                <div class="control-group">
+                    <label for="vision-provider-select">Vision Provider</label>
+                    <select id="vision-provider-select">
+                        <option value="ollama">Ollama</option>
+                        <option value="lm_studio">LM Studio</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="vision-model-select">Vision Model</label>
+                    <select id="vision-model-select"></select>
+                </div>
+            </div>
+            <small class="control-hint">Used by scanned-PDF OCR and local image/figure reading. Choose a provider with a vision-capable model loaded.</small>
+
+            <span class="sidebar-label">Vault Chat · retrieval &amp; generation</span>
+            <div class="control-grid">
+                <div class="control-group">
+                    <div class="slider-label"><label for="vault-top-k">Top K</label><span id="vault-top-k-value">6</span></div>
+                    <input type="range" id="vault-top-k" min="2" max="12" step="1" value="6">
+                </div>
+                <div class="control-group">
+                    <label for="vault-prompt-mode">Answer Mode</label>
+                    <select id="vault-prompt-mode">
+                        <option value="strict">Strict</option>
+                        <option value="balanced">Balanced</option>
+                        <option value="exploratory">Exploratory</option>
+                        <option value="concise">Concise</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <div class="slider-label"><label for="vault-temp">Temperature</label><span id="vault-temp-value">0.3</span></div>
+                    <input type="range" id="vault-temp" min="0" max="2" step="0.1" value="0.3">
+                </div>
+            </div>
+            <div class="control-group">
+                <label class="checkbox-row"><input type="checkbox" id="vault-hybrid-enabled" checked> Hybrid retrieval (BM25 + dense)</label>
+                <small class="control-hint">Fuses lexical (BM25) and semantic search via RRF. Off = dense-only. No reindex.</small>
+            </div>
+            <div class="control-group">
+                <label class="checkbox-row"><input type="checkbox" id="vault-reranker-enabled" checked> Cross-encoder reranker</label>
+                <small class="control-hint">Reranks candidates for precision. Heaviest component — turn off to free memory. No reindex.</small>
+            </div>
+            <div class="control-group">
+                <label class="checkbox-row"><input type="checkbox" id="vault-agent-enabled"> Agent mode (multi-step tool use)</label>
+                <small class="control-hint">When on, the model can call vault.search / vault.read_note / vault.list_materials across iterations.</small>
+                <div class="slider-label"><label for="vault-agent-max-iter">Max agent iterations</label><span id="vault-agent-max-iter-value">6</span></div>
+                <input type="range" id="vault-agent-max-iter" min="1" max="12" step="1" value="6">
+            </div>
+            <details class="advanced-controls">
+                <summary>Vault Chat · fine-tuning</summary>
+                <div class="control-group">
+                    <div class="slider-label"><label for="vault-cutoff">Similarity Cutoff</label><span id="vault-cutoff-value">0.25</span></div>
+                    <input type="range" id="vault-cutoff" min="0" max="0.7" step="0.05" value="0.25">
+                </div>
+                <div class="control-group">
+                    <label class="checkbox-row"><input type="checkbox" id="vault-mmr-enabled"> Diversity (MMR)</label>
+                    <div class="slider-label"><label for="vault-mmr-lambda">MMR threshold</label><span id="vault-mmr-lambda-value">0.5</span></div>
+                    <input type="range" id="vault-mmr-lambda" min="0.1" max="0.9" step="0.1" value="0.5">
+                </div>
+                <div class="control-group">
+                    <label class="checkbox-row"><input type="checkbox" id="vault-query-expansion"> Multi-query expansion</label>
+                    <div class="slider-label"><label for="vault-num-queries">Query variants</label><span id="vault-num-queries-value">3</span></div>
+                    <input type="range" id="vault-num-queries" min="1" max="5" step="1" value="3">
+                </div>
+                <div class="control-group">
+                    <div class="slider-label"><label for="vault-rerank-pool">Reranker candidate pool</label><span id="vault-rerank-pool-value">50</span></div>
+                    <input type="range" id="vault-rerank-pool" min="20" max="100" step="5" value="50">
+                    <small class="control-hint">Max candidates the cross-encoder reranks down to Top K. Larger = better recall, slower.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-reranker-model">Reranker model (HuggingFace id)</label>
+                    <input type="text" id="set-reranker-model" placeholder="cross-encoder/ms-marco-MiniLM-L-6-v2">
+                    <small class="control-hint">Config-only for safety — changing it may trigger a model download on the next chat.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-reranker-device">Reranker device</label>
+                    <select id="set-reranker-device">
+                        <option value="auto">Auto</option>
+                        <option value="cpu">CPU</option>
+                        <option value="mps">MPS (Apple GPU)</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="set-vector-backend">Vector store backend (new index builds)</label>
+                    <select id="set-vector-backend">
+                        <option value="simple">Simple (JSON)</option>
+                        <option value="lancedb">LanceDB (binary)</option>
+                    </select>
+                    <small class="control-hint">Governs fresh builds only; an existing index keeps its backend.</small>
+                </div>
+                <div class="control-group">
+                    <label class="checkbox-row"><input type="checkbox" id="set-prewarm-enabled" checked> Prewarm index at launch</label>
+                    <small class="control-hint">Off defers the multi-GB load to the first chat.</small>
+                </div>
+            </details>
+
+            <span class="sidebar-label">Single Paper · generation</span>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="doc-ctx">Context (num_ctx)</label>
+                    <input type="number" id="doc-ctx" value="32768" min="512" max="131072">
+                </div>
+                <div class="control-group">
+                    <label for="doc-predict">Max Tokens</label>
+                    <input type="number" id="doc-predict" value="4096" min="64" max="32768">
+                </div>
+                <div class="control-group">
+                    <div class="slider-label"><label for="doc-temp">Temperature</label><span id="doc-temp-value">0.3</span></div>
+                    <input type="range" id="doc-temp" min="0" max="2" step="0.1" value="0.3" oninput="document.getElementById('doc-temp-value').textContent = this.value">
+                </div>
+                <div class="control-group">
+                    <div class="slider-label"><label for="doc-top-p">Top P</label><span id="doc-top-p-value">0.9</span></div>
+                    <input type="range" id="doc-top-p" min="0.1" max="1" step="0.05" value="0.9" oninput="document.getElementById('doc-top-p-value').textContent = this.value">
+                </div>
+                <div class="control-group">
+                    <div class="slider-label"><label for="doc-repeat-penalty">Repeat Penalty</label><span id="doc-repeat-penalty-value">1.1</span></div>
+                    <input type="range" id="doc-repeat-penalty" min="0.5" max="2" step="0.1" value="1.1" oninput="document.getElementById('doc-repeat-penalty-value').textContent = this.value">
+                </div>
+            </div>
+
+            <span class="sidebar-label">Deck Generator · generation</span>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="deck-max-sections">Max sections</label>
+                    <input type="number" id="deck-max-sections" min="1" max="20" step="1" value="8">
+                </div>
+                <div class="control-group">
+                    <label for="deck-agent-iters">Agent iterations / turn</label>
+                    <input type="number" id="deck-agent-iters" min="1" max="12" step="1" value="6">
+                </div>
+                <div class="control-group">
+                    <label for="deck-temp">Temperature</label>
+                    <input type="number" id="deck-temp" min="0" max="2" step="0.1" value="0.3">
+                </div>
+            </div>
+
+            <div id="settings-status" class="modal-copy"></div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="closeModal('settings-modal')">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Audit Settings Modal -->
+    <div id="audit-settings-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="audit-settings-modal-title">
+        <div class="modal">
+            <h2 id="audit-settings-modal-title">Library Audit Settings</h2>
+            <p class="modal-copy">
+                All paths are relative to the configured Obsidian vault, except for the Zotero
+                paths which point at the live Zotero data directory. Defaults match the
+                conventional kb_harmonizer layout.
+            </p>
+            <div class="control-group">
+                <label for="audit-attachments-subdir">Attachments subdirectory</label>
+                <input type="text" id="audit-attachments-subdir" placeholder="Z_attachments">
+            </div>
+            <div class="control-group">
+                <label for="audit-biblio-articles-subdir">Biblio articles subdirectory (under attachments)</label>
+                <input type="text" id="audit-biblio-articles-subdir" placeholder="biblio_articles">
+            </div>
+            <div class="control-group">
+                <label for="audit-zotero-notes-subdir">Zotero notes subdirectory</label>
+                <input type="text" id="audit-zotero-notes-subdir" placeholder="Z_Zotero_Notes">
+            </div>
+            <div class="control-group">
+                <label for="audit-master-bib-path">Master BibTeX path (vault-relative)</label>
+                <input type="text" id="audit-master-bib-path" placeholder="presentations_slides_writings_teaching/_master.bib">
+            </div>
+            <div class="control-group">
+                <label for="audit-zotero-sqlite">Zotero SQLite database (absolute)</label>
+                <input type="text" id="audit-zotero-sqlite" placeholder="~/Zotero/zotero.sqlite">
+            </div>
+            <div class="control-group">
+                <label for="audit-zotero-storage">Zotero storage directory (absolute)</label>
+                <input type="text" id="audit-zotero-storage" placeholder="~/Zotero/storage">
+            </div>
+            <div class="control-group">
+                <label for="audit-biblio-skip-prefix">PDF filename prefix to skip (e.g. z_item)</label>
+                <input type="text" id="audit-biblio-skip-prefix" placeholder="z_item">
+            </div>
+            <div class="control-group">
+                <label for="audit-annotations-read-threshold">Annotations read threshold</label>
+                <input type="number" id="audit-annotations-read-threshold" min="0" max="10000" value="5">
+            </div>
+            <div id="audit-settings-status" class="modal-copy"></div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeModal('audit-settings-modal')">Cancel</button>
+                <button class="btn btn-primary" onclick="saveAuditSettings()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Exclusions Modal -->
+    <div id="excl-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="excl-modal-title">
+        <div class="modal">
+            <h2 id="excl-modal-title">Directory Exclusions</h2>
+            <div id="excl-status" class="modal-copy"></div>
+            <div id="excl-list"></div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="addExclusion()">Add Folder...</button>
+                <button class="btn btn-primary" onclick="closeModal('excl-modal')">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Image Extensions Modal -->
+    <div id="image-exts-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="image-exts-modal-title">
+        <div class="modal">
+            <h2 id="image-exts-modal-title">Image Extensions Indexed</h2>
+            <p class="modal-copy">
+                Comma-separated list of file extensions. Matching images are
+                described by the vision model and embedded into the vault
+                index. Extensions outside this list are ignored.
+            </p>
+            <input type="text" id="image-exts-input" aria-label="Comma-separated image extensions to index" placeholder=".png, .jpg, .webp">
+            <div id="image-exts-status" class="modal-copy"></div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeModal('image-exts-modal')">Cancel</button>
+                <button class="btn btn-primary" onclick="saveImageExts()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Pull Model Modal -->
+    <div id="pull-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="pull-modal-title">
+        <div class="modal">
+            <h2 id="pull-modal-title">Pull Model</h2>
+            <input type="text" id="pull-model-input" aria-label="Model name and tag to pull" placeholder="model:tag">
+            <div id="pull-status"></div>
+            <div id="pull-progress-wrap" class="progress-bar-wrap" role="progressbar"
+                 aria-label="Model download progress" aria-valuemin="0" aria-valuemax="100"
+                 aria-valuenow="0" style="display:none;">
+                <div id="pull-progress-fill" class="progress-bar-fill"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" id="pull-btn" onclick="pullModel()">Pull</button>
+                <button class="btn btn-outline" onclick="closeModal('pull-modal')">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- How to Use Modal -->
+    <div id="howto-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="howto-modal-title">
+        <div class="modal">
+            <h2 id="howto-modal-title">How to Use ChatEKLD</h2>
+            <div class="modal-copy">
+                <p><strong>Pick a provider.</strong> Choose Ollama or LM Studio in the sidebar, then select a chat model and an embedding model. OCR and Vision have their own provider and model selectors below.</p>
+
+                <p><strong>Obsidian Agent.</strong> Set your vault folder with “Change…”, then click “Index Vault”. The first index can be long for large vaults; you can Pause (resumable, preserves work) or Cancel (still resumable) at any time. After indexing, ask questions in the input bar — answers are grounded in your notes and PDFs.</p>
+
+                <p><strong>Single Paper.</strong> Click the upload area to pick a PDF. Choose a summary style, document type, audience, language, and (optionally) a focus question and LLM parameters. Click “Summarise” and then “Export TXT” or “Export MD” to save the result to your Downloads.</p>
+
+                <p><strong>Tips.</strong> If you change the embedding model after indexing, re-index from scratch — mixing embeddings yields a useless index. PDFs over 5000 pages are skipped; PDFs between 1000 and 5000 pages are extracted in 1000-page chunks. Scanned PDFs use the OCR model as a fallback when no text layer is found.</p>
+
+                <p><strong>Reset.</strong> “Reset App Data” clears uploads and the Obsidian index. You can also delete the saved config and feedback file from the reset flow if needed.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="closeModal('howto-modal')">Got it</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reset Modal -->
+    <div id="reset-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="reset-modal-title">
+        <div class="modal">
+            <h2 id="reset-modal-title">Reset App Data</h2>
+            <p class="modal-copy">This clears uploads and the Obsidian index.</p>
+            <div class="modal-footer">
+                <button class="btn btn-danger" onclick="resetAppData()">Reset</button>
+                <button class="btn btn-outline" onclick="closeModal('reset-modal')">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
