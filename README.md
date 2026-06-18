@@ -13,20 +13,6 @@ ChatEKLD is a local Flask and PyWebView application for PDF summarisation, Obsid
 
 **Feedback is very welcome!** This is an actively developed, personal project, so please don't hesitate to reach out to Etienne at [boss@etienned.xyz](mailto:boss@etienned.xyz) with ideas, bug reports, or just to let me know how you're finding it — I'd genuinely love to hear from you.
 
-## Screenshots
-
-Vault chat in agent mode searches your indexed notes and PDFs, and tells you plainly when it finds nothing rather than inventing an answer:
-
-![ChatEKLD Obsidian Agent searching the indexed vault](docs/screenshots/01-obsidian-agent.png)
-
-When the material is there, it assembles a grounded answer with citations back to the source notes and PDFs:
-
-![ChatEKLD Obsidian Agent returning a grounded, cited answer](docs/screenshots/02-obsidian-agent-answer.png)
-
-The Deck Generator turns a topic and your own Beamer template into a compile-ready, vault-grounded slide deck:
-
-![ChatEKLD Deck Generator tab](docs/screenshots/03-deck-generator.png)
-
 ## Workflows
 
 ChatEKLD is organised as four tabs, each a self-contained workflow:
