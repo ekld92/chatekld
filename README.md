@@ -1,17 +1,31 @@
 # ChatEKLD 2026
 
-👋 **Welcome!** ChatEKLD is a friendly, privacy-first desktop app that turns your Mac into a research workspace: summarise PDFs, chat with your Obsidian notes, reconcile your reference library, and generate grounded slide decks — all on your own machine.
+**Welcome!** ChatEKLD is a privacy-first desktop app that turns your Mac into a research workspace: summarise PDFs, chat with your Obsidian notes, reconcile your reference library, and generate grounded slide decks — all on your own machine.
 
 ChatEKLD is a local Flask and PyWebView application for PDF summarisation, Obsidian vault RAG, library reconciliation, and grounded LaTeX slide generation. It runs offline by default with Ollama or LM Studio, and can optionally route chat through OpenAI, Anthropic, or Google Gemini while keeping the index — and your notes — on-device.
 
 **At a glance:**
 
-- 📄 **Single Paper** — drop in a PDF and get a clean, tunable summary you can export.
-- 📚 **Obsidian Vault** — index your notes and PDFs, then ask questions and get grounded, cited answers (with an optional agent mode that searches as it reasons).
-- 🔍 **Library Audit** — a read-only health check that reconciles your vault against Zotero, your PDFs, and Finder tags.
-- 🎓 **Deck Generator** — turn a topic into a ready-to-compile LaTeX Beamer deck in your own template's house style.
+- **Single Paper** — drop in a PDF and get a clean, tunable summary you can export.
+- **Obsidian Vault** — index your notes and PDFs, then ask questions and get grounded, cited answers (with an optional agent mode that searches as it reasons).
+- **Library Audit** — a read-only reconciliation of your vault against Zotero, your PDFs, and Finder tags. This is a very personal tool, tailored to my own workflow, and may well not be of use to you.
+- **Deck Generator** — turn a topic into a ready-to-compile LaTeX Beamer deck in your own template's house style.
 
-💬 **Feedback is very welcome!** This is an actively developed, personal project, so please don't hesitate to reach out to Etienne at [etienne.durante@gmail.com](mailto:etienne.durante@gmail.com) with ideas, bug reports, or just to let me know how you're finding it — I'd genuinely love to hear from you.
+**Feedback is very welcome!** This is an actively developed, personal project, so please don't hesitate to reach out to Etienne at [boss@etienned.xyz](mailto:boss@etienned.xyz) with ideas, bug reports, or just to let me know how you're finding it — I'd genuinely love to hear from you.
+
+## Screenshots
+
+Vault chat in agent mode searches your indexed notes and PDFs, and tells you plainly when it finds nothing rather than inventing an answer:
+
+![ChatEKLD Obsidian Agent searching the indexed vault](docs/screenshots/01-obsidian-agent.png)
+
+When the material is there, it assembles a grounded answer with citations back to the source notes and PDFs:
+
+![ChatEKLD Obsidian Agent returning a grounded, cited answer](docs/screenshots/02-obsidian-agent-answer.png)
+
+The Deck Generator turns a topic and your own Beamer template into a compile-ready, vault-grounded slide deck:
+
+![ChatEKLD Deck Generator tab](docs/screenshots/03-deck-generator.png)
 
 ## Workflows
 
