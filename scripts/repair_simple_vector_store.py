@@ -4,6 +4,21 @@
 The repair is conservative: it preserves only complete entries from
 ``embedding_dict`` and rebuilds ``text_id_to_ref_doc_id`` plus
 ``metadata_dict`` from a valid LlamaIndex docstore.
+
+Offline, **app-closed** salvage tool, and **no re-embedding** — it recovers the
+embeddings that *did* survive in the JSON (e.g. after a crash truncated the file
+mid-write) and rebuilds the two side maps from the docstore; it never constructs
+an embedding model or re-vectorizes anything, so it runs fast with API keys
+unset. (Whatever embeddings were lost stay lost; pair this with
+``prune_storage_to_vector_store.py`` to trim the docstore/index store down to
+what was recovered.)
+
+Reads ``default__vector_store.json`` (streamed, so a multi-GB store needs little
+RAM) and ``docstore.json`` under ``--storage-dir``. Writes a
+``…json.repaired`` candidate, validates it loads as a real ``SimpleVectorStore``
+with consistent counts, and only swaps it into place with ``--replace`` /
+``--promote-existing`` (the original is moved aside to ``…json.pre-repair``).
+Without those flags it is a dry run.
 """
 
 from __future__ import annotations
@@ -26,6 +41,11 @@ READ_SIZE = 4 * 1024 * 1024
 
 
 def _read_more(src, buffer: str, eof: bool) -> tuple[str, bool]:
+    """Append the next ``READ_SIZE`` chunk to *buffer*; return ``(buffer, eof)``.
+
+    The streaming read primitive that keeps peak memory bounded while walking a
+    multi-GB vector store one chunk at a time.
+    """
     if eof:
         return buffer, eof
     chunk = src.read(READ_SIZE)
@@ -35,12 +55,18 @@ def _read_more(src, buffer: str, eof: bool) -> tuple[str, bool]:
 
 
 def _skip_ws(buffer: str, pos: int) -> int:
+    """Advance *pos* past any JSON whitespace in *buffer*; return the new index."""
     while pos < len(buffer) and buffer[pos] in " \t\r\n":
         pos += 1
     return pos
 
 
 def _ensure(src, buffer: str, pos: int, eof: bool, need: int = 1) -> tuple[str, bool]:
+    """Read until at least *need* chars are available from *pos* (or EOF).
+
+    Lets the caller safely inspect ``buffer[pos]`` / start a decode without
+    risking a short read in the middle of the next token.
+    """
     while len(buffer) - pos < need and not eof:
         buffer, eof = _read_more(src, buffer, eof)
     return buffer, eof
@@ -58,6 +84,12 @@ def _decode_next(decoder: json.JSONDecoder, src, buffer: str, pos: int, eof: boo
 
 
 def _write_json_member(out, first: bool, key: str, value: Any) -> bool:
+    """Stream one ``"key":value`` member to *out*, prefixing a comma if not *first*.
+
+    Returns ``False`` (the new *first*) so the caller threads "have we written a
+    member yet?" through a loop and emits commas only between members — building
+    a valid JSON object incrementally without buffering it whole.
+    """
     if not first:
         out.write(",")
     json.dump(key, out, ensure_ascii=False, separators=(",", ":"))
@@ -67,6 +99,15 @@ def _write_json_member(out, first: bool, key: str, value: Any) -> bool:
 
 
 def recover_embedding_dict(vector_store_path: Path, out, progress_every: int) -> list[str]:
+    """Stream-copy the *complete* ``embedding_dict`` members into *out*; return their ids.
+
+    Walks the (possibly truncated) source one member at a time and writes each
+    fully-decoded ``id: [floats]`` pair straight through to *out*. The moment a
+    member fails to decode at EOF (the truncation point), it stops and drops that
+    partial entry — so the output is always a syntactically valid
+    ``{"embedding_dict": {...}}`` containing only the embeddings that survived
+    intact. Returns the list of recovered ids for the side-map rebuild.
+    """
     decoder = json.JSONDecoder()
     recovered_ids: list[str] = []
     buffer = ""
@@ -135,6 +176,12 @@ def recover_embedding_dict(vector_store_path: Path, out, progress_every: int) ->
 
 
 def _node_metadata_and_ref_doc(raw_node: dict) -> tuple[str, dict]:
+    """Reconstruct ``(ref_doc_id, metadata_dict)`` for one docstore node.
+
+    Rebuilds the metadata in the exact shape ``SimpleVectorStore`` expects (text
+    stripped, ``_node_content`` dropped) so the repaired store's ``metadata_dict``
+    is byte-compatible with what LlamaIndex would have written originally.
+    """
     node = TextNode.from_dict(raw_node["__data__"])
     metadata = node_to_metadata_dict(node, remove_text=True, flat_metadata=False)
     metadata.pop("_node_content", None)
@@ -142,6 +189,14 @@ def _node_metadata_and_ref_doc(raw_node: dict) -> tuple[str, dict]:
 
 
 def write_rebuilt_maps(out, docstore_path: Path, recovered_ids: list[str], progress_every: int) -> tuple[int, int]:
+    """Stream the ``text_id_to_ref_doc_id`` and ``metadata_dict`` maps into *out*.
+
+    Both side maps are rebuilt *from the docstore* (the source of truth) for each
+    recovered id, not salvaged from the truncated file. An id missing from the
+    docstore is skipped (counted as *missing*) so the three maps end up over the
+    exact same id set — the invariant ``validate_vector_store`` checks. Closes the
+    top-level object. Returns ``(kept_count, missing_count)``.
+    """
     print(f"Loading docstore from {docstore_path}...", file=sys.stderr, flush=True)
     with docstore_path.open("r", encoding="utf-8") as f:
         docstore = json.load(f)
@@ -177,6 +232,13 @@ def write_rebuilt_maps(out, docstore_path: Path, recovered_ids: list[str], progr
 
 
 def validate_vector_store(path: Path) -> None:
+    """Load the repaired file as a real ``SimpleVectorStore`` and assert map parity.
+
+    The safety gate before any swap: it must parse as a genuine vector store and
+    have equal counts across ``embedding_dict`` / ``text_id_to_ref_doc_id`` /
+    ``metadata_dict`` (a mismatch means the rebuild is inconsistent). Raises
+    ``RuntimeError`` on any inconsistency so ``--replace`` never promotes a bad file.
+    """
     print(f"Validating repaired vector store JSON and schema: {path}", file=sys.stderr, flush=True)
     store = SimpleVectorStore.from_persist_path(str(path))
     data = store.data
@@ -191,6 +253,13 @@ def validate_vector_store(path: Path) -> None:
 
 
 def main() -> int:
+    """Parse args and run the recover → rebuild → validate → (optional) swap flow.
+
+    Default is a dry run that leaves a ``…json.repaired`` candidate beside the
+    original; ``--replace`` (or ``--promote-existing``, which validates and
+    promotes a previously-written candidate without re-running recovery) swaps it
+    in, moving the original to ``…json.pre-repair``. Returns a process exit code.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--storage-dir", default=os.path.expanduser("~/Library/Application Support/ChatEKLD/obsidian_storage"))
     parser.add_argument("--progress-every", type=int, default=10_000)

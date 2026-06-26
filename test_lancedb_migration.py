@@ -16,6 +16,7 @@ import numpy as np
 
 from rag.lancedb_store import (
     VECTOR_BACKEND_LANCEDB,
+    compact_lancedb_vector_store,
     is_lancedb_store,
     lancedb_available,
     lancedb_dir,
@@ -104,6 +105,63 @@ class TestLanceDBStoreLayer(unittest.TestCase):
             self.assertAlmostEqual(norm, 1.0, places=5)
             self.assertEqual(got.metadata["attachments"], json.dumps(["a.pdf", "b.png"]))
 
+    def test_add_tolerates_metadata_keys_absent_from_table_schema(self):
+        """A node whose metadata has keys the table schema lacks must insert.
+
+        LanceDB freezes the metadata struct schema from the first batch. The
+        vault table is created MD-first (so it has source/extension/header_path/
+        attachments but NOT page_start/page_end/is_image); large-PDF range
+        chunks and image chunks then carry those extra keys. Without the
+        projection in NormalizingLanceDBVectorStore.add(), LanceDB rejects them
+        with "field 'page_start' does not exist in table schema" and the whole
+        run aborts on the consecutive-failure breaker. The projection drops the
+        unknown flat keys (the docstore still keeps the full node), so the
+        insert succeeds and the node round-trips.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            vs = make_lancedb_vector_store(d)
+            # Create the table from an MD-like node: this fixes the struct
+            # schema to {source, extension, header_path, attachments, ...}.
+            md = TextNode(
+                id_="md1",
+                text="markdown chunk",
+                metadata={"source": "note.md", "extension": ".md",
+                          "header_path": "H1/H2", "attachments": ["fig.png"]},
+            )
+            md.embedding = [1.0] + [0.0] * (DIM - 1)
+            vs.add([md])
+
+            # PDF range chunk (page_start/page_end) + image chunk (is_image):
+            # both carry keys absent from the schema above.
+            pdf = TextNode(
+                id_="pdf1",
+                text="textbook page range chunk",
+                metadata={"source": "book.pdf", "extension": ".pdf",
+                          "page_start": 1000, "page_end": 2000},
+            )
+            pdf.embedding = [0.0, 1.0] + [0.0] * (DIM - 2)
+            img = TextNode(
+                id_="img1",
+                text="a labelled diagram of the brain",
+                metadata={"source": "Z_attachments/figure.png",
+                          "extension": ".png", "is_image": True},
+            )
+            img.embedding = [0.0, 0.0, 1.0] + [0.0] * (DIM - 3)
+
+            # Must not raise the schema-drift ValueError.
+            vs.add([pdf, img])
+
+            self.assertEqual(lancedb_table_count(d), 3)
+            got = {n.node_id: n for n in vs.get_nodes(node_ids=["pdf1", "img1"])}
+            # Nodes round-trip with text + the schema-known metadata intact;
+            # the dropped keys are simply absent from the flat row (and are
+            # never read at query time).
+            self.assertEqual(got["pdf1"].get_content(), "textbook page range chunk")
+            self.assertEqual(got["pdf1"].metadata.get("source"), "book.pdf")
+            self.assertNotIn("page_start", got["pdf1"].metadata)
+            self.assertEqual(got["img1"].metadata.get("source"), "Z_attachments/figure.png")
+            self.assertNotIn("is_image", got["img1"].metadata)
+
     def test_query_normalizes_query_vector(self):
         with tempfile.TemporaryDirectory() as d:
             vs = make_lancedb_vector_store(d)
@@ -126,6 +184,17 @@ class TestLanceDBStoreLayer(unittest.TestCase):
     def test_table_count_missing_dir(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(lancedb_table_count(d), -1)  # no table yet
+
+    def test_compact_is_safe_noop_off_lancedb(self):
+        # No raise, returns False, on the simple backend / a missing table /
+        # anything without a live ``_table``.
+        self.assertFalse(compact_lancedb_vector_store(None))
+
+        class _NoTable:
+            pass
+
+        self.assertFalse(compact_lancedb_vector_store(_NoTable()))
+        self.assertFalse(compact_lancedb_vector_store(SimpleVectorStore()))
 
 
 class TestMigration(unittest.TestCase):
@@ -224,6 +293,32 @@ class TestBackendAwareIndexVault(unittest.TestCase):
             self.assertIn("0 embedded", joined, joined)
             self.assertEqual(lancedb_table_count(index_dir), rows)
 
+    def test_index_with_no_recorded_embed_rebuilds(self):
+        """An existing index whose meta records NO embed model cannot be safely
+        extended (we can't prove its vectors match the current model), so the
+        indexer must rebuild instead of silently going incremental (L2)."""
+        from rag.vault import ObsidianVaultManager
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vault_dir, \
+             tempfile.TemporaryDirectory() as index_dir:
+            Path(vault_dir, "a.md").write_text("# A\n\nbody text", encoding="utf-8")
+            manager = ObsidianVaultManager()
+            manager.restore_vault_path(vault_dir)
+            self.assertEqual(self._index(manager, index_dir) and manager.get_status(), "done")
+
+            # Strip the recorded embed model (simulates torn/ancient meta).
+            meta_path = Path(index_dir, "obsidian_meta.json")
+            meta = json.loads(meta_path.read_text())
+            meta.pop("embed", None)
+            meta_path.write_text(json.dumps(meta))
+
+            manager2 = ObsidianVaultManager()
+            manager2.restore_vault_path(vault_dir)
+            msgs = self._index(manager2, index_dir)
+            self.assertEqual(manager2.get_status(), "done", msgs)
+            self.assertTrue(
+                any("did not record its embedding model" in m for m in msgs), msgs
+            )
+
     def test_crash_drift_upsert_replaces_orphan_not_duplicates(self):
         """Faithful crash simulation at the indexer level: the lancedb table is
         ahead of the docstore (a chunk's row is durable but its docstore node was
@@ -266,6 +361,61 @@ class TestBackendAwareIndexVault(unittest.TestCase):
                     idx, iter([chunk]), None, lancedb_upsert=False
                 )
                 self.assertEqual(lancedb_table_count(index_dir2), 2)
+
+    def test_compaction_merges_per_insert_fragments(self):
+        """Each streaming insert is its own single-row fragment; compaction must
+        merge them (the source of the O(n²) _versions bloat) while preserving
+        every row.  Tests the helper directly so the assertion is deterministic
+        (fragment merge does not depend on version-prune timing)."""
+        from rag.vault import ObsidianVaultManager
+        from llama_index.core import Document
+        from llama_index.core.embeddings import MockEmbedding
+
+        with tempfile.TemporaryDirectory() as index_dir:
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir):
+                mgr = ObsidianVaultManager()
+                idx = mgr._build_index_for_backend(
+                    fresh=True, backend="lancedb", embed_model=MockEmbedding(embed_dim=8)
+                )
+                for i in range(12):
+                    idx.insert(Document(text=f"body {i}", doc_id=f"n.md::{i:08x}"))
+
+                data_dir = Path(lancedb_dir(index_dir), "vectors.lance", "data")
+                before = len([p for p in data_dir.iterdir() if p.is_file()])
+                self.assertGreater(before, 1)  # one fragment per insert
+
+                vs = idx.storage_context.vector_store
+                self.assertTrue(compact_lancedb_vector_store(vs))
+
+                after = len([p for p in data_dir.iterdir() if p.is_file()])
+                self.assertLess(after, before)  # fragments merged
+                self.assertEqual(lancedb_table_count(index_dir), 12)  # no rows lost
+
+    def test_streaming_loop_compacts_at_insert_cadence(self):
+        """The streaming indexer compacts every _LANCEDB_COMPACT_EVERY inserts on
+        the lancedb backend (independently of the JSON checkpoint), so the live
+        fragment count stays bounded mid-run rather than growing one-per-insert."""
+        from rag.vault import ObsidianVaultManager
+        from llama_index.core import Document
+        from llama_index.core.embeddings import MockEmbedding
+
+        with tempfile.TemporaryDirectory() as index_dir:
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir):
+                mgr = ObsidianVaultManager()
+                idx = mgr._build_index_for_backend(
+                    fresh=True, backend="lancedb", embed_model=MockEmbedding(embed_dim=8)
+                )
+                chunks = [Document(text=f"b {i}", doc_id=f"n.md::{i:08x}") for i in range(12)]
+                with patch.object(ObsidianVaultManager, "_LANCEDB_COMPACT_EVERY", 4):
+                    added, _, _, _, _ = mgr._index_documents_streaming(
+                        idx, iter(chunks), None, vector_backend="lancedb"
+                    )
+                self.assertEqual(added, 12)
+                self.assertEqual(lancedb_table_count(index_dir), 12)
+                data_dir = Path(lancedb_dir(index_dir), "vectors.lance", "data")
+                # With compaction every 4 of 12 inserts, the final fragment count
+                # is far below the 12 a no-compaction run would leave.
+                self.assertLess(len([p for p in data_dir.iterdir() if p.is_file()]), 12)
 
 
 class TestClientSideMMR(unittest.TestCase):

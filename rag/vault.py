@@ -1,3 +1,24 @@
+"""Obsidian vault indexing, status, retrieval caches, and chat entrypoints.
+
+Owns :class:`ObsidianVaultManager` (the ``obsidian_manager`` singleton) and the
+end-to-end indexing pipeline. The deep implementation notes — the streaming
+indexing pipeline, the checkpoint cadence, the two vector-store backends, the
+retrieval mechanics (RRF / MMR / rerank / wikilink), and the BM25/reranker/wikilink
+cache contracts — live in ``rag/CLAUDE.md``; this module is their implementation.
+
+The one thing worth internalising before editing here is the **lock hierarchy**.
+The manager is touched concurrently by: the request thread serving chat, the
+daemon indexing thread, the launch-time prewarm thread, and the UI status poller.
+Several locks coordinate them, and they have an **ordering** that must be respected
+to stay deadlock-free — see the :class:`ObsidianVaultManager` docstring for the
+full map. Two rules summarise it: (1) the only lock *nesting* involving the meta
+cache is ``_status_lock`` → ``_meta_cache_lock`` (``get_status`` reads meta while
+holding the status lock), so no path may take ``_status_lock`` while already
+holding ``_meta_cache_lock`` — taking ``_meta_cache_lock`` *alone*, as the many
+``_read_index_meta`` read paths do, is always safe; (2) the multi-GB
+``self._index`` is published under ``_rw_lock`` write while the slow insert loop
+runs lock-free, so chat reads never block on a multi-hour reindex.
+"""
 import base64
 import gc
 import hashlib
@@ -32,6 +53,7 @@ from core.constants import (
     OBSIDIAN_INDEX_VERSION,
     OBSIDIAN_EXCLUDED_DIR_NAMES,
     EXACT_BLOCKED,
+    MD_MAX_CHUNK_TOKENS,
     PDF_MAX_PAGES,
     SYSTEM_ROOTS,
     VAULT_MD_EXTS,
@@ -44,7 +66,9 @@ from core.providers import get_provider
 from rag.lancedb_store import (
     VECTOR_BACKEND_LANCEDB,
     VECTOR_BACKEND_SIMPLE,
+    compact_lancedb_vector_store,
     lancedb_available,
+    lancedb_dir,
     lancedb_table_count,
     make_lancedb_vector_store,
 )
@@ -87,6 +111,85 @@ _INLINE_LINK_RE = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 
 # Schemes we never resolve as filesystem attachments.
 _NON_ATTACHMENT_SCHEMES = ("http://", "https://", "mailto:", "ftp://", "data:")
+
+
+def _closest_note_by_dir(candidates: list[str], note_dir: str) -> str:
+    """Deterministically pick among same-basename note candidates for an
+    ambiguous bare wikilink: prefer the candidate sharing the longest
+    directory prefix with the linking note, then fewest path segments, then
+    lexicographic order.
+
+    Mirrors ``ObsidianVaultManager._pick_closest_attachment``'s tie-break but
+    operates on vault-relative strings (no ``Path`` / filesystem), so the
+    note→note graph build stays FS-free.
+    """
+    note_parts = [p for p in note_dir.split("/") if p]
+
+    def shared_prefix(rel: str) -> int:
+        # Compare directory components only (drop the trailing filename
+        # segment) so a shared *folder* path drives locality, not a
+        # coincidental basename match.
+        dir_parts = rel.split("/")[:-1]
+        n = 0
+        for a, b in zip(note_parts, dir_parts):
+            if a != b:
+                break
+            n += 1
+        return n
+
+    return sorted(candidates, key=lambda r: (-shared_prefix(r), r.count("/"), r))[0]
+
+
+class _WikilinkGraph:
+    """Immutable note→note adjacency derived from the vault docstore.
+
+    Built once per indexing run (cached by docstore size) from the ``.md``
+    nodes' link text — never from the filesystem — so it adds no reindex and
+    no re-embedding.  ``outbound`` holds the notes a note links TO;
+    ``backlinks`` the notes that link INTO it; ``neighbors`` is their
+    deterministic union (consumed by the Phase-2 expansion retriever).
+    ``node_ids_for`` maps a note's vault-relative ``source`` to the docstore
+    node ids of its chunks so neighbours can be fetched without re-querying
+    the vector store.
+    """
+
+    __slots__ = ("_forward", "_backward", "_note_to_node_ids")
+
+    def __init__(
+        self,
+        forward: dict[str, set[str]],
+        backward: dict[str, set[str]],
+        note_to_node_ids: dict[str, list[str]],
+    ) -> None:
+        self._forward = forward
+        self._backward = backward
+        self._note_to_node_ids = note_to_node_ids
+
+    def outbound(self, note: str) -> list[str]:
+        """Notes *note* links to, sorted for determinism."""
+        return sorted(self._forward.get(note, ()))
+
+    def backlinks(self, note: str) -> list[str]:
+        """Notes that link into *note*, sorted for determinism."""
+        return sorted(self._backward.get(note, ()))
+
+    def neighbors(self, note: str) -> list[str]:
+        """Union of outbound links and backlinks for *note* (self excluded)."""
+        merged = set(self._forward.get(note, ())) | set(self._backward.get(note, ()))
+        merged.discard(note)
+        return sorted(merged)
+
+    def node_ids_for(self, note: str) -> list[str]:
+        """Docstore node ids of *note*'s chunks (empty if *note* is unknown)."""
+        return list(self._note_to_node_ids.get(note, ()))
+
+    @property
+    def note_count(self) -> int:
+        return len(self._note_to_node_ids)
+
+    @property
+    def edge_count(self) -> int:
+        return sum(len(targets) for targets in self._forward.values())
 
 
 def _write_json_atomic(path: str, data: dict) -> None:
@@ -153,7 +256,41 @@ def _simple_vector_store_has_any_embedding(path: Path) -> bool:
 
 
 class ObsidianVaultManager:
-    """Refactored ObsidianVaultManager for modularity and provider agnosticism."""
+    """Singleton owning the vault index, its caches, and the chat/indexing entrypoints.
+
+    Provider-agnostic (it takes the chat/embed/provider names per call rather than
+    binding a backend) and **heavily concurrent**. The lock map, with each lock's
+    job and the ordering rules that keep it deadlock-free:
+
+    * ``_op_lock`` (:class:`RagOperationLock`) — coarse admission control: only one
+      long operation (an index run, or a Note-Refactor write) at a time, with a TTL
+      so a crashed worker self-expires. ``try_acquire_lock`` captures the epoch into
+      ``_lock_epoch``; ``release_lock`` passes it back so a zombie cannot release a
+      newer holder's lock.
+    * ``_rw_lock`` (:class:`ReaderWriterLock`) — guards ``self._index`` *publication*.
+      Chat takes the read lock; the indexer takes the write lock only to publish the
+      index, to checkpoint, and for the final persist — the multi-hour insert loop
+      runs **outside** it, so chat is never blocked for the duration of a reindex
+      (double-checked locking on the lazy load).
+    * ``_index_mutation_lock`` (``Lock``) — serialises operations that mutate the
+      LlamaIndex internals: ``idx.insert`` / ``idx.delete_ref_doc``, the checkpoint
+      persist, lancedb compaction, and the *retrieval* phase of a query — so a chat
+      iterating the vector store cannot race an indexer insert ("dict changed size").
+    * ``_status_lock`` — guards the indexing state machine (``_index_state`` etc.).
+      ``_meta_cache_lock`` (the ``obsidian_meta.json`` read cache) is nested *inside*
+      ``_status_lock`` by ``get_status`` (the order is ``_status_lock`` →
+      ``_meta_cache_lock``); the ordering invariant is therefore that no path may
+      acquire ``_status_lock`` while holding ``_meta_cache_lock``. Taking
+      ``_meta_cache_lock`` on its own — as ``_read_index_meta``'s many other callers
+      do — is safe (a lock held alone cannot deadlock).
+    * ``_messages_lock`` — guards the bounded status-message ring (drained by the poll).
+    * Per-cache build locks — ``_bm25_build_lock`` / ``_wikilink_build_lock`` /
+      ``_reranker_load_lock`` / ``_prewarm_lock`` — each serialises one lazy, cached
+      build so concurrent first-Sends don't duplicate an expensive load.
+
+    Every field is initialised in ``__init__`` with an inline note on what guards it;
+    read those alongside this map.
+    """
 
     def __init__(self) -> None:
         self._vault_path: Optional[str] = None
@@ -206,6 +343,15 @@ class ObsidianVaultManager:
         self._meta_cache: Optional[dict] = None
         self._meta_cache_key: Optional[tuple] = None
 
+        # Status-poll lancedb row-count cache (see _cached_lancedb_count).
+        # get_status() is polled ~1 Hz and only needs the boolean count>0, but
+        # each raw lancedb_table_count opens a fresh connection that re-lists the
+        # fragment manifest. Stat-key + short TTL collapses that churn.
+        self._lancedb_count_lock: threading.Lock = threading.Lock()
+        self._lancedb_count_cache: Optional[int] = None
+        self._lancedb_count_key: Optional[tuple] = None
+        self._lancedb_count_at: float = 0.0
+
         # Hybrid retrieval (BM25) cache.  Built lazily on the first chat that
         # asks for hybrid mode and reused thereafter so we do not retokenise
         # the entire docstore on every Send.  Invalidated by node-count
@@ -214,6 +360,13 @@ class ObsidianVaultManager:
         self._bm25_retriever: Optional[Any] = None
         self._bm25_cached_doc_count: int = -1
         self._bm25_build_lock: threading.Lock = threading.Lock()
+        # Wikilink note→note graph cache (query-time graph augmentation).
+        # Built lazily from the docstore like BM25 — never from the filesystem
+        # — so it adds no reindex and no re-embedding.  Cached by docstore size
+        # and invalidated alongside BM25 after each persist.
+        self._wikilink_index: Optional[Any] = None
+        self._wikilink_cached_doc_count: int = -1
+        self._wikilink_build_lock: threading.Lock = threading.Lock()
         # Cross-encoder reranker cache.  The model load is one-shot (the
         # weights are kept in memory) so the first chat pays the download +
         # warm-up cost and subsequent ones reuse the same object with only
@@ -246,6 +399,12 @@ class ObsidianVaultManager:
         self._status_cb = cb
 
     def _emit(self, msg: str) -> None:
+        """Append a status line for the UI poll (and fire the optional callback).
+
+        Logs, then pushes onto the bounded message ring under ``_messages_lock``
+        (capped at the last 200 lines so a long run can't grow it without bound);
+        the ``/api/obsidian/status`` poll drains it via :meth:`drain_status_messages`.
+        """
         logger.info("ObsidianVaultManager: %s", msg)
         with self._messages_lock:
             self._status_messages.append(msg)
@@ -320,6 +479,15 @@ class ObsidianVaultManager:
         return meta
 
     def get_status(self) -> str:
+        """Return the current indexing state, recovering a persisted one when idle.
+
+        While a run is active this is just the live ``_index_state``. On a fresh
+        process that field is ``"idle"`` even though a complete/partial index may sit
+        on disk, so this lazily reads ``obsidian_meta.json`` (via the
+        ``_meta_cache_lock`` cache, taken *inside* ``_status_lock`` per the ordering
+        rule) to recover ``done`` / ``paused_partial`` / ``paused_scan`` and to detect
+        a checkpoint whose vector files are missing/incomplete (→ integrity warning).
+        """
         with self._status_lock:
             if self._index_state != "idle":
                 return self._index_state
@@ -382,28 +550,53 @@ class ObsidianVaultManager:
         }
 
     def drain_status_messages(self) -> list[str]:
+        """Atomically return and clear the pending status lines (read-once by the poll)."""
         with self._messages_lock:
             messages = list(self._status_messages)
             self._status_messages.clear()
             return messages
 
     def clear_status_messages(self) -> None:
+        """Drop any buffered status lines without returning them."""
         with self._messages_lock:
             self._status_messages.clear()
 
     def try_acquire_lock(self, ttl: int = 3600) -> bool:
+        """Admit one long operation; cache its epoch for the matching release.
+
+        Returns ``True`` and records ``_lock_epoch`` on success. The epoch is what
+        makes :meth:`release_lock` safe: a worker whose acquisition already expired
+        (TTL lapsed, another caller stole the lock) will pass a stale epoch and so
+        cannot release the new holder's lock.
+        """
         acquired = self._op_lock.try_acquire(ttl)
         if acquired:
             self._lock_epoch = self._op_lock.epoch
         return acquired
 
     def release_lock(self):
+        """Release the op-lock using the epoch captured at acquire time (no-op if stale)."""
         self._op_lock.release(self._lock_epoch)
 
     def force_release(self) -> bool:
+        """Unconditionally free the op-lock (recovery path, e.g. cancel); was-it-held."""
         return self._op_lock.force_release()
 
     def index_vault(self, llm_name: str, embed_name: str, provider_name: str = "ollama") -> None:
+        """Run a full incremental (re)index of the configured vault — the main orchestrator.
+
+        Called on the daemon thread admitted by ``/api/obsidian/index`` (which already
+        holds the op-lock). Drives the streaming pipeline documented in ``rag/CLAUDE.md``:
+        scan → chunk → stream-insert with periodic checkpoints → final persist →
+        cache invalidation. Concurrency-critical structure: it publishes ``self._index``
+        under the ``_rw_lock`` write lock after setup, then releases it so the
+        multi-hour insert loop runs lock-free; the write lock is re-taken only for each
+        mid-run checkpoint and the final persist. ``_stop_event`` (cancel) and
+        ``_pause_requested`` are polled cooperatively in the loop. Per-run warning flags
+        are reset up front so each run can warn once. Returns nothing — progress and
+        terminal state are surfaced through the status machine + message ring; the
+        caller releases the op-lock in its ``finally``.
+        """
         self._stop_event.clear()
         self._pause_requested = False
         self._pdf_cache_write_warning_emitted = False
@@ -457,24 +650,37 @@ class ObsidianVaultManager:
                     except Exception:
                         prev_meta = {}
                     embed_changed = bool(prev_meta.get("embed")) and prev_meta.get("embed") != embed_name
+                    # An index that recorded NO embed model cannot be safely
+                    # extended: we can't prove its existing vectors match the
+                    # current model, and a silent mix corrupts similarity search.
+                    # Treat it like a model change (rebuild), not a free incremental.
+                    embed_unknown = not bool(prev_meta.get("embed"))
                     has_vector_data = self._index_dir_has_vector_data(OBSIDIAN_INDEX_DIR)
                     if (
                         prev_meta.get("version") == OBSIDIAN_INDEX_VERSION
                         and has_vector_data
                         and not embed_changed
+                        and not embed_unknown
                     ):
                         is_incremental = True
-                    elif embed_changed and has_vector_data:
-                        # Mixing new-model vectors into an old-model store would
-                        # corrupt similarity search silently — force a rebuild.
-                        # A paused_scan with no persisted vectors has nothing to
-                        # be incompatible with, so we don't warn in that case.
-                        self._emit(
-                            f"WARNING: Existing index was built with embedding "
-                            f"model '{prev_meta['embed']}', but the current model is '{embed_name}'. "
-                            "New chunks would have incompatible vector representations; "
-                            "starting a fresh vector index."
-                        )
+                    elif has_vector_data and (embed_changed or embed_unknown):
+                        # Mixing incompatible vectors into the store would corrupt
+                        # similarity search silently — force a rebuild.  Gated on
+                        # has_vector_data: a paused_scan with no persisted vectors
+                        # has nothing to be incompatible with.
+                        if embed_changed:
+                            self._emit(
+                                f"WARNING: Existing index was built with embedding "
+                                f"model '{prev_meta['embed']}', but the current model is '{embed_name}'. "
+                                "New chunks would have incompatible vector representations; "
+                                "starting a fresh vector index."
+                            )
+                        else:
+                            self._emit(
+                                "WARNING: Existing index did not record its embedding "
+                                "model, so it cannot be safely extended; starting a "
+                                "fresh vector index."
+                            )
 
                 if not is_incremental:
                     if self._index_dir_has_vector_data(OBSIDIAN_INDEX_DIR):
@@ -579,7 +785,9 @@ class ObsidianVaultManager:
             chunks_iter = self._chunk_raw_documents(raw_docs, vault)
             added, skipped, deleted, failed, manifest_counts = (
                 self._index_documents_streaming(
-                    idx, chunks_iter, _persist_callback, lancedb_upsert=lancedb_upsert
+                    idx, chunks_iter, _persist_callback,
+                    lancedb_upsert=lancedb_upsert,
+                    vector_backend=vector_backend,
                 )
             )
 
@@ -711,6 +919,12 @@ class ObsidianVaultManager:
             prev_ver = str(prev_meta.get("version") or "unknown").replace("/", "_")
             bak = f"{OBSIDIAN_INDEX_DIR}.bak.{prev_ver}.{stamp}"
             os.rename(OBSIDIAN_INDEX_DIR, bak)
+            # Bounded retention: a version bump archives the whole prior index
+            # (docstore ~hundreds of MB + the LanceDB/JSON vectors), and nothing
+            # else ever deletes these siblings, so they accumulate tens of GB on
+            # the same disk the local LLM weights live on. Keep the newest few
+            # and prune the rest.
+            self._prune_old_index_backups(keep=2)
             return bak
         except Exception as exc:
             logger.warning("Could not archive prior index dir: %s", exc)
@@ -721,6 +935,38 @@ class ObsidianVaultManager:
             except Exception:
                 pass
             return ""
+
+    def _prune_old_index_backups(self, keep: int = 2) -> None:
+        """Delete all but the ``keep`` most recent ``<index>.bak.*`` siblings.
+
+        Each ``_archive_old_index_dir`` call renames the entire prior index dir
+        to a timestamped ``.bak`` sibling; without this sweep they grow without
+        bound. Best-effort and never raises — a failed prune must not abort a
+        reindex. Every removal is routed through ``log_storage_deletion`` per the
+        deletion-audit invariant (see the root ``CLAUDE.md``).
+        """
+        try:
+            index_dir = Path(OBSIDIAN_INDEX_DIR)
+            prefix = index_dir.name + ".bak."
+            parent = index_dir.parent
+            if not parent.is_dir():
+                return
+            baks = sorted(
+                (p for p in parent.iterdir()
+                 if p.is_dir() and p.name.startswith(prefix)),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for stale in baks[keep:]:
+                try:
+                    log_storage_deletion(f"prune_old_index_backup:{stale.name}")
+                    shutil.rmtree(stale, ignore_errors=True)
+                except Exception:
+                    logger.warning(
+                        "Could not prune stale index backup %s", stale.name,
+                    )
+        except Exception:
+            logger.debug("Index-backup prune sweep failed.", exc_info=True)
 
     def _write_index_meta(
         self,
@@ -834,6 +1080,41 @@ class ObsidianVaultManager:
             storage_ctx, embed_model=embed_model, store_nodes_override=override
         )
 
+    def _cached_lancedb_count(self, index_dir: str) -> int:
+        """Cached wrapper over ``lancedb_table_count`` for the status-poll path.
+
+        ``get_status`` is polled ~1 Hz and only needs the boolean ``count > 0``,
+        but each raw ``lancedb_table_count`` opens a fresh ``lancedb.connect()``
+        that re-lists the fragment manifest — avoidable per-poll churn during a
+        reindex (exactly the RAM-pressure window). Cache by the lancedb dir's
+        ``(st_size, st_mtime_ns)`` with a short monotonic TTL backstop. The dir
+        going away (``/api/reset``, version-bump archive) changes the stat key →
+        immediate miss → fresh count; a missing dir falls back to the raw call.
+        Only the monotonic ``count > 0`` gate uses this; exact-count callers do
+        not.
+        """
+        db_dir = lancedb_dir(index_dir)
+        try:
+            st = os.stat(db_dir)
+            key = (db_dir, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return lancedb_table_count(index_dir)
+        now = time.monotonic()
+        with self._lancedb_count_lock:
+            if (
+                self._lancedb_count_cache is not None
+                and self._lancedb_count_key == key
+                and now - self._lancedb_count_at < self._LANCEDB_COUNT_TTL_S
+            ):
+                return self._lancedb_count_cache
+        # Compute outside the lock — lancedb.connect() does file I/O.
+        count = lancedb_table_count(index_dir)
+        with self._lancedb_count_lock:
+            self._lancedb_count_cache = count
+            self._lancedb_count_key = key
+            self._lancedb_count_at = now
+        return count
+
     def _index_dir_has_vector_data(self, index_dir: str) -> bool:
         """Return True only when a persisted LlamaIndex store has useful data.
 
@@ -857,8 +1138,11 @@ class ObsidianVaultManager:
         if backend == VECTOR_BACKEND_LANCEDB:
             # Vectors live in the binary lancedb/ dir, not a JSON file. A
             # populated table (>0 rows) is the lancedb analogue of
-            # _simple_vector_store_has_any_embedding.
-            return lancedb_table_count(index_dir) > 0
+            # _simple_vector_store_has_any_embedding. Use the cached count: this
+            # path is on the ~1 Hz status poll, and the exact-count callers
+            # (crash-drift recovery, checkpoint validation) keep calling
+            # lancedb_table_count directly.
+            return self._cached_lancedb_count(index_dir) > 0
         vector_store = root / "default__vector_store.json"
         if not vector_store.exists():
             return False
@@ -922,6 +1206,23 @@ class ObsidianVaultManager:
             except OSError as exc:
                 raise RuntimeError(f"Could not read index checkpoint file {name}: {exc}") from exc
 
+    @staticmethod
+    def _lancedb_vector_store_of(idx: Any) -> Any:
+        """Best-effort fetch of *idx*'s vector store, for compaction.
+
+        ``StorageContext.vector_store`` is a *property* that can raise (e.g. a
+        ``KeyError`` if the default-store key is somehow absent), and a bare
+        ``getattr`` only swallows ``AttributeError`` — so an unguarded access
+        could propagate out and abort a multi-hour indexing run.  The compaction
+        this feeds is documented strictly best-effort, so a failure to even
+        locate the store must degrade to "no compaction", never raise.  Returns
+        None on any failure; ``compact_lancedb_vector_store(None)`` then no-ops.
+        """
+        try:
+            return idx.storage_context.vector_store
+        except Exception:
+            return None
+
     def _persist_index_checkpoint(self, idx: Any, backend: str = VECTOR_BACKEND_SIMPLE) -> None:
         """Persist LlamaIndex storage through a validated temporary checkpoint.
 
@@ -958,6 +1259,14 @@ class ObsidianVaultManager:
                 src = tmp_dir / name
                 if src.exists():
                     os.replace(src, target / name)
+            if backend == VECTOR_BACKEND_LANCEDB:
+                # Both callers hold _index_mutation_lock, so compaction here is
+                # safe without re-locking.  Compact + prune superseded versions so
+                # the binary store's on-disk footprint stays O(n) instead of the
+                # O(n²) per-insert version-manifest growth.  Best-effort: both the
+                # store fetch and the compaction itself swallow failures so a
+                # compaction hiccup never aborts the checkpoint.
+                compact_lancedb_vector_store(self._lancedb_vector_store_of(idx))
             self._index_integrity_error = ""
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1020,13 +1329,42 @@ class ObsidianVaultManager:
     # dump frequency on fast ones.  Class attrs so tests can patch them
     # (set the interval to 0 to restore count-only behaviour).
     # MAX_CONSECUTIVE_FAILURES: abort the run when this many inserts in a row
-    # fail.  Tighter than "100 failures total" because in practice an embedding
-    # backend that is going to recover does so within a handful of retries —
-    # 20 consecutive failures almost always means the backend is unreachable
-    # and continuing wastes hours.
+    # fail.  Paired with the interruptible backoff below (_FAILURE_BACKOFF_*),
+    # the breaker is a *wall-clock* window, not an instant count: each
+    # consecutive failure waits a little longer before the next attempt, so a
+    # backend that briefly hiccups (e.g. LM Studio JIT-reloading the embed model
+    # under memory pressure) gets ~tens of seconds to recover and reset the
+    # streak, while a truly-down backend still aborts in well under a minute
+    # rather than wasting hours.  Without the backoff a backend that instant-
+    # rejects (HTTP 400 in ~10 ms) burned through all 20 "retries" in ~0.2 s and
+    # aborted a multi-hour run before the model could finish loading.
     _PERSIST_EVERY = 500
     _PERSIST_MIN_INTERVAL_S = 600
     _MAX_CONSECUTIVE_FAILURES = 20
+    # Backoff between *consecutive* insert failures: wait
+    # min(BASE * 2**(streak-1), CAP) seconds before retrying the next chunk.
+    # A single failure followed by success costs one BASE pause, then the streak
+    # resets to 0.  Class attrs so tests patch them to 0 for instant runs (same
+    # pattern as _PERSIST_MIN_INTERVAL_S).  With 1.0/5.0 the 19 sleeps before the
+    # 20th-failure abort sum to ~87 s of recovery window.
+    _FAILURE_BACKOFF_BASE_S = 1.0
+    _FAILURE_BACKOFF_CAP_S = 5.0
+    # LanceDB only: compact + prune superseded versions every this many inserts,
+    # INDEPENDENTLY of the ≥10-min JSON-checkpoint cadence.  The checkpoint gate
+    # (max 500 inserts AND 600 s) is too coarse to bound the O(n²) version-manifest
+    # bloat on a fast embedder — the first checkpoint can be ~30k inserts in, by
+    # which point tens of GB of interim single-row-fragment manifests have piled
+    # up.  A tighter insert-count cadence keeps the live fragment count (and thus
+    # each manifest) small throughout.  Runs under _index_mutation_lock only (it
+    # changes neither query results nor the docstore), so it is much lighter than
+    # the full checkpoint.  No-op on the simple backend.  Class attr so tests can
+    # patch it down.
+    _LANCEDB_COMPACT_EVERY = 2000
+
+    # TTL (seconds) for the status-poll lancedb count cache. Bounds how long a
+    # stale count>0 boolean can be served; benign because that boolean only
+    # gates an empty→non-empty transition that, once true, stays true.
+    _LANCEDB_COUNT_TTL_S = 5.0
 
     def _chunk_raw_documents(
         self,
@@ -1046,6 +1384,20 @@ class ObsidianVaultManager:
         # 512-token chunks with 64-token overlap — keeps paragraphs together
         # while preserving cross-sentence context at boundaries.
         sentence_splitter = _SentenceSplitter(chunk_size=512, chunk_overlap=64)
+        # Secondary cap for the MD branch only: MarkdownNodeParser splits at
+        # heading boundaries with no size ceiling, so a long single-heading
+        # section can exceed the embedding token limit and be truncated. This
+        # re-splits only such oversized sections (see MD_MAX_CHUNK_TOKENS and the
+        # conditional pass below). 64-token overlap matches the PDF splitter so a
+        # sentence straddling a forced cut stays retrievable. Distinct object
+        # from the pinned 512-token PDF splitter above.
+        md_secondary = _SentenceSplitter(chunk_size=MD_MAX_CHUNK_TOKENS, chunk_overlap=64)
+        # Warn at most once per run if the secondary split ever raises (see the
+        # except below). The fallback there is intentionally silent-safe for the
+        # run, but a SYSTEMATIC failure would re-truncate every oversized section
+        # at embed time — exactly what this pass prevents — so it must stay
+        # observable in the log rather than failing invisibly.
+        md_split_warned = False
         vault_root = Path(vault_path).resolve()
         for doc in raw_docs:
             if self._stop_event.is_set():
@@ -1064,11 +1416,75 @@ class ObsidianVaultManager:
             parser_doc = _CurrentLlamaDocument(text=doc.text, metadata=doc.metadata)
             if ext in VAULT_MD_EXTS:
                 try:
-                    nodes = md_parser.get_nodes_from_documents([parser_doc])
+                    heading_nodes = md_parser.get_nodes_from_documents([parser_doc])
                 except ValueError as exc:
                     if "Unknown document type" not in str(exc):
                         raise
-                    nodes = [TextNode(text=doc.text, metadata=doc.metadata)]
+                    # Unparseable markdown → treat the whole doc as one section;
+                    # the secondary pass below still caps it (a free robustness
+                    # win over the previous always-one-node fallback).
+                    heading_nodes = [TextNode(text=doc.text, metadata=doc.metadata)]
+                # SECONDARY CAP PASS. MarkdownNodeParser only splits at heading
+                # boundaries, so one long section can exceed the embedding token
+                # limit and be silently truncated. Re-split ONLY oversized
+                # sections; pass every under-cap section through as the SAME node
+                # object so its chunk id (sha1 of i+text, computed below) is
+                # byte-identical to the pre-change output → zero re-embed churn
+                # for the ~97% of notes with no oversized section.
+                nodes = []
+                for hn in heading_nodes:
+                    hn_text = getattr(hn, "text", "") or ""
+                    # Fast path: a cl100k BPE token is always ≥ 1 UTF-8 byte, so
+                    # byte_len ≤ cap PROVES token_count ≤ cap — skip tokenizing
+                    # the many tiny note-sections. (A char-count floor would be
+                    # WRONG for multibyte scripts, where one code point can be
+                    # several tokens; bytes are the safe lower bound.)
+                    # NOTE: this checks TEXT bytes only, so it bypasses the
+                    # splitter's metadata-aware count — a section near the cap is
+                    # kept whole even if text+metadata would tip just over it.
+                    # That is intentional and safe: the cap (1024) sits ~2x under
+                    # the ~2048 embedding limit, so a kept-whole section (text ≤
+                    # cap + at most a few hundred metadata tokens) is still well
+                    # under the real limit. We trade exact-cap adherence for
+                    # byte-identity + speed; do not "tighten" this to bytes(text+
+                    # metadata) without re-checking that headroom.
+                    if len(hn_text.encode("utf-8")) <= MD_MAX_CHUNK_TOKENS:
+                        nodes.append(hn)
+                        continue
+                    try:
+                        # Metadata-aware count: the splitter measures text + the
+                        # embedded metadata (file_path/source/header_path), which
+                        # is exactly what counts against the embedding limit.
+                        # attachments are NOT attached yet (see below), so a big
+                        # link list cannot inflate this decision (the _tags.md
+                        # case). >1 result ⇒ the section was over cap.
+                        sub = md_secondary.get_nodes_from_documents([hn])
+                    except Exception as exc:
+                        # A pathological section must never abort the whole run
+                        # (this is a generator — an exception here would kill the
+                        # consuming indexer, bypassing its per-chunk insert
+                        # guard). Degrade to the un-split section, but log once so
+                        # a systematic failure (which would silently re-truncate
+                        # every oversized section at embed) stays visible.
+                        if not md_split_warned:
+                            md_split_warned = True
+                            logger.warning(
+                                "MD secondary split failed for %s; section left "
+                                "un-split (may truncate at embed time): %s",
+                                rel_str, exc,
+                            )
+                        sub = [hn]
+                    if len(sub) <= 1:
+                        # Under cap after the precise count: keep the ORIGINAL
+                        # node, not sub[0] — the splitter may normalise
+                        # whitespace, and preserving hn guarantees byte-identity.
+                        nodes.append(hn)
+                    else:
+                        nodes.extend(sub)
+                # Attachment extraction runs over the FINAL (post-split) node
+                # list so each sub-chunk records only the links present in its own
+                # text, and the (potentially large) attachments list is attached
+                # AFTER the split so it never inflates the split decision above.
                 md_path = Path(file_path) if file_path else None
                 if md_path is not None:
                     for _raw_node in nodes:
@@ -1144,6 +1560,7 @@ class ObsidianVaultManager:
         text: str,
         md_path: Path,
         vault_root: Path,
+        name_index: Optional[dict[str, list[str]]] = None,
     ) -> list[str]:
         """Return vault-relative posix paths for attachment references in *text*.
 
@@ -1153,6 +1570,14 @@ class ObsidianVaultManager:
         vault-relative posix paths.  External URLs and anchors are dropped.
         Retrieval can join these back to indexed chunks by matching the
         ``{rel_path}::`` prefix on doc_ids.
+
+        When *name_index* (a ``basename.lower() -> [vault-relative path]`` map
+        of the vault's image files) is supplied, a bare filename that does not
+        resolve beside the note falls back to a vault-wide basename lookup,
+        matching how Obsidian resolves ``![[image.png]]`` for vaults that keep
+        attachments in a central folder.  Callers that want the historical
+        parent-relative-only behaviour (the ``attachments`` metadata path) omit
+        it.
         """
         if not text:
             return []
@@ -1171,7 +1596,9 @@ class ObsidianVaultManager:
             lowered = target.lower()
             if any(lowered.startswith(sch) for sch in _NON_ATTACHMENT_SCHEMES):
                 return
-            resolved = self._resolve_md_attachment(target, md_path, vault_root)
+            resolved = self._resolve_md_attachment(
+                target, md_path, vault_root, name_index=name_index
+            )
             if resolved and resolved not in seen:
                 targets.append(resolved)
                 seen.add(resolved)
@@ -1189,20 +1616,103 @@ class ObsidianVaultManager:
         target: str,
         md_path: Path,
         vault_root: Path,
+        name_index: Optional[dict[str, list[str]]] = None,
     ) -> str:
-        """Normalise *target* (relative to *md_path*'s parent) into a
-        vault-relative posix path.  Returns "" if the target escapes the
-        vault or cannot be expressed below *vault_root*."""
+        """Normalise *target* into a vault-relative posix path.
+
+        Resolution order, mirroring Obsidian:
+          1. Relative to *md_path*'s parent (handles explicit relative paths
+             and images stored beside the note).  An existing file here wins
+             outright.
+          2. If *name_index* is supplied and *target* is a bare filename (no
+             directory component) that did not resolve in step 1, fall back to
+             a vault-wide basename lookup — Obsidian's "shortest path" link
+             resolution, which is how attachments in a central folder are
+             referenced from notes elsewhere in the vault.
+
+        Returns "" if the target escapes the vault.  With no *name_index* the
+        return value is identical to the historical parent-relative behaviour
+        (the step-1 path, whether or not it exists on disk) — and, crucially,
+        that path does **zero** filesystem stats, since the only consumer of a
+        non-existent step-1 path (the ``attachments`` metadata) wants it
+        verbatim.  The ``is_file`` probe and the vault-wide fallback are gated
+        on a supplied *name_index* precisely so they never run there.
+        """
+        # Step 1: resolve relative to the note's own folder.  ``parent_rel``
+        # holds that path (empty if the target escapes the vault) and is the
+        # default return value for every caller.
+        parent_rel = ""
         try:
             base = md_path.parent.as_posix()
             joined = os.path.normpath(os.path.join(base, target))
             rel = os.path.relpath(joined, vault_root.as_posix())
         except ValueError:
-            return ""
-        rel = rel.replace(os.sep, "/")
-        if rel == ".." or rel.startswith("../") or os.path.isabs(rel):
-            return ""
-        return rel
+            rel = ""
+        if rel:
+            rel = rel.replace(os.sep, "/")
+            if not (rel == ".." or rel.startswith("../") or os.path.isabs(rel)):
+                parent_rel = rel
+
+        # Steps that touch the filesystem (the ``is_file`` probe) and the
+        # vault-wide basename fallback run ONLY on the image-load path, which
+        # is the one that passes a name_index (possibly empty).  The
+        # ``attachments``-metadata path passes None and returns ``parent_rel``
+        # verbatim — no stat, byte-identical to the pre-fix behaviour.
+        if name_index is not None:
+            # An explicit/beside-note file that actually exists wins outright,
+            # mirroring Obsidian preferring the literal target before a search.
+            if parent_rel and (vault_root / parent_rel).is_file():
+                return parent_rel
+            # Obsidian shortest-path fallback: a bare filename (no directory
+            # component in the link) resolves by basename anywhere in the vault.
+            if "/" not in target and os.sep not in target:
+                candidates = name_index.get(os.path.basename(target).lower())
+                if candidates:
+                    if len(candidates) == 1:
+                        return candidates[0]
+                    return self._pick_closest_attachment(
+                        candidates, md_path, vault_root
+                    )
+        return parent_rel
+
+    @staticmethod
+    def _pick_closest_attachment(
+        candidates: list[str], md_path: Path, vault_root: Path
+    ) -> str:
+        """Deterministically pick among same-basename files for an ambiguous
+        bare wikilink: prefer the candidate sharing the longest directory
+        prefix with the linking note (Obsidian-like locality), then fewest
+        path segments, then lexicographic order."""
+        # Note's own vault-relative directory.  Use the unresolved parent (as
+        # the rest of the loader does — ``vault_root`` is already resolved
+        # once), so symlinked subdirs are treated consistently across the two
+        # resolution sites; a path that cannot be expressed below vault_root
+        # falls back to "" (no locality preference, still deterministic).
+        try:
+            note_dir = md_path.parent.relative_to(vault_root).as_posix()
+        except ValueError:
+            note_dir = ""
+        note_parts = [p for p in note_dir.split("/") if p]
+
+        def shared_prefix(rel: str) -> int:
+            # Compare directory components only: drop the trailing filename
+            # segment (``[:-1]``) so a shared *folder* path — not a coincidental
+            # basename match — drives locality.
+            dir_parts = rel.split("/")[:-1]
+            n = 0
+            for a, b in zip(note_parts, dir_parts):
+                if a != b:
+                    break
+                n += 1
+            return n
+
+        # Sort key: most shared dir segments first (negated for ascending
+        # sort), then fewest directory levels (``count("/")`` = segment count,
+        # favouring a top-level/central file), then lexicographic for a stable
+        # tie-break.  ``sorted`` is stable so the result is fully deterministic.
+        return sorted(
+            candidates, key=lambda r: (-shared_prefix(r), r.count("/"), r)
+        )[0]
 
     @staticmethod
     def _manifest_source(doc: LlamaDocument) -> str:
@@ -1222,6 +1732,7 @@ class ObsidianVaultManager:
         chunks_iter,
         persist_callback: Optional[Callable[[dict], None]] = None,
         lancedb_upsert: bool = False,
+        vector_backend: str = VECTOR_BACKEND_SIMPLE,
     ) -> tuple[int, int, int, int, dict[str, int]]:
         """Stream chunks into the index with per-insert fault tolerance and
         optional periodic persistence.
@@ -1249,6 +1760,11 @@ class ObsidianVaultManager:
         failed = 0
         consecutive_failures = 0
         pending_since_persist = 0
+        pending_since_compact = 0
+        # doc_ids whose stale copy was deleted but whose re-insert then failed in
+        # the same run (delete-before-insert is not atomic).  Tracked so the gap
+        # is surfaced specifically rather than hidden in the aggregate ``failed``.
+        reinsert_failed: set[str] = set()
         manifest_counts: dict[str, int] = {}
         current_doc_ids: set[str] = set()
 
@@ -1288,6 +1804,10 @@ class ObsidianVaultManager:
             if doc.doc_id:
                 current_doc_ids.add(doc.doc_id)
 
+            # Set when this chunk's old copy is deleted below, so an insert
+            # failure that follows a successful delete can be recorded as a
+            # content gap (delete-before-insert is not atomic).
+            deleted_old = False
             if can_increment and doc.doc_id and get_document_hash is not None:
                 try:
                     if get_document_hash(doc.doc_id) == doc.hash:
@@ -1307,6 +1827,7 @@ class ObsidianVaultManager:
                     if doc.doc_id in previous_doc_ids or lancedb_upsert:
                         with self._index_mutation_lock:
                             idx.delete_ref_doc(doc.doc_id, delete_from_docstore=True)
+                        deleted_old = True
                 except Exception:
                     pass
 
@@ -1317,10 +1838,17 @@ class ObsidianVaultManager:
                 manifest_counts[source] = manifest_counts.get(source, 0) + 1
                 added += 1
                 pending_since_persist += 1
+                pending_since_compact += 1
                 consecutive_failures = 0
             except Exception as exc:
                 failed += 1
                 consecutive_failures += 1
+                if deleted_old and doc.doc_id:
+                    # Old copy already removed but the re-embed failed: this chunk
+                    # is now absent until the next run re-yields it (hash will not
+                    # match the now-missing docstore entry).  Record it so the gap
+                    # is reported, not just folded into ``failed``.
+                    reinsert_failed.add(doc.doc_id)
                 logger.warning("Insert failed for %s: %s", doc.doc_id, exc)
                 if failed == 1 or failed % 5 == 0:
                     self._emit(
@@ -1335,6 +1863,25 @@ class ObsidianVaultManager:
                     )
                     self._stop_event.set()
                     break
+                # Interruptible exponential backoff before the next attempt, so a
+                # transiently-failing backend (instant 400s while the embed model
+                # reloads) gets wall-clock time to recover rather than burning the
+                # whole breaker budget in milliseconds.  Holds no lock (the insert
+                # ``with`` block already exited) and runs off the chat path (the
+                # indexer released the rw write lock for the insert loop).  A
+                # Cancel/Pause sets _stop_event mid-sleep → wait() returns True →
+                # abort promptly, mirroring the top-of-loop stop check.
+                if consecutive_failures == 1:
+                    self._emit(
+                        "WARNING: embedding insert failed — pausing briefly before "
+                        "continuing (transient backend error; will abort if it persists)."
+                    )
+                backoff_s = min(
+                    self._FAILURE_BACKOFF_BASE_S * (2 ** (consecutive_failures - 1)),
+                    self._FAILURE_BACKOFF_CAP_S,
+                )
+                if backoff_s > 0 and self._stop_event.wait(backoff_s):
+                    break
                 continue
 
             if (
@@ -1348,6 +1895,9 @@ class ObsidianVaultManager:
                         f"Checkpoint saved: {added} embedded, {skipped} unchanged."
                     )
                     pending_since_persist = 0
+                    # The checkpoint persist already compacted the lancedb table
+                    # (_persist_index_checkpoint), so reset the compaction gate too.
+                    pending_since_compact = 0
                     last_persist_time = time.monotonic()
                 except Exception as exc:
                     self._emit(f"WARNING: mid-run checkpoint failed: {exc}")
@@ -1357,6 +1907,22 @@ class ObsidianVaultManager:
                     # the next attempt.
                     pending_since_persist = 0
                     last_persist_time = time.monotonic()
+
+            # Interim lancedb compaction — independent of the JSON checkpoint so a
+            # fast embedder cannot accumulate a large O(n²) version-manifest spike
+            # between the (≥10-min) checkpoints.  Under the mutation lock only
+            # (no docstore/JSON work), so it is far cheaper than a checkpoint.
+            if (
+                vector_backend == VECTOR_BACKEND_LANCEDB
+                and pending_since_compact >= self._LANCEDB_COMPACT_EVERY
+            ):
+                # Fetch the store OUTSIDE the lock (read-only ref grab, guarded so
+                # a property raise can't abort the run), compact UNDER the mutation
+                # lock so retrieval can't read the table mid-optimize.
+                vector_store = self._lancedb_vector_store_of(idx)
+                with self._index_mutation_lock:
+                    compact_lancedb_vector_store(vector_store)
+                pending_since_compact = 0
 
         if can_increment and not self._stop_event.is_set():
             stale_doc_ids = previous_doc_ids - current_doc_ids
@@ -1377,6 +1943,13 @@ class ObsidianVaultManager:
                     "were not removed because indexing was interrupted. "
                     "They will be cleaned up automatically when a full run completes."
                 )
+
+        if reinsert_failed:
+            self._emit(
+                f"WARNING: {len(reinsert_failed)} changed chunk(s) were removed but "
+                "could not be re-embedded this run (embedding backend error); they "
+                "will be restored automatically on the next indexing run."
+            )
 
         return added, skipped, deleted, failed, manifest_counts
 
@@ -1461,6 +2034,18 @@ class ObsidianVaultManager:
             md_paths_buffered: list[tuple[Path, str]] = []
             pdf_paths: list[tuple[Path, str]] = []
             referenced_image_paths: dict[str, Path] = {}
+            # Obsidian resolves a bare wikilink (![[image.png]]) by searching
+            # the whole vault for that basename ("shortest path"), not relative
+            # to the linking note — so vaults that keep attachments in a central
+            # folder reference images that live nowhere near the note.  Build a
+            # basename -> [vault-relative path] index for the vault's image
+            # files during this single walk; _extract_md_attachments consults it
+            # to resolve those bare links.  Built from non-excluded images only
+            # (the same _should_skip_path guard the per-image load applies), so a
+            # bare name never resolves to a file we would then skip.  This map is
+            # fully populated before the first MD doc is yielded below, which is
+            # what makes it available when the MD-attachment loop runs.
+            name_index: dict[str, list[str]] = {}
 
             for scan_index, path in enumerate(sorted(vault_root.rglob("*"))):
                 if self._stop_event.is_set():
@@ -1470,6 +2055,14 @@ class ObsidianVaultManager:
                 if not path.is_file() or _should_skip_path(path):
                     continue
                 ext = path.suffix.lower()
+                if ext in configured_image_exts:
+                    # Images enter the pipeline only via the MD-attachment
+                    # branch, so they are indexed for name resolution but not
+                    # buffered as standalone source documents.
+                    name_index.setdefault(path.name.lower(), []).append(
+                        path.relative_to(vault_root).as_posix()
+                    )
+                    continue
                 if ext not in allowed_exts:
                     continue
                 rel = path.relative_to(vault_root).as_posix()
@@ -1490,7 +2083,9 @@ class ObsidianVaultManager:
                 except OSError as exc:
                     self._emit(f"WARNING: Failed to read {rel}: {exc}")
                     continue
-                for attachment in self._extract_md_attachments(text, path, vault_root):
+                for attachment in self._extract_md_attachments(
+                    text, path, vault_root, name_index=name_index
+                ):
                     image_ext = Path(attachment).suffix.lower()
                     if image_ext not in configured_image_exts:
                         continue
@@ -1570,16 +2165,31 @@ class ObsidianVaultManager:
                                 f"the {_VAULT_PDF_MAX_PAGES}-page vault limit."
                             )
                         elif page_count <= _VAULT_PDF_CHUNK:
-                            # Normal case — extract in one call.  This path must
-                            # stay byte-identical (text, metadata, single
-                            # document) to the pre-per-range loader: any change
-                            # would shift chunk hashes and re-embed every small
-                            # PDF in the vault.
+                            # Normal case — extract in one call.  For a text-layer
+                            # PDF (the common case) OCR is never invoked, so text
+                            # stays byte-identical to the pre-per-range loader and
+                            # chunk hashes are unchanged.  ``ocr_max_pages`` only
+                            # affects a SCANNED PDF: it lets the OCR fallback cover
+                            # the whole doc (up to _VAULT_PDF_CHUNK) instead of
+                            # silently stopping at 100 pages; the per-page heartbeat
+                            # keeps the op-lock TTL alive on a long scan.
                             sections = extract_structured_from_pdf(
-                                str(path), ocr_cb=glm_ocr_manager.extract_page_text
+                                str(path),
+                                ocr_cb=glm_ocr_manager.extract_page_text,
+                                ocr_max_pages=_VAULT_PDF_CHUNK,
+                                page_done_cb=lambda _n: self._op_lock.heartbeat(self._lock_epoch),
                             )
                             text = sections.full_text
-                            if text:
+                            if getattr(sections, "truncated", False):
+                                # Incomplete coverage (OCR cap/budget): surface it
+                                # and DO NOT cache the partial as complete, so the
+                                # next run retries instead of baking in the loss.
+                                self._emit(
+                                    f"WARNING: {rel} was only partially extracted "
+                                    "(scanned pages beyond the OCR limit were skipped); "
+                                    "not cached so it will retry next run."
+                                )
+                            elif text:
                                 self._save_pdf_cache_file(cache_file, text)
                         else:
                             # Large PDF: one document per 1000-page range, each
@@ -1674,9 +2284,23 @@ class ObsidianVaultManager:
                     start_page=start,
                     end_page=end,
                     ocr_cb=glm_ocr_manager.extract_page_text,
+                    # OCR the WHOLE range (a scanned range used to stop at 100 of
+                    # up to 1000 pages and cache that partial as complete).  The
+                    # per-page heartbeat keeps the op-lock TTL alive on a long scan.
+                    ocr_max_pages=EXTRACT_MAX_PAGES_PER_CALL,
+                    page_done_cb=lambda _n: self._op_lock.heartbeat(self._lock_epoch),
                 )
                 text = sections.full_text
-                if text:
+                if getattr(sections, "truncated", False):
+                    # Incomplete OCR coverage of this range: warn and DO NOT cache,
+                    # so the range is retried next run instead of permanently
+                    # serving a partial. Yield what we have (better than nothing).
+                    self._emit(
+                        f"WARNING: {rel} pages {start + 1}-{end} only partially "
+                        "extracted (scanned pages beyond the OCR limit skipped); "
+                        "not cached so it will retry next run."
+                    )
+                elif text:
                     self._save_pdf_cache_file(range_cache, text)
             if text:
                 yield LlamaDocument(
@@ -2067,18 +2691,23 @@ class ObsidianVaultManager:
 
     def _invalidate_retrieval_caches(self) -> None:
         """Drop the cached BM25 retriever (in memory AND the on-disk sidecar)
-        so the next chat rebuilds against the freshly-persisted docstore.
+        and the wikilink graph so the next chat rebuilds against the
+        freshly-persisted docstore.
 
         Called after each successful ``idx.storage_context.persist(...)`` —
         both the mid-run checkpoint and the final persist — so concurrent
         chats observe the new chunks once indexing publishes them.  The
         reranker is unaffected: it depends on the model name only, not on
-        index contents.
+        index contents.  The wikilink graph has no on-disk sidecar, so it is
+        a pure in-memory drop.
         """
         with self._bm25_build_lock:
             self._bm25_retriever = None
             self._bm25_cached_doc_count = -1
             shutil.rmtree(self._bm25_sidecar_dir(), ignore_errors=True)
+        with self._wikilink_build_lock:
+            self._wikilink_index = None
+            self._wikilink_cached_doc_count = -1
 
     def _bm25_sidecar_dir(self) -> str:
         return os.path.join(OBSIDIAN_INDEX_DIR, _BM25_SIDECAR_DIRNAME)
@@ -2271,6 +2900,215 @@ class ObsidianVaultManager:
             self._persist_bm25_sidecar(retriever, snapshot_count)
             return retriever
 
+    @staticmethod
+    def _resolve_note_link(
+        target: str,
+        src_note_rel: str,
+        indexed_md_sources: set[str],
+        note_name_index: dict[str, list[str]],
+    ) -> str:
+        """Resolve one raw link *target* found in note *src_note_rel* to the
+        vault-relative ``source`` of an indexed ``.md`` note, or "" when the
+        target is not a note link or cannot be resolved.
+
+        Resolution mirrors Obsidian (and the image path in
+        ``_resolve_md_attachment``) but checks membership against the
+        in-memory ``indexed_md_sources`` set instead of the filesystem, so it
+        performs ZERO stats — the whole point of building the graph from the
+        docstore:
+
+          1. Parent-relative to the linking note's folder (``.md`` appended
+             when the link omits the extension).  An indexed source there wins.
+          2. A bare filename (no directory component) that missed step 1 falls
+             back to a vault-wide basename lookup (``note_name_index``) —
+             Obsidian's shortest-path resolution — with ``_closest_note_by_dir``
+             breaking ambiguous basenames.
+
+        Non-note targets (images, PDFs, external URLs) never match an indexed
+        ``.md`` source and therefore return "".
+        """
+        target = (target or "").strip()
+        if not target:
+            return ""
+        target = unquote(target)
+        # Drop anchor / block-reference suffixes (the ``|alias`` is already
+        # stripped by the wikilink regex; ``#heading`` / ``^block`` and any
+        # inline-link title are handled here).
+        target = target.split("#", 1)[0].split("^", 1)[0].strip()
+        if not target:
+            return ""
+        if any(target.lower().startswith(sch) for sch in _NON_ATTACHMENT_SCHEMES):
+            return ""
+
+        has_dir = "/" in target or os.sep in target
+
+        def _with_md(p: str) -> str:
+            return p if p.lower().endswith(".md") else p + ".md"
+
+        # Step 1: parent-relative resolution against the indexed-source set.
+        src_dir = os.path.dirname(src_note_rel)
+        joined = os.path.normpath(os.path.join(src_dir, target) if src_dir else target)
+        rel = joined.replace(os.sep, "/")
+        if rel and not (rel == ".." or rel.startswith("../") or os.path.isabs(rel)):
+            cand = _with_md(rel)
+            if cand in indexed_md_sources:
+                return cand
+
+        # Step 2: bare-name shortest-path fallback (only when the link carried
+        # no directory component, matching Obsidian and the image resolver).
+        if not has_dir:
+            candidates = note_name_index.get(
+                _with_md(os.path.basename(target)).lower()
+            )
+            if candidates:
+                if len(candidates) == 1:
+                    return candidates[0]
+                return _closest_note_by_dir(candidates, os.path.dirname(src_note_rel))
+        return ""
+
+    def _extract_note_links(
+        self,
+        text: str,
+        src_note_rel: str,
+        indexed_md_sources: set[str],
+        note_name_index: dict[str, list[str]],
+    ) -> list[str]:
+        """Resolved vault-relative sources of every indexed note this chunk
+        links to, de-duplicated in first-seen order.
+
+        Scans the same wikilink + inline-link shapes as
+        ``_extract_md_attachments`` but keeps only targets that resolve to an
+        indexed ``.md`` note (via ``_resolve_note_link``).  Embeds (``![[…]]``)
+        count as links — a transcluded note is a relationship; non-note embeds
+        (images) are dropped by resolution.
+        """
+        if not text:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _accept(raw: str) -> None:
+            resolved = self._resolve_note_link(
+                raw, src_note_rel, indexed_md_sources, note_name_index
+            )
+            if resolved and resolved not in seen:
+                seen.add(resolved)
+                out.append(resolved)
+
+        for match in _OBSIDIAN_WIKILINK_RE.finditer(text):
+            _accept(match.group(1))
+        for match in _INLINE_LINK_RE.finditer(text):
+            # Strip an optional title segment: [label](url "title").
+            _accept(match.group(1).split(" ", 1)[0])
+        return out
+
+    def _build_wikilink_graph(self, nodes: list) -> _WikilinkGraph:
+        """Assemble the note→note adjacency from a docstore node snapshot.
+
+        Pass 1 records every indexed ``.md`` note (its ``source``, its chunk
+        node ids, and a basename index for shortest-path resolution).  Pass 2
+        resolves each note's outbound links against that set and inverts them
+        into backlinks.  Pure in-memory work over the docstore — no
+        filesystem, no embeddings, no index mutation.  A note split into
+        several chunks contributes all its node ids and the union of the links
+        across its chunks.
+        """
+        # Pass 1 — enumerate the indexed .md notes.  Collect the set of valid
+        # link targets (indexed_md_sources), the per-note chunk ids
+        # (note_to_node_ids, used later to fetch a neighbour's chunks), and the
+        # raw (source, text) pairs to scan for links in pass 2.  Non-.md nodes
+        # (PDFs, images) are not notes and never participate in the graph.
+        indexed_md_sources: set[str] = set()
+        note_to_node_ids: dict[str, list[str]] = {}
+        md_nodes: list[tuple[str, str]] = []  # (source, text)
+        for node in nodes:
+            meta = getattr(node, "metadata", None) or {}
+            source = meta.get("source") or meta.get("file_path") or ""
+            if not source:
+                continue
+            source = str(source)
+            ext = str(meta.get("extension") or os.path.splitext(source)[1]).lower()
+            if ext not in VAULT_MD_EXTS:
+                continue
+            indexed_md_sources.add(source)
+            node_id = getattr(node, "node_id", None) or getattr(node, "id_", None)
+            if node_id is not None:
+                note_to_node_ids.setdefault(source, []).append(str(node_id))
+            md_nodes.append((source, getattr(node, "text", "") or ""))
+
+        # basename.lower() -> [source] index for Obsidian shortest-path
+        # resolution of bare [[note]] links.  Built from the deduplicated
+        # source set so a multi-chunk note contributes one entry, not one per
+        # chunk.
+        note_name_index: dict[str, list[str]] = {}
+        for source in indexed_md_sources:
+            note_name_index.setdefault(
+                os.path.basename(source).lower(), []
+            ).append(source)
+
+        # Pass 2 — resolve each note's outbound links against the pass-1 set
+        # (union across the note's chunks; self-links dropped), then invert the
+        # forward edges into backlinks so neighbours() can union both.
+        forward: dict[str, set[str]] = {}
+        for source, text in md_nodes:
+            for target in self._extract_note_links(
+                text, source, indexed_md_sources, note_name_index
+            ):
+                if target != source:
+                    forward.setdefault(source, set()).add(target)
+
+        backward: dict[str, set[str]] = {}
+        for source, targets in forward.items():
+            for target in targets:
+                backward.setdefault(target, set()).add(source)
+
+        return _WikilinkGraph(forward, backward, note_to_node_ids)
+
+    def _get_wikilink_index(self) -> Optional[_WikilinkGraph]:
+        """Return the cached note→note wikilink graph, building it on demand.
+
+        Mirrors ``_get_bm25_retriever``'s discipline: cached by docstore size
+        so a vault with N chunks rebuilds at most once per indexing run,
+        double-checked under ``_wikilink_build_lock``, and the docstore
+        snapshot taken under ``_index_mutation_lock`` so an in-flight indexer
+        insert/delete cannot mutate the dict mid-iteration.  The build itself
+        (regex parse of node text) runs OUTSIDE the mutation lock, like BM25's
+        tokenisation, so it never stalls the indexer.  Returns None when no
+        index/docstore is loaded.  Reindex-free and re-embed-free — reads only
+        the docstore.
+        """
+        if self._index is None:
+            return None
+        docstore = getattr(self._index, "docstore", None)
+        docs = getattr(docstore, "docs", None) if docstore else None
+        if not docs:
+            return None
+        current_count = len(docs)
+        cached = self._wikilink_index
+        if cached is not None and self._wikilink_cached_doc_count == current_count:
+            return cached
+        with self._wikilink_build_lock:
+            # Double-check under the build lock so two concurrent chats do not
+            # both rebuild against the same docstore size.
+            if (
+                self._wikilink_index is not None
+                and self._wikilink_cached_doc_count == current_count
+            ):
+                return self._wikilink_index
+            # Snapshot the docstore under _index_mutation_lock so an in-flight
+            # indexer insert/delete cannot mutate the dict while we iterate;
+            # record the size from the same locked window so the fingerprint
+            # matches the exact snapshot we built from.
+            with self._index_mutation_lock:
+                nodes = list(docs.values())
+                snapshot_count = len(docs)
+            if not nodes:
+                return None
+            graph = self._build_wikilink_graph(nodes)
+            self._wikilink_index = graph
+            self._wikilink_cached_doc_count = snapshot_count
+            return graph
+
     # Accepted vault_reranker_device values; anything else behaves as "auto".
     _RERANKER_DEVICE_MODES = ("auto", "cpu", "mps")
 
@@ -2405,6 +3243,28 @@ class ObsidianVaultManager:
             self._reranker_last_tried = cache_key
             return reranker
 
+    def _effective_embed_name(
+        self, requested_embed: str, stage: Callable[[str], None]
+    ) -> str:
+        """Return the embed model retrieval must actually use.
+
+        The stored chunk vectors were produced by the model recorded in
+        ``obsidian_meta.json``.  Embedding the query with a DIFFERENT model fuses
+        two incompatible vector spaces and silently wrecks retrieval, so when the
+        configured embed model differs from the index's we retrieve with the
+        INDEX's model and warn — rather than honour the stale config and return
+        garbage.  Re-indexing is what actually switches models (the indexer
+        rebuilds on an embed change); this keeps chat correct until the user does.
+        """
+        indexed_embed = (self._read_index_meta() or {}).get("embed")
+        if indexed_embed and requested_embed and indexed_embed != requested_embed:
+            stage(
+                f"Index was built with embedding model '{indexed_embed}'; "
+                f"retrieving with it (re-index to switch to '{requested_embed}')."
+            )
+            return indexed_embed
+        return requested_embed
+
     def _ensure_index_loaded(
         self,
         *,
@@ -2482,8 +3342,24 @@ class ObsidianVaultManager:
         query_expansion: bool = False,
         num_queries: int = 1,
         rerank_pool_ceiling: Optional[int] = None,
+        wikilink_expansion: bool = False,
         stage_cb: Optional[Callable[[str], None]] = None,
     ):
+        """Single-shot RAG: retrieve, then return a streaming LLM response.
+
+        The public chat entrypoint for non-agent vault chat (the agent's RAG
+        fallback also calls it). Every keyword is a query-time knob already resolved
+        body→config→default by the route's ``_resolve_chat_params`` — none of them
+        touches the index, so they are all reindex-free. Ordering chosen for
+        concurrency: the index is lazy-loaded under the rw write lock (double-checked),
+        then the BM25 build and first-time reranker load happen **before** the read
+        lock so they don't block other readers or the indexer's persist; retrieval
+        runs under ``_index_mutation_lock`` (so it can't race an insert) while the LLM
+        token stream runs lock-free after retrieval returns. Always retrieves with the
+        index's *own* recorded embed model (``_effective_embed_name``) so a config-only
+        model switch can't fuse two vector spaces. ``stage_cb`` surfaces stage labels
+        as SSE ``{info}`` frames. Returns a streaming response object (``.response_gen``).
+        """
         from .engine import SimpleQueryEngine
 
         def _stage(message: str) -> None:
@@ -2493,9 +3369,12 @@ class ObsidianVaultManager:
                 except Exception:
                     logger.debug("Vault chat stage callback failed.", exc_info=True)
 
+        # Retrieve with the index's own embed model, not whatever config says,
+        # so a config switch without a re-index cannot mix vector spaces (M1).
+        effective_embed = self._effective_embed_name(embed_name, _stage)
         self._ensure_index_loaded(
             provider_name=provider_name,
-            embed_name=embed_name,
+            embed_name=effective_embed,
             stage_cb=stage_cb,
         )
 
@@ -2517,6 +3396,16 @@ class ObsidianVaultManager:
             if reranker_enabled and reranker_model
             else None
         )
+        # Wikilink note→note graph (query-time, no reindex).  Built lazily from
+        # the docstore and cached like BM25.  Built only when expansion is
+        # requested AND a reranker is active: expansion is rerank-gated (the
+        # engine attaches it only with a reranker present, since the reranker is
+        # what trims seeds+neighbours back to top_k), so without one the build
+        # would be wasted work and the stage label misleading.
+        want_wikilink = wikilink_expansion and reranker is not None
+        if want_wikilink:
+            _stage("Building wikilink graph…")
+        wikilink_graph = self._get_wikilink_index() if want_wikilink else None
 
         # Re-read self._index inside a read lock to guard against a concurrent
         # reset nulling it between the slow-path write lock and here.  Only
@@ -2529,7 +3418,7 @@ class ObsidianVaultManager:
             engine = SimpleQueryEngine(
                 local_index,
                 llm_name,
-                embed_name,
+                effective_embed,
                 top_k,
                 provider_name=provider_name,
                 similarity_cutoff=similarity_cutoff,
@@ -2544,6 +3433,8 @@ class ObsidianVaultManager:
                 query_expansion=query_expansion,
                 num_queries=num_queries,
                 rerank_pool_ceiling=rerank_pool_ceiling,
+                wikilink_graph=wikilink_graph,
+                wikilink_expansion=wikilink_expansion,
             )
 
         # Serialise retrieval against the indexer's idx.insert() calls.  With
@@ -2573,6 +3464,7 @@ class ObsidianVaultManager:
         query_expansion: bool = False,
         num_queries: int = 1,
         rerank_pool_ceiling: Optional[int] = None,
+        wikilink_expansion: bool = False,
         stage_cb: Optional[Callable[[str], None]] = None,
     ):
         """Retrieve evidence chunks for *message* without invoking the LLM.
@@ -2596,9 +3488,11 @@ class ObsidianVaultManager:
                 except Exception:
                     logger.debug("Vault retrieve stage callback failed.", exc_info=True)
 
+        # Retrieve with the index's own embed model, not whatever config says (M1).
+        effective_embed = self._effective_embed_name(embed_name, _stage)
         self._ensure_index_loaded(
             provider_name=provider_name,
-            embed_name=embed_name,
+            embed_name=effective_embed,
             stage_cb=stage_cb,
         )
 
@@ -2616,6 +3510,12 @@ class ObsidianVaultManager:
             if reranker_enabled and reranker_model
             else None
         )
+        # Rerank-gated, same as stream_chat: only build the graph when a
+        # reranker is active (the engine skips the wrap otherwise).
+        want_wikilink = wikilink_expansion and reranker is not None
+        if want_wikilink:
+            _stage("Building wikilink graph…")
+        wikilink_graph = self._get_wikilink_index() if want_wikilink else None
 
         with self._rw_lock.read_lock():
             local_index = self._index
@@ -2624,7 +3524,7 @@ class ObsidianVaultManager:
             engine = SimpleQueryEngine(
                 local_index,
                 llm_name,
-                embed_name,
+                effective_embed,
                 top_k,
                 provider_name=provider_name,
                 similarity_cutoff=similarity_cutoff,
@@ -2636,6 +3536,8 @@ class ObsidianVaultManager:
                 query_expansion=query_expansion,
                 num_queries=num_queries,
                 rerank_pool_ceiling=rerank_pool_ceiling,
+                wikilink_graph=wikilink_graph,
+                wikilink_expansion=wikilink_expansion,
             )
 
         _stage("Retrieving context…")
@@ -3042,6 +3944,16 @@ class ObsidianVaultManager:
                     self._get_reranker(model_name=reranker_model, top_n=warm_top_k)
                 except Exception as exc:
                     logger.warning("Prewarm reranker load failed: %s", exc)
+
+            # Warm the wikilink graph silently (no prewarm stage): the build is
+            # a fast docstore-only regex pass, much cheaper than BM25, and the
+            # first chat's stage_cb still surfaces it if this is skipped.  Only
+            # when expansion is enabled, so a disabled feature pays nothing.
+            if bool(cfg.get("vault_wikilink_expansion", False)):
+                try:
+                    self._get_wikilink_index()
+                except Exception as exc:
+                    logger.warning("Prewarm wikilink graph build failed: %s", exc)
 
             self._set_prewarm("ready", "Vault is ready.", generation=generation)
         except Exception as exc:

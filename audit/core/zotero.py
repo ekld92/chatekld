@@ -25,12 +25,25 @@ from bs4 import BeautifulSoup
 
 
 def _strip_html(s: str | None) -> str:
+    """Render Zotero's HTML note body down to plain text.
+
+    Zotero stores child-note bodies as HTML; we only need the text (for the
+    body-length proxy and any downstream tag/word inspection), so the markup
+    is discarded. Returns ``""`` for an empty/None body so callers never have
+    to None-guard the result.
+    """
     if not s:
         return ""
     return BeautifulSoup(s, "html.parser").get_text()
 
 
 def _parse_dt(s: str | None) -> _dt.datetime | None:
+    """Parse Zotero's ``YYYY-MM-DD HH:MM:SS`` UTC timestamp, or None.
+
+    Forgiving by design: a missing or non-conforming string yields ``None``
+    rather than raising, since a malformed ``dateModified`` must not abort the
+    whole read of an otherwise-valid library.
+    """
     if not s:
         return None
     try:
@@ -41,6 +54,15 @@ def _parse_dt(s: str | None) -> _dt.datetime | None:
 
 @dataclass
 class ZoteroAttachment:
+    """One Zotero attachment row resolved against the storage tree.
+
+    ``storage_path`` is populated only for ``storage:``-scheme attachments
+    (Zotero-managed files under ``storage/<key>/``); linked/relative
+    attachments leave it ``None`` (``is_stored=False``) because the audit
+    resolves PDFs from the vault's ``biblio_articles`` tree, not from Zotero's
+    own storage. Currently part of the read but unused downstream — see the
+    "dead Zotero attachments pipeline" note in the root CLAUDE.md.
+    """
     item_key: str
     parent_key: str | None
     filename: str
@@ -51,6 +73,15 @@ class ZoteroAttachment:
 
 @dataclass
 class ZoteroChildNote:
+    """A reading note attached to a parent bibliographic item.
+
+    The user's workflow attaches a child note when they actually read a paper,
+    so a parent item *having* a child note is the audit's "read" signal (see
+    ``reports/zotero_unread``). ``tags`` are the note's own Zotero tags, which
+    ``reports/note_tag_drift`` reconciles against the Obsidian note's YAML tags.
+    ``body_length`` is the plain-text length, kept as a cheap engagement proxy.
+    """
+
     note_key: str
     parent_item_id: int | None
     tags: list[str] = field(default_factory=list)
@@ -61,6 +92,15 @@ class ZoteroChildNote:
 
 @dataclass
 class ZoteroItem:
+    """A top-level (parent) Zotero item: the bibliographic record.
+
+    Only non-note, non-attachment types become ``ZoteroItem``s. ``tags`` are
+    the parent's own tags — equal to the ``keywords`` field of the matching
+    ``_master.bib`` entry once Better BibTeX has exported them, which is why
+    the inventory can join on title and then compare tag sets. ``child_notes``
+    are the attached reading notes.
+    """
+
     item_key: str
     item_type: str
     title: str | None
@@ -71,6 +111,17 @@ class ZoteroItem:
 
 @contextmanager
 def _open_snapshot(sqlite_path: Path) -> Iterator[sqlite3.Connection]:
+    """Yield an in-memory read-only snapshot of the Zotero database.
+
+    The read-only posture in two steps: the source is opened with the
+    ``mode=ro`` URI flag, then ``backup()``-copied into a throwaway
+    ``:memory:`` connection that all queries run against. This is load-bearing
+    — Zotero holds a write lock on the live ``zotero.sqlite`` (and its hot WAL)
+    while running, and querying it directly can fail or, worse, perturb it.
+    Snapshotting decouples us entirely: the live database is never read past
+    the single ``backup()`` and never written. Both connections are closed in
+    ``finally`` so a query error cannot leak a handle onto the live file.
+    """
     if not sqlite_path.exists():
         raise FileNotFoundError(f"Zotero DB not found at {sqlite_path}")
 
@@ -91,6 +142,17 @@ def _open_snapshot(sqlite_path: Path) -> Iterator[sqlite3.Connection]:
 def _resolve_storage_path(
     storage_root: Path, key: str, raw_path: str
 ) -> tuple[Path | None, bool, str]:
+    """Decode an ``itemAttachments.path`` cell into ``(path, is_stored, filename)``.
+
+    Zotero encodes an attachment's location with a small scheme vocabulary:
+    - ``storage:<name>`` — a Zotero-managed file at ``storage/<key>/<name>``;
+      resolves to a concrete path with ``is_stored=True``.
+    - ``attachments:<rel>`` — a "linked attachments" base-dir relative path;
+      we cannot resolve it without the user's base-dir setting, so only the
+      basename is returned (``path=None``).
+    - a bare path — kept only if absolute; relative bare paths resolve to None.
+    Returns the filename in every branch so callers always have a display name.
+    """
     if raw_path is None:
         return None, False, ""
     if raw_path.startswith("storage:"):
@@ -104,6 +166,17 @@ def _resolve_storage_path(
 
 
 def read_items(sqlite_path: Path, storage_root: Path) -> list[ZoteroItem]:
+    """Read every non-trashed parent item, with tags, attachments and notes.
+
+    Read-only: all work happens against the in-memory snapshot from
+    :func:`_open_snapshot`. Each table is pulled in one bulk query and joined
+    in Python (cheaper than N correlated subqueries for a personal library),
+    excluding rows present in ``deletedItems`` so trashed entries never surface
+    in a report. Only non-note/non-attachment types become parents; notes and
+    attachments are folded onto their parent by ``parentItemID``. Standalone
+    (parent-less) notes and attachments are intentionally dropped — they don't
+    fit the "bibliographic item with reading notes" model the reports assume.
+    """
     with _open_snapshot(sqlite_path) as conn:
         items_rows = conn.execute(
             """

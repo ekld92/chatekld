@@ -51,6 +51,18 @@ _FM_YEAR_KEYS = ("year", "date", "issued", "publication_year")
 
 @dataclass
 class BridgeResult:
+    """Outcome of resolving every active PDF against the bibliography.
+
+    Forward and reverse maps (``bib_to_pdfs`` / ``pdf_to_bib``) plus three
+    disjoint residual buckets — ``unmapped_pdfs`` (resolved to nothing),
+    ``ambiguous_pdfs`` (author+year matched >1 key, set aside rather than
+    guessed) and ``confirmed_no_match_pdfs`` (the user's curated "not in the
+    bib" list). ``source_per_pdf`` records *which* resolution step won for each
+    matched PDF (manual / fm_pointer / fm_authoryear / wikilink / authoryear),
+    feeding the diagnostics. ``fm_pointer_fields_seen`` / ``notes_with_fm`` are
+    purely informational counters surfaced in the CLI and summary.
+    """
+
     bib_to_pdfs: dict[str, list[Path]] = field(default_factory=dict)
     pdf_to_bib: dict[Path, str] = field(default_factory=dict)
     unmapped_pdfs: list[Path] = field(default_factory=list)
@@ -67,11 +79,19 @@ class BridgeResult:
 
 
 def _strip_accents(s: str) -> str:
+    """NFKD-decompose and drop combining marks (``é`` → ``e``)."""
     s = unicodedata.normalize("NFKD", s)
     return "".join(c for c in s if not unicodedata.combining(c))
 
 
 def _normalize_author_lastname(raw: str) -> str:
+    """Reduce an author string to a bare lowercase alpha surname key.
+
+    Takes the surname (the part before the first comma if present, else the
+    last whitespace token), strips accents, and removes every non-letter, so
+    ``"Das-Munshi, Jayati"`` → ``"dasmunshi"``. This is the bib-side key that
+    must equal a filename-derived author key for an author+year match.
+    """
     s = _strip_accents(raw)
     if "," in s:
         last = s.split(",", 1)[0]
@@ -124,6 +144,12 @@ def _filename_authoryear_candidates(stem: str) -> list[tuple[str, str]]:
 
 
 def _fm_get_first(fm: dict[str, Any], keys: Iterable[str]) -> Any:
+    """First non-empty value among ``keys``, matched case-insensitively.
+
+    Frontmatter key casing varies across plugins/users, so the lookup is done
+    over a lowercased copy of ``fm``. Empty strings and ``None`` are treated as
+    absent so the next candidate key is tried.
+    """
     if not fm:
         return None
     lower = {str(k).lower(): v for k, v in fm.items()}
@@ -136,6 +162,12 @@ def _fm_get_first(fm: dict[str, Any], keys: Iterable[str]) -> Any:
 
 
 def _fm_extract_year(fm: dict[str, Any]) -> str | None:
+    """Pull a 4-digit 19xx/20xx year out of any year-ish frontmatter field.
+
+    Tolerant of full dates (``2020-05-01``) and arbitrary surrounding text by
+    regex-extracting the first plausible year token. Returns ``None`` when no
+    year field is present or none contains a year.
+    """
     v = _fm_get_first(fm, _FM_YEAR_KEYS)
     if v is None:
         return None
@@ -145,6 +177,12 @@ def _fm_extract_year(fm: dict[str, Any]) -> str | None:
 
 
 def _fm_extract_first_author(fm: dict[str, Any]) -> str | None:
+    """Extract a single first-author string from varied frontmatter shapes.
+
+    Handles a bare string, a list (first element), and a citation-style dict
+    (``{family: ...}``-type keys). Returns ``None`` when no author field is
+    usable; the caller normalizes the result to a surname key.
+    """
     v = _fm_get_first(fm, _FM_AUTHOR_KEYS)
     if v is None:
         return None
@@ -194,6 +232,11 @@ def _fm_extract_pdf_pointers(fm: dict[str, Any]) -> list[str]:
 
 
 def _fm_pointer_field_present(fm: dict[str, Any]) -> str | None:
+    """Name of the first populated PDF-pointer field, for diagnostics only.
+
+    Drives the ``fm_pointer_fields_seen`` counter (which pointer conventions
+    the user's vault actually uses); not used for matching itself.
+    """
     if not fm:
         return None
     lower = {str(k).lower(): v for k, v in fm.items()}
@@ -207,6 +250,13 @@ def _fm_pointer_field_present(fm: dict[str, Any]) -> str | None:
 
 
 def _load_mapping(path: Path) -> tuple[dict[str, list[str]], set[str]]:
+    """Load ``mapping.json`` → ``(matches, no_match)``; ``({}, set())`` if absent.
+
+    ``matches`` is ``{citation_key: [vault-relative-pdf, ...]}`` and
+    ``no_match`` is the set of vault-relative PDFs the user confirmed are not
+    in the bib. Any read/parse error degrades to empty rather than raising —
+    a corrupt overrides file must not block a scan, only forfeit the curation.
+    """
     if not path.exists():
         return {}, set()
     try:
@@ -251,6 +301,13 @@ def _write_text_atomic(path: Path, text: str) -> None:
 
 
 def save_mapping(path: Path, matches: dict[str, list[str]], no_match: set[str]) -> None:
+    """Persist the mapping atomically, fully sorted for a stable diff.
+
+    Keys, per-key path lists, and the no-match set are all sorted so the
+    on-disk file is deterministic (clean git/iCloud diffs, no spurious churn).
+    Writes via :func:`_write_text_atomic` since this is the audit's only
+    writable file and the data is hand-curated.
+    """
     payload = {
         "matches": {k: sorted(v) for k, v in sorted(matches.items())},
         "no_match": sorted(no_match),
@@ -260,6 +317,8 @@ def save_mapping(path: Path, matches: dict[str, list[str]], no_match: set[str]) 
 
 def _rel_to_vault(pdf: Path, vault_root: Path) -> str:
     """Best-effort vault-relative path; falls back to absolute string."""
+    # Both paths are ``resolve()``-d before the relative computation so the
+    # stored key is canonical (the mapping is keyed by vault-relative path).
     try:
         return str(pdf.resolve().relative_to(vault_root.resolve()))
     except (OSError, ValueError):
@@ -314,6 +373,24 @@ def build_bridge(
     bib_entries: list[core_bib.BibEntry],
     pdfs: list[Path],
 ) -> BridgeResult:
+    """Resolve every PDF to a citation key via the five-step priority cascade.
+
+    Steps, highest priority first (a PDF is claimed by the first step that
+    matches and never reconsidered — ``matched`` is the guard):
+      1. manual ``mapping.json`` overrides (also seeds the confirmed-no-match
+         bucket);
+      2a. ``Z_Zotero_Notes/<key>.md`` frontmatter direct PDF pointers;
+      2b. frontmatter (author, year) → filename matcher;
+      3. wikilink ``[[*.pdf]]`` references in those notes;
+      4. residual author+year heuristic on the filename against the bib's
+         first authors — a *unique* hit links, a multi-candidate hit is parked
+         in ``ambiguous_pdfs`` (never guessed);
+      5. anything still unclaimed and not ambiguous becomes ``unmapped``.
+
+    Read-only: it consults notes, the bib, and the mapping file but writes
+    nothing. The two filename indexes (by name, by author+year candidates) are
+    built once up front so each step is a dict lookup, not a rescan.
+    """
     vault = settings.vault_root
     bib_by_key = {e.citation_key: e for e in bib_entries}
 
@@ -357,6 +434,9 @@ def build_bridge(
     matched: set[Path] = set()
 
     def _link(p: Path, key: str, source: str) -> None:
+        # Idempotent claim: record the forward+reverse maps and the winning
+        # source, then mark the PDF matched so no lower-priority step can
+        # re-claim it. First step to call _link for a PDF wins.
         if p in matched:
             return
         result.pdf_to_bib[p] = key

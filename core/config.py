@@ -19,6 +19,10 @@ from core.constants import (
     DEFAULT_ONLINE_TIMEOUT_S,
     DEFAULT_ONLINE_MAX_RETRIES,
     DEFAULT_ONLINE_MAX_TOKENS,
+    DEFAULT_VISION_TIMEOUT_S,
+    DEFAULT_VISION_MAX_TOKENS,
+    DEFAULT_OCR_MAX_TOKENS,
+    DEFAULT_REFACTOR_THUMB_MAX_SIDE,
     VAULT_IMAGE_EXTS,
 )
 
@@ -150,6 +154,17 @@ def load_config() -> dict:
         # llama-index LLM object to drive the rewrites, so it stays single.
         "vault_query_expansion": False,
         "vault_num_queries": 3,
+        # Wikilink graph expansion (query-time, no reindex): after retrieval,
+        # widen the result set with chunks from notes the seeds link to AND
+        # notes that link into them, before the rerank stage decides what
+        # survives. The toggle is body-overridable (live per Send); the caps
+        # are config-only. neighbor_cap bounds distinct neighbour notes per
+        # query, node_cap the total chunks appended, score_decay scales a
+        # neighbour's inherited seed score (matters on the no-reranker path).
+        "vault_wikilink_expansion": False,
+        "vault_wikilink_neighbor_cap": 10,
+        "vault_wikilink_node_cap": 24,
+        "vault_wikilink_score_decay": 0.5,
         # Agent mode (opt-in). When True, /api/obsidian/chat routes
         # through the ReAct agent loop with vault.search / vault.read_note /
         # vault.list_materials tools instead of the single-shot RAG path.
@@ -186,6 +201,14 @@ def load_config() -> dict:
         # failures, not graceful recovery. A hung embedding surfaces through the
         # indexer's own error handling instead.
         "local_request_timeout_s": 0,
+        # Vision / OCR call bounds (indexing-time image description + scanned
+        # PDF OCR). Separate from local_request_timeout_s (chat-only): these
+        # are always on so a runaway / stuck local vision model cannot stall a
+        # long indexing run. vision_timeout_s is the per-call HTTP timeout;
+        # the *_max_tokens cap the generation length.
+        "vision_timeout_s": DEFAULT_VISION_TIMEOUT_S,
+        "vision_max_tokens": DEFAULT_VISION_MAX_TOKENS,
+        "ocr_max_tokens": DEFAULT_OCR_MAX_TOKENS,
         # Embeddings are local-only. When ``provider`` is online the
         # indexer and vault chat fall back to this provider for embedding.
         "embed_provider": "ollama",
@@ -209,6 +232,13 @@ def load_config() -> dict:
         "paper_max_tokens": 4096,
         "paper_top_p": 0.9,
         "paper_repeat_penalty": 1.1,
+        # --- Plain Chat knobs ---
+        # Persisted defaults for the RAG-free Plain Chat panel.  /api/plainchat
+        # accepts temperature/system_prompt as per-request overrides; the route
+        # falls back to these when the body omits them.  chat_system_prompt is
+        # used as the FULL system prompt (no retrieval grounding to protect).
+        "chat_temperature": 0.3,
+        "chat_system_prompt": "You are a helpful assistant.",
         # --- Deck Generator knobs ---
         # Persisted defaults for the Deck Generator.  /api/deck/generate
         # accepts these as per-request overrides; api/routes/deck.py falls
@@ -217,13 +247,30 @@ def load_config() -> dict:
         "deck_temperature": 0.3,
         "deck_max_sections": 8,
         "deck_agent_max_iterations": 6,
+        # --- Note Refactor knobs ---
+        # Scope sub-folder analyzed by /api/refactor/plan; validated as a
+        # vault-relative no-traversal path in api/routes/config.py.
+        # "" ⇒ no default scope: the user must pick a folder before a plan
+        # runs (an empty scope resolves to None → a clean 400 in the route).
+        # refactor_extract_model "" ⇒ fall back to vision_model.
+        "refactor_scope_subdir": "",
+        "refactor_extract_model": "",
+        "refactor_table_double_read": True,
+        # Phase 2 vault-write knobs.  refactor_archive_dir "" ⇒ default
+        # BASE_DIR/refactor/archive/<vault_key>/ (local disk only — NOT iCloud);
+        # set an absolute path to point at a backed-up folder.  Must resolve
+        # OUTSIDE the vault (re-checked at apply time).  refactor_thumb_max_side
+        # bounds the longest side of the in-vault PNG thumbnail the archiver
+        # writes when it moves a full-res original out.
+        "refactor_archive_dir": "",
+        "refactor_thumb_max_side": DEFAULT_REFACTOR_THUMB_MAX_SIDE,
         # Library Audit (kb_harmonizer) settings. The audit subsystem
         # is fully manual — these keys are read only when the user
         # explicitly clicks "Run Scan" on the Library Audit tab.
         "audit_attachments_subdir": "Z_attachments",
         "audit_biblio_articles_subdir": "biblio_articles",
         "audit_zotero_notes_subdir": "Z_Zotero_Notes",
-        "audit_master_bib_path": "presentations_slides_writings_teaching/_master.bib",
+        "audit_master_bib_path": "_master.bib",
         "audit_zotero_sqlite": "~/Zotero/zotero.sqlite",
         "audit_zotero_storage": "~/Zotero/storage",
         "audit_annotations_read_threshold": 5,

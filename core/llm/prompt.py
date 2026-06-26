@@ -102,6 +102,20 @@ def build_summary_user_message(
         )
     else:
         body = f"Document Type: {doc_type}\n\nTemplate: {user_template}\n\nContent:\n{guarded}"
-    if focus_question:
-        body = f"### FOCUS QUESTION ###\n{focus_question}\n\n{body}"
+    # A focus question is the *user's own* trusted instruction, so it is placed
+    # ABOVE (outside) the untrusted-document guard rather than inside it. The
+    # .strip() guard matters: a whitespace-only value is truthy, and without it
+    # we would inject an empty but directive-bearing FOCUS QUESTION block for no
+    # reason. The trailing directive is what makes the question *actionable* —
+    # without it the model just sees a dangling question and must guess what to
+    # do with it. (The body is later sent as a plain message, never through
+    # str.format, so any braces in focus_question are inert here.)
+    if focus_question and focus_question.strip():
+        body = (
+            "### FOCUS QUESTION ###\n"
+            f"{focus_question}\n"
+            "Prioritise information in the document that addresses this question. "
+            "If the document does not address it, state that explicitly.\n\n"
+            f"{body}"
+        )
     return body

@@ -16,8 +16,15 @@ _API_KEY_PATTERNS = (
     # (``sk-svcacct-…``, ``sk-admin-…``) are matched, not just bare ``sk-``.
     re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
     re.compile(r"AIza[0-9A-Za-z_\-]{30,}"),
+    # Google OAuth 2.0 access tokens (Drive/Calendar/Gmail flows) — not caught
+    # by the AIza API-key pattern above.
+    re.compile(r"ya29\.[0-9A-Za-z_\-]{20,}"),
     re.compile(r"Bearer\s+[A-Za-z0-9._\-]{20,}", re.IGNORECASE),
     re.compile(r"x-api-key:\s*[A-Za-z0-9._\-]{20,}", re.IGNORECASE),
+    # Generic ``Authorization:`` header value — catches a raw token that is not
+    # ``Bearer``-prefixed (the {20,} run never matches the short word ``Bearer``
+    # itself, so it complements rather than overlaps the Bearer pattern).
+    re.compile(r"authorization:\s*[A-Za-z0-9._\-]{20,}", re.IGNORECASE),
 )
 
 

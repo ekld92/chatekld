@@ -1,6 +1,6 @@
 """CLI smoke test for the Library Audit subsystem.
 
-Reads the active papermind config to build :class:`audit.config.Settings`,
+Reads the active ChatEKLD config to build :class:`audit.config.Settings`,
 then runs one or more diagnostic checks against the configured vault and
 Zotero database. No data is written back to either store.
 
@@ -56,6 +56,7 @@ from .engine.reports import (
 
 
 def _rel(p: Path, settings: Settings) -> str:
+    """Vault-relative display path for CLI output; absolute if outside the vault."""
     try:
         return str(p.relative_to(settings.vault_root))
     except ValueError:
@@ -63,6 +64,7 @@ def _rel(p: Path, settings: Settings) -> str:
 
 
 def check_obsidian(settings: Settings) -> int:
+    """Print Obsidian-connector stats (notes, frontmatter, tags, PDF refs)."""
     print(f"\n[obsidian] scanning {settings.vault_root}")
     notes = list(obsidian.scan_vault(settings.vault_root, settings.ignored_dirs))
     tag_counter: Counter[str] = Counter()
@@ -78,6 +80,7 @@ def check_obsidian(settings: Settings) -> int:
 
 
 def check_zotero(settings: Settings) -> int:
+    """Print Zotero-connector stats (parents, child notes, tag counts)."""
     print(f"\n[zotero] reading {settings.zotero_sqlite}")
     if not settings.zotero_sqlite.exists():
         print("  zotero.sqlite not found — skip")
@@ -103,6 +106,13 @@ def check_zotero(settings: Settings) -> int:
 
 
 def check_zotero_debug(settings: Settings) -> int:
+    """Dump raw ``itemNotes`` row counts straight from a copied DB.
+
+    A lower-level probe than :func:`check_zotero`: it copies the live SQLite
+    (plus any ``-wal``/``-shm`` siblings) to a temp dir and opens it
+    ``mode=ro&immutable=1`` so the running Zotero is untouched, then prints the
+    note totals — used to debug why child notes may be under/over-counted.
+    """
     import shutil
     import sqlite3
     import tempfile
@@ -138,6 +148,7 @@ def check_zotero_debug(settings: Settings) -> int:
 
 
 def check_finder(settings: Settings) -> int:
+    """Print Finder-tag coverage under ``biblio_articles`` (macOS-only data)."""
     target = settings.biblio_articles_dir
     print(f"\n[finder] scanning tags under {target}")
     if not target.exists():
@@ -161,6 +172,7 @@ def check_finder(settings: Settings) -> int:
 
 
 def check_duplicates(settings: Settings) -> int:
+    """Count content-duplicate PDF sets across the whole ``Z_attachments`` tree."""
     print(f"\n[duplicates] hashing PDFs under {settings.attachments_dir}")
     if not settings.attachments_dir.exists():
         return 0
@@ -172,6 +184,7 @@ def check_duplicates(settings: Settings) -> int:
 
 
 def check_bib(settings: Settings) -> int:
+    """Print bib-parser stats (entry count, entries carrying keywords)."""
     print(f"\n[bib] parsing {settings.master_bib}")
     if not settings.master_bib.exists():
         return 0
@@ -182,6 +195,12 @@ def check_bib(settings: Settings) -> int:
 
 
 def check_bridge(settings: Settings) -> int:
+    """Run the PDF↔bib bridge and print a per-source match breakdown.
+
+    Mirrors the inventory's active-PDF set (skip-prefix applied) and prints how
+    many PDFs each resolution step claimed, plus sample unmapped/ambiguous
+    paths — the go-to diagnostic when matching looks wrong.
+    """
     print("\n[bridge] resolving biblio_articles PDFs against _master.bib")
     entries = bib.parse_bib(settings.master_bib)
     skip_prefix = settings.biblio_skip_prefix or None
@@ -218,6 +237,7 @@ def check_bridge(settings: Settings) -> int:
 
 
 def check_inventory(settings: Settings) -> int:
+    """Build the full inventory (annotations off) and print triangulation tallies."""
     print("\n[inventory] joining bib + bridge + Z_Zotero_Notes + Finder + Zotero")
     inv = eng_inventory.build_inventory(settings, count_annotations=False)
     records = inv.records
@@ -248,6 +268,7 @@ def check_inventory(settings: Settings) -> int:
 
 
 def check_note_tag_drift(settings: Settings) -> int:
+    """Aim (i): print citation keys whose Obsidian YAML lacks Zotero note tags."""
     print(
         "\n[note-tag-drift] Zotero child-note tags missing from Obsidian YAML (aim i)"
     )
@@ -263,6 +284,7 @@ def check_note_tag_drift(settings: Settings) -> int:
 
 
 def check_unread_unzoterod(settings: Settings) -> int:
+    """Aim (ii): print PDFs absent from the bib that also look unread."""
     print("\n[unread-unzoterod] PDFs not in bib AND look unread (aim ii)")
     inv = eng_inventory.build_inventory(settings, count_annotations=False)
     rep = r_unread_unzoterod.find(inv, settings)
@@ -276,6 +298,7 @@ def check_unread_unzoterod(settings: Settings) -> int:
 
 
 def check_zotero_unread(settings: Settings) -> int:
+    """Aim (iii): print bib entries whose Zotero parent has no child note."""
     print("\n[zotero-unread] bib entries with no Zotero child note (aim iii)")
     inv = eng_inventory.build_inventory(settings, count_annotations=False)
     rep = r_zotero_unread.find(inv)
@@ -289,6 +312,7 @@ def check_zotero_unread(settings: Settings) -> int:
 
 
 def check_read_unzoterod(settings: Settings) -> int:
+    """Aim (iv): print un-Zotero'd PDFs ranked by annotation count."""
     print("\n[read-unzoterod] PDFs not in bib, ranked by annotation count (aim iv)")
     inv = eng_inventory.build_inventory(settings, count_annotations=False)
     rep = r_read_unzoterod.find(inv, settings)
@@ -305,6 +329,7 @@ def check_read_unzoterod(settings: Settings) -> int:
 
 
 def check_zotero_no_pdf(settings: Settings) -> int:
+    """Aim (v): print bib entries for which the bridge found no PDF."""
     print("\n[zotero-no-pdf] bib entries with no resolved PDF (aim v)")
     inv = eng_inventory.build_inventory(settings, count_annotations=False)
     rep = r_zotero_no_pdf.find(inv)
@@ -322,6 +347,7 @@ def check_zotero_no_pdf(settings: Settings) -> int:
 
 
 def check_duplicates_biblio(settings: Settings) -> int:
+    """Count content-duplicate PDF sets scoped to ``biblio_articles`` only."""
     print(f"\n[duplicates-biblio] hashing PDFs under {settings.biblio_articles_dir}")
     sets = eng_duplicates.find_biblio_duplicates(settings)
     print(f"  duplicate sets: {len(sets)}")
@@ -347,6 +373,12 @@ CHECKS = {
 
 
 def main() -> int:
+    """Parse ``--check <name|all>``, load settings, run the selected check(s).
+
+    Returns a bit-OR'd exit code: ``2`` for an incomplete audit config (no
+    vault), ``1`` if any individual check raised (logged, others still run),
+    else the OR of each check's own return. Read-only throughout.
+    """
     parser = argparse.ArgumentParser(prog="audit")
     parser.add_argument(
         "--check",

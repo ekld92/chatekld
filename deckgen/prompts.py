@@ -95,7 +95,15 @@ def build_outline_message(topic: str, instructions: str, max_sections: int) -> s
     parts.append(
         f"Design a lecture outline on this topic using ONLY knowledge found in the "
         f"vault. Return a JSON array of between 3 and {max_sections} sections, each "
-        'an object {"title": str, "points": [str, ...]}. Output ONLY the JSON array.'
+        'an object {"title": str, "points": [str, ...]}. Output ONLY the JSON array.\n'
+        # 2026-06 audit: a one-line shape example anchors the JSON structure for
+        # small models. It is kept in NON-f-string segments so its { } braces
+        # stay literal — only the f-prefixed lines above interpolate
+        # {max_sections}. This is a hint, not a guarantee: outline.parse_outline
+        # remains authoritative (balanced-bracket extraction + heading-list
+        # fallback); the example just reduces how often that fallback is needed.
+        'Example shape (structure only — do not reuse this content): '
+        '[{"title": "Definition & Epidemiology", "points": ["what it is", "how common it is"]}]'
     )
     return "\n\n".join(parts)
 

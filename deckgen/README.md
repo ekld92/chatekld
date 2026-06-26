@@ -147,3 +147,40 @@ at the repo root (which *is* hermetic).
   fall back to plain RAG (ChatEKLD surfaces a capability warning — `deckgen` echoes it).
 - Cross-section coherence is best-effort; the whole outline is passed into each section
   call to reduce drift/overlap, but it is not eliminated.
+
+## Future improvements / To consider
+
+Captured from a 2026-06-19 design review on **offline batch generation** (e.g. "produce
+25 lecture decks, one per teaching topic, from a single prompt"):
+
+- **Batch / multi-deck generation is not built in.** `deckgen` is one deck per
+  invocation. Two ways to get a batch, neither requiring changes to the deckgen core:
+  - *(A) Caller supplies the topics* — loop a topic list and call `python -m deckgen`
+    once per topic (each scaffolds its own `<slug>/` folder). Run **sequentially**: the
+    vault holds a per-acquisition operation lock and there is a single local model in
+    memory, so parallel runs would contend on both.
+  - *(B) One prompt → N topics* — add a thin pre-step (one local LLM call: "propose N
+    teaching topics on X as a JSON list") that feeds each topic into path (A). This is
+    the only piece not already present; it belongs **outside** the app-independent core
+    (wrap `ChatEKLDClient` / `InProcessChatRunner`), e.g. a `deckgen` batch subcommand or
+    a separate script.
+- **Two hard prerequisites for an offline run:**
+  1. *A running, indexed Obsidian vault that actually covers every topic.* Outlines and
+     sections are grounded in the vault; a topic with no supporting notes comes back as
+     placeholder frames (exit code `2`). `/api/obsidian/status` must be `done` (or
+     `paused_partial`).
+  2. *A tool-capable local model.* Agent mode needs reliable function-calling. **Prefer
+     `qwen2.5` (14B+)**; `llama3.1`/`qwen3` also work. ⚠️ The app's `DEFAULT_LLM`
+     (`llama3.2`) is too small for dependable agent tool-calling — small models fall back
+     to plain RAG. The local embed model (`nomic-embed-text` by default) must also be
+     pulled.
+- **Runtime is the main practical caveat, not a blocker.** Each deck is ~8 sections and
+  **each section is its own bounded agent turn** (up to the 300 s per-turn wall-clock cap).
+  25 decks × ~8 sections locally can run to **several hours** — plan it as an overnight,
+  sequential batch and use the per-deck exit codes (`0` clean / `1` warnings or some
+  placeholders / `2` empty) to flag decks for re-run.
+- **Pre-flight sanity check (run on the Mac, all read-only):** confirm `ollama list`
+  shows the server up with a tool-capable model + the embed model; confirm
+  `~/Library/Application Support/ChatEKLD/obsidian_storage/obsidian_meta.json` exists; and,
+  with the app running, that `/api/obsidian/status` reports `done` and
+  `/api/obsidian/materials` lists notes covering the intended topics.

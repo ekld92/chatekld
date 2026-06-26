@@ -479,5 +479,134 @@ class TestVisionCallFailureCooldown(unittest.TestCase):
         self.assertIsNone(mgr._call_failure_at)
 
 
+class TestVisionCallBounds(unittest.TestCase):
+    """Vision/OCR calls must always be bounded — pre-emptive downscale on the
+    description path, a finite timeout, retries disabled, and a max-token cap —
+    so a runaway / stuck local model cannot stall a long indexing run.
+    """
+
+    def setUp(self):
+        _prefixes = ("services", "pdf_extractor")
+        for _key in list(sys.modules):
+            if any(_key == p or _key.startswith(p + ".") for p in _prefixes):
+                sys.modules.pop(_key, None)
+
+    @staticmethod
+    def _big_png_b64(w=4000, h=3000):
+        import base64
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (w, h), (10, 20, 30)).save(buf, "PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    @staticmethod
+    def _longest_side(b64):
+        import base64
+        from PIL import Image
+        with Image.open(io.BytesIO(base64.b64decode(b64))) as im:
+            return max(im.size)
+
+    def test_cfg_bounded_int_falls_back_and_clamps(self):
+        from services.vision import _cfg_bounded_int
+        # Unset / non-positive / unparseable -> hard default.
+        for value in ({}, {"vision_timeout_s": 0}, {"vision_timeout_s": -3},
+                      {"vision_timeout_s": "x"}, {"vision_timeout_s": None}):
+            with patch("core.config.load_config", return_value=value):
+                self.assertEqual(_cfg_bounded_int("vision_timeout_s", 120, 5, 600), 120)
+        # In-range value is returned verbatim.
+        with patch("core.config.load_config", return_value={"vision_timeout_s": 45}):
+            self.assertEqual(_cfg_bounded_int("vision_timeout_s", 120, 5, 600), 45)
+        # Positive but out-of-range -> CLAMPED (defends a hand-edited config.json
+        # that bypassed the POST /api/config validator).
+        with patch("core.config.load_config", return_value={"vision_timeout_s": 99999}):
+            self.assertEqual(_cfg_bounded_int("vision_timeout_s", 120, 5, 600), 600)
+        with patch("core.config.load_config", return_value={"vision_timeout_s": 1}):
+            self.assertEqual(_cfg_bounded_int("vision_timeout_s", 120, 5, 600), 5)
+
+    def test_fit_downscales_oversized_noops_small_survives_junk(self):
+        from services.vision import _fit_base64_image_to_max_side
+        from core.constants import VISION_IMAGE_MAX_SIDE
+        big = self._big_png_b64(4000, 3000)
+        fit = _fit_base64_image_to_max_side(big, VISION_IMAGE_MAX_SIDE)
+        # The 14px-alignment guarantee holds only because the cap is a multiple
+        # of 14 — assert against the real constant, not a hardcoded literal.
+        self.assertLessEqual(self._longest_side(fit), VISION_IMAGE_MAX_SIDE)
+        small = self._big_png_b64(200, 100)
+        self.assertEqual(_fit_base64_image_to_max_side(small, VISION_IMAGE_MAX_SIDE), small)
+        # Undecodable input (e.g. HEIC without pillow-heif) is returned as-is.
+        self.assertEqual(_fit_base64_image_to_max_side("not-an-image", VISION_IMAGE_MAX_SIDE), "not-an-image")
+
+    def test_describe_image_downscales_and_passes_bounds(self):
+        from services.vision import VisionManager
+        captured = {}
+
+        def fake(model, prompt, payload, *, timeout=None, max_tokens=None):
+            captured["side"] = self._longest_side(payload)
+            captured["timeout"] = timeout
+            captured["max_tokens"] = max_tokens
+            return "desc"
+
+        mgr = VisionManager(model="m", provider="lm_studio")
+        with patch("core.config.load_config", return_value={}), \
+             patch("services.vision._chat_lm_studio_image", side_effect=fake):
+            out = mgr.describe_image(self._big_png_b64())
+
+        self.assertEqual(out, "desc")
+        self.assertLessEqual(captured["side"], 1568)        # pre-emptive downscale
+        self.assertEqual(captured["timeout"], 120)          # DEFAULT_VISION_TIMEOUT_S
+        self.assertEqual(captured["max_tokens"], 1536)      # DEFAULT_VISION_MAX_TOKENS
+
+    def test_ocr_passes_timeout_and_ocr_max_tokens(self):
+        from services.vision import GLMOCRManager
+        captured = {}
+
+        def fake(model, prompt, payload, *, timeout=None, max_tokens=None):
+            captured["timeout"] = timeout
+            captured["max_tokens"] = max_tokens
+            return "page text"
+
+        mgr = GLMOCRManager(model="ocr", provider="lm_studio")
+        with patch("core.config.load_config",
+                   return_value={"vision_timeout_s": 90, "ocr_max_tokens": 2048}), \
+             patch("services.vision._chat_lm_studio_image", side_effect=fake):
+            out = mgr.extract_page_text("data")
+
+        self.assertEqual(out, "page text")
+        self.assertEqual(captured["timeout"], 90)
+        self.assertEqual(captured["max_tokens"], 2048)      # ocr_max_tokens, not vision
+
+    def test_lm_studio_transport_disables_retries_and_caps_tokens(self):
+        import services.vision as v
+        captured = {}
+
+        class _FakeCompletions:
+            def create(self, **kw):
+                captured["create_kw"] = kw
+                msg = type("M", (), {"content": "x"})()
+                choice = type("Ch", (), {"message": msg})()
+                return type("R", (), {"choices": [choice]})()
+
+        class _FakeClient:
+            def __init__(self, **kw):
+                captured["client_kw"] = kw
+                self.chat = type("Chat", (), {"completions": _FakeCompletions()})()
+
+        with patch("openai.OpenAI", _FakeClient):
+            out = v._chat_lm_studio_image("m", "p", "b64", timeout=77, max_tokens=512)
+        self.assertEqual(out, "x")
+        self.assertEqual(captured["client_kw"]["max_retries"], 0)
+        self.assertEqual(captured["client_kw"]["timeout"], 77)
+        self.assertEqual(captured["create_kw"]["max_tokens"], 512)
+
+        # timeout=None / max_tokens=None must NOT be forwarded (the OpenAI SDK
+        # can read an explicit timeout=None as "no timeout").
+        captured.clear()
+        with patch("openai.OpenAI", _FakeClient):
+            v._chat_lm_studio_image("m", "p", "b64")
+        self.assertEqual(captured["client_kw"]["max_retries"], 0)
+        self.assertNotIn("timeout", captured["client_kw"])
+        self.assertNotIn("max_tokens", captured["create_kw"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,13 @@ META_JSON = "obsidian_meta.json"
 
 
 def _confirm_app_closed(assume_yes: bool) -> bool:
+    """Interactive "is the app closed?" gate; ``--yes`` (``assume_yes``) skips it.
+
+    A running app holds the index in memory and would overwrite this migration on
+    its next checkpoint, so the migration must not run against a live instance.
+    Returns ``True`` only on an explicit y/yes (or ``assume_yes``); an EOF (e.g.
+    piped/non-interactive) is treated as "no".
+    """
     if assume_yes:
         return True
     print(
@@ -75,6 +82,16 @@ def _confirm_app_closed(assume_yes: bool) -> bool:
 
 
 def migrate(index_dir: str, *, batch_size: int, keep_json: bool) -> int:
+    """Move an index from the JSON SimpleVectorStore to LanceDB without re-embedding.
+
+    Streams ``embedding_dict`` with ijson, joins each vector to its docstore node
+    by id, bulk-inserts batches of *batch_size* into LanceDB, verifies row-count
+    parity, archives the legacy JSON to ``.bak`` (unless *keep_json*), and records
+    ``vector_backend=lancedb`` in ``obsidian_meta.json``. Idempotent: a no-op when
+    the index is already on LanceDB. Returns a process exit code (0 success, 1
+    parity failure, 2 missing prerequisites). See the module docstring for the
+    full step list and rationale.
+    """
     index_path = Path(index_dir)
     vec_json = index_path / VECTOR_JSON
     docstore_json = index_path / "docstore.json"
@@ -166,6 +183,7 @@ def migrate(index_dir: str, *, batch_size: int, keep_json: bool) -> int:
 
 
 def main(argv: list | None = None) -> int:
+    """Parse args, gate on the app-closed confirmation, and run :func:`migrate`."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--index-dir", default=OBSIDIAN_INDEX_DIR,
                         help=f"Vault index directory (default: {OBSIDIAN_INDEX_DIR})")

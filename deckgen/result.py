@@ -23,4 +23,9 @@ class ChatResult:
 
     @property
     def ok(self) -> bool:
+        """True when the turn produced answer text and recorded no error.
+
+        The callers' success predicate: a turn that errored, or one that streamed
+        only whitespace (e.g. an empty model reply), is treated as a failure.
+        """
         return self.error is None and bool(self.text.strip())

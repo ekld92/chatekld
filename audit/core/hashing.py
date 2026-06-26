@@ -19,6 +19,13 @@ CHUNK = 65536
 
 
 def _hash(path: Path, partial: bool) -> str | None:
+    """SHA-256 of a file, or just its first ``PARTIAL_BYTES`` when ``partial``.
+
+    Streams the full read in ``CHUNK``-sized blocks so a large PDF never loads
+    into memory. Returns ``None`` on any ``OSError`` (file vanished, permission
+    denied) so an unreadable file drops out of the duplicate search instead of
+    aborting it.
+    """
     h = hashlib.sha256()
     try:
         with open(path, "rb") as f:
@@ -33,10 +40,12 @@ def _hash(path: Path, partial: bool) -> str | None:
 
 
 def partial_hash(path: Path) -> str | None:
+    """Cheap pre-filter hash over only the file's first ``PARTIAL_BYTES``."""
     return _hash(path, partial=True)
 
 
 def full_hash(path: Path) -> str | None:
+    """Full-content SHA-256, the authoritative duplicate key."""
     return _hash(path, partial=False)
 
 

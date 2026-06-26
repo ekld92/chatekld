@@ -24,6 +24,7 @@
 │       ├── config.py              (/api/config; per-key LLM config validation)
 │       ├── deck.py                (/api/deck/* blueprint; SSE deck generation)
 │       ├── paper.py               (/api/summarise, /api/upload — single paper)
+│       ├── refactor.py            (/api/refactor/* blueprint; Note Refactor analyzer + hub)
 │       ├── status.py              (/api/status, /api/models, /api/pull, …)
 │       ├── usage.py               (/api/usage, /api/pricing)
 │       └── vault.py               (/api/obsidian/* incl. chat SSE)
@@ -63,7 +64,7 @@
 ├── audit/                         (Library Audit subsystem; vendored from kb_harmonizer)
 │   ├── __init__.py
 │   ├── __main__.py                (python -m audit --check ...)
-│   ├── config.py                  (papermind config -> Settings adapter)
+│   ├── config.py                  (ChatEKLD config -> Settings adapter)
 │   ├── manager.py                 (audit_manager singleton; manual-only scans)
 │   ├── scan.py                    (developer CLI)
 │   ├── serialize.py               (engine dataclasses -> JSON dicts)
@@ -88,7 +89,20 @@
 │   └── tests/                     (app-independent: no server, no requests)
 │       └── test_cli_integration.py · test_deckgen.py · test_template.py
 │
+├── refactor/                      (Note Refactor analyzer; Phase 1 read-only + Phase 1.5 hub)
+│   ├── __init__.py
+│   ├── resolver.py                (embed -> file via the reused Obsidian resolver + name_index)
+│   ├── cache.py                   (image-bytes sha256 + on-disk description / per-mode reuse)
+│   ├── hints.py                   (zero-vision "likely table" heuristic)
+│   ├── extract.py                 (the ONLY vision caller: table / redescribe / classify)
+│   ├── hygiene.py                 (advisory broken-embed / frontmatter notes)
+│   ├── discrepancy.py             (deterministic cross-note dose check)
+│   ├── ignore.py                  (sticky per-vault image ignore-list sidecar; never the vault)
+│   ├── plan.py                    (read-only orchestrator: 0 vision, 0 vault writes)
+│   └── result.py                  (third-party-free result dataclasses + serializers)
+│
 ├── scripts/                       (maintenance-only; run with the app closed, back up app data first)
+│   ├── compact_lancedb.py         (one-off offline LanceDB version-bloat reclaim)
 │   ├── migrate_vector_store.py    (SimpleVectorStore -> LanceDB, no re-embedding)
 │   ├── prune_storage_to_vector_store.py
 │   └── repair_simple_vector_store.py
@@ -99,11 +113,14 @@
 │   └── js/                        (ui.js + api.js are leaves; app.js is the root)
 │       ├── api.js · app.js · ui.js
 │       ├── audit.js · config.js · deck.js · settings.js
-│       ├── summarizer.js · vault.js
+│       ├── refactor.js · summarizer.js · vault.js
 │       └── vendor/marked.min.js   (v15.0.12, MIT — never loaded from a CDN)
 │
 ├── templates/
 │   └── index.html                 (single-page app shell)
+│
+├── docs/
+│   └── project_note_refactor.md   (Note Refactor design spec + phasing)
 │
 ├── resources/                     (.gitkeep — PyInstaller --add-data target)
 │
@@ -111,12 +128,19 @@
     ├── smoke_test.py
     ├── test_agent.py · test_audit.py · test_concurrency.py
     ├── test_deck.py · test_lancedb_migration.py · test_llm.py
-    ├── test_validators.py · test_vault_regressions.py
-    └── tests/audit/               (ported kb_harmonizer unit tests)
-        ├── conftest.py
-        ├── test_bib.py · test_bridge_filename.py · test_bridge_mapping.py
-        ├── test_hashing.py · test_inventory.py · test_naming.py
-        └── test_obsidian.py · test_pdf_annotations.py
+    ├── test_prompts.py · test_refactor.py · test_validators.py · test_vault_regressions.py
+    │                                  (test_prompts.py: model-free prompt invariants)
+    │                                  (test_refactor.py: hermetic Note Refactor analyzer + hub)
+    ├── tests/audit/               (ported kb_harmonizer unit tests)
+    │   ├── conftest.py
+    │   ├── test_bib.py · test_bridge_filename.py · test_bridge_mapping.py
+    │   ├── test_hashing.py · test_inventory.py · test_naming.py
+    │   └── test_obsidian.py · test_pdf_annotations.py
+    └── tests/eval/                (prompt eval net — vault-chat answer-quality golden set)
+        ├── scoring.py · test_scoring.py · run_eval.py (live; gated by RUN_LIVE_EVAL=1)
+        ├── golden_qa.json · README.md
+        └── fixtures/              (synthetic vault: cardiology/, nephrology/)
 
 The project virtual environment lives OUTSIDE the repo (default ~/venvs/papermind2026,
-overridable via PAPERMIND_VENV_DIR) and is never committed.
+overridable via CHATEKLD_VENV_DIR — the legacy PAPERMIND_VENV_DIR is still honoured)
+and is never committed.

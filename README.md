@@ -1,26 +1,21 @@
 # ChatEKLD 2026
 
-**Welcome!** ChatEKLD is a privacy-first desktop app that turns your Mac into a research workspace: summarise PDFs, chat with your Obsidian notes, reconcile your reference library, and generate grounded slide decks — all on your own machine.
-
 ChatEKLD is a local Flask and PyWebView application for PDF summarisation, Obsidian vault RAG, library reconciliation, and grounded LaTeX slide generation. It runs offline by default with Ollama or LM Studio, and can optionally route chat through OpenAI, Anthropic, or Google Gemini while keeping the index — and your notes — on-device.
 
-**At a glance:**
-
-- **Single Paper** — drop in a PDF and get a clean, tunable summary you can export.
-- **Obsidian Vault** — index your notes and PDFs, then ask questions and get grounded, cited answers (with an optional agent mode that searches as it reasons).
-- **Library Audit** — a read-only reconciliation of your vault against Zotero, your PDFs, and Finder tags. This is a very personal tool, tailored to my own workflow, and may well not be of use to you.
-- **Deck Generator** — turn a topic into a ready-to-compile LaTeX Beamer deck in your own template's house style.
-
-**Feedback is very welcome!** This is an actively developed, personal project, so please don't hesitate to reach out to Etienne at [boss@etienned.xyz](mailto:boss@etienned.xyz) with ideas, bug reports, or just to let me know how you're finding it — I'd genuinely love to hear from you.
+> **ChatEKLD writes to your Obsidian vault only when you explicitly ask it to — and only through Note Refactor.** Every other workflow is read-only: it *reads* your `.md` / `.pdf` files to build an on-device index — your notes are never modified, moved, or deleted. The app's own index, config, and logs live under `~/Library/Application Support/ChatEKLD/`; the Library Audit additionally writes a single `audit/mapping.json` of your manual PDF↔citation overrides, and the Deck Generator emits `.tex` files to an output folder you choose.
+>
+> **Note Refactor's Apply / Archive are the one exception** (opt-in, off by default, and never run without an explicit per-action confirmation). **Apply** inlines the approved image-description callouts into your notes; **Archive** moves a chosen full-res attachment *out* of the vault to a recoverable archive folder (default under the app data dir) and leaves a small thumbnail. Every change is written atomically, audit-logged, snapshotted, and reversible from the **Restore** dialog. Previewing (Run Plan), re-extraction, and classification remain read-only.
 
 ## Workflows
 
-ChatEKLD is organised as four tabs, each a self-contained workflow:
+ChatEKLD is organised as six tabs, each a self-contained workflow:
 
 1. **Single Paper** — upload one PDF, extract its text, and stream a tunable summary with prompt presets, document-type prompts, audience, focus question, and generation controls.
 2. **Obsidian Vault** — index `.md` and `.pdf` files, then query them through dense retrieval, optional BM25 lexical retrieval, RRF fusion, and an optional cross-encoder reranker — in single-shot RAG or an opt-in ReAct agent mode. Inspect the indexed-material manifest from the UI.
 3. **Library Audit** — a strictly read-only, **manual-only** reconciliation of the vault against Zotero (SQLite snapshot + Better BibTeX `_master.bib`), local PDFs (annotations + duplicates), and macOS Finder tags. Six reports plus a per-citation-key inventory.
 4. **Deck Generator** — turn a topic + free-form instructions into a LaTeX **Beamer** deck grounded in the indexed vault, in your own template's house style. Emit-only: it writes a compile-ready `.tex` + `Makefile`; you compile with `make`.
+5. **Note Refactor** — an analyzer **plus the app's only vault writer**, scoped to one sub-folder. *Read-only review:* reuse the indexer's cached image descriptions to preview an annotated version of each note, flag broken embeds / frontmatter smells, report advisory cross-note dose discrepancies, review ORIGINAL vs PROPOSED side-by-side, re-extract/classify a single image, and mark handwritten scans to ignore. *Opt-in writes (each explicitly confirmed):* **Apply** the approved callouts into the notes (callout-only — original embeds kept), **Archive** a chosen attachment out of the vault (vault-wide reference check first; full-res moved to a recoverable archive folder, a thumbnail left behind in an excluded `_thumbs/` folder), and **Restore** to reverse any change. Every write is atomic, audit-logged to `chatekld.log`, and recorded in a restore manifest.
+6. **Plain Chat** — a RAG-free, multi-turn conversation with the globally-configured provider/model: no vault retrieval, no agent loop, no tools. The server is stateless — the browser owns the `{role, content}` history and sends only the last 20 turns on each send, so a conversation is ephemeral (lost on reload). Streams through the same unified chat layer as the rest of the app, for both local and online providers.
 
 ## Features
 
@@ -41,6 +36,20 @@ ChatEKLD is organised as four tabs, each a self-contained workflow:
 
 **Deck Generator**
 - Generate a vault-grounded Beamer deck from the in-app **Deck Generator** window or the standalone `deckgen` CLI. Reuse your own Beamer template's preamble, custom macros (`\citefoot`, `\commonlogo`) and `_master.bib`; scaffold a compile-ready `<slug>/<slug>.tex` + `Makefile`. Emit-only.
+
+**Note Refactor** (analyze read-only · write only on explicit confirm)
+- Analyze one vault sub-folder: resolve each note's image embeds (Obsidian shortest-path), reuse the indexer's cached descriptions to inline a preview callout, and compute a unified diff — **the plan makes zero vision calls and zero vault writes**.
+- Pick the sub-folder by hand or with a native folder picker; browse notes in a sidebar and review ORIGINAL vs PROPOSED rendered markdown alongside the diff.
+- On demand (one image at a time), re-extract a markdown table (no-downscale double-read for accuracy), re-describe, or classify the image (printed-table｜figure-diagram｜handwritten｜photo｜other); a sticky per-vault ignore-list lets you set aside handwritten scans the local model can't OCR.
+- **Apply** (opt-in, confirmed): write the approved callout-only proposals into the selected notes — original embeds are kept. A stale-diff guard (the note must be unchanged since the plan) and a WYSIWYG guard (the recomputed body must match what you previewed) protect every atomic write.
+- **Archive** (opt-in, confirmed, per image): a vault-wide reference check refuses a shared image; otherwise the full-res original moves out of the vault to a recoverable archive folder (default under the app data dir — local disk, not iCloud — overridable via `refactor_archive_dir`), a ~384px PNG thumbnail is written into an excluded `<scope>/_thumbs/` folder, and that embed is swapped to the thumbnail.
+- **Restore** reverses any apply/archive from a per-vault restore manifest; every mutation is also audit-logged to `chatekld.log`.
+
+**Plain Chat**
+- A RAG-free, multi-turn conversation with the active chat provider/model — no vault retrieval, no agent loop, no tools, no per-panel model selector (it follows the global Provider/Model setting).
+- Stateless server: the browser keeps the `{role, content}` history and sends only the last 20 turns on every send; the conversation is ephemeral and is lost on reload or with **New chat**.
+- Two persisted knobs in the LLM Settings window: `chat_temperature` and `chat_system_prompt`. Unlike vault chat, the system prompt is the **full** system prompt — there is no retrieval grounding to protect, so the whole prompt is yours.
+- Streams through the unified `core.llm.chat.stream_chat_messages` helper for both local and online providers, falling back only before the first streamed token.
 
 **Providers & operations**
 - Select the active chat provider, chat model, and embedding model in the UI; separate selectors for the OCR and vision providers/models (scanned-PDF fallback + image/figure reading).
@@ -88,6 +97,8 @@ xattr -dr com.apple.quarantine ChatEKLD_$(date +%Y-%m-%d).app
 
 (Right-clicking the app and choosing **Open** may also work, but recent macOS versions increasingly route unsigned-app approval through System Settings → Privacy & Security → "Open Anyway" instead.)
 
+The bundle is intentionally **not sandboxed** so it can read whatever Obsidian vault folder you point it at (Documents, an iCloud Drive path, an external volume, …). The first time it reads a protected location (Documents, Desktop, Downloads, or iCloud), macOS shows a one-time TCC consent prompt — that is expected; click **Allow**. No special entitlement or security-scoped bookmark is required.
+
 If you only want to run from source without building a bundle, skip the installer and follow [Development](#development) instead.
 
 ## Development
@@ -99,14 +110,16 @@ pip install -r requirements.txt
 python launch.py
 ```
 
-The venv location is yours to choose — `~/venvs/papermind2026` is only a convention. `install_and_build.sh` creates its own venv at the same default path and honours a `PAPERMIND_VENV_DIR` override if you want it elsewhere.
+The venv location is yours to choose — `~/venvs/papermind2026` is only a convention. `install_and_build.sh` creates its own venv at the same default path and honours a `CHATEKLD_VENV_DIR` override (the legacy `PAPERMIND_VENV_DIR` is still accepted) if you want it elsewhere.
 
 Run checks from the virtual environment:
 
 ```bash
 python -m py_compile app.py api/routes/*.py core/*.py core/providers/*.py core/llm/*.py core/llm/adapters/*.py core/agent/*.py rag/*.py services/*.py audit/*.py audit/core/*.py audit/engine/*.py audit/engine/reports/*.py deckgen/*.py
-python -m pytest smoke_test.py test_concurrency.py test_vault_regressions.py test_llm.py test_validators.py test_agent.py test_audit.py test_deck.py tests/audit/ -v
+python -m pytest smoke_test.py test_concurrency.py test_vault_regressions.py test_llm.py test_validators.py test_agent.py test_audit.py test_deck.py test_prompts.py test_lancedb_migration.py tests/audit/ tests/eval/test_scoring.py -v
 ```
+
+`test_prompts.py` pins the prompt grounding/citation/placeholder invariants (model-free); `tests/eval/` is the vault-chat answer-quality golden set — its scoring layer is verified by `tests/eval/test_scoring.py`, and the live runner is opt-in (`RUN_LIVE_EVAL=1 python -m tests.eval.run_eval`, needs a real provider).
 
 The app-independent deckgen core has its own (non-hermetic, `requests`-free) suite:
 
@@ -117,7 +130,7 @@ python -m pytest deckgen/tests/ test_deck.py -v
 ## Architecture
 
 - `app.py` creates the Flask app and registers blueprints; `launch.py` is the PyWebView entry point (logging, `.env` loading, offline-HF setup).
-- `api/routes/` owns the HTTP route handlers (`paper`, `vault`, `audit`, `deck`, `config`, `status`, `usage`, `about`). `api/security.py` owns local-origin checks and error redaction; `api/validators.py` owns the canonical request-body coercion/clamp helpers.
+- `api/routes/` owns the HTTP route handlers (`paper`, `vault`, `audit`, `deck`, `refactor`, `config`, `status`, `usage`, `about`). `api/security.py` owns local-origin checks and error redaction; `api/validators.py` owns the canonical request-body coercion/clamp helpers.
 - `core/` owns config, constants, the SQLite database + lock, feedback, and locking/atomic-write utilities.
   - `core/providers/` — **local** Ollama and LM Studio adapters (embeddings + the legacy local-chat path).
   - `core/llm/` — the provider-agnostic chat layer (`types`, `base`, `factory`, `policy`, `usage`, `retry`, `prompt`, `redact`, `tool_schema`) plus adapters for `local`, `openai`, `anthropic`, `google`.
@@ -126,6 +139,7 @@ python -m pytest deckgen/tests/ test_deck.py -v
 - `rag/` owns vault indexing + chat entrypoints (`vault.py`), the LlamaIndex query engine (`engine.py`), single-paper summarisation (`summarizer.py`), and the optional LanceDB vector backend (`lancedb_store.py`).
 - `audit/` is the vendored Library Audit subsystem (read-only connectors under `core/`, report builders under `engine/`, the `audit_manager` singleton, and a `python -m audit` CLI).
 - `deckgen/` is the Beamer-deck orchestrator; its core is app-independent and `requests`-free. The CLI (`__main__.py`) drives the running app over HTTP; `inprocess.py` is the only app-coupled module (used by the in-app Deck Generator window).
+- `refactor/` is the Note Refactor package: a read-only analyzer (`resolver`, `cache`, `hints`, `extract`, `hygiene`, `discrepancy`, `ignore`, `plan`, `result`) plus the app's only vault writers (`journal` — restore manifest + scope-lock + audit; `apply` — callout-only batch note writer; `archive` — per-image move-out + thumbnail + restore). It reuses the indexer's Obsidian resolver + on-disk image cache; every vault write is atomic, scope-locked, audit-logged, and reversible. Exposed through `/api/refactor/*`.
 - `static/js/` owns the browser UI modules; `templates/index.html` is the single-page shell.
 
 Each subtree carries a `CLAUDE.md` with deep implementation notes (`rag/`, `core/llm/`, `core/agent/`, `audit/`), and `deckgen/README.md` documents the deck orchestrator. `CHANGELOG.md` holds history; `project_structure.txt` is the annotated file map.
@@ -170,7 +184,7 @@ OCR and vision are separate from the active chat provider. Each has its own prov
    # then edit that file and uncomment your key(s)
    ```
 
-2. Launch ChatEKLD. Pick OpenAI / Anthropic / Google from the provider dropdown. The chat-model dropdown will populate with the curated list for that provider.
+2. Launch ChatEKLD. Pick OpenAI / Anthropic / Google from the provider dropdown. The chat-model dropdown populates with a curated list **merged with the provider's live model list** (fetched once per provider, cached), so newly-released models appear automatically; if the key is unset or the provider is unreachable it falls back to the curated list alone.
 
 3. Ask a question on the Obsidian tab. Indexing keeps running on Ollama / LM Studio; only the retrieved chunks plus your question reach the online provider.
 
@@ -270,9 +284,12 @@ Per-request body fields override the persisted config keys; an invalid body valu
 | `query_expansion` | `vault_query_expansion` | bool | Rewrite the query into variants and RRF-fuse the results — better recall for vague questions. Adds an LLM call per turn; effective on local providers. |
 | `num_queries` | `vault_num_queries` | 1-5 | Number of query variants when `query_expansion` is on. |
 | `rerank_pool_ceiling` | `vault_rerank_pool_ceiling` | 10-200 | Max candidates the cross-encoder reranks down to `top_k`. Larger = better recall, slower. |
+| `wikilink_expansion` | `vault_wikilink_expansion` | bool | After retrieval, also pull chunks from notes your top hits link to / from (outbound ∪ backlinks) before the rerank stage decides what survives. **Rerank-gated** — it only takes effect when the reranker is on, and is a no-op otherwise (the reranker's `top_n` trim is what keeps the expansion from overflowing the context). Query-time, no reindex. The fan-out caps are config-only (see below). |
 | `system_prompt` | `vault_chat_system_prompt` | ≤4000 chars | User-supplied behavioural instructions. On the **local** provider path it is layered as a prefix on top of the selected `prompt_mode` template. On the **online** provider path it is sent through the request's native `system_prompt` field, separate from the QA template. In both cases the selected `prompt_mode` template (safety preamble, untrusted-context guard, and `{context_str}` / `{query_str}` placeholders) stays app-controlled and unmodified, so a typo in the textarea cannot disable retrieval grounding. |
 
 `vault_reranker_model` is config-only — it is not accepted as a body override, so a malicious page cannot point retrieval at an arbitrary HuggingFace repo.
+
+The Vault Chat sliders in the Settings window deliberately expose a narrower, *safe* subset of these ranges (e.g. `top_k` 2-12, `similarity_cutoff` 0-0.7, `rerank_pool_ceiling` 20-100). The `/api/obsidian/chat` body and the `/api/config` validators accept the full ranges shown in the table above; the sliders just keep the everyday controls in a sensible band.
 
 ### Agent mode
 
@@ -393,6 +410,7 @@ A single **LLM Settings** window (gear icon) centralises the configurable knobs 
 
 - **Online plumbing** — `online_timeout_s`, `online_max_retries`, `online_max_tokens`, `fallback_provider`, `fallback_on`.
 - **Timeouts** — `agent_wall_clock_s` (the per-agent-turn / per-deck-section cap) and `local_request_timeout_s` (per local HTTP call; `0` = each path's SDK default).
+- **OCR & Vision** — the OCR/Vision provider + model selects, plus the always-on call bounds `vision_timeout_s`, `vision_max_tokens`, and `ocr_max_tokens`.
 - **Retrieval** — `vault_reranker_model`, `vault_reranker_device` (`auto`/`cpu`/`mps`), and the vault-chat knobs.
 - **Generation defaults** — the per-function `paper_*` and `deck_*` values.
 
@@ -415,7 +433,7 @@ Every value the window writes is range-/enum-validated server-side by `POST /api
 - `ocr_provider`: provider used for scanned PDF OCR.
 - `vision_provider`: provider used for image/figure description.
 - `vault_exclude_dirs`: vault-relative folders to skip.
-- `vault_image_exts`: image file extensions sent to the vision model and embedded.
+- `vault_image_exts`: image file extensions sent to the vision model and embedded. Description is best-effort and decoder-dependent — the default set includes `.heic` (decodes only if the optional `pillow-heif` package is installed, which it is **not** by default) and vector formats like `.svg`/`.ico` that most vision models can't read; an image that fails to decode is skipped and counted in `skipped_image_count` rather than erroring the run.
 - `obsidian_vault_path`: selected vault path.
 - `ocr_model`: OCR model for scanned PDFs.
 - `vision_model`: image/figure description model.
@@ -431,11 +449,14 @@ Every value the window writes is range-/enum-validated server-side by `POST /api
 - `vault_query_expansion`: enable multi-query expansion — the fusion retriever rewrites the query into variants and RRF-fuses the results (default `false`). Adds an LLM call per turn; effective on local providers.
 - `vault_num_queries`: number of query variants when expansion is on (1-5, default 3).
 - `vault_rerank_pool_multiplier` / `vault_rerank_pool_floor` / `vault_rerank_pool_ceiling`: candidate-pool sizing for the rerank stage, `min(max(top_k * multiplier, floor), ceiling)` (defaults 4 / 20 / 50). The ceiling is also a per-request override (`rerank_pool_ceiling`, 10-200).
+- `vault_wikilink_expansion`: enable wikilink graph expansion — widen the result set with chunks from notes your top hits link to / from before the rerank stage (default `false`; also a per-request `wikilink_expansion` body field). Rerank-gated (no-op when the reranker is off). Query-time, no reindex.
+- `vault_wikilink_neighbor_cap` / `vault_wikilink_node_cap` / `vault_wikilink_score_decay`: fan-out caps for wikilink expansion — distinct neighbour notes per query (1-100, default 10), total chunks appended (1-200, default 24), and the decay applied to a neighbour's inherited seed score (0.0-1.0, default 0.5). Config-only (not per-request body overrides).
 - `vault_vector_backend`: vector store for **new** index builds — `simple` (legacy JSON, default) or `lancedb` (binary Apache-Arrow). Existing indexes keep whatever backend is recorded in `obsidian_meta.json`. See "Vector store backend (LanceDB)" above to migrate an existing vault with no re-embedding. Resolves to `simple` if lancedb is not installed.
+- `context_window`: token context window assumed for the chat model (default `32768`). Used to size the local LLM's context and to autoscale retrieval breadth down on small-context models. Advanced/internal — there is no Settings control; it is validated/clamped (512-131072) on save like the other LLM knobs.
 - `audit_attachments_subdir`: vault-relative folder containing all PDF attachments (default `Z_attachments`). Read only when an audit scan runs.
 - `audit_biblio_articles_subdir`: subfolder under the attachments dir that holds bibliography PDFs (default `biblio_articles`).
 - `audit_zotero_notes_subdir`: vault-relative folder that holds one `<bbtkey>.md` file per Zotero parent (default `Z_Zotero_Notes`).
-- `audit_master_bib_path`: vault-relative path to the Better BibTeX master export (default `presentations_slides_writings_teaching/_master.bib`).
+- `audit_master_bib_path`: vault-relative path to the Better BibTeX master export (default `_master.bib`).
 - `audit_zotero_sqlite`: absolute path to `zotero.sqlite` (default `~/Zotero/zotero.sqlite`). Opened read-only and immediately snapshotted into memory.
 - `audit_zotero_storage`: absolute path to the Zotero storage directory (default `~/Zotero/storage`).
 - `audit_annotations_read_threshold`: annotations count above which a PDF is considered "read" by the Unread report (default `5`).
@@ -454,10 +475,17 @@ Timeouts:
 - `agent_wall_clock_s`: per-agent-turn and per-deck-section wall-clock cap in seconds (default 300). Outer SSE / frontend timeouts derive from this but are floored at 300 s.
 - `local_request_timeout_s`: per local HTTP call timeout for chat/generation, in seconds (default `0` = leave each path's SDK default). Embeddings are intentionally excluded.
 
+Vision / OCR bounds (indexing-time image-description and scanned-PDF OCR calls; **always on**, separate from `local_request_timeout_s`, so a stuck local vision model cannot stall a multi-hour indexing run):
+
+- `vision_timeout_s`: per-call HTTP timeout for both image description and OCR, in seconds (5-600, default 120). Unlike `local_request_timeout_s` there is no `0 = off` — these calls are always bounded.
+- `vision_max_tokens`: generation cap for an image/figure description (64-8192, default 1536).
+- `ocr_max_tokens`: generation cap for scanned-page OCR (64-8192, default 4096; higher than image description since a dense page has more text).
+
 Per-function generation defaults (set in the Settings window; body values override, then these, then the hard clamp):
 
 - `paper_temperature` / `paper_num_ctx` / `paper_max_tokens` / `paper_top_p` / `paper_repeat_penalty`: Single-Paper generation defaults (defaults `0.3` / `32768` / `4096` / `0.9` / `1.1`).
 - `deck_temperature` / `deck_max_sections` / `deck_agent_max_iterations`: Deck Generator defaults (defaults `0.3` / `8` / `6`).
+- `chat_temperature` / `chat_system_prompt`: Plain Chat defaults (defaults `0.3` / `"You are a helpful assistant."`). The system prompt is the **full** prompt (≤4000 chars; no vault-grounding preamble — Plain Chat has no retrieved context to protect). Body values override these, then the hard clamp; the panel itself sends neither, so a Settings change applies on the next send with no reload.
 
 ## API
 
@@ -481,6 +509,7 @@ Most routes require `X-Requested-With: ChatEKLD`.
 | `/api/obsidian/status` | GET | Poll indexing state, messages, and warnings. |
 | `/api/obsidian/materials` | GET | List files recorded in the current vault index manifest. |
 | `/api/obsidian/chat` | POST | Stream vault RAG tokens as SSE. |
+| `/api/plainchat` | POST | Stream RAG-free Plain Chat tokens as SSE. Body `{messages, system_prompt?, temperature?}`; `messages` is capped to the last 20 turns. |
 | `/api/obsidian/pause` | POST | Request indexing pause (resumable). |
 | `/api/obsidian/cancel` | POST | Request indexing cancellation and release the operation lock. |
 | `/api/native-pick-folder` | POST | Open a native folder picker. |
@@ -501,6 +530,15 @@ Most routes require `X-Requested-With: ChatEKLD`.
 | `/api/deck/generate` | POST | Generate a vault-grounded deck (SSE: reuses the `info`/`error`/agent-trace contract, then a terminal `{"deck": {tex, warnings, tex_path, make_hint, …}}` frame). Emit-only. |
 | `/api/deck/native-pick-file` | POST | Native file picker (template selection). |
 | `/api/deck/native-pick-folder` | POST | Native folder picker (output directory). |
+| `/api/refactor/plan` | POST | Analyze a vault sub-folder (SSE: a `{"note": …}` frame per note + a terminal `{"refactor": …}` summary). Read-only — zero vision calls, zero vault writes. |
+| `/api/refactor/extract-image` | POST | One user-triggered vision pass for a single image (`mode: table` / `describe` / `classify`). The only vision-calling refactor path; caches under `obsidian_cache/`. |
+| `/api/refactor/image` | GET | Read-only image bytes (`?rel=`). |
+| `/api/refactor/apply` | POST | Vault write (requires `confirm: true`): callout-only batch note write with stale-diff + WYSIWYG guards. 503 if indexing holds the op-lock. |
+| `/api/refactor/archive` | POST | Vault write (requires `confirm: true`): per-image move-out + thumbnail + embed swap, after a vault-wide reference check (409 `{shared:true}` if shared). |
+| `/api/refactor/restore` | POST | Reverse an apply/archive (`{op_id}` or `{all:true}`) from the restore manifest. |
+| `/api/refactor/manifest` | GET | List restore-manifest ops for the Restore UI. |
+| `/api/refactor/native-pick-folder` | POST | Native folder picker (vault-relative scope). |
+| `/api/refactor/ignore` | GET/POST | Read or update the sticky per-vault image ignore-list (sidecar under `obsidian_cache/`, never the vault). |
 
 SSE routes send JSON token events, stream JSON error events when generation fails, and end with `data: [DONE]`. Agent-mode `/api/obsidian/chat` and `/api/deck/generate` additionally emit `iteration`, `thought`, `tool_call`, and `tool_result` events before the answer stream.
 
@@ -536,7 +574,7 @@ App data is stored under the platform app data directory.
 
 - **"OPENAI_API_KEY is not set" (or ANTHROPIC / GOOGLE) on /api/status.** The environment variable was not exported before launching the app. macOS GUI launches do not pick up shell `~/.zshrc` exports; either add the keys to `~/Library/LaunchAgents/` via `launchctl setenv`, source them in a wrapper script, or pin them in a `.env` you `source` before `python launch.py`.
 - **`rate_limit` on the online provider.** Lower the request rate, switch to a higher-tier model with a larger quota, or set `fallback_provider: "ollama"` plus `fallback_on: ["rate_limit"]` to spill over to the local provider on the rare hard limit.
-- **"Embedding model mismatch" warning after switching to an online provider.** Online providers do not provide embeddings — the warning is from the indexed embedding model versus the currently selected local embed model. Re-select the matching local embedding model under `embed`.
+- **"Embedding model mismatch" warning after switching to an online provider.** Online providers do not provide embeddings — the warning is from the indexed embedding model versus the currently selected local embed model. Re-select the matching local embedding model under `embed`. (Vault chat does not break in the meantime: it retrieves with the index's *own* recorded embedding model — warning once — rather than the mismatched selection, so results stay correct until you re-index.)
 - **No tokens appearing on the Obsidian tab when chat is set to an online provider.** Confirm `obsidian_storage/docstore.json` exists (i.e. you have indexed at least once with a local embedding model). Online chat reuses the local index; an empty index returns "No relevant content found" by design.
 - **Cost numbers look wrong.** Check `core/llm/usage.py` for the model's listed prices; the published rate can change between releases. Add an override under `llm_pricing_overrides` if you need to refresh it without waiting for an app update.
 
@@ -548,6 +586,8 @@ By default the vault index uses LlamaIndex's JSON `SimpleVectorStore`. An option
 - **Or build fresh on LanceDB**: set `"vault_vector_backend": "lancedb"` in `config.json` and reindex.
 
 Retrieval results match the JSON backend (embeddings are unit-normalized so LanceDB's L2 search ranks identically to cosine). Requires `lancedb` + `llama-index-vector-stores-lancedb` (in `requirements.txt`); falls back to `simple` if absent.
+
+The indexer inserts one chunk per LanceDB transaction, and each transaction writes a version manifest that lists every data fragment — so without maintenance the `_versions/` directory grows roughly with the *square* of the insert count (it can reach hundreds of GB over <1 GB of real vectors). To prevent this, the streaming indexer compacts and prunes superseded versions at each checkpoint **and** every few thousand inserts, keeping the on-disk footprint proportional to the vectors. If you have an index that was built before this maintenance existed and is already bloated, close the app and run `python scripts/compact_lancedb.py` once to reclaim the space.
 
 ## License
 

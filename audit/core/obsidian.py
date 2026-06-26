@@ -1,5 +1,20 @@
 """Obsidian vault connector (read-only)."""
 
+# Walks the vault's markdown notes and extracts the two dimensions the audit
+# cares about: the note's YAML-frontmatter ``tags`` (reconciled against Zotero
+# child-note tags by ``reports/note_tag_drift``) and the basenames of every
+# ``.pdf`` it links to (wikilink or markdown link). Nothing here ever writes a
+# note; the connector only ``read_text``s files.
+#
+# Two cross-cutting facilities make repeat scans cheap and malformed notes
+# visible:
+# - a process-wide ``(path, mtime_ns)`` note cache (``_NOTE_CACHE``), so the
+#   two independent walks of ``Z_Zotero_Notes`` in one scan (bridge + inventory)
+#   and unchanged notes across runs are parsed only once;
+# - a drainable, deduped, bounded ``_parse_warnings`` buffer that the audit
+#   manager surfaces in the status feed — a note whose YAML fails to parse is
+#   skipped, so its tags vanish from the drift report, and the user must be told.
+
 from __future__ import annotations
 
 import logging
@@ -37,6 +52,12 @@ _NOTE_CACHE_MAX = 50_000
 
 
 def _record_parse_warning(msg: str) -> None:
+    """Append a frontmatter-parse warning under the lock, up to the cap.
+
+    Lock-guarded because parsing runs on the scan worker thread while the
+    manager may drain concurrently. Silently drops past ``_PARSE_WARNINGS_MAX``
+    so a vault full of malformed notes cannot grow the buffer unbounded.
+    """
     with _parse_warnings_lock:
         if len(_parse_warnings) < _PARSE_WARNINGS_MAX:
             _parse_warnings.append(msg)
@@ -60,6 +81,15 @@ _yaml.preserve_quotes = True
 
 @dataclass
 class NoteInfo:
+    """Parsed view of one markdown note.
+
+    ``tags`` is the normalized YAML ``tags`` list (``#`` stripped);
+    ``pdf_links`` is the set of *basenames* of referenced PDFs (the bridge
+    matches on filename, not path); ``frontmatter`` is a plain-``dict`` copy
+    of the YAML (not the heavier ruamel ``CommentedMap``) so downstream
+    consumers can read pointer fields without depending on ruamel types.
+    """
+
     path: Path
     tags: list[str] = field(default_factory=list)
     pdf_links: set[str] = field(default_factory=set)
@@ -68,6 +98,13 @@ class NoteInfo:
 
 
 def walk_markdown(root: Path, ignored: frozenset[str]) -> Iterator[Path]:
+    """Yield every ``.md`` under ``root`` whose path crosses no ignored dir.
+
+    ``ignored`` is matched against each *path component* (so ``.obsidian``,
+    ``.trash`` etc. are pruned wherever they appear in the tree), not just the
+    top level. Lazy generator — callers can stop early without walking the
+    whole vault.
+    """
     for p in root.rglob("*.md"):
         if any(part in ignored for part in p.relative_to(root).parts):
             continue
@@ -77,6 +114,18 @@ def walk_markdown(root: Path, ignored: frozenset[str]) -> Iterator[Path]:
 def parse_frontmatter(
     text: str, path: Path | None = None
 ) -> tuple[dict[str, Any], str] | tuple[None, str]:
+    """Split leading ``--- ... ---`` YAML frontmatter from the note body.
+
+    Returns ``(frontmatter_dict, body)`` on success, or ``(None, text)`` when
+    there is no frontmatter block, the YAML fails to parse, or it parses to a
+    non-mapping. A parse failure is *recorded* two ways: a single-line message
+    is stashed on ``_local.last_warning`` (so :func:`read_note` can attach it
+    to the cache entry and re-surface it on cache hits) and pushed into the
+    drainable ``_parse_warnings`` buffer for the UI. The single-line form is
+    used deliberately — a full multi-line ruamel error would swamp the status
+    feed. A malformed note is treated as having no frontmatter, so its tags are
+    silently absent unless the warning is shown.
+    """
     _local.last_warning = None
     m = YAML_RE.match(text)
     if not m:
@@ -122,6 +171,16 @@ def find_pdf_links(text: str) -> set[str]:
 
 
 def read_note(path: Path) -> NoteInfo | None:
+    """Parse one note, served from the ``(path, mtime_ns)`` cache when fresh.
+
+    Returns ``None`` if the file cannot be ``stat``-ed or read. The cache makes
+    the second of the two per-scan walks of ``Z_Zotero_Notes`` (bridge then
+    inventory) and unchanged notes across runs free; a hit on a note that was
+    malformed re-records its stored warning so a never-fixed note doesn't
+    silently look healthy on the next scan. The cache is cleared wholesale once
+    it reaches ``_NOTE_CACHE_MAX`` rather than evicted entry-by-entry — simple
+    and bounded, and a scan re-warms it anyway.
+    """
     try:
         mtime_ns = path.stat().st_mtime_ns
     except OSError:
@@ -142,6 +201,13 @@ def read_note(path: Path) -> NoteInfo | None:
 
 
 def _read_note_uncached(path: Path) -> NoteInfo | None:
+    """Read + parse one note from disk (no cache consultation).
+
+    Returns ``None`` for an unreadable / non-UTF-8 file. PDF links are scanned
+    from the *whole* note text (frontmatter pointers and inline body links
+    both count); tags come only from parsed frontmatter. The frontmatter is
+    down-converted to a plain ``dict`` so callers never carry ruamel types.
+    """
     _local.last_warning = None
     try:
         text = path.read_text(encoding="utf-8")
@@ -164,6 +230,11 @@ def _read_note_uncached(path: Path) -> NoteInfo | None:
 
 
 def scan_vault(root: Path, ignored: frozenset[str]) -> Iterator[NoteInfo]:
+    """Yield a :class:`NoteInfo` for every readable note under ``root``.
+
+    The CLI ``--check obsidian`` path; the engine instead indexes notes by
+    stem via its own walks. Unreadable notes are skipped silently.
+    """
     for p in walk_markdown(root, ignored):
         n = read_note(p)
         if n is not None:

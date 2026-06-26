@@ -37,6 +37,14 @@ _ANNOTATION_MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
 
 def _norm_title(s: str | None) -> str:
+    """Canonicalize a title for cross-source matching.
+
+    The bib↔Zotero join is by title, but the two stores differ in accents,
+    punctuation and casing — so both sides are reduced to the same key:
+    NFKD-decompose, drop combining marks, lowercase, and collapse every
+    non-alphanumeric run to a single space. ``None``/empty yields ``""``,
+    which the indexers treat as "no usable title" and skip.
+    """
     if not s:
         return ""
     s = unicodedata.normalize("NFKD", s)
@@ -46,12 +54,20 @@ def _norm_title(s: str | None) -> str:
 
 
 def _walk_biblio_pdfs(root: Path) -> list[Path]:
+    """List every ``*.pdf`` file under ``root`` (empty if the dir is absent)."""
     if not root.exists():
         return []
     return [p for p in root.rglob("*.pdf") if p.is_file()]
 
 
 def _index_obsidian_notes_by_stem(settings: Settings) -> dict[str, obsidian.NoteInfo]:
+    """Index ``Z_Zotero_Notes`` by file stem (the BBT key by convention).
+
+    The user's convention names each note ``<citation_key>.md``, so keying by
+    stem lets the inventory join a note to its record by citation key. Ignored
+    directories are pruned and unreadable notes dropped. Reads go through the
+    cached ``obsidian.read_note`` so this walk shares parses with the bridge's.
+    """
     notes_dir = settings.zotero_notes_dir
     if not notes_dir.exists():
         return {}
@@ -68,6 +84,12 @@ def _index_obsidian_notes_by_stem(settings: Settings) -> dict[str, obsidian.Note
 def _index_zotero_by_title(
     items: list[zotero.ZoteroItem],
 ) -> dict[str, zotero.ZoteroItem]:
+    """Index Zotero parents by normalized title; first occurrence wins.
+
+    Keeping the *first* item for a colliding normalized title is deliberate —
+    duplicate-titled Zotero entries are rare, and a stable first-wins choice
+    keeps the join deterministic. Empty-title items are skipped.
+    """
     idx: dict[str, zotero.ZoteroItem] = {}
     for it in items:
         n = _norm_title(it.title)
@@ -78,6 +100,16 @@ def _index_zotero_by_title(
 
 @dataclass
 class Record:
+    """Everything the audit knows about one citation key, joined across sources.
+
+    A record exists for every key seen in the bib *or* produced by the bridge.
+    The four source slots (``bib_entry``, ``zotero_item``, ``obsidian_note``,
+    ``pdf_paths``) are each optional; a "fully triangulated" record has all
+    four. ``finder_tag_set`` and ``annotations_count_max`` are aggregated
+    across the record's resolved PDFs, and ``match_sources`` records *how* the
+    bridge tied each PDF to this key (manual / fm_pointer / wikilink / …).
+    """
+
     citation_key: str
     bib_entry: bib.BibEntry | None = None
     zotero_item: zotero.ZoteroItem | None = None
@@ -91,6 +123,7 @@ class Record:
 
     @property
     def zotero_note_tags(self) -> set[str]:
+        """Union of tags across all the parent's Zotero child notes."""
         if not self.zotero_item:
             return set()
         out: set[str] = set()
@@ -100,19 +133,31 @@ class Record:
 
     @property
     def obs_tags(self) -> set[str]:
+        """The Obsidian note's YAML tags as a set (empty if no note)."""
         return set(self.obsidian_note.tags) if self.obsidian_note else set()
 
     @property
     def bib_keywords(self) -> set[str]:
+        """The bib entry's keywords (≈ Zotero parent tags once BBT-exported)."""
         return self.bib_entry.keywords if self.bib_entry else set()
 
     @property
     def has_zotero_child_note(self) -> bool:
+        """True iff the matched Zotero parent has ≥1 child note (the read proxy)."""
         return bool(self.zotero_item and self.zotero_item.child_notes)
 
 
 @dataclass
 class Inventory:
+    """The full cross-source join plus the side data the reports need.
+
+    ``records`` is the per-citation-key map every report iterates. ``bridge``
+    is kept alongside so reports can answer "is this PDF in Zotero at all?"
+    from ``unmapped_pdfs``/``ambiguous_pdfs`` without rerunning resolution.
+    ``zotero_error`` is non-None when the Zotero read failed — reports must not
+    silently trust an inventory with zero Zotero rows as "nothing is in Zotero".
+    """
+
     records: dict[str, Record]
     bridge: eng_bridge.BridgeResult
     pdfs_skipped: list[Path]  # z_item* PDFs (exempt from everything except duplicates)
@@ -129,6 +174,14 @@ class Inventory:
 
 
 def _annotations_for(paths: list[Path]) -> int:
+    """Max annotation count across a record's PDFs (-1 if none / all unreadable).
+
+    A record may resolve to several copies of the same paper; the *most*
+    annotated copy is the best evidence the paper was read, so the max wins.
+    Serial on purpose — this runs over a record's handful of mapped PDFs, the
+    small set; the heavy *unmapped*-PDF pass is the one parallelised in
+    :func:`_read_annotations_parallel`.
+    """
     if not paths:
         return -1
     best = -1

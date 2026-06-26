@@ -1,0 +1,66 @@
+[
+  {
+    "id": "hfref-lvef",
+    "query": "What LVEF threshold defines heart failure with reduced ejection fraction?",
+    "prompt_mode": "strict",
+    "must_cite": ["heart_failure"],
+    "must_contain": ["40"],
+    "must_not_contain": []
+  },
+  {
+    "id": "hfref-therapy",
+    "query": "Which drug classes make up guideline-directed therapy for HFrEF?",
+    "prompt_mode": "balanced",
+    "must_cite": ["heart_failure"],
+    "must_contain": ["beta-blocker", "sglt2"],
+    "must_not_contain": []
+  },
+  {
+    "id": "htn-firstline",
+    "query": "What is first-line drug therapy for uncomplicated hypertension?",
+    "prompt_mode": "strict",
+    "must_cite": ["hypertension"],
+    "must_contain": ["ace inhibitor"],
+    "must_not_contain": []
+  },
+  {
+    "id": "htn-betablocker",
+    "query": "Are beta-blockers recommended as initial monotherapy for hypertension?",
+    "prompt_mode": "balanced",
+    "must_cite": ["hypertension"],
+    "must_contain": ["not recommended"],
+    "must_not_contain": []
+  },
+  {
+    "id": "ckd-staging",
+    "query": "How is chronic kidney disease staged?",
+    "prompt_mode": "strict",
+    "must_cite": ["ckd_staging"],
+    "must_contain": ["egfr", "g5"],
+    "must_not_contain": []
+  },
+  {
+    "id": "grounding-refusal",
+    "query": "What is the capital of France according to these notes?",
+    "prompt_mode": "strict",
+    "must_cite": [],
+    "must_contain": [],
+    "must_not_contain": ["paris"]
+  },
+  {
+    "id": "unanswerable-diabetes",
+    "query": "According to these notes, what is the first-line drug for type 2 diabetes?",
+    "prompt_mode": "strict",
+    "must_cite": [],
+    "must_contain": [],
+    "must_not_contain": ["metformin"]
+  },
+  {
+    "id": "unanswerable-pneumonia",
+    "query": "Which antibiotic do these notes recommend for community-acquired pneumonia?",
+    "prompt_mode": "strict",
+    "must_cite": [],
+    "must_contain": [],
+    "must_not_contain": ["amoxicillin", "azithromycin"]
+  }
+]

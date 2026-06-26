@@ -24,6 +24,11 @@ from core.llm.types import LLMRequest, ToolCall, ToolSchema, ToolTurn
 
 
 def jsonschema_to_openai_tool(spec: ToolSchema) -> dict[str, Any]:
+    """Serialise a :class:`ToolSchema` to OpenAI's
+    ``{"type": "function", "function": {... "parameters": <json-schema>}}``
+    dialect. Also used verbatim by the local adapter for Ollama 0.4+ and LM
+    Studio, which accept the same shape. An empty schema becomes the permissive
+    ``{"type": "object", "properties": {}}``."""
     return {
         "type": "function",
         "function": {
@@ -35,6 +40,8 @@ def jsonschema_to_openai_tool(spec: ToolSchema) -> dict[str, Any]:
 
 
 def jsonschema_to_anthropic_tool(spec: ToolSchema) -> dict[str, Any]:
+    """Serialise a :class:`ToolSchema` to Anthropic's dialect, where the
+    parameter schema is keyed ``input_schema`` (not ``parameters``)."""
     return {
         "name": spec.name,
         "description": spec.description,

@@ -1,3 +1,25 @@
+"""Config / models-pull / reset / JS-log endpoints.
+
+This blueprint owns the read/write side of ``config.json`` plus a handful of
+adjacent "app-management" routes:
+
+- ``GET/POST /api/config`` — the generic settings persistence path. The POST
+  side runs several guards before ``save_config``: it validates the vault path,
+  normalises ``vault_exclude_dirs`` / ``vault_image_exts``, routes the generic
+  ``llm`` field into the active online provider's per-provider key (then drops
+  ``llm`` so an online model name cannot clobber the local selection), strips
+  ``audit_*`` keys (those have a dedicated validated endpoint), and finally
+  clamps/drops every numeric/enum/bool LLM knob via ``_validate_llm_config_keys``.
+  API keys are never accepted/returned here (they live in env vars).
+- ``GET /api/report_types`` / ``/api/report-types`` — built-in + saved report
+  types (the hyphen form wraps them in ``{"report_types": [...]}``).
+- ``POST /api/pull`` — Ollama-only model pull, streamed as SSE.
+- ``POST /api/reset`` — confirmation-gated teardown of indexes / DB / optional
+  config + feedback files.
+- ``POST /api/log`` — rate-limited sink for frontend JS errors.
+
+Every route is gated by :func:`api.security.origin_is_local` (403 otherwise).
+"""
 import json
 import os
 import re
@@ -13,6 +35,7 @@ from core.constants import (
     EXACT_BLOCKED,
     FEEDBACK_FILE,
     OBSIDIAN_INDEX_DIR,
+    SYSTEM_PROMPT_LIMIT,
     SYSTEM_ROOTS,
     VAULT_MD_EXTS,
     VAULT_BINARY_EXTS,
@@ -27,6 +50,7 @@ from api.validators import (
     coerce_float_in_range,
     coerce_int_in_range,
     coerce_regex,
+    coerce_string_max_len,
 )
 from rag.vault import obsidian_manager
 
@@ -69,14 +93,125 @@ def _coerce_fallback_on(value):
     return filtered
 
 
+# A HuggingFace repo id is ``name`` or ``namespace/name``: each segment must
+# START with an alphanumeric and otherwise contains only ``[A-Za-z0-9._-]``,
+# with AT MOST ONE ``/`` and no leading/trailing slash. Enforcing that shape —
+# rather than a loose character class that happens to include ``.`` and ``/`` —
+# is what actually rejects path-like values: a leading ``/`` leaves the first
+# segment empty (no match), ``a//b`` introduces a second slash (no match), and
+# the ``..`` guard in ``_coerce_reranker_model`` blocks traversal components. So
+# a malformed value can never be persisted and later handed to
+# ``SentenceTransformer`` as a local filesystem path. The regex is unbounded per
+# segment; the overall length is capped separately in the coercer.
+_RERANKER_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?")
+
+
+def _coerce_reranker_model(value):
+    """Allow "" (no reranker model) or a HuggingFace repo id; else None.
+
+    This is the one Settings-window string that triggers a side effect — the
+    cross-encoder weights download to ``~/.cache/huggingface`` on the next chat
+    — so it is shape-validated here even though ``/api/config`` is local-origin
+    gated, as defence in depth against a malformed value being stored and later
+    handed to ``SentenceTransformer`` (which would otherwise treat an *existing*
+    local path as a model directory). Path-like inputs — a leading slash,
+    multiple slashes, or any ``..`` traversal component — are rejected, leaving
+    only ``name`` / ``namespace/name`` shapes (verified by the stress cases in
+    ``_RERANKER_MODEL_RE`` above). An empty value is kept (it disables the
+    reranker-model lookup); the stored value is stripped to match how
+    ``_resolve_chat_params`` reads it back.
+    """
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s == "":
+        return ""
+    # Overall length cap (the regex bounds neither segment) plus an explicit
+    # no-``..`` rule, so a traversal component can never survive even when it
+    # sits *inside* a single segment (e.g. ``a..b``), which the regex alone
+    # would accept as an ordinary dotted name.
+    if len(s) > 128 or ".." in s:
+        return None
+    return s if _RERANKER_MODEL_RE.fullmatch(s) else None
+
+
+def _coerce_vault_rel_subdir(value):
+    """Shape-validate a vault-relative sub-folder (no traversal/abs/NUL).
+
+    Existence + under-root checks happen at request time in
+    ``api/routes/refactor.py`` (the vault may be unset when config is saved), so
+    this only guards the stored *shape* — the same posture as the ``audit_*``
+    subdir keys. Empty ⇒ None (drop; keep the prior default).
+    """
+    if not isinstance(value, str):
+        return None
+    s = value.strip().replace("\\", "/")
+    if not s or len(s) > 1024:
+        return None
+    if any(ch in s for ch in ("\x00", "\n", "\r")):
+        return None
+    # Reject absolute / traversal BEFORE normalising away leading slashes, so a
+    # leading "/" can never be silently stripped into a valid-looking relative.
+    if os.path.isabs(s) or s.startswith("/"):
+        return None
+    parts = [p for p in s.split("/") if p]
+    if not parts or ".." in parts:
+        return None
+    return "/".join(parts)
+
+
+def _coerce_model_name(value):
+    """Allow "" (use vision_model) or a bounded, control-char-free model id."""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s == "":
+        return ""
+    if len(s) > 120 or any(ch in s for ch in ("\x00", "\n", "\r")):
+        return None
+    return s
+
+
+def _coerce_abs_dir_or_empty(value):
+    """Allow "" (use the default archive dir) or an ABSOLUTE, control-char-free path.
+
+    Shape-only: a relative path is rejected here, but "is this dir inside the
+    vault?" is re-checked at apply time in api/routes/refactor.py (the vault may
+    be unset when config is saved, mirroring the audit_* / refactor_scope_subdir
+    posture). ``~`` is allowed (expanded at use). Empty ⇒ "" (kept, not dropped)
+    so a user can clear the override back to the default.
+    """
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s == "":
+        return ""
+    if len(s) > 4096 or any(ch in s for ch in ("\x00", "\n", "\r")):
+        return None
+    # Accept a leading ~ (home) as absolute-equivalent; otherwise require an
+    # absolute path so a relative archive dir can never resolve under the CWD.
+    if not (s.startswith("~") or os.path.isabs(s)):
+        return None
+    return s
+
+
 # key -> callable(raw) -> clamped value or None (None ⇒ drop the key).
 _CONFIG_VALIDATORS = {
     # Online / shared LLM plumbing (also reused by the agent loop for local).
     "online_timeout_s": lambda v: coerce_int_in_range(v, 5, 600),
     "online_max_retries": lambda v: coerce_int_in_range(v, 0, 10),
     "online_max_tokens": lambda v: coerce_int_in_range(v, 64, 32768),
+    # Assumed chat-model context window: sizes the local LLM context and the
+    # retrieval-breadth autoscaler. No Settings control (advanced/internal), but
+    # validated here so a hand-edited / generic-POST garbage value can't reach
+    # the engine. Range mirrors paper_num_ctx.
+    "context_window": lambda v: coerce_int_in_range(v, 512, 131072),
     "agent_wall_clock_s": lambda v: coerce_int_in_range(v, 30, 1800),
     "local_request_timeout_s": lambda v: coerce_int_in_range(v, 0, 3600),
+    # Vision / OCR call bounds (always on — min 5, no "0 = off").
+    "vision_timeout_s": lambda v: coerce_int_in_range(v, 5, 600),
+    "vision_max_tokens": lambda v: coerce_int_in_range(v, 64, 8192),
+    "ocr_max_tokens": lambda v: coerce_int_in_range(v, 64, 8192),
     "fallback_provider": _coerce_fallback_provider,
     # Vault chat generation / retrieval knobs.
     "vault_top_k": lambda v: coerce_int_in_range(v, 1, 32),
@@ -86,12 +221,17 @@ _CONFIG_VALIDATORS = {
     "vault_chat_temperature": lambda v: coerce_float_in_range(v, 0.0, 2.0),
     "vault_hybrid_enabled": coerce_bool,
     "vault_reranker_enabled": coerce_bool,
+    "vault_reranker_model": _coerce_reranker_model,
     "vault_reranker_device": lambda v: coerce_enum(v, ("auto", "cpu", "mps")),
     "vault_mmr_enabled": coerce_bool,
     "vault_mmr_lambda": lambda v: coerce_float_in_range(v, 0.1, 0.9),
     "vault_query_expansion": coerce_bool,
     "vault_num_queries": lambda v: coerce_int_in_range(v, 1, 5),
     "vault_rerank_pool_ceiling": lambda v: coerce_int_in_range(v, 10, 200),
+    "vault_wikilink_expansion": coerce_bool,
+    "vault_wikilink_neighbor_cap": lambda v: coerce_int_in_range(v, 1, 100),
+    "vault_wikilink_node_cap": lambda v: coerce_int_in_range(v, 1, 200),
+    "vault_wikilink_score_decay": lambda v: coerce_float_in_range(v, 0.0, 1.0),
     "vault_agent_enabled": coerce_bool,
     "vault_agent_max_iterations": lambda v: coerce_int_in_range(v, 1, 12),
     "vault_vector_backend": lambda v: coerce_enum(v, ("simple", "lancedb")),
@@ -106,6 +246,22 @@ _CONFIG_VALIDATORS = {
     "deck_temperature": lambda v: coerce_float_in_range(v, 0.0, 2.0),
     "deck_max_sections": lambda v: coerce_int_in_range(v, 1, 20),
     "deck_agent_max_iterations": lambda v: coerce_int_in_range(v, 1, 12),
+    # Plain Chat (RAG-free panel). chat_system_prompt is the FULL system prompt
+    # (no retrieval grounding to protect), capped at the shared limit; a non-str
+    # is dropped (prior kept) while an empty string is a valid "no system
+    # prompt" and is persisted as-is, matching coerce_string_max_len semantics.
+    "chat_temperature": lambda v: coerce_float_in_range(v, 0.0, 2.0),
+    "chat_system_prompt": lambda v: coerce_string_max_len(v, SYSTEM_PROMPT_LIMIT),
+    # Note Refactor. Scope shape only; existence checked at request time.
+    # refactor_extract_model "" ⇒ fall back to vision_model.
+    "refactor_scope_subdir": _coerce_vault_rel_subdir,
+    "refactor_extract_model": _coerce_model_name,
+    "refactor_table_double_read": coerce_bool,
+    # Phase 2 vault-write knobs. archive_dir is shape-only (abs or ""); the
+    # not-inside-vault check is re-applied at apply time. thumb_max_side bounds
+    # the in-vault thumbnail's longest side.
+    "refactor_archive_dir": _coerce_abs_dir_or_empty,
+    "refactor_thumb_max_side": lambda v: coerce_int_in_range(v, 96, 1024),
     # fallback_on handled separately (list-valued).
 }
 
@@ -128,12 +284,35 @@ def _validate_llm_config_keys(data: dict) -> None:
 
 @config_bp.route("/api/config")
 def api_get_config():
+    """Return the persisted config verbatim.
+
+    ``load_config`` never includes API keys (they live only in env vars), so
+    this is safe to hand to the local UI as-is. Local-origin gated.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     return jsonify(load_config())
 
 @config_bp.route("/api/config", methods=["POST"])
 def api_save_config():
+    """Persist a partial config update after layered validation.
+
+    The body is a partial ``{key: value}`` patch (merged into the existing
+    config by ``save_config``, not a full replacement). Before persisting, the
+    handler applies, in order:
+
+    1. Vault-path validation (rejects broad/system roots) — a bad path 400s the
+       whole request rather than dropping the key, since it is user-visible.
+    2. ``vault_exclude_dirs`` / ``vault_image_exts`` normalisation.
+    3. Provider-warning clearing when any provider/model field changes.
+    4. The ``llm`` → per-provider-key routing for online providers (then ``llm``
+       is dropped so an online model name can't overwrite the local selection).
+    5. OCR/vision manager singleton updates (so a model change applies live).
+    6. ``audit_*`` key stripping (those go through ``/api/audit/config``).
+    7. ``_validate_llm_config_keys`` — clamp/drop the numeric/enum/bool knobs.
+
+    Local-origin gated; 400 on non-JSON or an invalid vault path.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
@@ -200,6 +379,14 @@ def api_save_config():
     return jsonify({"ok": True})
 
 def _validate_vault_path(raw: str) -> str:
+    """Resolve + safety-check the Obsidian vault path before persistence.
+
+    An empty value is allowed (clears the vault). A non-empty value must
+    resolve to an existing directory that is neither a known broad root
+    (``EXACT_BLOCKED`` — e.g. ``$HOME``) nor inside a system tree
+    (``SYSTEM_ROOTS``); any violation raises ``ValueError`` (turned into a 400
+    by the caller). Returns the absolute, symlink-resolved path string.
+    """
     raw = raw.strip()
     if not raw:
         return ""
@@ -216,6 +403,14 @@ def _validate_vault_path(raw: str) -> str:
     return str(path)
 
 def _normalise_vault_exclude_dirs(entries, vault_path: str) -> list[str]:
+    """Coerce the exclude-dirs list to deduped, vault-relative POSIX paths.
+
+    Absolute entries are rebased under the vault root (and dropped if they fall
+    outside it, or if the vault root is unknown); relative entries are kept as
+    given. Empty entries, ``..`` traversal, and duplicates are filtered out.
+    The stored form is always vault-relative so exclusions survive a vault move
+    and are applied before any file is read by the indexer.
+    """
     if not isinstance(entries, list):
         return []
 
@@ -257,6 +452,14 @@ _VAULT_IMAGE_EXTS_MAX = 64
 _VAULT_RESERVED_EXTS = VAULT_MD_EXTS | VAULT_BINARY_EXTS
 
 def _normalise_vault_image_exts(entries) -> list[str]:
+    """Coerce the image-extension allow-list to deduped, dotted, lowercase exts.
+
+    Each entry is lowercased, a leading ``.`` is tolerated, and the body must be
+    1-16 alphanumerics (``_VAULT_IMAGE_EXT_BODY``). Markdown/PDF extensions
+    (``_VAULT_RESERVED_EXTS``) are rejected so a user-saved list can never
+    reroute core vault files into the image/vision branch. Capped at
+    ``_VAULT_IMAGE_EXTS_MAX`` entries; ``[]`` disables image indexing entirely.
+    """
     if not isinstance(entries, list):
         return []
     normalised: list[str] = []
@@ -287,6 +490,13 @@ def _normalise_vault_image_exts(entries) -> list[str]:
 @config_bp.route("/api/report_types")
 @config_bp.route("/api/report-types")
 def api_get_report_types():
+    """Return the built-in + saved/overridden report types.
+
+    Two URL shapes share one handler for backwards compatibility: the legacy
+    underscore form ``/api/report_types`` returns the bare list, while the
+    hyphen form ``/api/report-types`` wraps it as ``{"report_types": [...]}``.
+    ``load_report_types`` merges built-ins with custom/overridden saved types.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     report_types = load_report_types()
@@ -296,6 +506,15 @@ def api_get_report_types():
 
 @config_bp.route("/api/pull", methods=["POST"])
 def api_pull():
+    """Pull an Ollama model, streaming progress as SSE (Ollama-only).
+
+    The model name is shape-validated with ``coerce_regex`` (which rejects
+    non-strings) BEFORE any ``str()`` so a JSON ``null`` cannot become the
+    literal ``"None"`` and be sent to the Ollama API. LM Studio has no pull
+    concept, so the route 400s when the active provider is ``lm_studio``.
+    Each streamed chunk is a Pydantic model serialised via ``model_dump()``
+    (Pydantic v2) with a ``dict()`` fallback; the stream ends with ``[DONE]``.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True) or {}
@@ -329,6 +548,18 @@ def api_pull():
 
 @config_bp.route("/api/reset", methods=["POST"])
 def api_reset():
+    """Confirmation-gated teardown of indexes, the uploads DB, and audit state.
+
+    Requires ``{"confirm": "reset"}`` (a literal token, not just truthiness) so
+    a stray POST cannot wipe data. Sequence: stop the indexer and *wait* for its
+    final persist (refuse with 503 on timeout rather than race a stray persist
+    that would re-create the storage dir with partial state), release its lock,
+    reset the audit subsystem to idle, clear the ``uploads`` table, and
+    ``rmtree`` the Obsidian storage dir (logged via ``log_storage_deletion``).
+    ``wipe_feedback`` / ``wipe_config`` optionally delete those files too — both
+    resolved through the (test-patchable) ``app.FEEDBACK_FILE`` / ``CONFIG_FILE``
+    attributes. Returns the list of deleted artefacts.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True) or {}
@@ -402,6 +633,14 @@ _log_rate_bucket: list[float] = []
 
 @config_bp.route("/api/log", methods=["POST"])
 def api_log():
+    """Sink for frontend JS errors (``logError`` in ``api.js``).
+
+    Rate-limited to ``_LOG_RATE_MAX`` messages per ``_LOG_RATE_WINDOW_S`` so a
+    runaway frontend cannot saturate ``chatekld.log`` (a throttled call returns
+    ``{"throttled": true}`` and is otherwise a no-op). The message is capped at
+    500 chars and routed to the ``chatekld.js`` logger — ``error`` level logs at
+    WARNING, everything else at DEBUG. Local-origin gated.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
 
@@ -415,7 +654,13 @@ def api_log():
         _log_rate_bucket.append(now)
 
     data = request.get_json(silent=True) or {}
-    msg = str(data.get("msg", "")).strip()[:500]
+    # Strip CR/LF before logging so a crafted frontend message cannot forge
+    # extra chatekld.log lines (e.g. a fake "VAULT WRITE"/deletion marker),
+    # and run it through redact() so the otherwise-uniform "redact before
+    # logging" discipline holds for this sink too.
+    from core.llm.redact import redact
+    raw = str(data.get("msg", "")).replace("\r", " ").replace("\n", " ")
+    msg = redact(raw).strip()[:500]
     level = str(data.get("level", "info")).lower()
     if msg:
         import logging as _logging

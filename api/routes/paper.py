@@ -1,3 +1,23 @@
+"""Single Paper + uploads + feedback endpoints.
+
+This blueprint backs the Single Paper workflow and its supporting routes:
+
+- ``POST /api/upload`` / ``DELETE /api/upload/<id>`` — accept a PDF (size- and
+  extension-checked), extract its text in a subprocess, and store it keyed by an
+  upload id; or delete a stored upload.
+- ``POST /api/summarise`` — stream a tunable summary as SSE. Generation knobs
+  resolve **body → persisted ``paper_*`` config → hard-coded clamp default**
+  (see :func:`_extract_summarise_params`); the document-type, audience, focus
+  question, and (capped) custom system prompt shape the prompt. The uploaded
+  PDF text is treated as untrusted source material by the summariser.
+- ``POST /api/export-summary`` — atomically write a ``.txt``/``.md`` summary to
+  the user's Downloads folder.
+- ``POST /api/feedback`` / ``GET /api/feedback/history`` — store/read feedback,
+  recursively capping every string field to bound disk writes.
+
+Every route is gated by :func:`api.security.origin_is_local`, and SSE routes use
+the shared ``{info}`` / ``{token}`` / ``{error}`` + ``[DONE]`` contract.
+"""
 import logging
 import json
 import os
@@ -59,6 +79,12 @@ def _extract_summarise_params(data: dict) -> dict:
     }
 
 def _normalise_prompt_preset(preset) -> dict:
+    """Coerce a preset entry into a ``{system, user_template}`` dict.
+
+    ``PROMPT_PRESETS`` entries are normally structured dicts, but tolerate a
+    bare string (used for both slots) and fall back to a minimal "Summarize."
+    preset for an unknown/None lookup, so the summariser always has both slots.
+    """
     if isinstance(preset, dict):
         return preset
     if isinstance(preset, str):
@@ -98,6 +124,18 @@ def _resolve_system_prompt(data: dict, preset: dict) -> tuple[str, str | None, s
 
 @paper_bp.route("/api/summarise", methods=["POST"])
 def api_summarise():
+    """Stream a tunable single-paper summary as SSE.
+
+    Looks up the stored extracted text by ``upload_id`` (400 if missing/empty),
+    resolves the prompt (preset → optional report-type override → optional
+    capped custom ``system_prompt``) and the generation params (body → ``paper_*``
+    config → default), then streams ``summarise_stream``. ``language`` and
+    ``focus_question`` are length-capped before entering the prompt so a
+    malicious body cannot inject an unbounded string. The provider is the body's
+    ``provider`` if it is a known provider, else the configured default. Tokens
+    are emitted as ``{token}`` frames, stage messages as ``{info}``, any failure
+    as a sanitised ``{error}``, ending with ``[DONE]``.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
 
@@ -183,6 +221,15 @@ def api_summarise():
 
 @paper_bp.route("/api/upload", methods=["POST"])
 def api_upload():
+    """Accept a PDF upload, extract its text, and store it under a new id.
+
+    Validates the multipart ``file`` part: a sanitised ``.pdf`` filename and a
+    ``Content-Length`` within the ``PDF_LIMIT_SIZE_MB`` cap (a pre-read guard;
+    ``process_pdf_upload`` enforces the same byte cap while streaming to disk).
+    Extraction runs in a subprocess so a hang can be killed by timeout. Returns
+    ``{upload_id, filename}``; a ``ValueError`` (bad/empty PDF) is a 400 and any
+    other failure a 500, both sanitised.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     
@@ -213,6 +260,12 @@ def api_upload():
 
 @paper_bp.route("/api/upload/<upload_id>", methods=["DELETE"])
 def api_delete_upload(upload_id: str):
+    """Delete a stored upload by id.
+
+    The path-segment ``upload_id`` is shape-validated with ``coerce_regex``
+    (1-128 of ``[A-Za-z0-9._-]``) before it reaches the parameterised DELETE,
+    as defence in depth. Idempotent: deleting an absent id still returns ok.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     if coerce_regex(upload_id, r"[A-Za-z0-9._-]{1,128}") is None:
@@ -225,6 +278,15 @@ def api_delete_upload(upload_id: str):
 
 @paper_bp.route("/api/export-summary", methods=["POST"])
 def api_export_summary():
+    """Write a summary to ``~/Downloads`` as ``.txt`` or ``.md``.
+
+    ``format`` is enum-clamped to ``txt``/``md`` (400 otherwise); the filename is
+    run through ``secure_filename`` (defaulting to ``summary``) and the content
+    is capped at 500k chars. The ``md`` variant gets a ``# Summary - <title>``
+    heading. The file is written with ``write_text_atomic`` (temp sibling +
+    rename) so a crash/disk-full mid-write cannot leave a truncated file the
+    user only notices after deleting the original chat. Returns the output path.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
@@ -256,6 +318,12 @@ def api_export_summary():
         return jsonify({"error": "Failed to write summary file", "details": sanitise_error_msg(e)}), 500
 
 def _cap_strings_recursive(val, max_chars: int):
+    """Truncate every string in a nested dict/list structure to *max_chars*.
+
+    Feedback bodies can nest strings inside dict/list fields, so a flat cap on
+    top-level values would leave a deeply nested string unbounded. This walks
+    the structure and caps each string leaf, leaving non-string scalars intact.
+    """
     if isinstance(val, str):
         return val[:max_chars]
     if isinstance(val, dict):
@@ -266,6 +334,12 @@ def _cap_strings_recursive(val, max_chars: int):
 
 @paper_bp.route("/api/feedback", methods=["POST"])
 def api_feedback():
+    """Persist a feedback record (every string field capped to bound disk use).
+
+    The whole JSON object is passed through :func:`_cap_strings_recursive` with a
+    10k-char cap per string leaf before ``save_feedback`` appends it, so a
+    crafted body cannot write an unbounded amount to the feedback log.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
@@ -283,6 +357,11 @@ def api_feedback():
 
 @paper_bp.route("/api/feedback/history")
 def api_feedback_history():
+    """Return a paginated slice of stored feedback records.
+
+    ``?limit=`` (clamped 1-500, default 50) and ``?offset=`` (clamped, default 0)
+    page the full record list; ``total`` reports the unpaginated count.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     from core.feedback import load_feedback

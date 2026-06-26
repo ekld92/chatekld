@@ -14,6 +14,13 @@ from ..inventory import Inventory
 
 @dataclass
 class NoteTagDriftRow:
+    """One citation key whose Obsidian note is missing some Zotero note tags.
+
+    ``missing_in_obs`` is the actionable set (``zotero_note_tags - obs_tags``);
+    the two full tag sets are carried for the UI to show the comparison.
+    ``author``/``title`` are pulled from the bib entry purely for display.
+    """
+
     citation_key: str
     zotero_note_tags: set[str] = field(default_factory=set)
     obs_tags: set[str] = field(default_factory=set)
@@ -23,6 +30,16 @@ class NoteTagDriftRow:
 
 
 def find_drift(inv: Inventory) -> list[NoteTagDriftRow]:
+    """Reconciliation rule for aim (i): Zotero note tags absent from Obsidian.
+
+    For each inventory record that has *both* a Zotero parent with at least one
+    child note *and* an Obsidian note, the row is emitted only when
+    ``zotero_note_tags - obs_tags`` is non-empty — i.e. the user tagged the
+    reading note in Zotero but never carried those tags into the Obsidian
+    note's YAML. The reverse direction is deliberately not flagged (the user
+    never syncs back into Zotero). Rows are sorted by most-missing-first, then
+    citation key, so the biggest gaps surface at the top.
+    """
     rows: list[NoteTagDriftRow] = []
     for rec in inv.records.values():
         # Require both sources to exist.

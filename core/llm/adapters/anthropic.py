@@ -57,6 +57,28 @@ _STOP_REASON_MAP: dict[str, FinishReason] = {
 
 
 class AnthropicProvider(LLMProvider):
+    """Online chat adapter for the Anthropic Messages API.
+
+    Deliberately speaks raw ``httpx`` rather than the ``anthropic`` SDK so the
+    adapter carries no hard dependency on that package (``httpx`` is already a
+    requirement). Wire format specifics it owns vs. the other adapters:
+
+    * Auth/version via the ``x-api-key`` + ``anthropic-version: 2023-06-01``
+      headers (not a Bearer token), POSTing to ``/v1/messages``.
+    * ``max_tokens`` is REQUIRED by the API (defaulted to 4096 when the caller
+      leaves it unset) and the system prompt is a top-level ``system`` field,
+      not a ``messages`` entry.
+    * **Temperature is clamped to ≤ 1.0** — Anthropic rejects the (1.0, 2.0]
+      range the app's vault-chat knob permits (see :meth:`_build_payload`).
+    * Tools use ``input_schema`` (not ``parameters``) and ``tool_choice`` is an
+      object union with no ``"none"`` variant — "none" is honoured by omitting
+      the tools payload entirely.
+    * The streaming response is a typed SSE event stream (``message_start`` /
+      ``content_block_delta`` / ``message_delta``), parsed line-by-line in
+      :meth:`stream`, with usage split across ``message_start`` (input) and
+      ``message_delta`` (output).
+    """
+
     name = "anthropic"
 
     def __init__(
@@ -67,12 +89,25 @@ class AnthropicProvider(LLMProvider):
         timeout_s: float = 60.0,
         max_retries: int = 3,
     ) -> None:
+        """Stash connection settings; the ``httpx`` client is built per call.
+
+        ``api_key`` / ``base_url`` normally resolve from the environment at call
+        time. ``timeout_s`` / ``max_retries`` come from ``online_timeout_s`` /
+        ``online_max_retries`` via :func:`core.llm.factory.get_llm_provider`.
+        """
         self._explicit_key = api_key
         self._explicit_base_url = base_url
         self.timeout_s = timeout_s
         self.max_retries = max_retries
 
     def _api_key(self) -> str:
+        """Resolve ``ANTHROPIC_API_KEY`` at call time, or raise AUTH.
+
+        Read from the environment on every call (never persisted to config) so
+        a key set after launch applies without a restart. Raising here before
+        any network call is what makes the live model listing degrade to
+        curated-only with no I/O when no key is set.
+        """
         key = self._explicit_key or os.environ.get("ANTHROPIC_API_KEY")
         if not key:
             raise LLMError(
@@ -83,6 +118,8 @@ class AnthropicProvider(LLMProvider):
         return key
 
     def _base_url(self) -> str:
+        """API base (``ANTHROPIC_BASE_URL`` or the public endpoint), trailing
+        slash stripped so URL joins are clean."""
         return (
             self._explicit_base_url
             or os.environ.get("ANTHROPIC_BASE_URL")
@@ -90,6 +127,7 @@ class AnthropicProvider(LLMProvider):
         ).rstrip("/")
 
     def _httpx(self):
+        """Import ``httpx`` lazily, raising INVALID_REQUEST if it is missing."""
         try:
             import httpx
         except ImportError as exc:
@@ -101,15 +139,51 @@ class AnthropicProvider(LLMProvider):
         return httpx
 
     def supports_embeddings(self) -> bool:
+        """Online providers are chat-only; embeddings resolve to a local
+        provider."""
         return False
 
     def supports_tool_use(self) -> bool:
+        """Anthropic Messages supports ``tools`` / ``tool_use`` blocks."""
         return True
 
     def list_models(self) -> tuple[list[str], str]:
-        return list(CURATED_MODELS), ""
+        """Curated models plus any the live ``/v1/models`` endpoint reports
+        (cached, key-gated). Falls back to curated-only without a key, offline,
+        or on any error — see ``core.llm.model_listing``."""
+        from core.llm.model_listing import merged_models
+        models = merged_models(
+            self.name, CURATED_MODELS, self._fetch_live_models,
+            cache_key=f"anthropic:{self._base_url()}",
+        )
+        return models, ""
+
+    def _fetch_live_models(self) -> list[str]:
+        """Model ids from Anthropic's ``/v1/models`` (all are chat models).
+
+        ``_headers()`` calls ``_api_key()`` — raising AUTH and making NO network
+        call when no key is set. Errors propagate to ``merged_models`` (→ curated
+        only). Uses a short listing timeout independent of the generation cap."""
+        httpx = self._httpx()
+        with httpx.Client(timeout=min(self.timeout_s, 10.0)) as client:
+            # No `after_id` pagination: limit=1000 (the endpoint max) dwarfs the
+            # ~dozen live Claude models, so a single page is always complete.
+            resp = client.get(
+                f"{self._base_url()}/v1/models",
+                headers=self._headers(),
+                params={"limit": 1000},
+            )
+        if resp.status_code >= 400:
+            return []
+        out: list[str] = []
+        for item in (resp.json().get("data") or []):
+            mid = item.get("id") if isinstance(item, dict) else None
+            if isinstance(mid, str) and mid:
+                out.append(mid)
+        return out
 
     def health_check(self) -> tuple[bool, str]:
+        """``ok`` iff a key is present — key-presence only, no network call."""
         try:
             self._api_key()
             return True, ""
@@ -117,6 +191,7 @@ class AnthropicProvider(LLMProvider):
             return False, err.message
 
     def _headers(self) -> dict[str, str]:
+        """Required Anthropic request headers (auth + pinned API version)."""
         return {
             "x-api-key": self._api_key(),
             "anthropic-version": _API_VERSION,
@@ -124,6 +199,14 @@ class AnthropicProvider(LLMProvider):
         }
 
     def _build_payload(self, request: LLMRequest, *, stream: bool) -> dict:
+        """Assemble the ``/v1/messages`` JSON body shared by both code paths.
+
+        Encodes the Anthropic-specific contract: ``max_tokens`` is mandatory
+        (defaulted), the system prompt is a top-level field, ``temperature`` is
+        clamped to ≤ 1.0, and tools use ``input_schema`` with an object-shaped
+        ``tool_choice`` (``"none"`` is realised by omitting the tools entirely,
+        since the union has no none variant).
+        """
         max_tokens = request.max_tokens if request.max_tokens is not None else 4096
         payload: dict = {
             "model": request.model,
@@ -134,7 +217,11 @@ class AnthropicProvider(LLMProvider):
         if request.system_prompt:
             payload["system"] = request.system_prompt
         if request.temperature is not None:
-            payload["temperature"] = request.temperature
+            # Anthropic caps temperature at 1.0 (verified vs platform.claude.com,
+            # 2026-06), whereas OpenAI/Gemini allow up to 2.0 and the app's
+            # vault-chat range is 0-2. Clamp so a temperature in (1.0, 2.0] does
+            # not 400 against Anthropic specifically.
+            payload["temperature"] = min(float(request.temperature), 1.0)
         if request.top_p is not None:
             payload["top_p"] = request.top_p
         if request.stop:
@@ -155,6 +242,14 @@ class AnthropicProvider(LLMProvider):
         return payload
 
     def generate(self, request: LLMRequest) -> LLMResponse:
+        """Non-streaming completion via a single POST to ``/v1/messages``.
+
+        Concatenates the ``text`` content blocks, parses any ``tool_use``
+        blocks into :class:`ToolCall`s, maps ``stop_reason`` to the normalised
+        finish reason, and records usage (including ``cache_read_input_tokens``).
+        Transport/HTTP errors are normalised to :class:`LLMError` and the whole
+        call is wrapped in :func:`retry_with_backoff`.
+        """
         httpx = self._httpx()
         start = time.monotonic()
 
@@ -229,6 +324,17 @@ class AnthropicProvider(LLMProvider):
         return retry_with_backoff(_do_call, max_attempts=self.max_retries)
 
     def stream(self, request: LLMRequest) -> StreamingResponse:
+        """Streaming completion over Anthropic's typed SSE event stream.
+
+        Parses the ``event:``/``data:`` line protocol by hand: ``message_start``
+        carries input + cache-read usage, ``content_block_delta`` of subtype
+        ``text_delta`` yields each token, and ``message_delta`` carries the
+        running output-token count plus the terminal ``stop_reason``. Like the
+        other streaming adapters this is NOT retried and the fallback layer only
+        switches providers before the first token — a mid-stream failure is
+        captured as ``final.error``, re-raised for a structured SSE error, and
+        usage is still recorded in the ``finally``.
+        """
         httpx = self._httpx()
         start = time.monotonic()
         final = LLMResponse(provider=self.name, model=request.model)
@@ -336,6 +442,16 @@ def _http_error_to_llm_error(
     *,
     body_text: Optional[str] = None,
 ) -> LLMError:
+    """Map a ≥400 Anthropic HTTP response onto a normalised :class:`LLMError`.
+
+    Prefers the provider's ``error.message`` from the JSON body, categorises by
+    status code, and sets ``retryable`` for the transient categories. Anthropic
+    reports billing exhaustion as a 400 ("Your credit balance is too low"), so a
+    RATE_LIMIT *or* INVALID_REQUEST whose message :func:`looks_like_quota`
+    recognises is re-mapped to the terminal QUOTA category. ``body_text`` lets
+    the streaming caller pass the already-read body (the stream response can't be
+    re-read).
+    """
     status = resp.status_code
     text = body_text
     if text is None:

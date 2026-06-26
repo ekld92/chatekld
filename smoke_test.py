@@ -117,7 +117,10 @@ class ChatEKLDSmokeTest(unittest.TestCase):
         for key in ("online_timeout_s", "online_max_retries", "online_max_tokens",
                     "paper_temperature", "paper_num_ctx", "deck_max_sections",
                     "deck_agent_max_iterations", "agent_wall_clock_s",
-                    "local_request_timeout_s"):
+                    "local_request_timeout_s", "vault_wikilink_expansion",
+                    "vault_wikilink_neighbor_cap", "vault_wikilink_node_cap",
+                    "vault_wikilink_score_decay",
+                    "vision_timeout_s", "vision_max_tokens", "ocr_max_tokens"):
             self.assertIn(key, data, f"missing default config key: {key}")
 
         # In-range value persists verbatim.
@@ -143,6 +146,30 @@ class ChatEKLDSmokeTest(unittest.TestCase):
         self.client.post('/api/config', json={"local_request_timeout_s": 0}, headers=self.headers)
         data = json.loads(self.client.get('/api/config', headers=self.headers).data)
         self.assertEqual(data.get("local_request_timeout_s"), 0)     # 0 = disabled, valid
+
+        # Vision/OCR bounds: in-range persists, out-of-range clamps. Unlike
+        # local_request_timeout_s there is no "0 = off" — the min is 5.
+        self.client.post('/api/config',
+                         json={"vision_timeout_s": 90, "vision_max_tokens": 2048},
+                         headers=self.headers)
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertEqual(data.get("vision_timeout_s"), 90)
+        self.assertEqual(data.get("vision_max_tokens"), 2048)
+        self.client.post('/api/config',
+                         json={"vision_timeout_s": 99999, "ocr_max_tokens": 1},
+                         headers=self.headers)
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertEqual(data.get("vision_timeout_s"), 600)   # clamped to max
+        self.assertEqual(data.get("ocr_max_tokens"), 64)      # clamped to min
+
+        # Wikilink-expansion caps clamp into range (config-only knobs).
+        self.client.post('/api/config',
+                         json={"vault_wikilink_neighbor_cap": 99999,
+                               "vault_wikilink_score_decay": 5.0},
+                         headers=self.headers)
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertEqual(data.get("vault_wikilink_neighbor_cap"), 100)  # clamped to max
+        self.assertEqual(data.get("vault_wikilink_score_decay"), 1.0)   # clamped to max
 
         # A malformed enum is DROPPED — the previously-saved value survives.
         self.client.post('/api/config', json={"vault_reranker_device": "auto"}, headers=self.headers)
@@ -498,6 +525,29 @@ class ChatEKLDSmokeTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 503)
         data = json.loads(resp.data)
         self.assertIn("error", data)
+
+    def test_30b_index_returns_503_when_prior_run_unfinished(self):
+        """POST /api/obsidian/index must refuse with 503 when a prior indexing
+        thread has not finished (wait_for_indexing False).  Closes the
+        cancel-then-reindex race: a cancel force-releases the op lock before its
+        thread's final persist, so the index route must wait for it to exit."""
+        import unittest.mock as mock
+        from rag.vault import obsidian_manager
+
+        with (
+            mock.patch.object(obsidian_manager, "get_vault_path", return_value="/tmp/vault"),
+            mock.patch.object(obsidian_manager, "wait_for_indexing", return_value=False),
+            mock.patch.object(obsidian_manager, "try_acquire_lock") as acq,
+        ):
+            resp = self.client.post(
+                "/api/obsidian/index",
+                json={},
+                content_type="application/json",
+                headers=self.headers,
+            )
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn("error", json.loads(resp.data))
+        acq.assert_not_called()  # bailed out before acquiring the lock
 
     def test_26_reset_wipe_feedback_and_config(self):
         """POST /api/reset with wipe_feedback=true and wipe_config=true deletes

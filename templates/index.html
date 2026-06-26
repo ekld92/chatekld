@@ -94,6 +94,8 @@
                 <button id="tab-document" class="tab" role="tab" aria-selected="false" aria-controls="document-tab" tabindex="-1" onclick="showTab('document')">Single Paper</button>
                 <button id="tab-audit" class="tab" role="tab" aria-selected="false" aria-controls="audit-tab" tabindex="-1" onclick="showTab('audit')">Library Audit</button>
                 <button id="tab-deck" class="tab" role="tab" aria-selected="false" aria-controls="deck-tab" tabindex="-1" onclick="showTab('deck')">Deck Generator</button>
+                <button id="tab-refactor" class="tab" role="tab" aria-selected="false" aria-controls="refactor-tab" tabindex="-1" onclick="showTab('refactor')">Note Refactor</button>
+                <button id="tab-chat" class="tab" role="tab" aria-selected="false" aria-controls="chat-tab" tabindex="-1" onclick="showTab('chat')">Plain Chat</button>
             </div>
         </div>
 
@@ -143,6 +145,27 @@
                         <input type="text" id="obsidian-input" aria-label="Ask about your vault" placeholder="Ask about your vault..." onkeydown="if(event.key==='Enter') chatWithVault()">
                         <button id="vault-send-btn" class="btn btn-primary" onclick="chatWithVault()">Send</button>
                         <button id="vault-clear-chat-btn" class="btn btn-outline" onclick="clearVaultChat()" title="Clear the chat window">Clear</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Plain Chat Tab -->
+        <div id="chat-tab" class="content-area" role="tabpanel" aria-labelledby="tab-chat" tabindex="0">
+            <div class="pane-view">
+                <div class="card">
+                    <div class="header">
+                        <span>Plain Chat</span>
+                        <div class="actions">
+                            <button class="btn btn-outline" onclick="plainchatNew()" title="Start a new conversation">New chat</button>
+                        </div>
+                    </div>
+                    <small class="control-hint">A direct, multi-turn conversation with the configured provider/model &mdash; no vault retrieval. Conversation is ephemeral (lost on reload). System prompt &amp; temperature live in <strong>&#9881; LLM Settings</strong>.</small>
+                    <div id="plainchat-history" class="chat-history"></div>
+                    <div id="plainchat-error-boundary" class="task-error-boundary"></div>
+                    <div class="input-bar">
+                        <input type="text" id="plainchat-input" aria-label="Chat message" placeholder="Message the model..." onkeydown="if(event.key==='Enter') chatPlain()">
+                        <button id="plainchat-send-btn" class="btn btn-primary" onclick="chatPlain()">Send</button>
                     </div>
                 </div>
             </div>
@@ -275,7 +298,7 @@
                         <div class="control-group">
                             <label for="deck-template-path">Beamer template (.tex / .sty)</label>
                             <div class="input-row">
-                                <input type="text" id="deck-template-path" placeholder="…/presentations_slides_writings_teaching/template/presentation.tex">
+                                <input type="text" id="deck-template-path" placeholder="…/your_templates/presentation.tex">
                                 <button class="btn btn-outline" onclick="deckPickTemplateFile()">Browse…</button>
                                 <button class="btn btn-outline" onclick="deckLoadTemplate()">Load</button>
                             </div>
@@ -326,6 +349,45 @@
 
                         <div id="deck-activity" class="deck-activity" aria-live="polite"></div>
                         <div id="deck-result" class="deck-result"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Note Refactor Tab (Phase 1 — read-only analyzer) -->
+        <div id="refactor-tab" class="content-area" role="tabpanel" aria-labelledby="tab-refactor" tabindex="0">
+            <div class="pane-view">
+                <div class="card">
+                    <div class="header">
+                        <span>Note Refactor</span>
+                        <div class="actions">
+                            <button id="refactor-run-btn" class="btn btn-primary" onclick="refactorRunPlan()">Run Plan</button>
+                            <button id="refactor-apply-btn" class="btn btn-outline" onclick="refactorOpenApply()" disabled>Apply approved (0)</button>
+                            <button id="refactor-restore-btn" class="btn btn-outline" onclick="refactorOpenRestore()">Restore…</button>
+                        </div>
+                    </div>
+                    <div class="vault-info">
+                        <span><strong>⚠ Writes to your vault.</strong> Phase 1 previews are read-only, but <strong>Apply</strong> inlines the approved callouts into your notes, and per-image <strong>Archive</strong> moves a full-res original out of the vault (to a recoverable archive folder) leaving a small thumbnail. Every change is atomic, logged, and reversible from <strong>Restore</strong>. Nothing is written until you explicitly confirm.</span>
+                    </div>
+                    <div id="refactor-status" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
+
+                    <div class="deck-body">
+                        <div class="control-group">
+                            <label for="refactor-scope">Scope sub-folder (vault-relative)</label>
+                            <div class="input-row">
+                                <input type="text" id="refactor-scope" placeholder="your_subfolder">
+                                <button class="btn btn-outline" onclick="refactorPickScopeFolder()">Browse…</button>
+                            </div>
+                            <small class="control-hint">Only this sub-folder's <code>.md</code> notes are analyzed. Attachments are resolved across the whole vault.</small>
+                        </div>
+
+                        <div id="refactor-summary" class="deck-summary" style="display:none;"></div>
+                        <div id="refactor-discrepancies" class="refactor-discrepancies"></div>
+                        <div id="refactor-activity" class="deck-activity" aria-live="polite"></div>
+                        <div class="refactor-layout">
+                            <div id="refactor-note-list" class="refactor-note-list" role="listbox" aria-label="Analyzed notes"></div>
+                            <div id="refactor-detail" class="refactor-detail"></div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -416,6 +478,23 @@
                 </div>
             </div>
             <small class="control-hint">Used by scanned-PDF OCR and local image/figure reading. Choose a provider with a vision-capable model loaded.</small>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="set-vision-timeout">Vision/OCR request timeout (seconds)</label>
+                    <input type="number" id="set-vision-timeout" min="5" max="600" step="5" value="120">
+                    <small class="control-hint">Per-call HTTP timeout for image-description and OCR. Always on (no SDK 10-min default) so a stuck image cannot stall indexing.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-vision-max-tokens">Image description max tokens</label>
+                    <input type="number" id="set-vision-max-tokens" min="64" max="8192" step="64" value="1536">
+                    <small class="control-hint">Caps figure/image description length so a runaway model returns promptly.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-ocr-max-tokens">OCR max tokens</label>
+                    <input type="number" id="set-ocr-max-tokens" min="64" max="8192" step="64" value="4096">
+                    <small class="control-hint">Caps scanned-page OCR length (higher than image description — a dense page has more text).</small>
+                </div>
+            </div>
 
             <span class="sidebar-label">Vault Chat · retrieval &amp; generation</span>
             <div class="control-grid">
@@ -466,6 +545,10 @@
                     <label class="checkbox-row"><input type="checkbox" id="vault-query-expansion"> Multi-query expansion</label>
                     <div class="slider-label"><label for="vault-num-queries">Query variants</label><span id="vault-num-queries-value">3</span></div>
                     <input type="range" id="vault-num-queries" min="1" max="5" step="1" value="3">
+                </div>
+                <div class="control-group">
+                    <label class="checkbox-row"><input type="checkbox" id="vault-wikilink-enabled"> Wikilink expansion</label>
+                    <small class="control-hint">Also surface chunks from notes linked to / from your top results, before reranking. No re-index.</small>
                 </div>
                 <div class="control-group">
                     <div class="slider-label"><label for="vault-rerank-pool">Reranker candidate pool</label><span id="vault-rerank-pool-value">50</span></div>
@@ -539,6 +622,19 @@
                 </div>
             </div>
 
+            <span class="sidebar-label">Plain Chat · generation</span>
+            <div class="control-grid">
+                <div class="control-group">
+                    <div class="slider-label"><label for="set-chat-temp">Temperature</label><span id="set-chat-temp-value">0.3</span></div>
+                    <input type="range" id="set-chat-temp" min="0" max="2" step="0.1" value="0.3" oninput="document.getElementById('set-chat-temp-value').textContent = this.value">
+                </div>
+            </div>
+            <div class="control-group">
+                <label for="set-chat-system-prompt">System prompt</label>
+                <textarea id="set-chat-system-prompt" rows="3" maxlength="4000" placeholder="You are a helpful assistant."></textarea>
+                <small class="control-hint">Used as the full system prompt for the Plain Chat panel (no vault grounding). Leave blank for no system prompt.</small>
+            </div>
+
             <div id="settings-status" class="modal-copy"></div>
             <div class="modal-footer">
                 <button class="btn btn-primary" onclick="closeModal('settings-modal')">Done</button>
@@ -569,7 +665,7 @@
             </div>
             <div class="control-group">
                 <label for="audit-master-bib-path">Master BibTeX path (vault-relative)</label>
-                <input type="text" id="audit-master-bib-path" placeholder="presentations_slides_writings_teaching/_master.bib">
+                <input type="text" id="audit-master-bib-path" placeholder="_master.bib">
             </div>
             <div class="control-group">
                 <label for="audit-zotero-sqlite">Zotero SQLite database (absolute)</label>
@@ -622,6 +718,43 @@
             <div class="modal-footer">
                 <button class="btn btn-outline" onclick="closeModal('image-exts-modal')">Cancel</button>
                 <button class="btn btn-primary" onclick="saveImageExts()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Note Refactor: Apply confirmation Modal (writes to the vault) -->
+    <div id="refactor-apply-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="refactor-apply-modal-title">
+        <div class="modal" style="max-width:560px; max-height:80vh; overflow-y:auto;">
+            <h2 id="refactor-apply-modal-title">Apply to your vault?</h2>
+            <p class="modal-copy">
+                This writes the approved callouts into the following note(s).
+                Original embeds are kept; nothing is moved. Each note is written
+                atomically and snapshotted so it can be reverted from
+                <strong>Restore</strong>.
+            </p>
+            <ul id="refactor-apply-list" class="refactor-confirm-list"></ul>
+            <div id="refactor-apply-modal-status" class="modal-copy"></div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeModal('refactor-apply-modal')">Cancel</button>
+                <button id="refactor-apply-confirm" class="btn btn-primary" onclick="refactorConfirmApply()">Write to vault</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Note Refactor: Restore Modal -->
+    <div id="refactor-restore-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="refactor-restore-modal-title">
+        <div class="modal" style="max-width:640px; max-height:82vh; overflow-y:auto;">
+            <h2 id="refactor-restore-modal-title">Restore vault changes</h2>
+            <p class="modal-copy">
+                Every apply / archive is recorded here. Reverting restores the
+                note from its snapshot and moves an archived original back into
+                the vault.
+            </p>
+            <div id="refactor-restore-list" class="refactor-restore-list"></div>
+            <div id="refactor-restore-status" class="modal-copy"></div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeModal('refactor-restore-modal')">Close</button>
+                <button id="refactor-restore-all" class="btn btn-outline" onclick="refactorRevertAll()">Revert all</button>
             </div>
         </div>
     </div>

@@ -71,6 +71,12 @@ class AuditManager:
     # Status / messages
     # ------------------------------------------------------------------
     def _emit(self, msg: str) -> None:
+        """Log a status line and append it to the rolling buffer (capped at 200).
+
+        Called from the worker thread (and passed as ``progress_fn`` into the
+        inventory build). The ``del [:-200]`` keeps only the most recent 200
+        lines so a multi-hour scan can't grow the buffer without bound.
+        """
         logger.info("AuditManager: %s", msg)
         with self._messages_lock:
             self._messages.append(msg)
@@ -78,16 +84,29 @@ class AuditManager:
             del self._messages[:-200]
 
     def drain_messages(self) -> list[str]:
+        """Atomically return and clear the buffered status lines.
+
+        ``/api/audit/status`` polls this, so each line is delivered to the UI
+        exactly once. Guarded by ``_messages_lock`` independently of the state
+        lock so draining never blocks scan progress.
+        """
         with self._messages_lock:
             out = list(self._messages)
             self._messages.clear()
             return out
 
     def clear_messages(self) -> None:
+        """Drop all buffered status lines (called when a fresh scan starts)."""
         with self._messages_lock:
             self._messages.clear()
 
     def get_status_payload(self) -> dict:
+        """Snapshot the status for ``/api/audit/status``.
+
+        Reads the live fields under ``_state_lock`` (consistent snapshot), then
+        drains the message buffer outside it. ``started_at``/``finished_at``
+        are coerced to ``None`` when unset so the UI gets ``null`` not ``0.0``.
+        """
         with self._state_lock:
             state = self._state
             error = self._error
@@ -168,6 +187,7 @@ class AuditManager:
         return True
 
     def is_scanning(self) -> bool:
+        """True iff a scan is currently in flight (state-lock guarded read)."""
         with self._state_lock:
             return self._state == STATE_SCANNING
 
@@ -184,10 +204,18 @@ class AuditManager:
     # Result access
     # ------------------------------------------------------------------
     def get_inventory(self) -> tuple[Optional[eng_inventory.Inventory], Optional[Settings]]:
+        """Return the cached inventory + the settings it was built with.
+
+        Both are ``None`` until the first scan completes; the report endpoints
+        return 404 in that case. The pair is read together under the lock so
+        the inventory and the settings used to serialize its paths can't be
+        torn apart by a concurrent reset/new-scan.
+        """
         with self._state_lock:
             return self._inventory, self._settings
 
     def get_duplicates(self) -> tuple[Optional[list[eng_duplicates.DuplicateSet]], Optional[Settings]]:
+        """Return the cached duplicate sets + their settings (None until ready)."""
         with self._state_lock:
             return self._duplicates, self._settings
 
@@ -230,6 +258,21 @@ class AuditManager:
         include_duplicates: bool,
         run_id: int,
     ) -> None:
+        """The scan worker body (one per thread); never called directly.
+
+        Two phases, cancel-checked between them: build the inventory, then —
+        if opted in — hash for duplicates. ``_stop_event`` is polled after each
+        phase (the per-PDF pikepdf open inside a phase is not interruptible), so
+        a cancel finalises with whatever partial result exists and the right
+        ``clear_dupes`` semantics. After the inventory phase it drains the
+        Obsidian frontmatter-parse warnings into the feed (a skipped note's
+        tags are invisible to the drift report, so the user must be told) and
+        surfaces any ``zotero_error``. Every exit routes through
+        :meth:`_finalise` with this thread's ``run_id`` so a stale completion
+        (a newer scan already started) drops its result instead of clobbering
+        the live one. The blanket ``except`` is the thread's last line of
+        defence — an unhandled error becomes ``STATE_ERROR``, not a dead thread.
+        """
         try:
             self._emit("Building inventory (bib + bridge + Zotero + Obsidian)...")
             inv = eng_inventory.build_inventory(

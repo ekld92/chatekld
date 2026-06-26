@@ -1,3 +1,28 @@
+"""Obsidian vault blueprint: indexing control + the vault-chat SSE route.
+
+This module owns the **canonical** streaming-chat pattern the rest of the app
+mirrors (``api/routes/plainchat.py`` is a stripped copy, ``api/routes/deck.py``
+reuses the same stall model). The shape, repeated in every SSE route:
+
+    request thread (the Flask generator) ── consumes ──►  event_q  ◄── produces ── daemon worker thread
+
+* A **daemon worker** (``_run_chat`` for single-shot RAG, ``_run_agent`` for the
+  ReAct loop) runs the slow generation off the request thread and ``_put``s
+  ``{token}`` / ``{info}`` / ``{error}`` / agent-trace dicts onto a **bounded**
+  ``queue.Queue`` (``maxsize=512`` → back-pressure) plus a ``_DONE`` sentinel in
+  its ``finally``.
+* The **consumer** (the ``generate`` generator) ``get``s with a stall timeout and
+  re-emits each item as an SSE ``data:`` frame, ending with ``[DONE]``.
+* A shared ``threading.Event`` (``cancel``) is the only cross-thread signal: the
+  consumer sets it on timeout / client disconnect / terminal error, and the worker
+  checks it to stop pumping. Running generation on a separate thread is what lets
+  the consumer enforce a wall-clock/stall bound the blocking model call cannot.
+
+Indexing is guarded separately by the manager's ``RagOperationLock`` (TTL 3600 s):
+``api_obsidian_index`` waits out any in-flight run, then admits exactly one indexer
+thread. ``_resolve_chat_params`` resolves every live retrieval/generation knob
+body→config→default so a Settings change applies on the next Send with no reload.
+"""
 import queue
 import threading
 import time
@@ -6,7 +31,15 @@ import json
 from pathlib import Path
 from flask import Blueprint, jsonify, request, Response
 from core.config import load_config
-from core.constants import DEFAULT_EMBED, VAULT_SYSTEM_PROMPT_LIMIT
+from core.constants import (
+    DEFAULT_EMBED,
+    VAULT_SYSTEM_PROMPT_LIMIT,
+    # Shared SSE stall-guard timing (single source of truth in core/constants.py;
+    # aliased to the historical private names so the usage + comments below are
+    # undisturbed). The full rationale lives at the definition site.
+    SSE_STALL_MARGIN_S as _STALL_MARGIN_S,
+    SSE_SINGLE_SHOT_FLOOR_S as _SINGLE_SHOT_FLOOR_S,
+)
 from api.security import origin_is_local, sanitise_error_msg
 from api.validators import (
     MISSING,
@@ -40,21 +73,10 @@ from core.agent import (
 _agent_capability_state = AgentCapabilityState()
 
 _CHAT_TOKEN_TIMEOUT_S = 300  # default agent wall-clock cap (config: agent_wall_clock_s)
-# The SSE consumer waits this much LONGER than the effective stall base so the
-# worker's own structured timeout event (an InfoEvent/ErrorEvent + _DONE) fires
-# before the consumer's generic stall guard — preserving the "server emits a
-# clean error" behaviour the frontend's longer abort also relies on.
-_STALL_MARGIN_S = 30
-# Floor for the consumer's per-event wait. The SAME consumer loop serves both
-# the agent path (bounded by its own wall-clock deadline) AND the single-shot
-# RAG path (whose ONLY time guard is this consumer get). agent_wall_clock_s can
-# be lowered to 30 s to cap agent turns, but a single-shot first token
-# (retrieval + rerank + cold model) can legitimately take longer, so the stall
-# guard never drops below this floor — the agent deadline still fires first for
-# the agent path, this only widens the no-events-at-all backstop. The frontend
-# abort in static/js/vault.js mirrors this floor so the timeout chain stays
-# ordered (agent deadline ≤ consumer ≤ frontend abort).
-_SINGLE_SHOT_FLOOR_S = 300
+# _STALL_MARGIN_S / _SINGLE_SHOT_FLOOR_S are imported from core/constants.py
+# (SSE_STALL_MARGIN_S / SSE_SINGLE_SHOT_FLOOR_S) so the vault, deck, and
+# plain-chat SSE routes share one definition; see the comment there for the
+# full timeout-chain rationale. consumer_timeout_s below derives from them.
 _EMPTY_RESPONSE_SENTINEL = "Empty Response"  # LlamaIndex default for no-context responses
 _NO_CONTENT_MSG = "No relevant content found in your vault for this query."
 _NO_AGENT_ANSWER_MSG = (
@@ -224,6 +246,19 @@ def _resolve_chat_params(data: dict, cfg: dict) -> dict:
     if rerank_pool_ceiling is not MISSING:
         out["rerank_pool_ceiling"] = rerank_pool_ceiling
 
+    # Wikilink graph expansion (query-time, no reindex): live per-Send toggle
+    # so flipping it in the UI takes effect on the next message. The caps live
+    # in config only (read by the engine), so they are not body overrides. The
+    # agent's active vault.search is intentionally not threaded this knob —
+    # parity with mmr_enabled / query_expansion, which are also single-shot
+    # only; it still applies to the agent's RAG fallback via stream_chat.
+    wikilink_expansion = _resolve(
+        "wikilink_expansion", "vault_wikilink_expansion",
+        coerce_bool,
+    )
+    if wikilink_expansion is not MISSING:
+        out["wikilink_expansion"] = wikilink_expansion
+
     custom_sys = _resolve(
         "system_prompt", "vault_chat_system_prompt",
         lambda v: coerce_string_max_len(v, VAULT_SYSTEM_PROMPT_LIMIT),
@@ -259,18 +294,29 @@ vault_bp = Blueprint('vault', __name__)
 
 @vault_bp.route("/api/obsidian/status")
 def api_obsidian_status():
+    """Poll indexing state, progress messages, and warnings (local-origin only)."""
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     return jsonify(obsidian_manager.get_status_payload())
 
 @vault_bp.route("/api/obsidian/materials")
 def api_obsidian_materials():
+    """List the files recorded in the current vault index manifest."""
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     return jsonify(obsidian_manager.get_indexed_materials())
 
 @vault_bp.route("/api/obsidian/index", methods=["POST"])
 def api_obsidian_index():
+    """Admit exactly one background indexing run, then return immediately.
+
+    Lock discipline (the subtle part): a *cancel* force-releases the op-lock before
+    its background thread finishes its final persist, so a reindex fired right after
+    a cancel could race the cancelled run's checkpoint on the same index dir. We
+    therefore ``wait_for_indexing`` for any in-flight run to fully exit (503 on
+    timeout), THEN ``try_acquire_lock`` (503 if still held), and only then spawn the
+    daemon indexer thread — which releases the lock in its own ``finally``.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     from core.config import resolve_chat_model
@@ -281,6 +327,13 @@ def api_obsidian_index():
     embed = data.get("embed") or cfg.get("embed", DEFAULT_EMBED)
     if not obsidian_manager.get_vault_path():
         return jsonify({"error": "Vault path not configured"}), 400
+    # A cancel force-releases the op lock BEFORE its background thread finishes the
+    # final persist, so a reindex started right after a cancel could run its
+    # setup/archive concurrently with the cancelled run's checkpoint on the same
+    # index dir.  Wait for any in-flight run to fully exit first (mirrors the
+    # reset path's guard).  A normal cancel's thread exits in well under a second.
+    if not obsidian_manager.wait_for_indexing(timeout=30.0):
+        return jsonify({"error": "A previous indexing run is still finishing; please retry shortly."}), 503
     if not obsidian_manager.try_acquire_lock(ttl=3600):
         return jsonify({"error": "An indexing operation is already in progress"}), 503
     def run_index():
@@ -295,6 +348,15 @@ def api_obsidian_index():
 
 @vault_bp.route("/api/obsidian/chat", methods=["POST"])
 def api_obsidian_chat():
+    """Stream a vault answer as SSE — single-shot RAG or (opt-in) the ReAct agent.
+
+    Resolves the per-request knobs (``_resolve_chat_params``), picks the worker
+    (``_run_agent`` when ``agent_enabled`` else ``_run_chat``), then runs the
+    queue+worker+consumer loop described in the module docstring. The agent path is
+    additionally bounded by ``wall_clock_s`` (the exact user cap); the consumer's
+    stall timeout is floored at ``_SINGLE_SHOT_FLOOR_S`` so lowering that cap can
+    never starve a slow single-shot first token (the two share this one consumer).
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
@@ -323,11 +385,17 @@ def api_obsidian_chat():
     consumer_timeout_s = max(wall_clock_s, _SINGLE_SHOT_FLOOR_S) + _STALL_MARGIN_S
 
     def generate():
+        """The SSE consumer: drain the worker's queue into ``data:`` frames + [DONE]."""
         cancel = threading.Event()
+        # Bounded queue → back-pressure: a fast producer cannot grow memory without
+        # bound if the client drains slowly.
         event_q: queue.Queue = queue.Queue(maxsize=512)
-        _DONE = object()
+        _DONE = object()  # unique sentinel marking the worker has finished
 
         def _put(item):
+            # Block until enqueued, but re-check ``cancel`` every 1 s so a
+            # disconnected/timed-out consumer (queue full, nobody draining) cannot
+            # wedge the worker here forever — it bails and reaches its finally/_DONE.
             placed = False
             while not placed and not cancel.is_set():
                 try:
@@ -337,10 +405,17 @@ def api_obsidian_chat():
                     continue
 
         def _stage(text: str) -> None:
+            # stage_cb: surface a retrieval/fallback stage label as an {info} frame.
             if text:
                 _put({"info": text})
 
         def _run_chat():
+            """Single-shot RAG worker: pump retrieval+generation tokens onto the queue.
+
+            Runs off the request thread so the consumer can apply the stall timeout
+            independently. Always enqueues ``_DONE`` in ``finally`` so the consumer's
+            blocking ``get`` returns promptly instead of waiting the full timeout.
+            """
             try:
                 response = obsidian_manager.stream_chat(
                     message,
@@ -375,6 +450,15 @@ def api_obsidian_chat():
                     pass
 
         def _run_agent():
+            """ReAct-agent worker: run the tool loop, forwarding its events to the queue.
+
+            Translates each :class:`AgentEvent` to the queue-item dict shape via
+            ``_agent_event_to_queue_item`` (so the consumer pattern-matches one set of
+            keys), bounds the loop with ``deadline`` (= the user wall-clock cap), wires
+            a clean single-shot RAG fallback against the ORIGINAL message, and shares
+            the ``cancel`` Event so a consumer timeout stops the loop. Emits a usage
+            footer ``{info}`` only when the model actually ran. ``_DONE`` in finally.
+            """
             try:
                 ctx = VaultToolContext(
                     llm_name=llm,
@@ -423,6 +507,10 @@ def api_obsidian_chat():
                     provider_name=provider,
                     model=llm,
                     user_system_prompt=chat_params.get("custom_system_prompt", ""),
+                    # Forward the resolved per-request temperature so agent mode
+                    # honours the same knob as single-shot RAG (None ⇒ the loop
+                    # falls back to the persisted vault_chat_temperature).
+                    temperature=chat_params.get("temperature"),
                     tools=tools,
                     cfg=cfg,
                     on_event=_on_agent_event,
@@ -528,6 +616,12 @@ def api_obsidian_chat():
 
 @vault_bp.route("/api/native-pick-folder", methods=["POST"])
 def api_native_pick_folder():
+    """Open a native folder picker; optionally constrain the choice to inside the vault.
+
+    When ``constrain_to_vault`` is set, the chosen path is resolved and required to be
+    a *sub*-folder of the configured vault (the vault root itself is rejected),
+    returning the vault-relative path for the caller to use as a scope.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     import webview
@@ -553,6 +647,7 @@ def api_native_pick_folder():
 
 @vault_bp.route("/api/obsidian/pause", methods=["POST"])
 def api_obsidian_pause():
+    """Request a resumable pause of the in-flight indexing run."""
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     ok = obsidian_manager.pause_indexing()
@@ -560,6 +655,7 @@ def api_obsidian_pause():
 
 @vault_bp.route("/api/obsidian/cancel", methods=["POST"])
 def api_obsidian_cancel():
+    """Cancel indexing and force-release the op-lock; report whether it was held."""
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     was_held = obsidian_manager.cancel_indexing()

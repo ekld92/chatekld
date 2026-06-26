@@ -39,7 +39,22 @@ class DeckgenClientError(RuntimeError):
 
 
 class ChatEKLDClient:
+    """HTTP/SSE driver for a *running* ChatEKLD instance (the CLI's transport).
+
+    Holds one ``requests.Session`` pre-seeded with the required
+    ``X-Requested-With: ChatEKLD`` header (and deliberately no ``Origin``/
+    ``Referer``, so the server's loopback acceptance applies). The orchestration
+    core duck-types this as a "client" — :class:`~deckgen.inprocess.InProcessChatRunner`
+    exposes the same ``.chat(...) -> ChatResult`` contract without HTTP.
+    """
+
     def __init__(self, base_url: str, *, timeout_read: int = _READ_TIMEOUT_S) -> None:
+        """Bind to *base_url* (trailing slash stripped) and set the CSRF header.
+
+        *timeout_read* is the per-request read timeout for the streaming chat call;
+        it must exceed the server's per-turn cap so the server's structured SSE
+        error fires before this client gives up (see the module-level constants).
+        """
         self.base_url = base_url.rstrip("/")
         self._timeout_read = timeout_read
         self._session = requests.Session()
@@ -49,12 +64,24 @@ class ChatEKLDClient:
     # -- read endpoints -----------------------------------------------------
 
     def status(self) -> dict:
+        """The vault index status payload (``GET /api/obsidian/status``).
+
+        Used by the CLI preflight to warn when the vault is mid-index or has no
+        usable index before it spends a model budget on outline/sections.
+        """
         return self._get_json("/api/obsidian/status")
 
     def materials(self) -> dict:
+        """The indexed-materials manifest (``GET /api/obsidian/materials``)."""
         return self._get_json("/api/obsidian/materials")
 
     def _get_json(self, path: str) -> dict:
+        """GET a JSON endpoint, mapping transport/HTTP/non-JSON failures to errors.
+
+        Raises :class:`DeckgenClientError` on a connection failure, a 403 (almost
+        always a non-loopback base URL), any non-200, or a non-JSON body — so the
+        caller gets one error type to handle regardless of how the call went wrong.
+        """
         url = f"{self.base_url}{path}"
         try:
             resp = self._session.get(url, timeout=(_CONNECT_TIMEOUT_S, 30))
@@ -146,6 +173,15 @@ class ChatEKLDClient:
 
     @staticmethod
     def _consume_sse(resp, on_event: Optional[Callable[[dict], None]]) -> ChatResult:
+        """Drain the SSE stream into a :class:`ChatResult`, firing *on_event* per frame.
+
+        Parses ``data:`` frames, stops at ``[DONE]``, and routes each JSON event by
+        key into the accumulating result: ``token`` appends to the answer text,
+        ``info``/``error`` collect, and the agent-trace events (``iteration``,
+        ``thought``, ``tool_call``, ``tool_result``) are appended to ``trace``.
+        Malformed frames and a throwing *on_event* are swallowed so one bad frame
+        cannot abort the whole turn; the response is always closed.
+        """
         result = ChatResult()
         try:
             for raw in resp.iter_lines(decode_unicode=True):

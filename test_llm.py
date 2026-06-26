@@ -287,6 +287,59 @@ class TestRedaction(unittest.TestCase):
         self.assertIn("<redacted>", out)
 
 
+class TestLocalErrorClassification(unittest.TestCase):
+    """PR1: a local-backend connection/timeout failure must be classified as
+    NETWORK / TIMEOUT (retryable, fallback-eligible) rather than the default
+    UNKNOWN, so an offline Ollama / LM Studio fails over to a configured online
+    fallback instead of surfacing a hard error."""
+
+    def test_connection_refused_maps_to_network(self):
+        from core.llm.adapters.local import _classify_local_error
+        from core.llm.types import ErrorCategory
+        err = _classify_local_error(
+            ConnectionError("Connection refused"), provider="ollama", model="x")
+        self.assertEqual(err.category, ErrorCategory.NETWORK)
+        self.assertTrue(err.retryable)
+
+    def test_timeout_maps_to_timeout(self):
+        from core.llm.adapters.local import _classify_local_error
+        from core.llm.types import ErrorCategory
+        err = _classify_local_error(
+            TimeoutError("Read timed out"), provider="lm_studio", model="x")
+        self.assertEqual(err.category, ErrorCategory.TIMEOUT)
+        self.assertTrue(err.retryable)
+
+    def test_classifies_by_exception_class_name(self):
+        # httpx.ConnectError / openai.APIConnectionError carry "connect" in the
+        # class name even when the message does not.
+        from core.llm.adapters.local import _classify_local_error
+        from core.llm.types import ErrorCategory
+
+        class APIConnectionError(Exception):
+            pass
+
+        err = _classify_local_error(
+            APIConnectionError("backend unavailable"), provider="lm_studio", model="x")
+        self.assertEqual(err.category, ErrorCategory.NETWORK)
+
+    def test_unrelated_error_stays_unknown(self):
+        from core.llm.adapters.local import _classify_local_error
+        from core.llm.types import ErrorCategory
+        err = _classify_local_error(
+            ValueError("totally unrelated"), provider="ollama", model="x")
+        self.assertEqual(err.category, ErrorCategory.UNKNOWN)
+        self.assertFalse(err.retryable)
+
+    def test_existing_llmerror_passes_through(self):
+        from core.llm.adapters.local import _classify_local_error
+        from core.llm.types import LLMError, ErrorCategory
+        original = LLMError(category=ErrorCategory.QUOTA, message="no credits",
+                            provider="ollama", model="x", retryable=False)
+        self.assertIs(
+            _classify_local_error(original, provider="ollama", model="x"),
+            original)
+
+
 class TestPromptBuilder(unittest.TestCase):
     def test_render_context_orders_and_caps(self):
         from core.llm.prompt import render_context
@@ -644,11 +697,97 @@ class TestOpenAIAdapter(unittest.TestCase):
 
     def test_curated_models_list_includes_recent(self):
         from core.llm.adapters.openai import OpenAIProvider, CURATED_MODELS
+        from core.llm import model_listing
+        model_listing.clear_cache()
         p = OpenAIProvider()
-        models, err = p.list_models()
+        # Stub the live fetch so the unit test stays offline/hermetic; with no
+        # live additions list_models is exactly the curated set.
+        with patch.object(OpenAIProvider, "_fetch_live_models", return_value=[]):
+            models, err = p.list_models()
         self.assertFalse(err)
         self.assertIn("gpt-4o-mini", models)
         self.assertEqual(set(models), set(CURATED_MODELS))
+
+    def test_list_models_merges_live_with_curated(self):
+        from core.llm.adapters.openai import OpenAIProvider, CURATED_MODELS
+        from core.llm import model_listing
+        model_listing.clear_cache()
+        p = OpenAIProvider()
+        # A newly-released model the curated list doesn't know about, plus one it
+        # already has — the merge appends the new id once and never duplicates.
+        live = ["gpt-5-turbo", "gpt-4o-mini"]
+        with patch.object(OpenAIProvider, "_fetch_live_models", return_value=live):
+            models, err = p.list_models()
+        self.assertFalse(err)
+        self.assertEqual(models[: len(CURATED_MODELS)], CURATED_MODELS)  # curated first, order kept
+        self.assertIn("gpt-5-turbo", models)
+        self.assertEqual(models.count("gpt-4o-mini"), 1)  # deduped
+        model_listing.clear_cache()
+
+    def test_list_models_falls_back_to_curated_on_live_error(self):
+        from core.llm.adapters.openai import OpenAIProvider, CURATED_MODELS
+        from core.llm import model_listing
+        model_listing.clear_cache()
+        p = OpenAIProvider()
+        # A raising live fetch (no key, network down, malformed response) must
+        # never empty the picker — it degrades to curated-only.
+        with patch.object(
+            OpenAIProvider, "_fetch_live_models", side_effect=RuntimeError("network down")
+        ):
+            models, err = p.list_models()
+        self.assertFalse(err)
+        self.assertEqual(set(models), set(CURATED_MODELS))
+        model_listing.clear_cache()
+
+    def test_live_fetch_failure_recovers_under_short_negative_ttl(self):
+        # Audit finding #4: a failed fetch must NOT be cached for the full TTL —
+        # otherwise a transient blip (or the first call before the key is set)
+        # blocks discovery for minutes. With failure_ttl_s=0 the failure expires
+        # at once, so the next call re-fetches and the new model surfaces.
+        from core.llm import model_listing as ml
+        ml.clear_cache()
+        curated = ["gpt-4o"]
+        r1 = ml.merged_models("openai", curated, lambda: (_ for _ in ()).throw(RuntimeError("blip")),
+                              cache_key="k", failure_ttl_s=0.0)
+        self.assertEqual(r1, curated)
+        r2 = ml.merged_models("openai", curated, lambda: ["gpt-5-new"],
+                              cache_key="k", failure_ttl_s=0.0)
+        self.assertIn("gpt-5-new", r2)  # re-fetched, not the stale failure
+        ml.clear_cache()
+
+    def test_live_fetch_success_even_empty_is_cached_for_full_ttl(self):
+        # The flip side: a successful-but-empty result is a real answer and must
+        # be cached (not re-fetched every call) — only failures get the short TTL.
+        from core.llm import model_listing as ml
+        ml.clear_cache()
+        calls = {"n": 0}
+        def empty_ok():
+            calls["n"] += 1
+            return []
+        ml.merged_models("openai", ["gpt-4o"], empty_ok, cache_key="k2", ttl_s=300.0)
+        ml.merged_models("openai", ["gpt-4o"], empty_ok, cache_key="k2", ttl_s=300.0)
+        self.assertEqual(calls["n"], 1)  # second call served from cache
+        ml.clear_cache()
+
+    def test_reasoning_model_param_contract(self):
+        # o-series reasoning models reject temperature/top_p and require
+        # max_completion_tokens (verified vs platform.openai.com 2026-06).
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.types import LLMRequest
+        p = OpenAIProvider()
+        rp = p._common_params(LLMRequest(model="o3-mini", temperature=0.3, top_p=0.9, max_tokens=500))
+        self.assertNotIn("temperature", rp)
+        self.assertNotIn("top_p", rp)
+        self.assertNotIn("max_tokens", rp)
+        self.assertEqual(rp["max_completion_tokens"], 500)
+        # gpt-* keep the legacy shape (and compat-endpoint friendliness)
+        gp = p._common_params(LLMRequest(model="gpt-4o-mini", temperature=0.3, max_tokens=500))
+        self.assertEqual(gp["temperature"], 0.3)
+        self.assertEqual(gp["max_tokens"], 500)
+        self.assertNotIn("max_completion_tokens", gp)
+        # gpt-4o must NOT be misdetected as reasoning (it ends in 'o', not o\d)
+        self.assertFalse(OpenAIProvider._is_reasoning_model("gpt-4o"))
+        self.assertTrue(OpenAIProvider._is_reasoning_model("o1-preview"))
 
     def test_health_check_requires_key(self):
         from core.llm.adapters.openai import OpenAIProvider
@@ -752,6 +891,27 @@ class TestOpenAIAdapter(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestLocalAdapter(unittest.TestCase):
+    def test_effective_local_timeout_quantizes_to_bound_client_cache(self):
+        # Audit finding #1: the agent feeds a continuously-varying remaining-
+        # deadline float as the ollama client timeout, and OllamaProvider._client
+        # caches one client+httpx pool per distinct (host, timeout). Without ceil
+        # quantization that cache grows unboundedly (fd/memory leak). Verify the
+        # varying sub-second floats collapse to a single integer-second bucket.
+        from core.llm.adapters.local import _effective_local_timeout
+        from core.llm.types import LLMRequest
+        # Pin the configured local timeout to "unset" so only request.timeout_s
+        # drives the result (immune to any persisted local_request_timeout_s).
+        with patch("core.providers.base.local_request_timeout", return_value=None):
+            buckets = {
+                _effective_local_timeout(LLMRequest(model="m", timeout_s=t))
+                for t in (29.8, 29.831, 29.861, 29.89, 29.918, 29.999, 30.0)
+            }
+            self.assertEqual(buckets, {30.0})  # all collapse → bounded cache key space
+            # ceil never rounds DOWN (a call is never cut shorter than intended)
+            self.assertEqual(_effective_local_timeout(LLMRequest(model="m", timeout_s=12.01)), 13.0)
+            # no timeout anywhere → None (leave the SDK default)
+            self.assertIsNone(_effective_local_timeout(LLMRequest(model="m", timeout_s=None)))
+
     def test_health_check_delegates(self):
         from core.llm.adapters.local import LocalLLMProvider
         p = LocalLLMProvider("ollama")

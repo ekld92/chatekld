@@ -1,8 +1,9 @@
 // Settings window: the single editor for LLM/RAG parameters that previously
 // had no UI (online timeout/retries/tokens, fallback policy, reranker
-// device/model, vector backend, prewarm) plus the persistence for the Single
-// Paper and Deck generation knobs (paper_* / deck_*), which the existing
-// summarizer.js / deck.js still read by id and send per-request.
+// device/model, vector backend, prewarm, vision/OCR timeout + token caps)
+// plus the persistence for the Single Paper and Deck generation knobs
+// (paper_* / deck_*), which the existing summarizer.js / deck.js still read by
+// id and send per-request.
 //
 // The vault chat knobs, OCR/Vision selects and provider/model selectors live
 // inside the same modal but are owned by vault.js / config.js respectively —
@@ -22,6 +23,9 @@ const _NUMERIC_FIELDS = [
     ['set-online-max-tokens', 'online_max_tokens', 'int'],
     ['set-agent-wall-clock', 'agent_wall_clock_s', 'int'],
     ['set-local-timeout', 'local_request_timeout_s', 'int'],
+    ['set-vision-timeout', 'vision_timeout_s', 'int'],
+    ['set-vision-max-tokens', 'vision_max_tokens', 'int'],
+    ['set-ocr-max-tokens', 'ocr_max_tokens', 'int'],
     ['set-reranker-model', 'vault_reranker_model', 'string'],
     ['doc-ctx', 'paper_num_ctx', 'int'],
     ['doc-predict', 'paper_max_tokens', 'int'],
@@ -31,6 +35,8 @@ const _NUMERIC_FIELDS = [
     ['deck-max-sections', 'deck_max_sections', 'int'],
     ['deck-agent-iters', 'deck_agent_max_iterations', 'int'],
     ['deck-temp', 'deck_temperature', 'float'],
+    ['set-chat-temp', 'chat_temperature', 'float'],
+    ['set-chat-system-prompt', 'chat_system_prompt', 'string'],
 ];
 const _SELECT_FIELDS = [
     ['set-reranker-device', 'vault_reranker_device'],
@@ -50,6 +56,9 @@ export function initSettings(cfg) {
     _setVal('set-online-max-tokens', cfg.online_max_tokens ?? 4096);
     _setVal('set-agent-wall-clock', cfg.agent_wall_clock_s ?? 300);
     _setVal('set-local-timeout', cfg.local_request_timeout_s ?? 0);
+    _setVal('set-vision-timeout', cfg.vision_timeout_s ?? 120);
+    _setVal('set-vision-max-tokens', cfg.vision_max_tokens ?? 1536);
+    _setVal('set-ocr-max-tokens', cfg.ocr_max_tokens ?? 4096);
     _setVal('set-reranker-model', cfg.vault_reranker_model ?? '');
     _setVal('doc-ctx', cfg.paper_num_ctx ?? 32768);
     _setVal('doc-predict', cfg.paper_max_tokens ?? 4096);
@@ -59,6 +68,10 @@ export function initSettings(cfg) {
     _setVal('deck-max-sections', cfg.deck_max_sections ?? 8);
     _setVal('deck-agent-iters', cfg.deck_agent_max_iterations ?? 6);
     _setVal('deck-temp', cfg.deck_temperature ?? 0.3);
+    // Plain Chat knobs. `??` (nullish) so a persisted empty system prompt ("")
+    // stays empty rather than reverting to the default placeholder text.
+    _setVal('set-chat-temp', cfg.chat_temperature ?? 0.3);
+    _setVal('set-chat-system-prompt', cfg.chat_system_prompt ?? 'You are a helpful assistant.');
 
     _setSelectVal('set-reranker-device', cfg.vault_reranker_device ?? 'auto');
     _setSelectVal('set-vector-backend', cfg.vault_vector_backend ?? 'simple');
@@ -87,7 +100,10 @@ function _wire() {
         const el = document.getElementById(id);
         if (!el) continue;
         el.addEventListener('change', debounce);
-        if (el.type === 'range' || el.type === 'number' || el.type === 'text') {
+        // Live-save on every keystroke/drag for text-like and range controls.
+        // A <textarea> reports el.type === 'textarea' (NOT 'text'), so it must be
+        // listed explicitly or the chat system-prompt would only save on blur.
+        if (el.type === 'range' || el.type === 'number' || el.type === 'text' || el.type === 'textarea') {
             el.addEventListener('input', debounce);
         }
     }

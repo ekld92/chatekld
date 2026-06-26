@@ -1,4 +1,4 @@
-"""Ensure the papermind project root is on sys.path for the audit unit tests.
+"""Ensure the ChatEKLD project root is on sys.path for the audit unit tests.
 
 The root ``conftest.py`` handles app-module eviction (see its docstring)
 but does not touch ``sys.path``.  When pytest collects test files nested

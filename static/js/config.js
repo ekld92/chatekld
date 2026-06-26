@@ -1,3 +1,16 @@
+/**
+ * Provider / model configuration controller. Owns the provider, chat-model,
+ * embedding-model, and OCR/Vision provider+model selectors, and the Ollama
+ * model-pull flow. Imports only ui.js + api.js (per the JS module hierarchy);
+ * it must NEVER import app.js — that is what the cycle-free `updateProviderBadge`
+ * placement in ui.js exists to permit.
+ *
+ * Online providers (openai/anthropic/google) are chat-only, so when one is
+ * active the embedding list is repopulated from a LOCAL provider via
+ * /api/vision-models (see _populateEmbeddingsFromLocal). Each online provider
+ * remembers its own chat model in a distinct config field
+ * (openai_model/anthropic_model/google_model), resolved by _resolveSavedChatModel.
+ */
 import { secureFetch, readSSE } from './api.js';
 import { updateProviderBadge, taskBegin, taskEnd, isOnlineProvider } from './ui.js';
 
@@ -15,6 +28,11 @@ const _ONLINE_MODEL_KEYS = {
     google: 'google_model',
 };
 
+/**
+ * Fetch /api/config and prime every config-owned control + the module's cached
+ * provider/model state. Returns the raw config object so app.js init can pass it
+ * on to the other modules' initialisers without a second GET.
+ */
 export async function loadConfig() {
     const resp = await secureFetch('/api/config');
     const data = await resp.json();
@@ -56,6 +74,12 @@ function _resolveSavedChatModel(config, provider) {
     return config.llm || '';
 }
 
+/**
+ * Persist a provider switch and refresh everything that depends on it: re-reads
+ * the saved chat model (each online provider stores its own), updates the badge,
+ * toggles the Ollama-only Pull button, broadcasts a `providerChanged` window
+ * event for other tabs to react to, then reloads the model lists.
+ */
 export async function onProviderChange() {
     const providerSelect = document.getElementById('provider-select');
     const newProvider = providerSelect.value;
@@ -112,6 +136,13 @@ async function onEmbedProviderChange() {
     }
 }
 
+/**
+ * Populate the chat- and embedding-model selectors from /api/models. For local
+ * providers the single returned list is split heuristically into generative vs
+ * embedding models (by name); for online providers the list is chat-only and the
+ * embedding selector is filled separately from a local provider. Restores the
+ * persisted selection when it is still a valid option, then saves.
+ */
 export async function loadModels() {
     const resp = await secureFetch('/api/models');
     const data = await resp.json();
@@ -215,6 +246,11 @@ async function _populateEmbeddingsFromLocal(embedSelect) {
     }
 }
 
+/**
+ * Populate both the OCR and Vision provider+model selectors and persist the
+ * resolved selections. OCR/Vision settings are independent of the chat provider
+ * (see Provider Rules) — they always target a local provider (Ollama/LM Studio).
+ */
 export async function loadVisionModels() {
     await loadVisionModelSelect('ocr');
     await loadVisionModelSelect('vision');
@@ -278,14 +314,23 @@ function populateModelSelect(select, models, selected, fallback) {
     }
 }
 
+/** The currently-active chat provider (cached; read by vault.js / summarizer.js). */
 export function getActiveProvider() { return _activeProvider; }
+/** The selected chat model — the live <select> value, falling back to the cache. */
 export function getSelectedModel() {
     return document.getElementById('model-select')?.value || _configModel;
 }
+/** The selected embedding model — the live <select> value, falling back to the cache. */
 export function getSelectedEmbed() {
     return document.getElementById('embed-select')?.value || _configEmbed;
 }
 
+/**
+ * Persist the current chat + embedding model selections to /api/config. Only
+ * non-empty fields are sent; /api/config routes `llm` per the Provider Rules
+ * (into the active online provider's field, or the local `llm`). No-ops when
+ * nothing is selected.
+ */
 export async function saveSelectedModels() {
     const llm = getSelectedModel();
     const embed = getSelectedEmbed();
@@ -301,6 +346,7 @@ export async function saveSelectedModels() {
     });
 }
 
+/** Persist the OCR + Vision provider/model selections to /api/config. */
 export async function saveVisionModels() {
     const ocrProvider = document.getElementById('ocr-provider-select')?.value || _configOcrProvider;
     const ocr = document.getElementById('ocr-model-select')?.value || _configOcrModel;
@@ -330,6 +376,11 @@ export async function saveVisionModels() {
     });
 }
 
+/**
+ * Pull an Ollama model (Ollama-only feature). Streams /api/pull progress via SSE,
+ * driving a determinate progress bar from the `completed`/`total` byte counts,
+ * then reloads the model list so the new model is selectable.
+ */
 export async function pullModel() {
     const model = document.getElementById('pull-model-input').value.trim();
     if (!model) return;

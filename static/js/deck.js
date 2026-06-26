@@ -33,6 +33,7 @@ function _addActivity(text, muted = false) {
 
 // --- Template loading -------------------------------------------------------
 
+/** Native-pick a template .tex/.sty, fill the path input, and load it. */
 export async function pickTemplateFile() {
     try {
         const r = await secureFetch('/api/deck/native-pick-file', { method: 'POST' });
@@ -44,6 +45,7 @@ export async function pickTemplateFile() {
     } catch (e) { logError('Template pick failed', e); }
 }
 
+/** Native-pick the output folder for the scaffolded deck. */
 export async function pickOutDir() {
     try {
         const r = await secureFetch('/api/deck/native-pick-folder', { method: 'POST' });
@@ -52,6 +54,11 @@ export async function pickOutDir() {
     } catch (e) { logError('Output folder pick failed', e); }
 }
 
+/**
+ * Validate + scan the template at the path input (/api/deck/load-template),
+ * load its .tex into the editor, default the output dir to the detected suite
+ * root, and render the macro/bibliography hint.
+ */
 export async function loadTemplate() {
     const path = ($('deck-template-path').value || '').trim();
     if (!path) { _status('Enter or browse to a template .tex/.sty first.', true); return; }
@@ -108,6 +115,14 @@ function _renderTemplateHint(d) {
 
 // --- Generation -------------------------------------------------------------
 
+/**
+ * Generate the deck (emit-only). POSTs the topic + edited template + knobs and
+ * streams the SSE trace: `{info}` activity, the agent frames
+ * (iteration/tool_call/tool_result) shown as muted lines, and the terminal
+ * `{deck}` frame rendered by _renderDeck. `thought` frames are deliberately
+ * suppressed as noise; a non-200 (pre-stream reject) is surfaced and aborted so
+ * the UI never hangs on "Generating…".
+ */
 export async function generate() {
     if (_generating) return;
     const topic = ($('deck-topic').value || '').trim();

@@ -41,6 +41,14 @@ def _since_iso_for_window(window: str) -> str | None:
 
 @usage_bp.route("/api/usage", methods=["GET"])
 def api_usage():
+    """Return token/USD usage for a time window plus the recent request log.
+
+    ``?window=`` is enum-clamped against ``_WINDOW_TO_DAYS`` (default ``month``)
+    and turned into an ISO cutoff by :func:`_since_iso_for_window` (``all`` ⇒
+    no cutoff). ``?recent=`` (clamped 0-200, default 25) bounds how many recent
+    per-request records are returned alongside the aggregated summary.
+    Local-origin gated.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     window = request.args.get("window", "month")
@@ -62,6 +70,12 @@ def api_usage():
 
 @usage_bp.route("/api/pricing", methods=["GET"])
 def api_pricing():
+    """Return the per-model input/output/cached-input USD rates.
+
+    Flattens ``PRICING_TABLE`` (already merged with any
+    ``llm_pricing_overrides``) into a ``{model: {input, output, cached_input}}``
+    map so the UI can display/estimate costs. Local-origin gated.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     return jsonify({

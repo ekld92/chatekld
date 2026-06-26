@@ -2,7 +2,7 @@
 
 Vendored from kb_harmonizer with the original ``Settings.load()`` removed
 in favour of :func:`load_settings`, which reads the audit-specific keys
-from papermind's ``config.json``. Every subpath that was hardcoded in the
+from ChatEKLD's ``config.json``. Every subpath that was hardcoded in the
 upstream version (``biblio_articles`` subfolder, ``Z_Zotero_Notes``
 subfolder, master bib path) is now exposed as a configurable key.
 
@@ -20,7 +20,7 @@ from pathlib import Path
 DEFAULT_ATTACHMENTS_SUBDIR = "Z_attachments"
 DEFAULT_BIBLIO_ARTICLES_SUBDIR = "biblio_articles"
 DEFAULT_ZOTERO_NOTES_SUBDIR = "Z_Zotero_Notes"
-DEFAULT_MASTER_BIB_PATH = "presentations_slides_writings_teaching/_master.bib"
+DEFAULT_MASTER_BIB_PATH = "_master.bib"
 DEFAULT_ZOTERO_SQLITE = "~/Zotero/zotero.sqlite"
 DEFAULT_ZOTERO_STORAGE = "~/Zotero/storage"
 DEFAULT_ANNOTATIONS_READ_THRESHOLD = 5
@@ -80,24 +80,29 @@ class Settings:
 
     @property
     def master_bib(self) -> Path:
+        """Absolute path to ``_master.bib`` (vault root + configured subpath)."""
         return self.vault_root / self.master_bib_path
 
     @property
     def mapping_file(self) -> Path:
+        """Path to the manual-mapping override file (test override wins)."""
         if self.mapping_file_override is not None:
             return self.mapping_file_override
         return mapping_file_path()
 
     @property
     def attachments_dir(self) -> Path:
+        """Absolute path to the ``Z_attachments`` tree (duplicate-scan root)."""
         return self.vault_root / self.attachments_subdir
 
     @property
     def biblio_articles_dir(self) -> Path:
+        """Absolute path to ``biblio_articles`` — the active-PDF set's root."""
         return self.attachments_dir / self.biblio_articles_subdir
 
     @property
     def zotero_notes_dir(self) -> Path:
+        """Absolute path to ``Z_Zotero_Notes`` (the per-key markdown notes)."""
         return self.vault_root / self.zotero_notes_subdir
 
 
@@ -106,7 +111,7 @@ class AuditConfigError(ValueError):
 
 
 def load_settings() -> Settings:
-    """Build a :class:`Settings` from papermind's persisted config.
+    """Build a :class:`Settings` from ChatEKLD's persisted config.
 
     Raises :class:`AuditConfigError` when the Obsidian vault path is not
     configured, since every report depends on the vault root.

@@ -37,7 +37,11 @@ def get_llm_provider(name: str, cfg: Optional[dict] = None) -> LLMProvider:
                 pass
         if "online_max_retries" in cfg:
             try:
-                online_kwargs["max_retries"] = int(cfg["online_max_retries"])
+                # Clamp to the same [0, 10] range the POST /api/config validator
+                # enforces, so a hand-edited config.json (which bypasses that
+                # validator) cannot make the retry loop attempt hundreds of
+                # round-trips and outlast the SSE consumer's stall guard.
+                online_kwargs["max_retries"] = max(0, min(int(cfg["online_max_retries"]), 10))
             except (TypeError, ValueError):
                 pass
     if key == "openai":
@@ -132,8 +136,10 @@ __all__ = [
 
 
 def is_online(name: Optional[str]) -> bool:
+    """True if *name* is one of the online (chat-only) providers."""
     return (name or "").strip().lower() in ONLINE_PROVIDER_NAMES
 
 
 def is_local(name: Optional[str]) -> bool:
+    """True if *name* is one of the local (embedding-capable) providers."""
     return (name or "").strip().lower() in LOCAL_PROVIDER_NAMES

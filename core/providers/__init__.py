@@ -29,6 +29,17 @@ _LOCAL_PROVIDER_NAMES = frozenset({"ollama", "lm_studio"})
 
 
 def get_provider(provider_name: Optional[str] = None) -> "Provider":
+    """Return a LOCAL :class:`Provider`, always — never an online adapter.
+
+    Resolution order: an explicit *provider_name*, else the persisted
+    ``provider`` config key (default ``ollama``). When the name is an ONLINE
+    provider (``openai``/``anthropic``/``google``), it is silently substituted
+    with the configured local embed provider via
+    :func:`core.config.resolve_embed_provider`, so the indexer / embedding paths
+    keep a working local model even while chat runs online. A fresh provider
+    instance is returned on each call (the ollama HTTP client is cached at module
+    scope, so this stays cheap).
+    """
     if provider_name is None:
         cfg = load_config()
         provider_name = cfg.get("provider", "ollama")

@@ -1,3 +1,11 @@
+/**
+ * Shared UI primitives — the activity bar, accessibility announcers, recoverable
+ * error boundaries, modal/tab/tablist wiring, the provider badge, clipboard, and
+ * the HTML sanitiser. A LEAF module in the JS module hierarchy: it imports only
+ * api.js (for logError) and nothing else from the project, so every feature
+ * module can depend on it without a circular import. `updateProviderBadge` lives
+ * here precisely so config.js and app.js can both import it without a cycle.
+ */
 import { logError } from './api.js';
 
 const _activeTasks = new Map();
@@ -5,6 +13,11 @@ let _modalTrigger = null;
 let _modalKeyHandler = null;
 const _MODAL_FOCUSABLE_SELECTOR = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href]';
 
+/**
+ * Register a long-running task under `id` with a user-visible `label`. Tasks are
+ * keyed by id so concurrent operations each show in the activity bar; call
+ * taskEnd(id) to clear one. Re-registering the same id replaces its label.
+ */
 export function taskBegin(id, label) {
     _activeTasks.set(id, label);
     renderActivityBar();
@@ -37,6 +50,11 @@ export function announceError(message) {
     });
 }
 
+/**
+ * Set a status element's text plus the ARIA role/live-region pair appropriate to
+ * its severity: errors become an assertive alert (and are echoed to the global
+ * screen-reader announcer) while non-errors are a polite status update.
+ */
 export function setStatusA11y(el, message, isError) {
     if (!el) return;
     el.textContent = message;
@@ -193,6 +211,11 @@ const _PROVIDER_COLORS = {
     google: '#4285f4',
 };
 
+/**
+ * Recolour + relabel the header provider badge for the active provider. Lives in
+ * this leaf module so both config.js and app.js can import it without a cycle.
+ * An unknown provider falls back to the Ollama label/colour.
+ */
 export function updateProviderBadge(provider) {
     const label = _PROVIDER_LABELS[provider] || provider || 'Ollama';
     const color = _PROVIDER_COLORS[provider] || '#34c759';
@@ -224,6 +247,13 @@ export function copyToClipboard(text, btn) {
     });
 }
 
+/**
+ * Best-effort HTML sanitiser for rendered-markdown output. Parses the string in
+ * an inert document, strips active/embedding elements (script/style/iframe/
+ * object/embed/form) and every event-handler (on*) or `javascript:` attribute,
+ * and returns the cleaned innerHTML. Applied to the output of `marked.parse`
+ * before it is assigned anywhere (see vault.js / plainchat.js / refactor.js).
+ */
 export function sanitiseHtml(html) {
     const doc = new DOMParser().parseFromString(html || '', 'text/html');
     doc.querySelectorAll('script, style, iframe, object, embed, form').forEach(el => el.remove());

@@ -54,6 +54,26 @@ _FINISH_REASONS: dict[str, FinishReason] = {
 
 
 class GoogleProvider(LLMProvider):
+    """Online chat adapter for the Google Gemini ``v1beta`` REST API.
+
+    Speaks raw ``httpx`` rather than the optional Gemini SDK so the adapter has
+    no hard dependency on that package. Wire-format specifics it owns:
+
+    * Auth is a ``?key=`` query parameter (not a header); the model + method are
+      in the path (``/v1beta/models/<model>:generateContent`` vs
+      ``:streamGenerateContent``, the latter with ``?alt=sse``).
+    * Messages are ``contents`` parts and the system prompt is a top-level
+      ``systemInstruction``; sampling/limit knobs live under
+      ``generationConfig`` with Gemini's own names (``topP``,
+      ``maxOutputTokens``, ``stopSequences``).
+    * Tools are ``function_declarations`` and tool-calling mode is set via
+      ``toolConfig.functionCallingConfig.mode`` (AUTO/ANY/NONE). Gemini ties a
+      response to a call by *name*, not id, so the adapter synthesises ids (see
+      :func:`parse_gemini_function_call`).
+    * Usage comes from ``usageMetadata`` (``promptTokenCount`` /
+      ``candidatesTokenCount`` / ``cachedContentTokenCount``).
+    """
+
     name = "google"
 
     def __init__(
@@ -64,12 +84,24 @@ class GoogleProvider(LLMProvider):
         timeout_s: float = 60.0,
         max_retries: int = 3,
     ) -> None:
+        """Stash connection settings; the ``httpx`` client is built per call.
+
+        ``timeout_s`` / ``max_retries`` come from ``online_timeout_s`` /
+        ``online_max_retries`` via :func:`core.llm.factory.get_llm_provider`.
+        """
         self._explicit_key = api_key
         self._explicit_base_url = base_url
         self.timeout_s = timeout_s
         self.max_retries = max_retries
 
     def _api_key(self) -> str:
+        """Resolve the key at call time (``GOOGLE_API_KEY``, then legacy
+        ``GEMINI_API_KEY``), or raise AUTH.
+
+        Read from the environment on every call (never persisted) so a key set
+        post-launch applies without restart, and so the live model listing makes
+        no network call when no key is set.
+        """
         key = (
             self._explicit_key
             or os.environ.get("GOOGLE_API_KEY")
@@ -84,6 +116,8 @@ class GoogleProvider(LLMProvider):
         return key
 
     def _base_url(self) -> str:
+        """API base (``GOOGLE_BASE_URL`` or the public endpoint), trailing slash
+        stripped."""
         return (
             self._explicit_base_url
             or os.environ.get("GOOGLE_BASE_URL")
@@ -91,6 +125,7 @@ class GoogleProvider(LLMProvider):
         ).rstrip("/")
 
     def _httpx(self):
+        """Import ``httpx`` lazily, raising INVALID_REQUEST if it is missing."""
         try:
             import httpx
         except ImportError as exc:
@@ -102,15 +137,62 @@ class GoogleProvider(LLMProvider):
         return httpx
 
     def supports_embeddings(self) -> bool:
+        """Online providers are chat-only; embeddings resolve to a local
+        provider."""
         return False
 
     def supports_tool_use(self) -> bool:
+        """Gemini supports ``function_declarations`` / ``functionCall``."""
         return True
 
     def list_models(self) -> tuple[list[str], str]:
-        return list(CURATED_MODELS), ""
+        """Curated models plus any the live ``/v1beta/models`` endpoint reports
+        that support ``generateContent`` (cached, key-gated). Falls back to
+        curated-only without a key, offline, or on any error — see
+        ``core.llm.model_listing``."""
+        from core.llm.model_listing import merged_models
+        models = merged_models(
+            self.name, CURATED_MODELS, self._fetch_live_models,
+            cache_key=f"google:{self._base_url()}",
+        )
+        return models, ""
+
+    def _fetch_live_models(self) -> list[str]:
+        """Chat-capable Gemini model ids from ``/v1beta/models``.
+
+        Filters to models advertising ``generateContent`` (drops embedding /
+        imagen / aqa entries) and strips the ``models/`` name prefix.
+        ``_api_key()`` raises AUTH (→ no network) when no key is set; errors
+        propagate to ``merged_models`` (→ curated only)."""
+        httpx = self._httpx()
+        with httpx.Client(timeout=min(self.timeout_s, 10.0)) as client:
+            # No `pageToken` pagination: pageSize=1000 (the endpoint max) dwarfs
+            # the few-dozen Gemini models, so a single page is always complete.
+            resp = client.get(
+                f"{self._base_url()}/v1beta/models",
+                params={"key": self._api_key(), "pageSize": 1000},
+            )
+        if resp.status_code >= 400:
+            return []
+        out: list[str] = []
+        for item in (resp.json().get("models") or []):
+            if not isinstance(item, dict):
+                continue
+            methods = (
+                item.get("supportedGenerationMethods")
+                or item.get("supported_generation_methods")
+                or []
+            )
+            if "generateContent" not in methods:
+                continue
+            name = item.get("name") or ""  # "models/gemini-2.5-pro"
+            mid = name.split("/", 1)[1] if name.startswith("models/") else name
+            if mid:
+                out.append(mid)
+        return out
 
     def health_check(self) -> tuple[bool, str]:
+        """``ok`` iff a key is present — key-presence only, no network call."""
         try:
             self._api_key()
             return True, ""
@@ -118,6 +200,14 @@ class GoogleProvider(LLMProvider):
             return False, err.message
 
     def _build_payload(self, request: LLMRequest) -> dict:
+        """Assemble the Gemini request body (shared by stream + non-stream).
+
+        Maps the request onto ``contents`` + ``generationConfig`` +
+        ``systemInstruction`` + ``tools``/``toolConfig``, using Gemini's field
+        names (``topP``, ``maxOutputTokens``, ``stopSequences``) and translating
+        ``tool_choice`` into the ``functionCallingConfig.mode`` enum
+        (AUTO/ANY/NONE).
+        """
         payload: dict = {"contents": build_gemini_contents(request)}
 
         generation_config: dict = {}
@@ -154,17 +244,28 @@ class GoogleProvider(LLMProvider):
         return payload
 
     def _build_url(self, model: str, *, stream: bool) -> str:
+        """Build the per-method endpoint URL (the model + method live in the
+        path: ``:generateContent`` vs ``:streamGenerateContent``)."""
         method = "streamGenerateContent" if stream else "generateContent"
         base = self._base_url()
         return f"{base}/v1beta/models/{model}:{method}"
 
     def _params(self, *, stream: bool) -> dict[str, str]:
+        """Query params: the ``key`` (Gemini auths via query string) plus
+        ``alt=sse`` to request the SSE framing for streaming."""
         params: dict[str, str] = {"key": self._api_key()}
         if stream:
             params["alt"] = "sse"
         return params
 
     def generate(self, request: LLMRequest) -> LLMResponse:
+        """Non-streaming completion via a single POST to ``:generateContent``.
+
+        Extracts text + tool calls + finish reason from the ``candidates``
+        (promoting STOP→TOOL_USE when calls are present but the model still
+        reported STOP), reads usage from ``usageMetadata``, and wraps the whole
+        call in :func:`retry_with_backoff`.
+        """
         httpx = self._httpx()
         start = time.monotonic()
 
@@ -224,6 +325,17 @@ class GoogleProvider(LLMProvider):
         return retry_with_backoff(_do_call, max_attempts=self.max_retries)
 
     def stream(self, request: LLMRequest) -> StreamingResponse:
+        """Streaming completion over Gemini's ``?alt=sse`` ``data:`` stream.
+
+        Each ``data:`` line is a full ``GenerateContentResponse`` fragment;
+        :func:`_extract_text_and_finish` pulls the incremental text and finish
+        reason, and ``usageMetadata`` (present on later fragments) supplies the
+        running token counts. NOTE: tool calls are NOT surfaced on the streaming
+        path (tool use goes through :meth:`generate`). As with the other
+        adapters, not retried and the fallback layer only switches before the
+        first token; a mid-stream failure becomes ``final.error`` and is
+        re-raised, with usage still recorded in the ``finally``.
+        """
         httpx = self._httpx()
         start = time.monotonic()
         final = LLMResponse(provider=self.name, model=request.model)
@@ -311,6 +423,9 @@ class GoogleProvider(LLMProvider):
 
 
 def _extract_text_finish_and_calls(body: dict) -> tuple[str, FinishReason, list]:
+    """Walk a Gemini response body's ``candidates[].content.parts`` and pull out
+    the concatenated text, parsed ``functionCall`` tool calls, and the mapped
+    finish reason (unknown reasons map to OTHER)."""
     text_parts: list[str] = []
     tool_calls: list = []
     finish = FinishReason.STOP
@@ -340,6 +455,7 @@ def _extract_text_and_finish(body: dict) -> tuple[str, FinishReason]:
 
 
 def _usage_from_body(body: dict) -> LLMUsage:
+    """Read token usage from a response's ``usageMetadata`` block."""
     meta = body.get("usageMetadata") or {}
     return LLMUsage(
         input_tokens=int(meta.get("promptTokenCount", 0) or 0),
@@ -355,6 +471,14 @@ def _http_error_to_llm_error(
     *,
     body_text: Optional[str] = None,
 ) -> LLMError:
+    """Map a ≥400 Gemini HTTP response onto a normalised :class:`LLMError`.
+
+    Prefers the provider's ``error.message``, categorises by status, and sets
+    ``retryable`` for the transient categories. Only a RATE_LIMIT/INVALID_REQUEST
+    whose message :func:`looks_like_quota` recognises is promoted to terminal
+    QUOTA — Gemini's per-minute "Quota exceeded for quota metric …" 429 is NOT
+    matched by those signals, so it correctly stays a retryable RATE_LIMIT.
+    """
     status = resp.status_code
     text = body_text
     if text is None:

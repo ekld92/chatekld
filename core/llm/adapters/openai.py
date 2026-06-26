@@ -46,6 +46,20 @@ CURATED_MODELS: list[str] = [
     "o3-mini",
 ]
 
+# Substrings marking a NON-chat OpenAI model id (embeddings, audio, image,
+# moderation, …) so the live merge doesn't pollute the chat picker. A denylist
+# (not an allowlist) so a new chat family — gpt-6, o5, chatgpt-* — is appended
+# automatically rather than silently filtered out.
+#
+# Deliberately NOT included: "search" and "computer-use" — both match real chat
+# models (gpt-4o-search-preview, computer-use-preview) and would wrongly drop
+# them. The legacy "*-search-*" embedding models are already covered by the
+# "babbage"/"davinci"/"embedding" tokens, so omitting "search" loses nothing.
+_NON_CHAT_OPENAI_TOKENS = (
+    "embedding", "whisper", "tts", "audio", "dall-e", "image", "moderation",
+    "realtime", "transcribe", "babbage", "davinci", "codex", "guard",
+)
+
 _FINISH_REASONS: dict[str, FinishReason] = {
     "stop": FinishReason.STOP,
     "length": FinishReason.LENGTH,
@@ -56,6 +70,27 @@ _FINISH_REASONS: dict[str, FinishReason] = {
 
 
 class OpenAIProvider(LLMProvider):
+    """Online chat adapter for the OpenAI Chat Completions API.
+
+    Implements the provider-agnostic :class:`LLMProvider` contract over the
+    official ``openai`` SDK. The wire format is the SDK's native
+    ``chat.completions.create`` shape — messages built by
+    :func:`build_openai_messages`, tools wrapped as
+    ``{"type": "function", "function": {...}}`` by
+    :func:`jsonschema_to_openai_tool`, and tool calls returned as
+    ``tool_calls[i].function.arguments`` JSON *strings* (parsed by
+    :func:`parse_openai_tool_call`).
+
+    Two parameter contracts coexist: ``gpt-*`` models keep the legacy
+    ``max_tokens`` + sampling params (also the safest shape for
+    OpenAI-compatible ``base_url`` servers), while the o-series reasoning
+    models require ``max_completion_tokens`` and reject ``temperature`` /
+    ``top_p`` — see :meth:`_common_params` / :meth:`_is_reasoning_model`.
+    Retries are handled in-process (``max_retries=0`` on the SDK client +
+    :func:`retry_with_backoff`) so transient/terminal classification stays
+    under the adapter's control.
+    """
+
     name = "openai"
 
     def __init__(
@@ -67,6 +102,14 @@ class OpenAIProvider(LLMProvider):
         timeout_s: float = 60.0,
         max_retries: int = 3,
     ) -> None:
+        """Stash connection settings; the SDK client is built lazily per call.
+
+        ``api_key`` / ``base_url`` are normally left ``None`` so they resolve
+        from the environment at call time (key never persisted to config); the
+        explicit forms exist mostly for tests and OpenAI-compatible endpoints.
+        ``timeout_s`` / ``max_retries`` come from ``online_timeout_s`` /
+        ``online_max_retries`` via :func:`core.llm.factory.get_llm_provider`.
+        """
         self._explicit_key = api_key
         self._explicit_base_url = base_url
         self._organization = organization
@@ -74,6 +117,14 @@ class OpenAIProvider(LLMProvider):
         self.max_retries = max_retries
 
     def _api_key(self) -> str:
+        """Resolve the API key at call time, or raise an AUTH ``LLMError``.
+
+        Read from the environment (``OPENAI_API_KEY``, then the legacy
+        ``OPENAI_KEY``) on every call so a key set after launch is picked up
+        without a restart. Raising AUTH here is what gates the live model
+        listing: ``_fetch_live_models`` builds the client (→ this) before any
+        network call, so a missing key degrades to curated-only with no I/O.
+        """
         key = self._explicit_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")
         if not key:
             raise LLMError(
@@ -87,9 +138,18 @@ class OpenAIProvider(LLMProvider):
         return key
 
     def _base_url(self) -> Optional[str]:
+        """Optional API base override (``OPENAI_BASE_URL``) for OpenAI-compatible
+        servers; ``None`` uses the SDK's default endpoint."""
         return self._explicit_base_url or os.environ.get("OPENAI_BASE_URL")
 
     def _client(self):
+        """Construct a fresh ``openai.OpenAI`` client with in-process retries off.
+
+        ``max_retries=0`` deliberately disables the SDK's own retry loop so the
+        adapter owns transient-vs-terminal classification and backoff via
+        :func:`retry_with_backoff`. Raises an INVALID_REQUEST ``LLMError`` when
+        the SDK is not installed rather than a bare ImportError.
+        """
         try:
             import openai
         except ImportError as exc:
@@ -110,12 +170,20 @@ class OpenAIProvider(LLMProvider):
         return openai.OpenAI(**client_kwargs)
 
     def supports_embeddings(self) -> bool:
+        """Online providers are chat-only; embeddings always resolve to a local
+        provider (see the root CLAUDE.md Provider Rules)."""
         return False
 
     def supports_tool_use(self) -> bool:
+        """OpenAI Chat Completions supports the structured ``tools=`` schema."""
         return True
 
     def health_check(self) -> tuple[bool, str]:
+        """``ok`` iff an API key is present — no network round-trip.
+
+        Mirrors ``/api/status`` semantics for online providers: a True here
+        only asserts the key is set, not that the endpoint is reachable.
+        """
         try:
             self._api_key()
             return True, ""
@@ -123,19 +191,81 @@ class OpenAIProvider(LLMProvider):
             return False, err.message
 
     def list_models(self) -> tuple[list[str], str]:
-        return list(CURATED_MODELS), ""
+        """Curated models plus any chat models the live ``/v1/models`` endpoint
+        reports (cached, key-gated). Falls back to curated-only without a key,
+        offline, or on any error — see ``core.llm.model_listing``."""
+        from core.llm.model_listing import merged_models
+        models = merged_models(
+            self.name, CURATED_MODELS, self._fetch_live_models,
+            cache_key=f"openai:{self._base_url() or ''}",
+        )
+        return models, ""
+
+    def _fetch_live_models(self) -> list[str]:
+        """Chat-capable model ids from the OpenAI models endpoint.
+
+        Constructs the client (which calls ``_api_key()`` — raising AUTH and so
+        making NO network call when no key is set), lists models, and drops the
+        non-chat families. Exceptions propagate to ``merged_models``, which
+        treats them as "use curated only"."""
+        client = self._client()
+        out: list[str] = []
+        for m in client.models.list():
+            mid = getattr(m, "id", "") or (m.get("id") if isinstance(m, dict) else "")
+            low = str(mid).lower()
+            if mid and not any(tok in low for tok in _NON_CHAT_OPENAI_TOKENS):
+                out.append(str(mid))
+        return out
 
     def _build_messages(self, request: LLMRequest) -> list[dict]:
+        """Translate the request (system prompt + messages + tool history) into
+        OpenAI ``messages`` via the shared :func:`build_openai_messages`."""
         return build_openai_messages(request)
 
+    @staticmethod
+    def _is_reasoning_model(model: str) -> bool:
+        """True for the o-series reasoning models (o1, o3, o4, o5, …).
+
+        These have a different Chat Completions parameter contract than the
+        gpt-* models (verified against platform.openai.com, 2026-06): they
+        REQUIRE ``max_completion_tokens`` (the deprecated ``max_tokens`` 400s
+        with "not supported with this model") and REJECT ``temperature`` /
+        ``top_p`` ("Only the default (1) value is supported"). Detect by family
+        prefix — an ``o`` followed by a digit — so a future ``o5``/``o6`` is
+        covered without an allowlist edit, while ``gpt-4o`` (starts with ``g``)
+        is correctly excluded. gpt-5 reasoning variants are intentionally NOT
+        matched here: ``gpt-5-chat`` accepts the sampling params, so name-based
+        detection would mis-strip them; revisit if a gpt-5 reasoning id is added
+        to the curated set.
+        """
+        m = (model or "").lower()
+        return len(m) >= 2 and m[0] == "o" and m[1].isdigit()
+
     def _common_params(self, request: LLMRequest) -> dict:
+        """Build the non-``messages`` kwargs shared by :meth:`generate` and
+        :meth:`stream`, applying the reasoning-vs-chat parameter contract.
+
+        For o-series reasoning models the sampling params are dropped and the
+        token cap is renamed to ``max_completion_tokens`` (the legacy
+        ``max_tokens`` 400s these models); ``gpt-*`` keep ``max_tokens`` +
+        sampling. Tools, when present, are serialised to the OpenAI dialect and
+        ``tool_choice`` defaults to ``"auto"``. See :meth:`_is_reasoning_model`.
+        """
         params: dict = {"model": request.model}
-        if request.temperature is not None:
-            params["temperature"] = request.temperature
-        if request.top_p is not None:
-            params["top_p"] = request.top_p
+        reasoning = self._is_reasoning_model(request.model)
+        # o-series reasoning models reject temperature/top_p and require
+        # max_completion_tokens; gpt-* keep the legacy shape (also safer for
+        # OpenAI-compatible base_url endpoints that may not know the new param).
+        if not reasoning:
+            if request.temperature is not None:
+                params["temperature"] = request.temperature
+            if request.top_p is not None:
+                params["top_p"] = request.top_p
         if request.max_tokens is not None:
-            params["max_tokens"] = request.max_tokens
+            if reasoning:
+                params["max_completion_tokens"] = request.max_tokens
+            else:
+                params["max_tokens"] = request.max_tokens
         if request.stop:
             params["stop"] = request.stop
         if request.tools:
@@ -144,6 +274,15 @@ class OpenAIProvider(LLMProvider):
         return params
 
     def generate(self, request: LLMRequest) -> LLMResponse:
+        """Non-streaming completion: one ``chat.completions.create(stream=False)``
+        call wrapped in :func:`retry_with_backoff`.
+
+        Extracts text, normalised finish reason, token usage (including the
+        cached-prompt-token detail), and any parsed tool calls into an
+        :class:`LLMResponse`, and records the request with the usage tracker.
+        Provider exceptions are normalised to ``LLMError`` by
+        :meth:`_classify_error` so the retry/fallback layers can pattern-match.
+        """
         start = time.monotonic()
         client = self._client()
 
@@ -189,6 +328,18 @@ class OpenAIProvider(LLMProvider):
         return retry_with_backoff(_do_call, max_attempts=self.max_retries)
 
     def stream(self, request: LLMRequest) -> StreamingResponse:
+        """Streaming completion: yield content deltas as they arrive.
+
+        Requests usage on the final chunk (``stream_options={"include_usage":
+        True}``) and accumulates tokens into ``buf`` so the ``final``
+        :class:`LLMResponse` carries the full text + usage once the generator is
+        exhausted. NOTE: this adapter is NOT wrapped in
+        :func:`retry_with_backoff` and the fallback layer only switches
+        providers *before the first token* — a mid-stream failure here is
+        captured as ``final.error`` and re-raised, surfacing to the route as a
+        structured SSE error rather than a silent re-stream of the whole answer.
+        Usage is recorded in the ``finally`` so a failed stream still counts.
+        """
         start = time.monotonic()
         client = self._client()
         final = LLMResponse(provider=self.name, model=request.model)
@@ -252,6 +403,16 @@ class OpenAIProvider(LLMProvider):
         return StreamingResponse(response_gen=_iter(), final=final)
 
     def _classify_error(self, exc: BaseException, model: str) -> LLMError:
+        """Map an SDK/transport exception onto a normalised :class:`LLMError`.
+
+        Categorises first by SDK exception type, then by HTTP status as a
+        fallback, and sets ``retryable`` for the transient categories
+        (timeout/network/rate_limit/server_error). Critically, a RATE_LIMIT that
+        :func:`looks_like_quota` recognises (``insufficient_quota`` and friends)
+        is re-mapped to the terminal QUOTA category so a billing exhaustion
+        surfaces immediately instead of burning retries — keeping it distinct
+        from a transient per-minute 429.
+        """
         if isinstance(exc, LLMError):
             return exc
         try:
@@ -352,6 +513,12 @@ def _openai_tool_call_to_dict(raw) -> dict:
 
 
 def _cached_tokens_from_usage(usage) -> int:
+    """Read OpenAI's prompt-cache hit count from ``usage.prompt_tokens_details``.
+
+    Returns 0 when the field is absent (older models / no cache hit). These
+    cached input tokens are billed at a discount, so the usage tracker records
+    them separately for accurate cost estimation.
+    """
     if usage is None:
         return 0
     details = getattr(usage, "prompt_tokens_details", None)

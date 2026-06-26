@@ -3,6 +3,21 @@
 
 Use after repairing a truncated SimpleVectorStore when docstore/index_store
 still reference nodes whose embeddings were not recovered.
+
+Offline, **app-closed** maintenance tool, and **no re-embedding** — it only
+*removes* dangling references; it never constructs an embedding model or calls a
+provider. Run it after ``repair_simple_vector_store.py`` has recovered whatever
+complete embeddings it could: that repair may leave ``docstore.json`` /
+``index_store.json`` pointing at node ids whose embeddings did not survive, which
+this script trims back so every retained node has a real vector.
+
+Reads, under ``--storage-dir`` (default the app's ``obsidian_storage``):
+``default__vector_store.json`` (the authoritative set of surviving embedding ids),
+``docstore.json``, ``index_store.json``, ``obsidian_meta.json``. Writes (each
+backed up once to a ``.pre-prune`` sibling, atomic temp-then-replace): the pruned
+docstore/index_store, a rebuilt ``indexed_materials.json`` manifest, and an
+``obsidian_meta.json`` marked ``partial`` / ``paused_partial``. ``--dry-run``
+reports the counts without touching any file.
 """
 
 from __future__ import annotations
@@ -22,6 +37,11 @@ PREFIX_SPACED = '{"embedding_dict": {'
 
 
 def _read_more(src, buffer: str, eof: bool) -> tuple[str, bool]:
+    """Append the next ``READ_SIZE`` chunk to *buffer*; return ``(buffer, eof)``.
+
+    The streaming primitive that keeps the parser's memory bounded: a single chunk
+    is read at a time so a multi-GB vector store never has to be loaded whole.
+    """
     if eof:
         return buffer, eof
     chunk = src.read(READ_SIZE)
@@ -31,12 +51,20 @@ def _read_more(src, buffer: str, eof: bool) -> tuple[str, bool]:
 
 
 def _skip_ws(buffer: str, pos: int) -> int:
+    """Advance *pos* past any JSON whitespace in *buffer*; return the new index."""
     while pos < len(buffer) and buffer[pos] in " \t\r\n":
         pos += 1
     return pos
 
 
 def vector_store_ids(path: Path, progress_every: int) -> set[str]:
+    """Stream the keys of ``embedding_dict`` out of a SimpleVectorStore JSON file.
+
+    A hand-rolled streaming JSON walk (it only needs the top-level keys, not the
+    huge embedding *values*) so peak memory stays flat on a multi-GB store. The
+    returned id set is the authoritative "these nodes still have a vector" set the
+    prune functions filter the docstore / index store against.
+    """
     decoder = json.JSONDecoder()
     ids: set[str] = set()
     buffer = ""
@@ -104,6 +132,12 @@ def vector_store_ids(path: Path, progress_every: int) -> set[str]:
 
 
 def atomic_json_write(path: Path, data: dict) -> None:
+    """Write *data* as JSON to *path* atomically (temp sibling + ``os.replace``).
+
+    The temp file is created in the same directory so the final rename is a true
+    same-filesystem atomic swap; a failed write unlinks the temp and re-raises,
+    never leaving a half-written store in place.
+    """
     fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", text=True)
     temp_path = Path(temp_name)
     try:
@@ -119,6 +153,12 @@ def atomic_json_write(path: Path, data: dict) -> None:
 
 
 def backup_once(path: Path) -> Path:
+    """Copy *path* to ``<name>.pre-prune`` once; refuse if that backup exists.
+
+    Refusing rather than overwriting protects the *original* pre-prune copy: a
+    second run must not clobber the only untouched snapshot with already-pruned
+    data. Delete the ``.pre-prune`` files by hand once the prune is verified good.
+    """
     backup = path.with_name(path.name + ".pre-prune")
     if backup.exists():
         raise RuntimeError(f"Refusing to overwrite existing backup {backup}")
@@ -127,6 +167,13 @@ def backup_once(path: Path) -> Path:
 
 
 def prune_docstore(path: Path, ids: set[str], *, dry_run: bool = False) -> tuple[int, int]:
+    """Drop docstore nodes (and ref-doc node-id lists) not backed by a vector in *ids*.
+
+    Rewrites ``docstore/ref_doc_info`` (each entry's ``node_ids`` filtered, the
+    entry dropped if none survive), ``docstore/data`` and ``docstore/metadata`` to
+    the retained ids, then writes atomically (after a one-time backup) unless
+    *dry_run*. Returns ``(kept_node_count, kept_ref_doc_count)``.
+    """
     print(f"Loading docstore {path}...", flush=True)
     with path.open("r", encoding="utf-8") as f:
         docstore = json.load(f)
@@ -168,6 +215,13 @@ def prune_docstore(path: Path, ids: set[str], *, dry_run: bool = False) -> tuple
 
 
 def prune_index_store(path: Path, ids: set[str], *, dry_run: bool = False) -> int:
+    """Filter the index store's ``nodes_dict`` to node ids that survive in *ids*.
+
+    The index store nests its node map as a JSON string under ``__data__``; this
+    parses it, keeps only entries whose key *and* value are still vector-backed,
+    re-serializes it, and writes atomically (after a backup) unless *dry_run*.
+    Returns the total retained node count across all index entries.
+    """
     with path.open("r", encoding="utf-8") as f:
         index_store = json.load(f)
     entries = index_store.get("index_store/data", {})
@@ -192,6 +246,14 @@ def prune_index_store(path: Path, ids: set[str], *, dry_run: bool = False) -> in
 
 
 def rebuild_manifest(path: Path, docstore_path: Path, meta_path: Path, *, dry_run: bool = False) -> int:
+    """Rebuild ``indexed_materials.json`` from the (already-pruned) docstore.
+
+    Re-derives the per-source material list (source path, extension, surviving
+    chunk count) from the pruned ``docstore/ref_doc_info`` so the UI's
+    indexed-material manifest matches what is actually retrievable. Preserves
+    ``vault_path``/``indexed_at`` from the previous manifest (falling back to
+    ``obsidian_meta.json`` for ``indexed_at``). Returns the material count.
+    """
     with docstore_path.open("r", encoding="utf-8") as f:
         docstore = json.load(f)
     ref_info = docstore.get("docstore/ref_doc_info", {})
@@ -237,6 +299,13 @@ def rebuild_manifest(path: Path, docstore_path: Path, meta_path: Path, *, dry_ru
 
 
 def update_meta(path: Path, vector_count: int, *, dry_run: bool = False) -> None:
+    """Stamp ``obsidian_meta.json`` as a repaired *partial* index.
+
+    Sets ``repaired_at`` / ``repaired_vector_count`` and flips the index into the
+    ``partial`` / ``paused_partial`` state so the app treats it as a usable but
+    incomplete index (the user can resume indexing) rather than a clean full one.
+    Writes atomically after a one-time backup unless *dry_run*.
+    """
     with path.open("r", encoding="utf-8") as f:
         meta = json.load(f)
     meta["repaired_at"] = datetime.now(timezone.utc).isoformat()
@@ -251,6 +320,10 @@ def update_meta(path: Path, vector_count: int, *, dry_run: bool = False) -> None
 
 
 def main() -> int:
+    """Parse args and run the prune pipeline (vector ids → docstore/index/manifest/meta).
+
+    Returns a process exit code (0 on success).
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--storage-dir", default=os.path.expanduser("~/Library/Application Support/ChatEKLD/obsidian_storage"))
     parser.add_argument("--progress-every", type=int, default=10_000)

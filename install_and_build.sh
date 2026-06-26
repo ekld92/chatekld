@@ -54,11 +54,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # polluting git status and prevents PyInstaller from accidentally bundling the
 # venv into the .app. Default to a portable $HOME-relative path so the installer
 # works for any user (the previous hardcoded /Users/<name>/... path broke on
-# every machine but the author's); override with PAPERMIND_VENV_DIR to relocate.
+# every machine but the author's); override with CHATEKLD_VENV_DIR to relocate
+# (the legacy PAPERMIND_VENV_DIR is still honoured as a deprecated fallback).
 # NOTE: under `set -u` (enabled above) this reference aborts if HOME is unset —
 # acceptable because a macOS terminal/Finder launch always sets HOME, and an
 # unset HOME would break the rest of the build anyway.
-VENV_DIR="${PAPERMIND_VENV_DIR:-$HOME/venvs/papermind2026}"
+VENV_DIR="${CHATEKLD_VENV_DIR:-${PAPERMIND_VENV_DIR:-$HOME/venvs/papermind2026}}"
 APP_NAME="ChatEKLD_$(date +%Y-%m-%d)"
 
 if [[ ! -d "$VENV_DIR" ]]; then
@@ -181,6 +182,7 @@ eval "\"$VENV_DIR/bin/pyinstaller\" \\
     --add-data \"services:services\" \\
     --add-data \"api:api\" \\
     --add-data \"audit:audit\" \\
+    --add-data \"deckgen:deckgen\" \\
     --add-data \"README.md:.\" \\
     --collect-all \"ollama\" \\
     --collect-all \"pymupdf\" \\

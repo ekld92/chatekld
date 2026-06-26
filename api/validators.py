@@ -15,6 +15,11 @@ MISSING: Any = object()
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
+    """Clamp *value* into [lo, hi].
+
+    Assumes *value* is finite — callers must reject NaN/±Inf first, because a
+    NaN compares False against both bounds and would slip through unchanged.
+    """
     if value < lo:
         return lo
     if value > hi:
@@ -43,6 +48,12 @@ def coerce_int_in_range(value: Any, lo: int, hi: int) -> int | None:
 
 
 def coerce_float_in_range(value: Any, lo: float, hi: float) -> float | None:
+    """Return float(value) clamped to [lo, hi], or None if not finite/parseable.
+
+    The finite-ness guard is essential (see :func:`coerce_int_in_range`): NaN
+    and ±Inf — which the json module will happily parse from a hand-edited
+    config — are rejected rather than clamped, since NaN defeats ``_clamp``.
+    """
     try:
         f = float(value)
     except (TypeError, ValueError):

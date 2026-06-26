@@ -18,9 +18,8 @@ def _make_vault(tmp_path: Path) -> Path:
     """Build a minimal vault matching the default subpath conventions."""
     biblio = tmp_path / "Z_attachments" / "biblio_articles"
     biblio.mkdir(parents=True)
-    bib_dir = tmp_path / "presentations_slides_writings_teaching"
-    bib_dir.mkdir()
-    (bib_dir / "_master.bib").write_text(
+    # _master.bib at the vault root matches the neutral default master_bib_path.
+    (tmp_path / "_master.bib").write_text(
         "@article{smith2020, title={X}, year={2020}, author={Smith, J}}",
         encoding="utf-8",
     )

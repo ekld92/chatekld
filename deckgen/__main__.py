@@ -42,10 +42,16 @@ _NOTABLE_INFO = (
 
 
 def _eprint(*args, **kwargs) -> None:
+    """Print to stderr so progress/warnings never contaminate ``--out -`` stdout.
+
+    The CLI can write the finished deck to stdout (``--out -``); keeping every
+    status line on stderr means a shell redirect captures only the ``.tex``.
+    """
     print(*args, file=sys.stderr, **kwargs)
 
 
 def _slugify(text: str) -> str:
+    """Turn arbitrary text into a filesystem-safe lowercase slug (``"deck"`` if empty)."""
     slug = re.sub(r"[^A-Za-z0-9]+", "_", text.strip()).strip("_").lower()
     return slug or "deck"
 
@@ -92,6 +98,15 @@ def _make_event_printer(verbose: bool):
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """Construct the full ``python -m deckgen`` argument parser.
+
+    Groups: content (``--topic``/``--instructions``/``--audience``), model/agent
+    (``--provider``/``--model``/``--temperature``/``--agent-max-iters``/
+    ``--max-sections``), connection (``--base-url``/``--port``), output + built-in
+    title-slide metadata, and the house-style template flags
+    (``--template``/``--out-dir``/``--citations``). See ``main`` for how they wire
+    into the outline → sections → assemble → write pipeline.
+    """
     p = argparse.ArgumentParser(
         prog="python -m deckgen",
         description="Generate a Beamer .tex lecture deck from the ChatEKLD Obsidian vault.",
@@ -146,6 +161,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _preflight(client: ChatEKLDClient, verbose: bool) -> None:
+    """Probe vault status and warn (never abort) about a missing/in-progress index.
+
+    A SystemExit fires only if the app is entirely unreachable; an unusable or
+    still-building index is a warning, because the user may legitimately want to
+    proceed anyway (e.g. against a partial index). This sets expectations before
+    the model budget is spent on generation.
+    """
     try:
         status = client.status()
     except DeckgenClientError as exc:
@@ -164,6 +186,15 @@ def _preflight(client: ChatEKLDClient, verbose: bool) -> None:
 
 
 def main(argv: Optional[list] = None) -> int:
+    """Run the end-to-end CLI pipeline and return a process exit code.
+
+    Stages: resolve the base URL + preflight, optionally load a house-style
+    template, request the outline (stop here on ``--dry-run``), generate each
+    section, assemble + validate the ``.tex``, then write — either scaffolding a
+    compile-ready ``<slug>/`` suite (template mode, no explicit ``--out``) or a
+    single ``.tex`` (stdout when ``--out -``). Returns the :func:`_exit_code`
+    verdict (0 clean / 1 warnings-or-some-placeholders / 2 all-placeholder).
+    """
     args = _build_parser().parse_args(argv)
     instructions = _read_instructions(args.instructions)
     on_event = _make_event_printer(args.verbose)

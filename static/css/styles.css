@@ -1375,3 +1375,189 @@ input[type="range"] {
 }
 .deck-warnings ul { margin: 6px 0 0; padding-left: 18px; }
 .deck-warnings li { margin: 4px 0; }
+
+/* --- Note Refactor (Phase 1) --- */
+.refactor-section-title { font-weight: 600; margin: 12px 0 6px; color: var(--text-primary); }
+.refactor-discrepancies:empty { display: none; }
+.refactor-discrepancy {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--danger);
+    border-radius: var(--radius-sm);
+    padding: 6px 10px;
+    margin: 6px 0;
+    font-size: 13px;
+}
+.refactor-discrepancy ul { margin: 4px 0 0; padding-left: 18px; }
+.refactor-discrepancy li { color: var(--text-secondary); font-size: 12px; }
+
+.refactor-note-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+.refactor-badge {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    background: var(--bg-elevated);
+    color: var(--text-tertiary);
+}
+.refactor-badge.badge-changed { background: var(--accent-glow); color: var(--accent-hover); }
+.refactor-badge.badge-table { background: rgba(255,159,10,0.18); color: #ffb340; }
+.refactor-badge.badge-status { background: var(--bg-elevated); color: var(--text-secondary); }
+
+.refactor-hygiene { color: var(--danger-hover); font-size: 12px; margin: 4px 0; }
+
+.refactor-image {
+    border-top: 1px solid var(--border);
+    padding: 8px 0;
+}
+.refactor-image-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.refactor-image-head code { font-size: 11px; }
+.refactor-image-body { display: flex; gap: 12px; align-items: flex-start; }
+.refactor-thumb {
+    max-width: 280px;
+    max-height: 280px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-app);
+}
+.refactor-image-side { flex: 1; min-width: 0; }
+.refactor-desc { font-size: 13px; color: var(--text-secondary); white-space: pre-wrap; }
+.refactor-desc:empty { display: none; }
+.refactor-image-actions { display: flex; gap: 6px; margin: 8px 0 4px; }
+.refactor-extract-out:empty { display: none; }
+.refactor-extract-text {
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    background: var(--bg-app);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    margin: 4px 0;
+    overflow-x: auto;
+}
+.refactor-extract-warn { color: #ffb340; font-size: 12px; margin: 4px 0; }
+.refactor-extract-error { color: var(--danger); font-size: 12px; margin: 4px 0; }
+
+.refactor-diff {
+    white-space: pre;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    background: var(--bg-app);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    margin-top: 6px;
+}
+.refactor-diff .diff-add { color: #4ade80; }
+.refactor-diff .diff-del { color: var(--danger-hover); }
+.refactor-diff .diff-hunk { color: var(--accent-hover); }
+.refactor-diff .diff-ctx { color: var(--text-tertiary); }
+
+/* --- Note Refactor hub: master-detail layout (Phase 1.5) --- */
+.refactor-layout { display: flex; gap: 12px; margin-top: 10px; align-items: flex-start; }
+.refactor-note-list {
+    flex: 0 0 280px;
+    max-height: 70vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    padding: 6px;
+}
+.refactor-note-list:empty::before {
+    content: "No notes yet.";
+    color: var(--text-tertiary);
+    font-size: 12px;
+}
+.refactor-note-entry {
+    cursor: pointer;
+    padding: 5px 8px;
+    border-radius: var(--radius-sm);
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.refactor-note-entry:hover { background: var(--bg-elevated); }
+.refactor-note-entry.selected { background: var(--accent-glow); }
+.refactor-note-entry .refactor-note-path { word-break: break-all; }
+.refactor-entry-badges { display: flex; gap: 4px; flex-wrap: wrap; }
+
+.refactor-detail {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    padding: 10px 12px;
+}
+.refactor-detail-placeholder { font-size: 13px; padding: 12px 4px; }
+.refactor-detail-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.refactor-view-toggle { display: flex; gap: 6px; margin-bottom: 8px; }
+
+.refactor-md-cols { display: flex; gap: 12px; align-items: flex-start; }
+.refactor-md-col { flex: 1; min-width: 0; }
+.refactor-md-col-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--text-tertiary);
+    margin-bottom: 4px;
+}
+.refactor-md-preview {
+    font-size: 13px;
+    color: var(--text-secondary);
+    background: var(--bg-app);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    max-height: 60vh;
+    overflow: auto;
+    word-wrap: break-word;
+}
+.refactor-md-preview > :first-child { margin-top: 0; }
+.refactor-md-preview img { max-width: 100%; height: auto; }
+.refactor-md-preview pre { white-space: pre-wrap; overflow-x: auto; }
+.refactor-md-preview blockquote {
+    border-left: 3px solid var(--accent-hover);
+    margin: 6px 0;
+    padding-left: 10px;
+    color: var(--text-secondary);
+}
+@media (max-width: 900px) { .refactor-md-cols { flex-direction: column; } }
+
+/* Classification + ignore states */
+.refactor-badge.badge-muted { background: var(--bg-elevated); color: var(--text-tertiary); }
+.refactor-badge.badge-classify { background: var(--bg-elevated); color: var(--text-secondary); }
+.refactor-badge.badge-handwritten { background: rgba(255,159,10,0.18); color: #ffb340; }
+.refactor-image-ignored { opacity: 0.5; }
+.refactor-classify-result { font-size: 13px; color: var(--text-secondary); margin: 4px 0; }
+
+/* Phase 2 — vault-write controls (apply / archive / restore). */
+.refactor-approve-cb { margin-right: 6px; cursor: pointer; }
+.refactor-archive-btn { border-color: rgba(255,159,10,0.5); }
+.refactor-archive-confirm {
+    font-size: 13px; color: var(--text-secondary);
+    background: rgba(255,159,10,0.08); border: 1px solid rgba(255,159,10,0.25);
+    border-radius: 6px; padding: 8px; margin: 6px 0;
+}
+.refactor-archived-note { font-size: 12px; margin-top: 6px; }
+.refactor-confirm-list {
+    max-height: 240px; overflow-y: auto; margin: 8px 0; padding-left: 18px;
+    font-size: 13px; color: var(--text-secondary);
+}
+.refactor-confirm-list li { margin: 2px 0; word-break: break-all; }
+.refactor-restore-list { max-height: 50vh; overflow-y: auto; margin: 8px 0; }
+.refactor-restore-op {
+    display: grid; grid-template-columns: 1fr auto; align-items: center;
+    gap: 4px 12px; padding: 8px 0; border-bottom: 1px solid var(--border);
+    font-size: 13px;
+}
+.refactor-restore-op .muted { grid-column: 1; font-size: 12px; }
+.refactor-restore-op button { grid-row: 1 / span 2; grid-column: 2; }

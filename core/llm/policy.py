@@ -42,11 +42,24 @@ _DEFAULT_FALLBACK_ON = frozenset({
 
 @dataclass(frozen=True)
 class FallbackPolicy:
+    """A resolved one-primary / one-fallback retry policy.
+
+    ``fallback_on`` is the set of error categories that trigger the switch — it
+    deliberately excludes terminal categories (AUTH, INVALID_REQUEST, QUOTA) so a
+    bad key or exhausted balance surfaces immediately instead of being masked by
+    the fallback. The actual before-vs-after-first-token boundary is enforced by
+    the streaming callers, not here: this object only answers *whether* a given
+    error is fallback-eligible.
+    """
+
     primary: str
     fallback: Optional[str] = None
     fallback_on: frozenset[ErrorCategory] = field(default_factory=lambda: _DEFAULT_FALLBACK_ON)
 
     def should_fall_back(self, err: LLMError) -> bool:
+        """True iff *err*'s category is in ``fallback_on`` and a distinct
+        fallback provider is configured (a fallback equal to the primary is a
+        no-op and treated as none)."""
         if self.fallback is None or self.fallback == self.primary:
             return False
         return err.category in self.fallback_on

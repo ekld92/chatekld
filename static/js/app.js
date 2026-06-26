@@ -1,15 +1,32 @@
+/**
+ * Application root — the ROOT of the JS module hierarchy: it imports from every
+ * other module (which in turn import only ui.js + api.js), so this is the single
+ * place the dependency graph converges and nothing imports from here. Wires the
+ * DOMContentLoaded bootstrap: loads config once and fans it out to each feature
+ * module's initialiser, then publishes the inline-handler entry points the HTML
+ * references onto `window` (e.g. window.chatPlain, window.refactorRunPlan).
+ */
 import * as UI from './ui.js';
 import * as Config from './config.js';
 import * as Vault from './vault.js';
 import * as Summarizer from './summarizer.js';
 import * as Audit from './audit.js';
 import * as Deck from './deck.js';
+import * as Refactor from './refactor.js';
 import * as Settings from './settings.js';
+import * as PlainChat from './plainchat.js';
 import { secureFetch } from './api.js';
 import { updateProviderBadge } from './ui.js';
 
 // --- Initialization ---
 
+/**
+ * One-shot bootstrap on DOMContentLoaded. Loads /api/config ONCE and threads the
+ * result into each module's initialiser (so they don't each re-fetch it), binds
+ * the `window.*` inline-handler entry points the templates call, wires tablist
+ * keyboard nav, and starts the 15 s runtime-status poll. A failure in the init
+ * block is logged but non-fatal — event binding below still runs.
+ */
 async function init() {
     console.log('[ChatEKLD] Initializing...');
     
@@ -26,6 +43,7 @@ async function init() {
         await Vault.refreshIndexState();
         await Summarizer.loadReportTypes();
         await Audit.initAuditTab();
+        Refactor.initRefactorTab(config);
     } catch (e) {
         console.error('Init config failed:', e);
     }
@@ -63,6 +81,14 @@ async function init() {
     window.deckPickTemplateFile = Deck.pickTemplateFile;
     window.deckPickOutDir = Deck.pickOutDir;
     window.deckGenerate = Deck.generate;
+    window.refactorRunPlan = Refactor.runPlan;
+    window.refactorPickScopeFolder = Refactor.pickScopeFolder;
+    window.refactorOpenApply = Refactor.openApply;
+    window.refactorOpenRestore = Refactor.openRestore;
+    window.refactorConfirmApply = Refactor.confirmApply;
+    window.refactorRevertAll = Refactor.revertAll;
+    window.chatPlain = PlainChat.chatPlain;
+    window.plainchatNew = PlainChat.newChat;
 
     // Arrow-key navigation for the ARIA tablists.
     UI.wireTablistKeys(

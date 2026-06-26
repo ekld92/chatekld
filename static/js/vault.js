@@ -1,3 +1,20 @@
+/**
+ * Obsidian Vault tab: indexing lifecycle, the live retrieval/generation knobs,
+ * vault RAG chat (with optional agent-mode trace rendering), exclusions, and the
+ * indexed-materials manifest. Imports only ui.js + api.js + config.js (per the JS
+ * module hierarchy).
+ *
+ * Key non-obvious points (see inline comments):
+ *  - the live query-knob values are sent in EVERY /api/obsidian/chat body, so a
+ *    save failure never changes what the next Send uses;
+ *  - the fetch-abort budget is computed LIVE at send time in _chatAbortMs() from
+ *    the wall-clock control, never cached at init, so a Settings change applies
+ *    on the next Send without reload (it is the outermost link of the timeout
+ *    chain: agent deadline ≤ server consumer stall ≤ this abort);
+ *  - _renderAnswer falls back to plain text when the vendored `marked` is absent;
+ *  - all user-controlled strings (paths, folder names, answers) go through
+ *    createElement/textContent or sanitiseHtml — never raw innerHTML.
+ */
 import { secureFetch, readSSE } from './api.js';
 import { taskBegin, taskEnd, setStatusA11y, openModal, closeModal, sanitiseHtml, copyToClipboard, showTaskError, clearTaskError } from './ui.js';
 import { getActiveProvider, getSelectedEmbed, getSelectedModel, saveSelectedModels } from './config.js';
@@ -30,6 +47,7 @@ const _CHAT_PARAM_DEFAULTS = {
     query_expansion: false,
     num_queries: 3,
     rerank_pool_ceiling: 50,
+    wikilink_expansion: false,
 };
 
 const _SYSTEM_PROMPT_MAX = 4000;
@@ -170,6 +188,7 @@ function getVaultChatParams() {
         query_expansion: _readCheckbox('vault-query-expansion', _CHAT_PARAM_DEFAULTS.query_expansion),
         num_queries: Math.round(_readNumber('vault-num-queries', _CHAT_PARAM_DEFAULTS.num_queries)),
         rerank_pool_ceiling: Math.round(_readNumber('vault-rerank-pool', _CHAT_PARAM_DEFAULTS.rerank_pool_ceiling)),
+        wikilink_expansion: _readCheckbox('vault-wikilink-enabled', _CHAT_PARAM_DEFAULTS.wikilink_expansion),
     };
 }
 
@@ -194,6 +213,11 @@ function _setSelect(el, requested, fallback) {
     el.value = allowed.includes(requested) ? requested : fallback;
 }
 
+/**
+ * Restore the persisted vault-chat knobs from config into their controls,
+ * normalising out-of-range/invalid values (see the inline note on browser
+ * range clamping and the deliberate exclusion of the fetch-abort budget).
+ */
 export function applyVaultChatParams(cfg) {
     // Restore persisted values into the controls.  Missing keys fall back to
     // the live default constants so a partially-populated config never leaves
@@ -219,6 +243,7 @@ export function applyVaultChatParams(cfg) {
         query_expansion: cfg.vault_query_expansion ?? _CHAT_PARAM_DEFAULTS.query_expansion,
         num_queries: cfg.vault_num_queries ?? _CHAT_PARAM_DEFAULTS.num_queries,
         rerank_pool_ceiling: cfg.vault_rerank_pool_ceiling ?? _CHAT_PARAM_DEFAULTS.rerank_pool_ceiling,
+        wikilink_expansion: cfg.vault_wikilink_expansion ?? _CHAT_PARAM_DEFAULTS.wikilink_expansion,
     };
     _setRange(
         document.getElementById('vault-top-k'),
@@ -279,6 +304,8 @@ export function applyVaultChatParams(cfg) {
         params.rerank_pool_ceiling,
         (v) => String(parseInt(v, 10)),
     );
+    const wlEl = document.getElementById('vault-wikilink-enabled');
+    if (wlEl) wlEl.checked = !!params.wikilink_expansion;
 }
 
 function _saveVaultChatParams() {
@@ -300,10 +327,15 @@ function _saveVaultChatParams() {
             vault_query_expansion: p.query_expansion,
             vault_num_queries: p.num_queries,
             vault_rerank_pool_ceiling: p.rerank_pool_ceiling,
+            vault_wikilink_expansion: p.wikilink_expansion,
         }),
     }).catch(() => { /* best-effort; the request body is still authoritative */ });
 }
 
+/**
+ * Wire the vault-chat knob controls: live slider-label updates plus debounced
+ * persistence to /api/config (persistence is a UX nicety — see the inline note).
+ */
 export function wireVaultChatParamControls() {
     // Live label updates + debounced persistence.  Persistence is a UX
     // nicety; the live values are sent in every /api/obsidian/chat body
@@ -344,6 +376,8 @@ export function wireVaultChatParamControls() {
     if (mmrCb) mmrCb.addEventListener('change', debounce);
     const qexpCb = document.getElementById('vault-query-expansion');
     if (qexpCb) qexpCb.addEventListener('change', debounce);
+    const wlCb = document.getElementById('vault-wikilink-enabled');
+    if (wlCb) wlCb.addEventListener('change', debounce);
 }
 
 function _updateIndexButtons(state) {
@@ -381,6 +415,11 @@ export async function pickVaultFolder() {
     }
 }
 
+/**
+ * Kick off (or resume) a vault index build and start polling its status. Sets a
+ * 24 h poll deadline as a runaway backstop; on a start failure surfaces a
+ * retryable error in the vault error boundary and resets the buttons to idle.
+ */
 export async function indexVault() {
     if (_isQuerying) return;
     
@@ -526,6 +565,11 @@ function _renderPrewarmBanner(status, message) {
     }
 }
 
+/**
+ * Poll /api/obsidian/status until prewarm settles, driving the prewarm banner and
+ * gating the Send button while the index/BM25/reranker stages load. Self-guards
+ * against concurrent pollers; treats ready/skipped/idle/error as terminal.
+ */
 export async function pollPrewarmStatus() {
     if (_prewarmPolling) return;
     _prewarmPolling = true;
@@ -676,6 +720,14 @@ function _showVaultError(message, retry) {
     showTaskError(el, message, actions);
 }
 
+/**
+ * Send a vault RAG question and stream the answer. Reads the live query knobs
+ * (sent in this request's body — see the module banner), enforces the live
+ * fetch-abort budget, and consumes the SSE stream: `{info}` notices, the
+ * agent-trace frames (iteration/thought/tool_call/tool_result) rendered lazily
+ * into a collapsible <details>, and `{token}` answer chunks. On error the partial
+ * bot bubble is replaced with a retryable error boundary that re-asks once.
+ */
 export async function chatWithVault() {
     if (_isQuerying) {
         const statusDiv = document.getElementById('obsidian-status-msg');
@@ -928,6 +980,11 @@ export async function removeExclusion(path) {
     }
 }
 
+/**
+ * Re-render the exclusion list from /api/config. Each row is built with
+ * createElement/textContent because vault folder names are user-controlled and
+ * could otherwise inject markup (the canonical no-innerHTML-for-user-strings case).
+ */
 export async function renderExclusions() {
     const list = document.getElementById('excl-list');
     if (!list) return;
@@ -1009,6 +1066,12 @@ export async function saveImageExts() {
     }
 }
 
+/**
+ * One-shot status fetch at tab init: sets the index buttons, renders any warnings,
+ * and paints the current prewarm banner up-front (so it shows even if prewarm
+ * finished before the UI mounted), handing off to pollPrewarmStatus only when a
+ * non-terminal prewarm stage is still in flight.
+ */
 export async function refreshIndexState() {
     try {
         const resp = await secureFetch('/api/obsidian/status');

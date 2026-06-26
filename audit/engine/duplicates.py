@@ -12,12 +12,19 @@ from ..core import hashing
 
 @dataclass
 class DuplicateSet:
+    """A group of byte-identical PDFs sharing one full-content SHA-256.
+
+    ``paths`` always holds ≥2 entries. ``size_bytes`` is the per-file size
+    (all copies are identical, so any one applies).
+    """
+
     content_hash: str
     paths: list[Path]
     size_bytes: int
 
     @property
     def wasted_bytes(self) -> int:
+        """Reclaimable bytes: every copy beyond the first is redundant."""
         return self.size_bytes * (len(self.paths) - 1)
 
 
@@ -26,6 +33,16 @@ def find_biblio_duplicates(
     *,
     cancel_fn: Callable[[], bool] | None = None,
 ) -> list[DuplicateSet]:
+    """Find content-identical PDF sets under ``biblio_articles``.
+
+    Read-only: hashes file content only, never opens for write. Delegates the
+    size→partial→full hash funnel to ``core.hashing.find_duplicate_sets``
+    (most files never get fully hashed). Result sets are sorted by reclaimable
+    space descending so the biggest wins lead. ``cancel_fn`` is threaded into
+    the hasher and checked between files, so the manager can abort a long run;
+    the partial result gathered so far is returned. A per-set ``stat`` failure
+    degrades that set's ``size_bytes`` to 0 rather than aborting.
+    """
     root = settings.biblio_articles_dir
     if not root.exists():
         return []

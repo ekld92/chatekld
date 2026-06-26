@@ -9,6 +9,7 @@ a price between releases of this app.
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -113,6 +114,12 @@ def estimate_cost_usd(model: str, usage: LLMUsage, overrides: Optional[dict] = N
 
 @dataclass
 class UsageRecord:
+    """One LLM request's accounting row — the unit stored in both the ring and JSONL.
+
+    The same record is appended to the in-memory ring AND serialized to the
+    on-disk log; ``uid`` ties the two copies together so :meth:`UsageTracker.summary`
+    can de-duplicate them (a record present in both must be counted once).
+    """
     timestamp: str
     provider: str
     model: str
@@ -177,6 +184,11 @@ class UsageTracker:
         self._disk_cache_key: Optional[tuple[int, int]] = None
 
     def configure(self, log_path: str) -> None:
+        """Point the tracker at *log_path* and drop the parsed-disk cache.
+
+        Resetting the cache forces the next :meth:`summary` to re-read the new file
+        (the old (size, mtime) key is meaningless for a different path).
+        """
         with self._lock:
             self._log_path = log_path
             self._disk_cache = []
@@ -194,6 +206,16 @@ class UsageTracker:
         error_category: str = "",
         pricing_overrides: Optional[dict] = None,
     ) -> UsageRecord:
+        """Cost out a request, append it to the ring, and persist it to JSONL.
+
+        Thread-safety: the ring append and the ``log_path`` read happen under
+        ``self._lock``; the (slower, fallible) file append is done AFTER releasing
+        the lock — snapshotting ``log_path`` first — so disk I/O never serialises
+        every concurrent recorder. A failed request is recorded with ``cost=0.0``
+        (no charge for a call that produced nothing) and a fresh ``uid`` is minted
+        for cross-store de-duplication. A disk-write failure is swallowed (the
+        in-memory ring still has it); recording must never break the caller's path.
+        """
         cost = estimate_cost_usd(model, usage, pricing_overrides) if success else 0.0
         record = UsageRecord(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -222,6 +244,11 @@ class UsageTracker:
         return record
 
     def recent(self, limit: int = 100) -> list[UsageRecord]:
+        """Return up to *limit* most-recent records, snapshotted under the lock.
+
+        Copies the deque inside the lock so the caller iterates a stable list while
+        other threads keep appending.
+        """
         with self._lock:
             return list(self._recent)[-limit:]
 
@@ -277,6 +304,13 @@ class UsageTracker:
         return records
 
     def _iter_disk_records(self):
+        """Yield records from the JSONL, skipping any unparseable / schema-drifted line.
+
+        Deliberately tolerant: a truncated final line (crash mid-append), a bad JSON
+        line, or a row with unexpected keys (``TypeError`` from ``UsageRecord(**data)``)
+        is skipped rather than aborting the whole summary. Called only by
+        :meth:`_disk_records`, which caches the result by the file's (size, mtime).
+        """
         log_path = self._log_path
         if not log_path or not os.path.exists(log_path):
             return
@@ -299,6 +333,11 @@ class UsageTracker:
 
     @staticmethod
     def _accumulate(summary: UsageSummary, record: UsageRecord) -> None:
+        """Fold one record into the running totals + per-provider/per-model breakdowns.
+
+        Pure (no shared state, no lock): mutates only the caller-owned *summary*, so
+        it is safe to call while iterating a snapshot of the ring/disk records.
+        """
         summary.total_requests += 1
         summary.total_input_tokens += record.input_tokens
         summary.total_output_tokens += record.output_tokens
@@ -333,6 +372,19 @@ def configure_default_usage_tracker(base_dir: str) -> None:
     usage_tracker.configure(os.path.join(base_dir, "llm_usage.jsonl"))
 
 
+@functools.lru_cache(maxsize=1)
+def _cl100k_encoding():
+    """The process-global, immutable ``cl100k_base`` encoder.
+
+    ``tiktoken.get_encoding`` reconstructs the encoder (parses the ~1.7 MB BPE
+    merge table) on every call; this fires once per local generation lacking a
+    provider usage block, so memoize it. lru_cache never caches the raising
+    case, so a missing tiktoken still degrades via the caller's except.
+    """
+    import tiktoken
+    return tiktoken.get_encoding("cl100k_base")
+
+
 def estimate_tokens(text: str) -> int:
     """Cheap heuristic when a provider does not return usage figures.
 
@@ -343,8 +395,6 @@ def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
+        return len(_cl100k_encoding().encode(text))
     except Exception:
         return max(1, len(text) // 4)

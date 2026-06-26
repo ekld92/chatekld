@@ -3,6 +3,11 @@
 .DS_Store
 
 .vscode/
+
+# Local-only operator notes — kept out of BOTH remotes so the private→public
+# mirror workflow is never advertised in the public snapshot. See PUBLISHING.md.
+PUBLISHING.md
+
 # Python
 venv/
 __pycache__/

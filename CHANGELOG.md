@@ -2,6 +2,222 @@
 
 This file tracks the current refactor line. Older entries were removed because they described deleted integrations and stale endpoints.
 
+## 2026-06-23 (Indexing: backoff in the insert-failure breaker)
+
+- **Transient embedding-backend blips no longer abort a long indexing run.** The consecutive-insert-failure circuit breaker (`rag/vault.py::_index_documents_streaming`, abort after `_MAX_CONSECUTIVE_FAILURES`=20) had no delay between attempts, so a backend that *instant-rejects* — observed as LM Studio returning HTTP 400 "Failed to decode batch!" in ~10 ms while it JIT-reloads the embed model under memory pressure — burned all 20 "retries" in ~0.2 s and killed a multi-hour run before the model could finish loading. The breaker is now a **wall-clock window**: each consecutive failure waits `min(_FAILURE_BACKOFF_BASE_S * 2**(streak-1), _FAILURE_BACKOFF_CAP_S)` (1.0 / 5.0 s → ~87 s across the 19 pre-abort sleeps) via the interruptible `self._stop_event.wait(delay)`, so a brief hiccup gets time to recover and a streak-resetting success cancels the backoff, while a truly-down backend still aborts in under a minute. The sleep holds no lock and runs off the chat path; a Cancel/Pause mid-sleep aborts promptly. Dropped blip chunks self-heal on the next incremental run (never inserted ⇒ re-yielded). New class attrs `_FAILURE_BACKOFF_BASE_S`/`_FAILURE_BACKOFF_CAP_S` (patchable to 0 in tests, like `_PERSIST_MIN_INTERVAL_S`).
+- Tests: `test_vault_regressions.py::test_index_streaming_backoff_spaces_and_caps_consecutive_failures` (exponential-then-capped delays, no real sleep) and `...backoff_is_interruptible_by_cancel` (stop event mid-sleep aborts before the threshold); the two existing failure tests patch the backoff to 0.
+
+## 2026-06-23 (Production hardening — disk, leaks, fallback, stall bounds)
+
+Code-review follow-ups: bound an unbounded-disk-growth path, trim avoidable per-poll/per-call allocation under the 16 GB constraint, make a local backend going offline fail over instead of erroring, and stop a guard-less SSE route hanging on a wedged model.
+
+### Resource management
+- **Unbounded `.bak` index dirs pruned.** Every `OBSIDIAN_INDEX_VERSION` bump archives the whole prior index to a timestamped `obsidian_storage.bak.*` sibling and nothing ever deleted them — tens of GB could accumulate. `rag/vault.py::_prune_old_index_backups` keeps the newest 2 and routes each removal through `log_storage_deletion` (deletion-audit invariant). Called from `_archive_old_index_dir` after the rename.
+- **Status-poll lancedb count cached.** `get_status()` is polled ~1 Hz and only needs `count > 0`, but each call opened a fresh `lancedb.connect()`. `_cached_lancedb_count` caches by the lancedb dir's `(st_size, st_mtime_ns)` with a 5 s TTL backstop; exact-count callers (crash-drift recovery, checkpoint validation) keep calling `lancedb_table_count` directly.
+- **tiktoken encoder memoized** (`core/llm/usage.py`, `core/providers/lms.py`) via `functools.lru_cache` — was rebuilt per call (the LM Studio `_tokenizer` property potentially per chunk).
+- **Ollama client-cache keyspace bounded** — `_ollama_client` rounds a non-None timeout to whole seconds (floored at 1 s so a sub-second value can't round to 0.0 and make httpx time out immediately) before keying, so the agent loop's near-continuous remaining-budget float no longer mints a fresh never-evicted `ollama.Client` per call.
+
+### Graceful degradation / robustness
+- **Local connection/timeout errors are now fallback-eligible.** `core/llm/adapters/local.py::_classify_local_error` maps a connection-refused/timeout from a stopped Ollama/LM Studio to `NETWORK`/`TIMEOUT` (retryable) instead of the default `UNKNOWN`, so a configured online `fallback_provider` actually takes over (matching the online adapters). Applied at all four transport catch sites.
+- **`/api/summarise` stall bound.** That route streams synchronously with no consumer stall guard; at the default `local_request_timeout_s=0` a connected-but-wedged local model could hang it. The summariser now passes an explicit per-read floor (`PAPER_LOCAL_STALL_TIMEOUT_S=120` when the knob is unset) threaded through `OllamaProvider`/`LMStudioProvider.stream_chat(request_timeout=...)`.
+- **Guarded local stream extraction** — the summariser reads chunk fields via `getattr` and skips empty/keep-alive frames instead of raising `IndexError`/`AttributeError` mid-stream.
+
+### Logging / hygiene
+- `err.message` redacted before logging at the three fallback-warning sites (`rag/summarizer.py`, `core/llm/chat.py`, `rag/engine.py`).
+- Dropped two unused imports (`refactor/apply.py`, `refactor/archive.py`); commented two best-effort `except` swallows in `pdf_extractor.py`.
+
+### Tests
+- New `test_llm.py::TestLocalErrorClassification` (network/timeout/name-based/unknown/passthrough) and `test_vault_regressions.py::TestIndexBackupPrune` (keeps newest 2, audits each removal, leaves the live dir + unrelated siblings untouched).
+
+## 2026-06-23 (Privacy / nomenclature scrub)
+
+Portability + privacy pass ahead of sharing the app: remove maintainer-specific identifiers and the lingering old project name from shipped defaults, code, and docs so a fresh install on another Mac carries no personal data and consistently calls itself **ChatEKLD**.
+
+### Changed — defaults now neutral
+- `refactor_scope_subdir` and `_DEFAULT_SCOPE` default to `""` (no personal default folder name — an empty scope resolves to `None` → a clean 400, so the user must pick a folder). `audit_master_bib_path` / `audit/config.py::DEFAULT_MASTER_BIB_PATH` default to a neutral `_master.bib` (was a maintainer-specific sub-folder path). UI placeholders in `templates/index.html` genericised.
+
+### Changed — nomenclature
+- Renamed the build-script env var to `CHATEKLD_VENV_DIR`, keeping the legacy `PAPERMIND_VENV_DIR` as a deprecated fallback and `~/venvs/papermind2026` as the default path (existing venvs keep working). Replaced "papermind" → "ChatEKLD" in docstrings/instructions (`audit/`, tests, `project_structure.txt`, `README.md`, the `CLAUDE.md` deep-notes). `CHANGELOG` history left intact.
+
+### Removed — personal identifiers
+- Stripped 12 `file:///Users/<user>/…` absolute links from `PROMPTS.md` (now repo-relative). Genericised the maintainer's vault path, scope-folder name, vault-key hash, and study-domain description across `docs/project_note_refactor.md` and the `test_refactor.py` fixture (placeholders `<vault>` / `<scope>`, neutral fixture name `study_notes`); removed a contributor name from a `core/llm/model_listing.py` comment.
+
+### Security / hardening
+- `/api/log` now strips CR/LF and runs the message through `core.llm.redact.redact` before logging — closes a log-injection vector (forged audit lines) and restores the uniform "redact before logging" discipline.
+- Dev-only `app.py:__main__` `app.run(...)` now pins `host="127.0.0.1"` explicitly (mirrors `launch.py`), and the README documents the un-sandboxed first-launch TCC consent prompt alongside the existing Gatekeeper/quarantine note.
+
+## 2026-06-22 (Plain Chat — RAG-free multi-turn panel)
+
+A sixth tab: a plain, multi-turn conversation with the globally-configured chat provider/model — **no vault retrieval, no agent loop, no tools**. The server is stateless; the browser owns the conversation and re-sends the (capped) history on every turn, so a chat is ephemeral (lost on reload).
+
+### Added — backend
+- `POST /api/plainchat` (`api/routes/plainchat.py`): an SSE route that streams `{info}` / `{token}` / `{error}` frames + the `[DONE]` sentinel. The queue + daemon-worker + consumer skeleton is lifted from `api/routes/vault.py::api_obsidian_chat` with **every** agent / iteration / tool branch stripped. `_validate_messages` (a) structurally validates the body (a list of `{role∈{user,assistant}, content:str}`; a malformed entry rejects the whole request rather than silently dropping a turn), (b) caps each message to 24 000 chars and the array to the last 20 turns, then (c) **normalizes for provider shape** — drops leading assistant turns and merges consecutive same-role turns — so strict-alternation providers (Anthropic/Gemini) accept a window sliced mid-exchange. Provider/model resolve from config (`resolve_chat_model`); `temperature`/`system_prompt` resolve **body → persisted `chat_*` config → hard default**, so a Settings change applies on the next send with no reload (the panel sends neither).
+- `core/llm/chat.py::stream_chat_messages`: the unified local + online RAG-free streaming helper. Modelled on `rag/summarizer.py::_stream_online` but driven by a full `messages` array (online adapters send native message arrays; the local adapter flattens to a role-tagged prompt), so multi-turn works on every provider with no model-layer change. Falls back to `fallback_provider` **only before the first streamed token**; usage/cost tracking fires automatically inside the adapter.
+
+### Added — frontend
+- `static/js/plainchat.js` (`window.chatPlain` / `window.plainchatNew`, `ui.js`+`api.js`-only): keeps the `{role, content}` history array, sends only `{messages: history.slice(-20)}`, renders answers via vendored `marked` + `sanitiseHtml` with a `textContent` fallback, disables **Send** for the in-flight turn, renders a muted **non-recorded** bubble on an empty answer, and rolls back the un-answered user turn on error so a retry re-sends it exactly once. New **Plain Chat** tab + sidebar `chat_temperature` slider / `chat_system_prompt` textarea (persisted by `settings.js`, not `plainchat.js`).
+
+### Safety / correctness
+- On an empty-but-clean stream the route emits **no** synthetic token — a placeholder would be recorded into the client's history and re-sent as a fake assistant turn. The bounded worker queue (`maxsize=512`) applies back-pressure; the `cancel` Event lets a timed-out/disconnected consumer stop the worker; the consumer's `event_q.get` stall guard is the path's only time bound (plain chat has no agent wall-clock).
+
+### Config / constants / tests
+- New persisted keys `chat_temperature` (default `0.3`) and `chat_system_prompt` (default `"You are a helpful assistant."` — the **full** system prompt, ≤`SYSTEM_PROMPT_LIMIT`, no vault-grounding preamble). Validated/clamped in `api/routes/config.py::_validate_llm_config_keys` (`chat_temperature` 0–2, `chat_system_prompt` string-capped, empty kept).
+- `SSE_SINGLE_SHOT_FLOOR_S` (300) / `SSE_STALL_MARGIN_S` (30) promoted to `core/constants.py` so the vault, deck, and plain-chat SSE routes share one stall model instead of cross-importing `vault.py` privates.
+- Hermetic `test_plainchat.py` covers message validation/normalization, the body→config→default resolution, the empty-stream contract, and the stall/error frames.
+
+## 2026-06-22 (Note Refactor — Phase 2: first vault writers — apply / archive / restore)
+
+The app's **first feature that writes to the user's Obsidian vault**, scoped to one sub-folder and entirely opt-in (off by default; every action requires an explicit `confirm`). This supersedes the README's former "ChatEKLD never writes to your vault" banner (now: "writes only via Note Refactor's Apply/Archive"). Phase 1 previewing, re-extraction, and classification remain read-only.
+
+### Added — bulk Apply (callout-only, WYSIWYG)
+- `POST /api/refactor/apply` (`refactor/apply.py`): writes the **same** callout-only proposal the user previewed — the advisory `> [!extracted]` callout inlined beneath each described embed, with original embeds **kept**. Batch of approved notes, each applied independently (one failure never aborts the rest). Two guards protect every write: a **stale-diff** guard (the note's on-disk sha256 must equal the plan's `content_sha256`) and a **WYSIWYG** guard (the server-recomputed body's `proposed_sha256` must equal what the UI previewed). A note is only written when its bytes are a clean UTF-8 round-trip. The per-note transform is now the shared public `refactor.plan.analyze_note(...)`, so preview == apply by construction.
+
+### Added — per-image Archive (move-out + thumbnail)
+- `POST /api/refactor/archive` (`refactor/archive.py`): an explicit, per-image action (never coupled to the bulk apply). A **vault-wide reference-safety check** refuses any image embedded by another note (409 `{shared:true}`). Otherwise it materialises the original (iCloud-safe), writes a ≤384px **PNG thumbnail** into the excluded `<scope>/_thumbs/` folder (auto-added to `vault_exclude_dirs`), copies the full-res original into the recoverable archive dir (copy → verify → delete), and swaps that one embed to the thumbnail.
+
+### Added — Restore + manifest
+- `POST /api/refactor/restore` (`{op_id}` or `{all:true}`) reverses any apply/archive: note body from snapshot, archived original back to its vault path, thumbnail removed. `GET /api/refactor/manifest` lists the ops for the Restore UI. `refactor/journal.py` owns the per-vault `manifest.json` (restore journal), scope-lock (`assert_under`), and archive-dir resolution (rejects a dir inside the vault).
+
+### Safety
+- Atomic writes only (`core.utils.write_text_atomic` + new `write_bytes_atomic`). Every write/move is scope-locked to `<scope>` (+ `_thumbs/`) or the archive dir (outside the vault). Each write endpoint requires `confirm: true` and holds `obsidian_manager.try_acquire_lock` for the duration (**503 if indexing is in progress**), released in `finally`. Every mutation is audit-logged via new `core.utils.log_vault_write` (see CLAUDE.md *Logging, Deletion & Vault-Write Auditing*) and journalled for rollback/resume.
+
+### Config / UI / tests
+- New keys `refactor_archive_dir` (abs path or `""` = `BASE_DIR/refactor/archive/<vault_key>/`, must resolve outside the vault) and `refactor_thumb_max_side` (96–1024, default 384), validated/clamped in `api/routes/config.py`. New constants `REFACTOR_THUMBS_DIRNAME` / `DEFAULT_REFACTOR_THUMB_MAX_SIDE`.
+- `static/js/refactor.js` gains per-note approve checkboxes + an "Apply approved" confirm modal, a per-image "Archive…" inline confirm, and a "Restore…" modal reading the manifest (`ui.js`+`api.js`-only, no `innerHTML` for user strings). The tab blurb now warns that Apply/Archive write to the vault.
+- `test_refactor.py`: 22 new hermetic tests (callout apply + snapshot, stale/WYSIWYG guards, shared-image refusal, archive move + thumbnail + embed swap + `_thumbs` exclusion, restore of both, op-lock 503, scope-lock validator, thumbnail PNG, config validators, plus the self-audit cases below). Full suite green.
+
+### Fixed (Phase 2 self-audit)
+- **Restore is now atomic-or-nothing.** Reverting an archive of a note that was *edited after* archiving previously half-reverted — it could delete the thumbnail while the note still embedded it (broken embed) or clobber the user's later edits. `revert_archive_image` now runs all conflict checks up front and refuses the whole op (touching nothing) unless the note is still exactly what we wrote or already back at its pre-archive form.
+- **Restore won't clobber a re-created file.** If a *different* file now occupies the archived image's original path, restore refuses rather than overwriting it (digest-compared; an identical file is treated as already-restored and the revert completes idempotently).
+- **The move-safety reference check is now maximally conservative.** It previously skipped notes in the user's `vault_exclude_dirs` / `.trash`, so an image still embedded by an excluded-folder note could be wrongly judged "not shared" and moved — breaking that embed. The walk now scans every `.md` except `.git`/`.obsidian` (which structurally hold no user embeds).
+- **Archive re-verifies the note immediately before its destructive write** (closing the window where the note changes during the thumbnail/copy work); on mismatch it rolls back the thumbnail + archive copy + the just-appended manifest op, leaving the vault untouched. The original-file `unlink` is now `assert_under`-guarded.
+- **Restore persists the manifest per-op** (not once after the loop), so a crash mid-batch never leaves on-disk reverts unrecorded — matching `apply_notes`.
+
+## 2026-06-22 (Note Refactor — read-only analyzer + central hub)
+
+A new **Note Refactor** tab and `refactor/` package. It is **read-only with respect to the vault** (Phase 1 + Phase 1.5): it resolves an Obsidian sub-folder's image embeds, reuses the indexer's on-disk description cache (zero vision calls by default), flags broken links / frontmatter smells, and reports advisory cross-note dose discrepancies. The only persisted artifacts are under `BASE_DIR/obsidian_cache/` — never the vault. Apply/archive (the first real vault writes) remain Phase 2.
+
+### Added — Phase 1 (read-only analyzer)
+- `refactor/` package (`resolver` / `cache` / `hints` / `extract` / `hygiene` / `discrepancy` / `plan` / `result`) and `api/routes/refactor.py`: `POST /api/refactor/plan` (SSE: `info`/`error` + a `{"note": …}` frame per analyzed note + a terminal `{"refactor": …}` summary), `POST /api/refactor/extract-image` (the **only** vision-calling path — one user-chosen image at a time; serialized via `_VISION_LOCK`; caches `obsidian_cache/<sha256>.{table,redescribe}.txt`, never the indexer's base `<sha256>.txt`), and `GET /api/refactor/image` (read-only bytes, fetched as a blob so the X-Requested-With/origin check stays intact). `static/js/refactor.js` tab + `refactor_scope_subdir` / `refactor_extract_model` / `refactor_table_double_read` config keys. Hermetic `test_refactor.py`.
+
+### Added — Phase 1.5 (central hub)
+- **Folder picker.** `POST /api/refactor/native-pick-folder` → vault-relative scope via `_abs_to_scope` (rejects the vault root + anything outside the vault, like `_resolve_scope`); a `Browse…` button beside the scope input. Manual typing still works.
+- **Single-note detail pane.** A sidebar/detail master-detail UI renders ORIGINAL vs PROPOSED markdown (vendored `marked` + `sanitiseHtml`, `textContent` fallback like `vault.js::_renderAnswer`) with a Rendered/Diff toggle. The `{"note"}` frame now carries the `original`/`proposed` bodies (~2× frame size, fine for the scoped sub-folder).
+- **Classify + handwritten signal.** `extract-image` gains `mode="classify"` → one cheap vision pass labelling printed-table｜figure-diagram｜handwritten｜photo｜other (cached `<sha256>.classify.txt`), surfaced as a first-class "handwritten — can't OCR" badge.
+- **Sticky ignore-list.** `GET`/`POST /api/refactor/ignore` over a rel-path-keyed, per-vault JSON sidecar at `obsidian_cache/refactor/<vault_key>/ignore_list.json` (**never the vault**). Ignored images grey out, drop from the not-extracted/likely-table counts, and get no inlined callout in the plan. The read-modify-write is serialized with a module lock so concurrent toggles under waitress's worker threads can't lose updates.
+
+### Fixed (Phase 1.5 self-audit)
+- `extract.classify` no longer caches a bogus `other` label when the model returns an empty (non-exception) reply — it surfaces an error and writes nothing, so a later plan run can't show a confident-but-wrong label (mirrors `redescribe` / the `NO_TABLE` skip).
+- The detail pane disconnects the thumbnail `IntersectionObserver` on re-render so the previous note's detached `<img>` nodes aren't retained until the next run (cached blob URLs survive and are reused).
+
+## 2026-06-22 (Indexing-pipeline audit fixes: LanceDB compaction, scanned-PDF coverage, embed-at-chat, lifecycle)
+
+Five batches from a read-only audit of the vault indexing pipeline, landed before a full `embeddinggemma:300m` reindex on the `lancedb` backend.
+
+### Fixed — LanceDB `_versions` O(n²) bloat (reindex blocker)
+- The streaming indexer inserts one chunk per transaction; on LanceDB each insert is a new single-row fragment **and** a new version manifest that re-lists every fragment, so `_versions/` grew ~O(n²) (66k inserts measured at **209 GB** over <1 GB of real vectors — a full reindex would fill the disk). New `rag/lancedb_store.py::compact_lancedb_vector_store` runs `Table.optimize(cleanup_older_than=0)` on the live table (best-effort, never raises). It is called (a) from `_persist_index_checkpoint` (lancedb branch, under the locks both callers already hold) and (b) **every `_LANCEDB_COMPACT_EVERY` (2000) inserts** in `_index_documents_streaming`, under `_index_mutation_lock` only — independent of the ≥10-min JSON-checkpoint gate, which is too coarse to bound the interim spike on a fast embedder. `scripts/compact_lancedb.py` is a one-off reclaim for an already-bloated table (app closed). (Implements an earlier internal fix plan, plus the insert-count cadence + reclaim script that plan had deferred.)
+
+### Fixed — scanned PDFs no longer silently lose ~90% of their content
+- `_perform_ocr_fallback` capped OCR at `_OCR_MAX_PAGES` (100) **per call**, but the vault loader extracts in 1000-page ranges, so a scanned ≥100-page range only ever indexed its first 100 pages — and cached that partial as complete, so it never self-healed. `extract_structured_from_pdf` now takes `ocr_max_pages` (the vault loader passes the full range size = 1000) and `page_done_cb` (per-page op-lock heartbeat so a long scan can't expire the TTL); `ArticleSections` gained a `truncated` flag. The vault loader **warns and does not cache** a truncated range so it retries next run. The interactive upload path keeps the 100-page default (bounded by its own extraction timeout). `pdf_extractor.py`, `rag/vault.py`.
+
+### Fixed — chat no longer mixes embedding spaces on a model switch
+- Retrieval embedded the query with whatever `embed` config said, even when it differed from the model the index was built with — fusing two vector spaces and silently wrecking results (only an advisory UI banner guarded it). `stream_chat`/`retrieve` now resolve the **index's own** embed model from `obsidian_meta.json` (`_effective_embed_name`), warn once, and retrieve with it. The indexer already rebuilds on an embed change; this keeps chat correct until the user reindexes. `rag/vault.py`.
+
+### Fixed — index lifecycle / robustness
+- **Cancel-then-reindex race:** `cancel_indexing` force-releases the op lock *before* its background thread finishes the final persist, so a reindex started immediately after could archive/rebuild the index dir concurrently with the cancelled run's checkpoint. `POST /api/obsidian/index` now `wait_for_indexing(timeout=30)` first (mirrors the reset path). `api/routes/vault.py`.
+- **No-recorded-embed index:** a `has_vector_data` index whose meta lacks an `embed` model is now rebuilt rather than silently extended (it can't be proven compatible). `rag/vault.py`.
+- **Delete-before-insert gap:** a changed chunk whose re-insert fails *after* its old copy was deleted is now tracked and reported (`reinsert_failed`) instead of being hidden in the aggregate `failed` count; it self-heals on the next run.
+
+### Tests
+- `test_lancedb_migration.py`: compaction merges per-insert fragments + preserves rows, the streaming loop compacts at the insert cadence, `compact_lancedb_vector_store` is a safe no-op off lancedb, and a no-recorded-embed index rebuilds. `test_vault_regressions.py::TestPdfRangeSplitting`: truncated range yielded-but-not-cached, full-range `ocr_max_pages` passed (mock updated to mirror `ArticleSections.truncated`). `test_vault_regressions.py::TestChatEmbedMismatchGuard`. `smoke_test.py::test_30b` (index route 503 when a prior run is unfinished).
+
+## 2026-06-21 (MD secondary cap: stop silently truncating long markdown sections)
+
+### Fixed — long single-heading markdown sections are no longer truncated at embed time
+- **`MarkdownNodeParser` splits `.md` only at heading boundaries**, with no size ceiling, so a long single-heading section produced one oversized chunk that exceeded the embedding model's token limit (nomic-embed-text / EmbeddingGemma ~2048) and was **silently truncated** — its tail never embedded and was unretrievable. A read-only scan of the live vault found **52 oversized sections across 39 notes**, 9 already exceeding 2048 tokens today (e.g. a 4,581-token section, >50% clipped). `_chunk_raw_documents` now runs a **conditional secondary `SentenceSplitter` pass** on the MD branch that sub-splits **only** sections over `MD_MAX_CHUNK_TOKENS` (1024, `core/constants.py`). `rag/vault.py`.
+- **Oversize is detected by splitter output cardinality**, and under-cap sections pass through as the **original node object** → identical `i`+text → byte-identical chunk id ⇒ **zero re-embed churn** for the ~97% of notes with no oversized section. A note *with* an oversized section re-chunks that section onward (the `i` shift); the stale-doc_id sweep self-heals it — **no `OBSIDIAN_INDEX_VERSION` bump**. A provably-safe byte-length fast path skips tokenizing tiny sections (a cl100k token is always ≥ 1 UTF-8 byte). The secondary split is `try/except`-guarded so a pathological section degrades to un-split rather than aborting the (generator-based) run.
+- Attachment extraction now runs over the **final** post-split node list (each sub-chunk gets only its own links), with the `attachments` list attached **after** the split so it can't inflate the split decision (the `_tags.md` metadata-budget case). PDF chunking is untouched.
+
+### Notes
+- `MD_MAX_CHUNK_TOKENS` is a **pinned constant**, not a config knob: it changes chunk ids, so editing it is a reindex — the same contract as the 512-token PDF chunk size. 1024 leaves ~2x headroom under the 2048 hard limit for tiktoken-vs-SentencePiece divergence. Best landed alongside an embedding-model switch so the (small) reindex is paid once.
+
+### Tests
+- `test_vault_regressions.py::TestMdSecondaryCap`: under-cap byte-identity (legacy hash), oversized split ≤ cap with unique doc_ids + propagated `header_path`, tail-only attachments, multibyte-under-cap byte-identity. `test_chunker_params_pinned` extended to pin the secondary splitter line.
+
+## 2026-06-21 (Vision/OCR call bounds: a stuck image can no longer stall indexing)
+
+### Fixed — indexing-time vision/OCR calls are now always bounded
+- **A runaway or stuck local vision model no longer freezes a multi-hour indexing run.** The image-description and scanned-PDF OCR calls (`services/vision.py`) had no timeout, no retry cap, and no token cap, so they inherited the OpenAI/LM Studio SDK default of a 600 s timeout × 2 retries = **up to 30 minutes per stuck image**, blocking the whole streaming indexer (observed against `lm_studio` + `gemma-4-e4b` generating unbounded tokens on a single image). The transports now take keyword-only `timeout`/`max_tokens`: LM Studio passes `timeout` + `max_retries=0` to `openai.OpenAI(...)` and `max_tokens` to `create(...)`; Ollama uses the timed `_ollama_client(OLLAMA_HOST, timeout)` + `options={"num_predict": max_tokens}`. `_chat_lm_studio_image` never forwards `timeout=None` (the SDK can read that as "no timeout"). `services/vision.py`, `core/providers/ollama.py`.
+- **The description path pre-emptively downscales oversized images** (`_fit_base64_image_to_max_side`, longest side > `VISION_IMAGE_MAX_SIDE` = 1568 px) to kill the giant-image prefill-stall mode. Best-effort PNG re-encode that returns the original on any failure (undecodable image — HEIC without `pillow-heif`, which is not installed — or non-image input). Invisible to the description cache (keyed on original bytes). OCR is deliberately **not** pre-downscaled (legibility); its existing context-overflow downscale-retry is unchanged and still caches on the original `base64_png`.
+
+### Added — Settings-window knobs for the vision/OCR bounds
+- `vision_timeout_s` (5-600, default 120; **always on — no "0 = off"** unlike `local_request_timeout_s`), `vision_max_tokens` (64-8192, default 1536), `ocr_max_tokens` (64-8192, default 4096). Persisted defaults in `core/config.py`, validated/clamped in `api/routes/config.py::_CONFIG_VALIDATORS`, read **per call** via `_cfg_bounded_int` (lazy `load_config`) so a change applies without restart, with a hard `DEFAULT_*` fallback on missing/≤0/garbage and a clamp to the validator range for a hand-edited out-of-range value. UI controls live in the **LLM Settings → Global · OCR & Vision** block and are owned by `static/js/settings.js`. `core/constants.py` adds `DEFAULT_VISION_TIMEOUT_S`/`DEFAULT_VISION_MAX_TOKENS`/`DEFAULT_OCR_MAX_TOKENS`/`VISION_MAX_RETRIES`/`VISION_IMAGE_MAX_SIDE`.
+
+### Tests
+- `test_concurrency.py::TestVisionCallBounds`: downscale shrinks oversized / no-ops small / survives junk; `describe_image` downscales and passes the bounded `timeout`/`max_tokens`; OCR passes `ocr_max_tokens` (not `vision_max_tokens`); the LM Studio transport sets `max_retries=0`, forwards a real `timeout`, caps `max_tokens`, and omits `timeout`/`max_tokens` when unset; `_cfg_bounded_int` falls back for unset/0/garbage and clamps a positive out-of-range value. `smoke_test.py::test_03c` covers the three new keys as defaults + clamp.
+
+## 2026-06-20 (Production-readiness pass: provider-API correctness, agent timeouts, live model listing)
+
+A code-review + audit response. All changes verified against the live provider docs (platform.claude.com, ai.google.dev, platform.openai.com) where an HTTP contract was involved.
+
+### Fixed — online provider API correctness
+- **OpenAI o-series reasoning models now send the right parameters.** `o1` / `o1-mini` / `o1-preview` / `o3-mini` (all in the curated list) reject `temperature`/`top_p` ("Only the default (1) value is supported") and require `max_completion_tokens` instead of the deprecated `max_tokens` — so every chat call against them used to 400. `OpenAIProvider._common_params` now detects the o-series by family prefix (`_is_reasoning_model`: `o` + digit, so future `o5`/`o6` are covered while `gpt-4o` is not) and emits `max_completion_tokens` + omits the sampling params; `gpt-*` keep the legacy shape (also safer for OpenAI-compatible `base_url` endpoints). `core/llm/adapters/openai.py`.
+- **Anthropic temperature is clamped to its documented 1.0 ceiling.** Anthropic caps `temperature` at 1.0 while OpenAI/Gemini allow 2.0 and the vault-chat range is 0-2; a temperature in (1.0, 2.0] would 400 against Anthropic only. `AnthropicProvider._build_payload` now clamps to `min(temp, 1.0)`. `core/llm/adapters/anthropic.py`.
+
+### Added — live model discovery (curated fallback)
+- **`/api/models` for online providers now merges `CURATED_MODELS` with a live fetch** from each provider's models endpoint (OpenAI `client.models.list()`, Anthropic `GET /v1/models`, Gemini `GET /v1beta/models` filtered to `generateContent`), so newly-released models (e.g. a just-shipped Claude tier) appear without a code edit and retired ids simply never get appended. Curated stays first and authoritative for pricing + default selection. `core/llm/model_listing.py` (`merged_models`: short-TTL-cached, key-gated, never-raises, 20 s negative-TTL on failure so a not-yet-set key recovers fast) + per-adapter `_fetch_live_models`. Degrades to curated-only without a key / offline / on error, so no-key callers and the hermetic test suite are unchanged.
+
+### Fixed — agent loop resilience & correctness
+- **Agent reasoning calls are now bounded by the turn's wall-clock deadline.** Each iteration caps the per-call timeout to the remaining `deadline_monotonic_s`; the local tool-call path honours it via `_effective_local_timeout` (the tighter of `request.timeout_s` and `local_request_timeout_s`, **ceil-quantized to whole seconds** so the `OllamaProvider._client` cache — keyed by `(host, timeout)` — stays bounded instead of leaking one httpx pool per distinct float). `OllamaProvider._client(timeout=…)` gained an explicit override. This stops a wedged local backend from keeping the SSE worker thread alive past the deadline. `core/agent/loop.py`, `core/llm/adapters/local.py`, `core/providers/ollama.py`.
+- **Agent mode honours the per-request `temperature`** and no longer coerces a configured `0.0` up to `0.3` (the old `cfg.get(...) or 0.3` treated falsy 0.0 as unset). `run_agent_loop(temperature=…)` threaded from the route. `core/agent/loop.py`, `api/routes/vault.py`.
+
+### Changed — hardening
+- **Secret redaction** adds Google OAuth (`ya29.…`) and generic `Authorization:` token patterns. `core/llm/redact.py`.
+- **`online_max_retries` is clamped to `[0, 10]` in the factory** (mirrors the `/api/config` validator) so a hand-edited `config.json` can't make the retry loop attempt hundreds of round-trips. `core/llm/factory.py`.
+
+### Added — answer-quality eval is now runnable hermetically
+- Extracted `run_eval.run_pairs(manager, pairs, …)` so the scoring pipeline (previously only reachable behind `RUN_LIVE_EVAL=1` and never executed) is driven in CI by `tests/eval/test_eval_pipeline.py` with a fake manager — proving a grounded answer passes and a hallucinated one fails. Added two unanswerable hallucination-tripwire pairs to `golden_qa.json`. `tests/eval/`.
+
+### Docs
+- README states the **read-only vault** guarantee prominently (the app never writes to your Obsidian vault) and adds a screenshots scaffold (`docs/screenshots/`, whitelisted in `.gitignore`). `core/llm/CLAUDE.md` documents the live-listing merge, the o-series/Anthropic parameter contracts, and the agent-tool-path timeout exception; root `CLAUDE.md` updates the `/api/models` description.
+
+### Tests
+- New hermetic tests: live-merge / curated-fallback / failure-recovery / success-empty-cached (model listing), o-series + Anthropic parameter contracts, ollama client-cache quantization bound, agent temperature/timeout, and the eval pipeline. Full `test_llm` / `test_agent` / `test_concurrency` / `test_validators` / `test_prompts` / `test_deck` / `tests/eval` suites green (the only `test_llm` failures observed are a pre-existing, intermittent numpy "cannot load module more than once" import flake, identical with and without these changes).
+
+## 2026-06-20 (Wikilink graph expansion — query-time, no reindex)
+
+### Added — vault retrieval
+- **Wikilink graph expansion** for vault chat: an opt-in, **reindex-free / re-embed-free** retrieval layer that widens the retrieved result set with chunks from notes linked to/from your top hits (outbound ∪ backlinks) before the rerank stage. Rerank-gated, so irrelevant neighbours drop out and the final answer size is unchanged.
+  - **Graph builder** (`rag/vault.py`): `_WikilinkGraph` + `_get_wikilink_index()` build a note→note adjacency lazily from the docstore (regex over `.md` node text, Obsidian shortest-path resolution against the in-memory indexed-source set — no filesystem walk), cached by docstore size and invalidated by `_invalidate_retrieval_caches` like BM25 (no on-disk sidecar). Optionally warmed silently by `prewarm`.
+  - **Expansion retriever** (`rag/engine.py`): `_WikilinkExpansionRetriever` wraps the finalized retriever in `_build_retrieval_pipeline` **before** the postprocessors — one insertion point covering the local, online, and agent-search paths. Neighbour chunks are fetched from the docstore at a decayed seed score; bounded by neighbour-note and node caps.
+  - **Config** (`core/config.py`, `api/routes/config.py`, `api/routes/vault.py`): `vault_wikilink_expansion` (default `False`, body-overridable via `wikilink_expansion`) plus config-only caps `vault_wikilink_neighbor_cap` (1-100/10), `vault_wikilink_node_cap` (1-200/24), `vault_wikilink_score_decay` (0.0-1.0/0.5), all in the `_validate_llm_config_keys` clamp map. Applies to single-shot RAG (and the agent's RAG fallback) only — not the agent's active `vault.search`, matching `mmr_enabled`/`query_expansion`.
+  - **UI** (`templates/index.html`, `static/js/vault.js`): a "Wikilink expansion" checkbox (`#vault-wikilink-enabled`) in the Vault Chat fine-tuning controls, owned by `vault.js` like the other live retrieval toggles (live per-Send body field + debounced config persistence).
+  - **Tests**: `TestWikilinkGraph` (resolution/both-directions/limitations), `TestWikilinkExpansionRetriever` (caps/decay/dedup/seed-skip/pipeline-wrap-only-when-enabled), `_resolve_chat_params` resolution, and smoke config-clamp coverage. ~30 new hermetic tests; full vault/engine/config suite green.
+
+## 2026-06-19 (Prompt audit + vault image descriptions + LanceDB metadata tolerance)
+
+### Changed — prompt audit (all query/generation-time; **no reindex**)
+- **Single-paper system prompt.** Dropped the "Each section: 3-6 sentences" clause that contradicted the per-template length budgets (CONCISE 1-2, DETAILED 1-3); dropped the "expert research assistant" persona framing while keeping the medical/biomedical domain cue; phrased affirmatively (small local models follow positive instructions more reliably). The detailed preset gains a lead-bias mitigation line ("draw on the whole article — including Methods and Results — not only the abstract/introduction"). `core/constants.py`.
+- **Focus question is now actionable.** When supplied it carries an explicit directive ("Prioritise information that addresses this question; if the document does not, state that explicitly") instead of being injected inert, and is `.strip()`-guarded so a whitespace-only value adds nothing. `core/llm/prompt.py`.
+- **Report-type prompts (7 built-ins).** Replaced the "You are a researcher specializing in X" identity opener with a "When summarising X, …" scoping clause; the "pay special attention to / focus on …" focus directives (the high-value part) are preserved verbatim. Only built-in defaults change — user-saved/overridden report types in `report_types.json` are untouched. `core/constants.py`.
+- **Vault RAG citation instruction is consistent across all four answer modes.** strict/balanced/exploratory/concise now all end with "cite the source filename in brackets, e.g. `[note.md]`" (previously three said "cite source filenames when available" and only concise used brackets). `rag/engine.py`.
+- **Agent preamble** gains an efficiency nudge ("prefer one or two focused searches") and a one-line worked example, targeting the small-local-model failure mode (tool-call looping / malformed calls that trip the RAG fallback). The pre-existing stop condition and untrusted-tool-output guard are retained. `core/agent/loop.py`.
+- **Deckgen outline prompt** gains a one-line JSON shape example; `outline.parse_outline` (balanced-bracket extraction + heading-list fallback) remains authoritative. `deckgen/prompts.py`.
+
+### Changed — vault image indexing (`b11dc65`)
+- **Vault image vision prompt** (`VisionManager.describe_image`) now asks for a short description of what the image depicts **plus** a transcription of any visible text/labels/data, instead of the pure "extract all text" OCR prompt — which returned nothing for text-light figures, so those images embedded empty and were dropped. The scanned-PDF path (`GLMOCRManager.extract_page_text`) stays pure-OCR. The description cache is keyed by image bytes, not prompt text, so clear `obsidian_cache/.../image_cache/` to regenerate already-cached descriptions.
+- **Obsidian-style attachment resolution.** Bare wikilinks (`![[image.png]]`) now resolve via a vault-wide basename index built during the single `rglob` walk, so an image in a central attachments folder resolves even when the link omits its path; ambiguous basenames break by shortest-path proximity to the linking note. The `attachments` metadata stays byte-identical, so no re-embedding is forced.
+
+### Fixed — LanceDB backend (`8af0b0b`, `c14f565`)
+- **Heterogeneous node metadata no longer aborts a lancedb build.** LanceDB freezes the metadata struct schema at table creation (MD-first → `{file_path, source, extension, header_path, attachments}`); later inserts adding a field — `page_start`/`page_end` on large-PDF range chunks, `is_image` on vault images — failed with "field does not exist in table schema", silently breaking large-textbook indexing (each run hit the consecutive-failure breaker at the first such chunk). `NormalizingLanceDBVectorStore.add()` now projects each node's metadata onto the live table's columns (`_allowed_metadata_keys()` reads the struct schema; `_LANCE_FLAT_METADATA_KEYS` is the fresh-table fallback). Dropping is lossless for the read path (those keys are write-only at query time; the full node lives in the docstore + `_node_content`). Vector-row only — `doc_id`/`doc.hash`/docstore untouched, so already-indexed MD/PDF chunks skip by hash with no re-embedding; only the previously-failing large PDFs + vault images embed (first-time) on the next run. `rag/lancedb_store.py`.
+
+### Added — prompt regression net
+- `test_prompts.py` (repo root, model-free): 20 invariants pinning the grounding/citation/placeholder/length-cap contracts of the prompts above, so an accidental edit surfaces as a failing assertion.
+- `tests/eval/`: a self-contained fixture vault + golden Q&A pairs + a pure scoring layer (`scoring.py`, with `must_not_contain` using word-boundary matching to avoid substring false positives) plus an opt-in live runner (`run_eval.py`, gated by `RUN_LIVE_EVAL=1`) for before/after answer-quality comparison. The data + scoring half is verified hermetically by `tests/eval/test_scoring.py`.
+
+### Tests
+- New: 20 in `test_prompts.py`, 8 in `tests/eval/test_scoring.py`; lancedb metadata-projection regression in `test_lancedb_migration.py` (`8af0b0b`). Prompt-relevant + vault suites green with no regressions (`test_llm`, `test_agent`, `test_deck`, `test_validators`, `smoke_test`, `deckgen/tests`: 290 passed/1 skipped; `test_vault_regressions`, `test_concurrency`: 190 passed).
+
 ## 2026-06-18 (Library Audit: precompute unmapped-PDF annotations during the scan)
 
 Fixes the "Unread PDFs" / "Read PDFs Missing Zotero" tabs hanging on "Loading…": both reports iterate `inv.bridge.unmapped_pdfs` and previously read every unmapped PDF's annotations **lazily on the report GET** (thousands of synchronous `pikepdf` opens on the request thread, recomputed on every tab visit, with no progress and no cancel). The work now happens once, during the scan, in parallel.
@@ -220,7 +436,7 @@ First batch of `PERF_MEMORY_PLAN.md` (16 GB Apple Silicon audit). All changes ar
 - **`audit/` package.** Vendored from kb_harmonizer (`audit/core/` connectors for bib / obsidian / zotero / pdf_annotations / finder_tags / hashing / naming, `audit/engine/` for bridge + inventory + duplicates, plus the five report builders under `audit/engine/reports/`). The PySide6 UI subpackage was dropped. `audit/config.py` adapts papermind's `config.json` keys into the kb_harmonizer-shaped `Settings` dataclass, exposing every previously-hardcoded subpath as a configurable key. `audit/manager.py` runs the single background scan thread with cooperative cancel via `_stop_event`. `audit/serialize.py` converts engine dataclasses to JSON dicts. `audit/scan.py` is the developer CLI (`python -m audit --check ...`).
 - **`/api/audit/*` blueprint.** Eight endpoints (`config` GET/POST, `status` GET, `scan` POST, `cancel` POST, `inventory` GET, `reports/<name>` GET, `mapping` POST, `reveal` POST) — all behind the same `X-Requested-With: ChatEKLD` gate as the existing routes. Path-traversal and absolute-path attempts in vault-relative subdir fields are rejected at the route layer. The macOS-only `reveal` endpoint bounds `open -R` / `open` / `zotero://` invocations to paths under the configured vault root or Zotero storage tree.
 - **`/api/reset` integration.** Reset now also calls `audit_manager.request_cancel()` + `clear_results()` so an in-flight audit is signalled to abort and the cached inventory is dropped, matching the post-reset "no scan yet" empty state on the Library Audit tab.
-- **8 new config keys.** `audit_attachments_subdir` (default `Z_attachments`), `audit_biblio_articles_subdir` (default `biblio_articles`), `audit_zotero_notes_subdir` (default `Z_Zotero_Notes`), `audit_master_bib_path` (default `presentations_slides_writings_teaching/_master.bib`), `audit_zotero_sqlite` (default `~/Zotero/zotero.sqlite`), `audit_zotero_storage` (default `~/Zotero/storage`), `audit_annotations_read_threshold` (default `5`), `audit_biblio_skip_prefix` (default `z_item`). Vault root is shared with the existing `obsidian_vault_path` so there is no second vault setting.
+- **8 new config keys.** `audit_attachments_subdir` (default `Z_attachments`), `audit_biblio_articles_subdir` (default `biblio_articles`), `audit_zotero_notes_subdir` (default `Z_Zotero_Notes`), `audit_master_bib_path` (default `_master.bib`), `audit_zotero_sqlite` (default `~/Zotero/zotero.sqlite`), `audit_zotero_storage` (default `~/Zotero/storage`), `audit_annotations_read_threshold` (default `5`), `audit_biblio_skip_prefix` (default `z_item`). Vault root is shared with the existing `obsidian_vault_path` so there is no second vault setting.
 - **New requirements.** `pikepdf>=8.15,<10.0` (read-only PDF annotation counting), `ruamel.yaml>=0.18,<0.19` (Obsidian frontmatter parsing that preserves quoting), `bibtexparser>=1.4,<2.0` (Better BibTeX exports), `beautifulsoup4>=4.12,<5.0` (already transitive via markitdown — pinned explicitly so an upstream change does not silently break the Zotero child-note HTML stripper).
 - **PyInstaller bundling.** Added `audit/` to `--add-data` and `pikepdf` / `ruamel.yaml` / `bibtexparser` / `bs4` to `--collect-all` in `install_and_build.sh` so the frozen .app bundles the new package and its C-extension dependencies.
 - **Tests.** 86 ported kb_harmonizer unit tests under `tests/audit/` (bib parser, bridge filename / mapping helpers, hashing with cancellation, naming scorer, obsidian frontmatter / link parsing, PDF annotations error contract). 17 new audit-level tests in `test_audit.py` covering the Settings adapter, manager state machine, the create_app no-auto-scan regression, the auth gate on every `/api/audit/*` route, and config-validation rejection of path traversal / absolute paths / non-finite thresholds. Total: 154 tests passing across `tests/audit/`, `test_audit.py`, `test_validators.py`, `smoke_test.py`.

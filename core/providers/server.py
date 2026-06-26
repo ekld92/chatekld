@@ -1,3 +1,14 @@
+"""Local backend process lifecycle: start/stop Ollama, nudge LM Studio.
+
+Owns spawning ``ollama serve`` (and recording its PID for clean shutdown),
+best-effort launching LM Studio + loading the configured model, and a
+process-global warning list the UI surfaces. The recurring theme here is
+robustness to a Finder-/LaunchServices-launched ``.app``, which inherits a
+minimal PATH that excludes Homebrew — so binaries are resolved against an
+augmented PATH (:func:`_augmented_path_env` / :func:`_resolve_binary`) and the
+child process inherits it too. None of this gates online providers; it is purely
+the local-backend bootstrap.
+"""
 import os
 import sys
 import time
@@ -53,15 +64,18 @@ def _resolve_binary(name: str, candidates: tuple[str, ...] = ()) -> Optional[str
 
 
 def add_provider_warning(message: str) -> None:
+    """Append a de-duplicated, UI-surfaced provider warning (thread-safe)."""
     with _provider_warnings_lock:
         if message and message not in _provider_warnings:
             _provider_warnings.append(message)
 
 def get_provider_warnings() -> list[str]:
+    """Return a snapshot copy of the current provider warnings."""
     with _provider_warnings_lock:
         return list(_provider_warnings)
 
 def clear_provider_warnings() -> None:
+    """Drop all accumulated provider warnings (e.g. once a backend comes up)."""
     with _provider_warnings_lock:
         _provider_warnings.clear()
 
@@ -174,6 +188,14 @@ def start_lm_studio_server() -> Tuple[bool, str]:
     return False, warning
 
 def _try_lms_load_model(provider=None) -> None:
+    """Best-effort: ensure the configured ``llm`` model is loaded in LM Studio.
+
+    No-ops when no model is configured or it is already loaded. When the model
+    is absent it tries ``lms load <model>`` via the CLI (resolved against the
+    Homebrew-augmented PATH), and on any failure — missing CLI, list error,
+    timeout, non-zero exit — records a provider warning rather than raising, so a
+    failed auto-load never blocks startup; the user can load it manually.
+    """
     cfg = load_config()
     model = str(cfg.get("llm", "")).strip()
     if not model:

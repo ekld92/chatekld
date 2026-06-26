@@ -151,12 +151,24 @@ _MAX_MACROS = 24
 
 @dataclass
 class MacroInfo:
+    """One document-defined macro surfaced to the model's prompt cheatsheet.
+
+    Captures just enough to render a usable call signature: the name (without the
+    leading backslash), the argument count, whether the first argument is optional
+    (``[..]`` form), and a friendly description for the house macros we recognize.
+    """
     name: str           # without the leading backslash
     arity: int = 0
     optional_first: bool = False  # first arg is optional ([..])
     description: str = ""
 
     def signature(self) -> str:
+        """Render a human-readable call form, e.g. ``\\citefoot{arg}`` or ``\\x[opt]{arg}``.
+
+        The placeholders are illustrative only (``[opt]`` for the optional first
+        argument, ``{arg}`` for each mandatory one) — they show the model the shape
+        of a call without claiming any particular argument semantics.
+        """
         sig = f"\\{self.name}"
         if self.arity <= 0:
             return sig
@@ -171,6 +183,13 @@ class MacroInfo:
 
 @dataclass
 class TemplateParts:
+    """The fully-analyzed template: the three reusable spans plus derived metadata.
+
+    ``preamble`` / ``opening`` / ``closing`` are the verbatim shell slices (see
+    :func:`split_template`); ``base_dir`` is the template's directory (used to
+    resolve sibling ``.sty``/``.bib`` files); ``macros`` and ``bib_index`` are the
+    scanned house macros and bibliography that feed the per-section prompts.
+    """
     preamble: str
     opening: str
     closing: str
@@ -180,6 +199,11 @@ class TemplateParts:
 
     @property
     def bib_keys(self) -> set:
+        """The set of citation keys in the template's bibliography.
+
+        Used by ``assemble.validate`` to flag a model-emitted ``\\citefoot{key}``
+        whose key is not in the template's ``.bib`` (a hallucinated citation).
+        """
         return set(self.bib_index.keys())
 
 
@@ -304,6 +328,11 @@ def _resolve_local(base_dir: str, arg: str, default_ext: str) -> Optional[str]:
 
 
 def _read_capped(path: str, cap: int) -> str:
+    """Read at most *cap* bytes of *path* as text; "" on any OS error.
+
+    The cap bounds memory so a pathological ``.sty`` / ``.bib`` cannot blow up the
+    process; ``errors="replace"`` means a non-UTF-8 byte never aborts the scan.
+    """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             return fh.read(cap)
@@ -423,6 +452,12 @@ def resolve_bib(preamble: str, base_dir: str = "") -> dict:
 
 
 def _parse_bib_into(text: str, index: dict) -> None:
+    """Populate *index* with ``key -> (author, year, title)`` for each bib entry.
+
+    Skips ``@comment``/``@string``/``@preamble``/``@set`` non-entry blocks. Each
+    entry body is delimited as "from this entry header to the next", so the field
+    scan never bleeds into the following entry.
+    """
     for m in _BIB_ENTRY_RE.finditer(text):
         etype = m.group(1).lower()
         if etype in _BIB_NONENTRY:
@@ -475,6 +510,11 @@ def _bib_field(body: str, field_name: str) -> str:
 
 
 def _clean_bib_value(value: str) -> str:
+    """Normalize a raw bib field: drop brace-grouping and collapse whitespace.
+
+    BibTeX uses ``{...}`` braces to protect casing/grouping; they carry no meaning
+    for the short author/year/title display we feed the prompt, so they are removed.
+    """
     value = re.sub(r"[{}]", "", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value

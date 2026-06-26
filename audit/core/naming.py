@@ -1,5 +1,12 @@
 """Filename quality scoring. Lower score = cleaner."""
 
+# A heuristic used to pick the most human-readable name among a set of
+# content-identical (duplicate) PDFs — the canonical one a user would keep.
+# The score is a sum of penalties (a copy suffix, a long hash-like hyphenated
+# stem, a digit-heavy or vowel-less stem, raw length) minus a bonus for
+# carrying a plausible publication year. Tuned to taste, not derived from
+# anything formal; the absolute number is meaningless, only the ranking is used.
+
 from __future__ import annotations
 
 import re
@@ -12,6 +19,16 @@ _VOWEL_RE = re.compile(r"[aeiouy]", re.IGNORECASE)
 
 
 def score(name: str) -> float:
+    """Penalty score for a filename — lower is cleaner / more keepable.
+
+    Operates on the stem only (extension ignored). Penalties: a duplicate
+    suffix like `` (1)``/`` copy``/``_3`` (+100); a long, heavily hyphenated
+    stem that looks like a slug or hash (+200); a digit-dense stem after the
+    year is removed (+150); a vowel-less stem (+100, catches encoded/garbled
+    names); plus 0.1 per character to break ties toward shorter names. A bonus
+    (−50) rewards a stem that contains a 19xx/20xx year. The year is excluded
+    from the digit-density test so a normal ``author_2020`` name isn't punished.
+    """
     base = Path(name).stem
     s = 0.0
     if _DUP_SUFFIX_RE.search(base):
@@ -35,6 +52,11 @@ def score(name: str) -> float:
 
 
 def get_cleanest_name(filenames: Iterable[str]) -> str:
+    """Pick the lowest-scoring (cleanest) name; ties broken alphabetically.
+
+    Raises ``ValueError`` on an empty input. The secondary ``x.lower()`` sort
+    key makes the choice deterministic when two names score equally.
+    """
     names = list(filenames)
     if not names:
         raise ValueError("empty filenames")

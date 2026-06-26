@@ -27,7 +27,14 @@ from api.validators import (
     coerce_string_max_len,
 )
 from core.config import load_config, resolve_chat_model
-from core.constants import DEFAULT_EMBED
+from core.constants import (
+    DEFAULT_EMBED,
+    # Shared SSE stall-guard timing (single source of truth in core/constants.py;
+    # aliased to the historical private names used below). Rationale at the
+    # definition site.
+    SSE_STALL_MARGIN_S as _STALL_MARGIN_S,
+    SSE_SINGLE_SHOT_FLOOR_S as _SINGLE_SHOT_FLOOR_S,
+)
 from rag.vault import obsidian_manager
 
 from deckgen.assemble import assemble_with_template, validate
@@ -72,15 +79,11 @@ _DENY_PREFIXES = (
 )
 
 _CHAT_TOKEN_TIMEOUT_S = 300  # default per-turn wall-clock cap (config: agent_wall_clock_s)
-# Consumer waits this much longer than the effective stall base so the worker's
-# own structured timeout/error fires first (mirrors api/routes/vault.py).
-_STALL_MARGIN_S = 30
-# Floor for the consumer's per-event wait — the no-events-at-all backstop never
-# drops below this even if the per-turn cap is lowered. Each deck turn is still
-# bounded by turn_timeout_s inside the agent loop; this only guards total event
-# silence (e.g. a hung local call when local_request_timeout_s is 0). Mirrors
-# api/routes/vault.py so both SSE routes share one stall model.
-_SINGLE_SHOT_FLOOR_S = 300
+# _STALL_MARGIN_S / _SINGLE_SHOT_FLOOR_S are imported from core/constants.py so
+# the vault, deck, and plain-chat SSE routes share one stall model. Each deck
+# turn is still bounded by turn_timeout_s inside the agent loop; the floor only
+# guards total event silence (e.g. a hung local call when local_request_timeout_s
+# is 0). Full rationale at the definition site.
 
 
 def _resolve_template_path(raw) -> str | None:
@@ -122,6 +125,11 @@ def _resolve_out_dir(raw) -> str | None:
 
 
 def _read_template_file(path: str) -> str:
+    """Read at most ``_TEMPLATE_MAX_BYTES`` of a template file.
+
+    Uses ``errors="replace"`` so a stray non-UTF-8 byte in a user template
+    cannot raise, and a hard read cap so an enormous file cannot exhaust memory.
+    """
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         return fh.read(_TEMPLATE_MAX_BYTES)
 
@@ -229,6 +237,14 @@ def api_deck_generate():
     consumer_timeout_s = max(wall_clock_s, _SINGLE_SHOT_FLOOR_S) + _STALL_MARGIN_S
 
     def generate():
+        # SSE body: a daemon worker thread runs the (slow, blocking) deckgen
+        # pipeline and pushes frames onto a bounded queue; this generator (the
+        # consumer) drains the queue to the client. The split keeps the Flask
+        # response responsive and lets a client disconnect or a stall timeout
+        # signal `cancel` so the worker unwinds instead of leaking. Mirrors the
+        # vault/plain-chat SSE skeleton; the consumer timeout is the floored
+        # stall backstop computed above, while each turn is bounded by the
+        # agent's own `turn_timeout_s`.
         cancel = threading.Event()
         event_q: queue.Queue = queue.Queue(maxsize=1024)
         _DONE = object()

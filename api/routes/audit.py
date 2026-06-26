@@ -136,6 +136,10 @@ def _normalise_abs_path(raw: Any) -> str | None:
 
 
 def _normalise_prefix(raw: Any) -> str | None:
+    """Coerce the biblio skip-prefix: 0-32 chars of ``[A-Za-z0-9_.-]`` (else None).
+
+    An empty string is valid (no skip prefix); the regex allows zero-length.
+    """
     s = coerce_string_max_len(raw, 32)
     if s is None:
         return None
@@ -143,10 +147,17 @@ def _normalise_prefix(raw: Any) -> str | None:
 
 
 def _normalise_threshold(raw: Any) -> int | None:
+    """Coerce the annotations "read" threshold to an int in [0, 10000], else None."""
     return coerce_int_in_range(raw, _THRESHOLD_MIN, _THRESHOLD_MAX)
 
 
 def _audit_config_view(cfg: dict | None = None) -> dict[str, Any]:
+    """Project the persisted config into the audit-settings response shape.
+
+    Falls back to ``_AUDIT_DEFAULTS`` for any unset audit key, and adds the
+    derived ``mapping_file`` path and the shared ``obsidian_vault_path`` so the
+    Library Audit UI can render the full settings panel from one payload.
+    """
     if cfg is None:
         cfg = load_config()
     out: dict[str, Any] = {}
@@ -159,6 +170,7 @@ def _audit_config_view(cfg: dict | None = None) -> dict[str, Any]:
 
 @audit_bp.route("/api/audit/config")
 def api_audit_get_config():
+    """Return the current audit settings (with defaults filled in)."""
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     return jsonify(_audit_config_view())
@@ -166,6 +178,16 @@ def api_audit_get_config():
 
 @audit_bp.route("/api/audit/config", methods=["POST"])
 def api_audit_save_config():
+    """Validate and persist the audit settings (the only audit write endpoint).
+
+    This is the dedicated, path-traversal-aware entry point for the ``audit_*``
+    keys — the generic ``/api/config`` strips them precisely so they can only be
+    set here. Each key is run through its specific normaliser (relative subpaths
+    reject traversal; the Zotero sqlite/storage paths must be absolute so they
+    can't anchor to the CWD and widen ``reveal`` scope; prefix/threshold are
+    shape/range checked). Any single invalid value 400s the whole request rather
+    than being silently dropped; only the validated subset is then saved.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
@@ -221,6 +243,7 @@ def api_audit_save_config():
 
 @audit_bp.route("/api/audit/status")
 def api_audit_status():
+    """Return the audit manager's lifecycle/progress payload (read-only poll)."""
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     return jsonify(audit_manager.get_status_payload())
@@ -228,6 +251,15 @@ def api_audit_status():
 
 @audit_bp.route("/api/audit/scan", methods=["POST"])
 def api_audit_scan():
+    """Start a background reconciliation scan — the ONLY scan trigger.
+
+    No other code path may call ``audit_manager.start_scan()`` (pinned by
+    ``TestFlaskAppBootDoesNotScan``), so the scan is strictly manual. The body's
+    ``count_annotations`` / ``include_duplicates`` are coerced to bool (defaulting
+    to True when absent/invalid); a non-object body is treated as ``{}``. Returns
+    409 when a scan is already running, 400 when the manager rejects the config,
+    else ok. The scan itself is read-only against all external stores.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     # An empty body is valid (use defaults). A non-object payload (list,
@@ -253,6 +285,7 @@ def api_audit_scan():
 
 @audit_bp.route("/api/audit/cancel", methods=["POST"])
 def api_audit_cancel():
+    """Request cancellation of an in-flight scan (no-op if none is running)."""
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     cancelled = audit_manager.request_cancel()
@@ -261,6 +294,11 @@ def api_audit_cancel():
 
 @audit_bp.route("/api/audit/inventory")
 def api_audit_inventory():
+    """Return the cached per-citation-key inventory from the last scan.
+
+    404 with a "Run a scan first" message when no completed scan is cached
+    (also the post-reset empty state) — there is no implicit scan on read.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     inv, settings = audit_manager.get_inventory()
@@ -274,6 +312,16 @@ def api_audit_inventory():
 
 @audit_bp.route("/api/audit/reports/<name>")
 def api_audit_report(name: str):
+    """Build and return one of the six reconciliation reports by name.
+
+    The ``<name>`` path segment is allow-listed against ``_REPORT_NAMES`` (404
+    otherwise) and dispatched to the matching report builder over the cached
+    inventory (404 if no scan is cached). The annotation-based reports
+    (``unread_unzoterod`` / ``read_unzoterod``) serve from the scan's precomputed
+    ``unmapped_annotations`` to avoid re-opening thousands of PDFs on this
+    request thread, with a lazy per-path disk fallback. ``duplicates`` 404s if
+    that phase was skipped on the last run.
+    """
     if not origin_is_local():
         return jsonify({"error": "Forbidden"}), 403
     if name not in _REPORT_NAMES:
@@ -452,6 +500,12 @@ def api_audit_reveal():
 
 
 def _is_within(path: Path, root: Path) -> bool:
+    """Return True iff *path* is *root* or a descendant of it.
+
+    Both should be resolved before calling; used to bound ``reveal`` to the
+    vault / Zotero-storage roots. ``relative_to`` raising ``ValueError`` means
+    *path* escapes *root*.
+    """
     try:
         path.relative_to(root)
         return True

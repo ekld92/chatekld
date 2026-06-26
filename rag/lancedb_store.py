@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from datetime import timedelta
 from typing import Any
 
 # Layout inside OBSIDIAN_INDEX_DIR. Kept in one place so the migration script,
@@ -42,6 +43,25 @@ try:  # optional dependency — guarded exactly like BM25 / sbert-rerank
 except Exception:  # pragma: no cover - exercised only when the extra is absent
     lancedb = None  # type: ignore[assignment]
     LanceDBVectorStore = None  # type: ignore[assignment,misc]
+
+
+# Stable projection of *user* metadata keys that the LanceDB row carries as
+# flat struct columns.  LanceDB stores a node's metadata as a single struct
+# column whose field set is frozen when the table is first created (from the
+# MD-first loader, so these are exactly the keys an MD chunk emits).  LanceDB
+# then rejects any later insert whose metadata introduces a field the struct
+# lacks ("field 'X' does not exist in table schema"), which is what broke
+# large-PDF range chunks (`page_start`/`page_end`) and vault-image chunks
+# (`is_image`).  This constant is only the *fresh-table fallback*; for an
+# existing table the live schema is authoritative (see
+# ``_allowed_metadata_keys``).  Dropping a key from this flat projection loses
+# nothing the read path uses: the full node — every metadata key — is still
+# persisted in the docstore (``store_nodes_override=True``) and in the row's
+# own ``_node_content`` blob; the flat columns exist only for filtering, which
+# the vault retrieval path does not use.
+_LANCE_FLAT_METADATA_KEYS = frozenset(
+    {"file_path", "source", "extension", "header_path", "attachments"}
+)
 
 
 def lancedb_available() -> bool:
@@ -87,23 +107,81 @@ if LanceDBVectorStore is not None:
         (and therefore the docstore) are never mutated.
         """
 
+        def _allowed_metadata_keys(self) -> frozenset[str]:
+            """User-metadata keys the persisted table can accept as struct columns.
+
+            An existing table's own schema is authoritative — we never present a
+            field it does not already have, so a schema-drift insert error is
+            structurally impossible.  A not-yet-created table (``_table is None``)
+            falls back to the fixed projection, which then *becomes* the created
+            schema.  ``_table`` is populated by the integration's ``__init__``
+            when it opens an existing table, so this is reliable on the very
+            first ``add`` to an existing table, not only after one insert.
+            Reading ``schema`` is an in-memory metadata access (no table scan);
+            ``add`` is called once per chunk, so we recompute rather than cache
+            (avoids a pydantic private-attr declaration for negligible cost).
+            """
+            tbl = getattr(self, "_table", None)
+            if tbl is None:
+                return _LANCE_FLAT_METADATA_KEYS
+            try:
+                # The struct field iterates as its child Fields; their names are
+                # every metadata key the table currently stores (user keys plus
+                # the integration's own _node_content/_node_type/etc., which are
+                # never present in node.metadata so they are irrelevant below).
+                return frozenset(f.name for f in tbl.schema.field("metadata").type)
+            except Exception:
+                # Schema unreadable for any reason — fall back to the fixed
+                # projection rather than risk presenting an unknown field.
+                return _LANCE_FLAT_METADATA_KEYS
+
         def add(self, nodes: list, **add_kwargs: Any) -> list[str]:  # type: ignore[override]
+            """Insert nodes after unit-normalizing vectors and projecting metadata.
+
+            For each node, on a ``model_copy`` (the caller's node — and so the
+            docstore — is never mutated): unit-normalize the embedding for cosine
+            parity, drop any metadata key the persisted struct schema lacks
+            (``_allowed_metadata_keys``, the schema-drift guard), and
+            JSON-stringify list/dict values LanceDB cannot store. The copy is
+            reused verbatim when neither transform applies (the common MD/PDF
+            chunk), avoiding needless allocation.
+            """
+            allowed = self._allowed_metadata_keys()
             prepared = []
             for node in nodes:
                 update: dict[str, Any] = {"embedding": _unit(node.get_embedding())}
                 meta = node.metadata or {}
-                shimmed = None
+                # Project metadata onto the table's stable column set: drop any
+                # key the schema lacks (e.g. page_start/page_end/is_image) and
+                # JSON-stringify list/dict values (LanceDB rejects non-scalars).
+                # ``changed`` stays False — and the original metadata is reused
+                # verbatim — when neither transform is needed, preserving the
+                # pre-fix copy for the common MD/PDF chunk.  The docstore keeps
+                # the untouched node, so dropped keys are not lost globally.
+                projected: dict[str, Any] = {}
+                changed = False
                 for key, value in meta.items():
+                    if key not in allowed:
+                        changed = True  # drop a field absent from the schema
+                        continue
                     if isinstance(value, (list, dict)):
-                        if shimmed is None:
-                            shimmed = dict(meta)
-                        shimmed[key] = json.dumps(value, ensure_ascii=False)
-                if shimmed is not None:
-                    update["metadata"] = shimmed
+                        projected[key] = json.dumps(value, ensure_ascii=False)
+                        changed = True
+                    else:
+                        projected[key] = value
+                if changed:
+                    update["metadata"] = projected
                 prepared.append(node.model_copy(update=update))
             return super().add(prepared, **add_kwargs)
 
         def query(self, query: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+            """Unit-normalize the query vector so L2 search ranks by cosine.
+
+            Mirrors the insert-side normalization: with both the stored vectors
+            and the query vector on the unit sphere, LanceDB's default-L2 nearest
+            neighbours are exactly the cosine nearest neighbours, making ranking
+            bit-for-bit identical to the legacy ``SimpleVectorStore``.
+            """
             if getattr(query, "query_embedding", None) is not None:
                 query.query_embedding = _unit(query.query_embedding)
             return super().query(query, **kwargs)
@@ -148,3 +226,31 @@ def lancedb_table_count(index_dir: str) -> int:
         return int(lancedb.connect(db_dir).open_table(LANCEDB_TABLE).count_rows())
     except Exception:
         return -1
+
+
+def compact_lancedb_vector_store(vector_store: Any) -> bool:
+    """Compact data fragments and prune superseded versions on the LIVE table.
+
+    The streaming indexer calls ``idx.insert`` once per chunk; on LanceDB each
+    insert is its own transaction → one new single-row data fragment **and** one
+    new version manifest, and every manifest re-lists every fragment, so manifest
+    storage in ``_versions/`` grows ~O(n²) (66k inserts measured at 209 GB over
+    <1 GB of real vectors).  Periodically merging the single-row fragments
+    (``optimize``) collapses them, and ``cleanup_older_than=timedelta(0)`` prunes
+    every superseded version, bounding ``_versions/`` to O(n).
+
+    Operates on the live open ``_table`` (no second connection).  Best-effort —
+    returns ``False`` on any failure, on the simple backend, or when the table is
+    not yet open, and never raises into the caller (the indexer must not abort a
+    multi-hour run because a compaction hiccup).  The caller holds
+    ``_index_mutation_lock`` (which the retrieval path also takes), so no
+    concurrent reader observes the pruned versions mid-optimize.
+    """
+    tbl = getattr(vector_store, "_table", None)
+    if tbl is None:
+        return False
+    try:
+        tbl.optimize(cleanup_older_than=timedelta(0))
+        return True
+    except Exception:
+        return False

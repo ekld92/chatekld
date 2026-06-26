@@ -459,9 +459,12 @@ class TestVaultIndexingRegressions(unittest.TestCase):
 
         manager = ObsidianVaultManager()
         index = FakeIndex()
-        added, skipped, deleted, failed, manifest = manager._index_documents_streaming(
-            index, iter([good1, bad, good2])
-        )
+        # Backoff patched to 0 so the single failure's recovery pause doesn't
+        # slow the test; the tolerate-and-continue behaviour is unchanged.
+        with patch.object(ObsidianVaultManager, "_FAILURE_BACKOFF_BASE_S", 0):
+            added, skipped, deleted, failed, manifest = manager._index_documents_streaming(
+                index, iter([good1, bad, good2])
+            )
 
         self.assertEqual((added, skipped, deleted, failed), (2, 0, 0, 1))
         self.assertEqual(index.inserted, [good1.doc_id, good2.doc_id])
@@ -488,9 +491,13 @@ class TestVaultIndexingRegressions(unittest.TestCase):
 
         manager = ObsidianVaultManager()
         index = FakeIndex()
-        added, skipped, deleted, failed, _ = manager._index_documents_streaming(
-            index, iter(docs)
-        )
+        # Backoff patched to 0: the breaker is a wall-clock window in production
+        # (~87 s of inter-failure sleeps before the abort), but the count-based
+        # abort semantics under test are unchanged, so zero it out for speed.
+        with patch.object(ObsidianVaultManager, "_FAILURE_BACKOFF_BASE_S", 0):
+            added, skipped, deleted, failed, _ = manager._index_documents_streaming(
+                index, iter(docs)
+            )
 
         self.assertEqual(added, 0)
         self.assertEqual(skipped, 0)
@@ -499,6 +506,87 @@ class TestVaultIndexingRegressions(unittest.TestCase):
         self.assertEqual(index.insert_calls, threshold)
         self.assertTrue(manager._stop_event.is_set())
         # Reset for subsequent tests in the suite.
+        manager._stop_event.clear()
+
+    def test_index_streaming_backoff_spaces_and_caps_consecutive_failures(self):
+        """Each consecutive failure waits a little longer before the next attempt
+        (exponential, capped) — turning the breaker into a wall-clock recovery
+        window — without sleeping for real in the test."""
+        from rag.vault import ObsidianVaultManager
+        from llama_index.core import Document as LlamaDocument
+
+        threshold = ObsidianVaultManager._MAX_CONSECUTIVE_FAILURES
+        docs = [LlamaDocument(text=f"d{i}", doc_id=f"d{i}.md::0") for i in range(threshold + 5)]
+
+        class FakeIndex:
+            def __init__(self):
+                self.docstore = None
+
+            def insert(self, doc):
+                raise RuntimeError("backend down")
+
+        manager = ObsidianVaultManager()
+        # Record the requested backoff intervals instead of really sleeping; the
+        # stub returns False (event not set) so the loop keeps going to the abort.
+        waits: list[float] = []
+
+        def fake_wait(timeout=None):
+            waits.append(timeout)
+            return False
+
+        with patch.object(manager._stop_event, "wait", side_effect=fake_wait):
+            manager._index_documents_streaming(FakeIndex(), iter(docs))
+
+        # 19 sleeps before the 20th failure aborts (the aborting failure never sleeps).
+        self.assertEqual(len(waits), threshold - 1)
+        # Exponential base*2**(streak-1) capped at _FAILURE_BACKOFF_CAP_S.
+        base = ObsidianVaultManager._FAILURE_BACKOFF_BASE_S
+        cap = ObsidianVaultManager._FAILURE_BACKOFF_CAP_S
+        self.assertEqual(waits[0], base)
+        self.assertEqual(waits[1], base * 2)
+        self.assertTrue(all(0 < w <= cap for w in waits))
+        # Monotonically non-decreasing and pinned at the cap once reached.
+        self.assertEqual(waits, sorted(waits))
+        self.assertEqual(waits[-1], cap)
+        manager._stop_event.clear()
+
+    def test_index_streaming_backoff_is_interruptible_by_cancel(self):
+        """A Cancel/Pause (stop event set) during a backoff sleep aborts the run
+        promptly, well before the consecutive-failure threshold."""
+        from rag.vault import ObsidianVaultManager
+        from llama_index.core import Document as LlamaDocument
+
+        threshold = ObsidianVaultManager._MAX_CONSECUTIVE_FAILURES
+        docs = [LlamaDocument(text=f"d{i}", doc_id=f"d{i}.md::0") for i in range(threshold + 5)]
+
+        class FakeIndex:
+            def __init__(self):
+                self.docstore = None
+                self.insert_calls = 0
+
+            def insert(self, doc):
+                self.insert_calls += 1
+                raise RuntimeError("backend down")
+
+        manager = ObsidianVaultManager()
+        index = FakeIndex()
+
+        calls = {"n": 0}
+
+        def fake_wait(timeout=None):
+            # Simulate a cancel arriving during the 3rd backoff sleep.
+            calls["n"] += 1
+            return calls["n"] >= 3
+
+        with patch.object(manager._stop_event, "wait", side_effect=fake_wait):
+            added, skipped, deleted, failed, _ = manager._index_documents_streaming(
+                index, iter(docs)
+            )
+
+        # Aborted on the interrupted backoff, not the breaker: 3 failed inserts.
+        self.assertEqual(failed, 3)
+        self.assertEqual(index.insert_calls, 3)
+        self.assertLess(failed, threshold)
         manager._stop_event.clear()
 
     def test_mid_run_checkpoint_gated_by_count_and_min_interval(self):
@@ -660,6 +748,45 @@ class TestVaultIndexingRegressions(unittest.TestCase):
             self.assertEqual(mock_vision.describe_image.call_count, 1)
             # Orphan images must not be counted as skipped either — they
             # never enter the indexing pipeline in the first place.
+            self.assertEqual(manager._skipped_image_count, 0)
+
+    def test_bare_wikilink_resolves_image_in_central_folder(self):
+        """A bare ![[image.png]] link resolves to a central attachments folder.
+
+        Obsidian's default "shortest path" link format references images by
+        bare filename even when they live in a vault-wide attachments folder
+        rather than beside the note. The loader must resolve those via a
+        vault-wide basename lookup; the historical parent-relative-only
+        behaviour silently dropped every such image.
+        """
+        from rag.vault import ObsidianVaultManager
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vault_dir, tempfile.TemporaryDirectory() as index_dir, tempfile.TemporaryDirectory() as cache_dir:
+            vault = Path(vault_dir)
+            (vault / "Z_attachments").mkdir()
+            (vault / "notes").mkdir()
+            # Image lives in a central folder; the note lives elsewhere and
+            # references it by bare filename — the real-world failing case.
+            (vault / "Z_attachments" / "figure.png").write_bytes(b"\x89PNG central")
+            (vault / "notes" / "paper.md").write_text(
+                "See ![[figure.png]].", encoding="utf-8"
+            )
+            manager = ObsidianVaultManager()
+
+            with (
+                patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir),
+                patch("rag.vault.OBSIDIAN_CACHE_DIR", cache_dir),
+                patch("rag.vault.load_config", return_value={"vault_image_exts": [".png"]}),
+                patch("rag.vault.vision_manager") as mock_vision,
+            ):
+                mock_vision.describe_image.return_value = "central figure description"
+                docs = list(manager._load_vault_documents(vault_dir))
+
+            sources = {doc.metadata["source"] for doc in docs}
+            self.assertIn("notes/paper.md", sources)
+            # Resolved to its true vault-relative location, not notes/figure.png.
+            self.assertIn("Z_attachments/figure.png", sources)
+            self.assertEqual(mock_vision.describe_image.call_count, 1)
             self.assertEqual(manager._skipped_image_count, 0)
 
     def test_unreferenced_pdf_is_still_folder_driven(self):
@@ -2109,6 +2236,24 @@ class TestVaultChatLiveControls(unittest.TestCase):
         self.assertEqual(params["top_k"], 3)
         self.assertEqual(params["prompt_mode"], "exploratory")
 
+    def test_wikilink_expansion_resolution(self):
+        from api.routes.vault import _resolve_chat_params
+        # Body wins over config.
+        self.assertTrue(
+            _resolve_chat_params(
+                {"wikilink_expansion": True}, {"vault_wikilink_expansion": False}
+            )["wikilink_expansion"]
+        )
+        # Config fallback when the body omits it.
+        self.assertTrue(
+            _resolve_chat_params({}, {"vault_wikilink_expansion": True})[
+                "wikilink_expansion"
+            ]
+        )
+        # Omitted entirely when neither source sets it, so stream_chat's
+        # default (off) applies and behaviour is unchanged.
+        self.assertNotIn("wikilink_expansion", _resolve_chat_params({}, {}))
+
     def test_missing_everything_returns_empty(self):
         # No request fields and no config keys — caller-side defaults apply.
         # The dict must not carry stale keys that would override stream_chat
@@ -3371,6 +3516,12 @@ class TestReindexInvariant(unittest.TestCase):
             "Changing PDF chunk size/overlap forces a reindex.",
         )
         self.assertIn("MarkdownNodeParser(include_metadata=True)", src)
+        # The MD secondary cap pass is itself a pinned chunking param: removing
+        # it un-caps long sections, and changing the cap re-chunks them.
+        self.assertIn(
+            "SentenceSplitter(chunk_size=MD_MAX_CHUNK_TOKENS, chunk_overlap=64)", src,
+            "Removing/altering the MD secondary cap changes chunk ids.",
+        )
 
     def test_chunk_id_scheme_pinned(self):
         import inspect
@@ -3380,6 +3531,119 @@ class TestReindexInvariant(unittest.TestCase):
         # or the 16-hex slice invalidates every stored chunk id.
         self.assertIn("hashlib.sha1(", src)
         self.assertIn("{rel_str}::{chunk_hash}", src)
+
+
+class TestMdSecondaryCap(unittest.TestCase):
+    """Conditional MD secondary split (MD_MAX_CHUNK_TOKENS).
+
+    MarkdownNodeParser splits .md only at heading boundaries, so a long single
+    section exceeded the embedding token limit and was silently truncated. The
+    chunker now sub-splits ONLY oversized sections while passing every under-cap
+    section through byte-for-byte (no chunk-id churn). PDF chunking is untouched.
+    """
+
+    def _chunks(self, manager, vault_dir, rel, text):
+        from llama_index.core import Document as LlamaDocument
+        p = Path(vault_dir) / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        raw = LlamaDocument(text=text, metadata={
+            "file_path": str(p), "source": rel, "extension": ".md",
+        })
+        return list(manager._chunk_raw_documents([raw], vault_dir))
+
+    def test_under_cap_sections_are_byte_identical(self):
+        """A note with only small sections yields the exact legacy doc_ids
+        (sha1(f'{i}\\n{text}')[:16]) — the no-churn promise."""
+        import hashlib
+        from rag.vault import ObsidianVaultManager
+        manager = ObsidianVaultManager()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vd:
+            chunks = self._chunks(manager, vd, "small.md",
+                                  "# H1\n\nshort body.\n\n# H2\n\nanother section.")
+        self.assertGreaterEqual(len(chunks), 1)
+        for i, c in enumerate(chunks):
+            expected = hashlib.sha1(
+                f"{i}\n{c.text}".encode(), usedforsecurity=False
+            ).hexdigest()[:16]
+            self.assertEqual(c.doc_id, f"small.md::{expected}")
+
+    def test_oversized_section_is_subsplit_under_cap(self):
+        from rag.vault import ObsidianVaultManager
+        from core.constants import MD_MAX_CHUNK_TOKENS
+        manager = ObsidianVaultManager()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vd:
+            chunks = self._chunks(manager, vd, "big.md", "# Big\n\n" + ("word " * 6000))
+        self.assertGreater(len(chunks), 1, "an oversized section must split")
+        self.assertTrue(all(c.doc_id.startswith("big.md::") for c in chunks))
+        self.assertEqual(len(set(c.doc_id for c in chunks)), len(chunks),
+                         "sub-chunk doc_ids must be unique")
+        self.assertTrue(all("header_path" in (c.metadata or {}) for c in chunks),
+                        "header_path must propagate to every sub-chunk")
+        # Each sub-chunk is within the token cap (same tokenizer the splitter uses).
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        self.assertTrue(all(len(enc.encode(c.text)) <= MD_MAX_CHUNK_TOKENS for c in chunks))
+
+    def test_attachments_land_on_their_own_subchunk(self):
+        """An embed only in a split section's tail must appear on the tail
+        sub-chunk, not be smeared across every sub-chunk."""
+        from rag.vault import ObsidianVaultManager
+        manager = ObsidianVaultManager()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vd:
+            text = "# A\n\n" + ("para. " * 3000) + "\n\nsee ![[tail_only.png]]"
+            chunks = self._chunks(manager, vd, "att.md", text)
+        self.assertGreater(len(chunks), 1)
+        with_att = [i for i, c in enumerate(chunks) if c.metadata.get("attachments")]
+        self.assertEqual(with_att, [len(chunks) - 1],
+                         "attachment must land only on the tail sub-chunk")
+        for c in chunks:
+            if c.metadata.get("attachments"):
+                self.assertIn("attachments", c.excluded_embed_metadata_keys)
+                self.assertIn("attachments", c.excluded_llm_metadata_keys)
+
+    def test_mixed_document_churn_boundary(self):
+        """Pin the i-shift churn boundary in a under -> over -> under document:
+        the section BEFORE the oversized one keeps its exact doc_id (no churn),
+        the oversized section splits (more chunks), and the section AFTER it
+        shifts position and therefore re-hashes."""
+        from rag.vault import ObsidianVaultManager
+        manager = ObsidianVaultManager()
+        intro = "# First\n\nsmall intro section."
+        last = "# Last\n\nsmall trailing section."
+        small_mid = "# Mid\n\nshort middle."
+        big_mid = "# Mid\n\n" + ("word " * 6000)
+        # Same rel path in two temp vaults so the "{rel}::" prefix matches and
+        # doc_ids are directly comparable.
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vd:
+            small_chunks = self._chunks(manager, vd, "mixed.md",
+                                        f"{intro}\n\n{small_mid}\n\n{last}")
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vd:
+            big_chunks = self._chunks(manager, vd, "mixed.md",
+                                      f"{intro}\n\n{big_mid}\n\n{last}")
+        # Section BEFORE the oversized one is untouched — same id at position 0.
+        self.assertEqual(small_chunks[0].doc_id, big_chunks[0].doc_id)
+        # The oversized middle section splits → the big variant has more chunks.
+        self.assertGreater(len(big_chunks), len(small_chunks))
+        # Section AFTER the oversized one shifts position → its id changes.
+        small_last = next(c for c in small_chunks if "trailing section" in c.text)
+        big_last = next(c for c in big_chunks if "trailing section" in c.text)
+        self.assertNotEqual(small_last.doc_id, big_last.doc_id)
+
+    def test_multibyte_under_cap_section_stays_byte_identical(self):
+        """A multibyte (CJK) section under the token cap must not split and must
+        stay byte-identical — guards the byte-length pre-filter's correctness."""
+        import hashlib
+        from rag.vault import ObsidianVaultManager
+        manager = ObsidianVaultManager()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vd:
+            chunks = self._chunks(manager, vd, "cjk.md", "# 見出し\n\n" + ("文字" * 100))
+        self.assertEqual(len(chunks), 1)
+        c = chunks[0]
+        expected = hashlib.sha1(
+            f"0\n{c.text}".encode(), usedforsecurity=False
+        ).hexdigest()[:16]
+        self.assertEqual(c.doc_id, f"cjk.md::{expected}")
 
 
 class TestPdfRangeSplitting(unittest.TestCase):
@@ -3408,9 +3672,13 @@ class TestPdfRangeSplitting(unittest.TestCase):
         self.pdf_path.write_bytes(b"%PDF-fake")
         self.signature = {"size": 9, "mtime_ns": 1, "sha256": "f" * 64}
 
-    def _fake_sections(self, text):
+    def _fake_sections(self, text, truncated=False):
+        # Mirror ArticleSections: a real result carries truncated=False, so the
+        # MagicMock must set it explicitly (an unset MagicMock attr is truthy,
+        # which would wrongly look like an incomplete extraction to the loader).
         section = MagicMock()
         section.full_text = text
+        section.truncated = truncated
         return section
 
     def _run_loader(self, page_count, extract_side_effect):
@@ -3459,6 +3727,44 @@ class TestPdfRangeSplitting(unittest.TestCase):
         )
         self.assertEqual(extract_mock.call_count, 0)
         self.assertEqual(len(docs), 3)
+
+    def test_truncated_range_yielded_but_not_cached(self):
+        """An incompletely-extracted range (e.g. scanned pages beyond the OCR
+        limit) is still yielded but NOT cached, so the next run retries instead
+        of permanently serving the partial."""
+        docs, extract_mock = self._run_loader(
+            1500,
+            lambda *a, **kw: self._fake_sections(
+                f"partial {kw['start_page']}", truncated=True
+            ),
+        )
+        # Both ranges extracted and yielded (better partial than nothing)…
+        self.assertEqual(extract_mock.call_count, 2)
+        self.assertEqual(len(docs), 2)
+        # …but nothing cached, so a resumed run re-extracts.
+        cache_parent = self.manager._pdf_cache_file(
+            self.vault_root, self.signature
+        ).parent
+        self.assertEqual(list(cache_parent.glob("*-p*.txt")), [])
+        docs2, extract_mock2 = self._run_loader(
+            1500, lambda *a, **kw: self._fake_sections("x", truncated=True)
+        )
+        self.assertEqual(extract_mock2.call_count, 2)
+
+    def test_full_range_ocr_max_pages_passed(self):
+        """The loader must let the OCR fallback cover the whole 1000-page range
+        (the old 100-page cap silently dropped 90% of a scanned range)."""
+        seen = {}
+
+        def capture(*a, **kw):
+            seen["ocr_max_pages"] = kw.get("ocr_max_pages")
+            seen["has_page_cb"] = callable(kw.get("page_done_cb"))
+            return self._fake_sections("ok")
+
+        self._run_loader(1500, capture)
+        from pdf_extractor import EXTRACT_MAX_PAGES_PER_CALL
+        self.assertEqual(seen["ocr_max_pages"], EXTRACT_MAX_PAGES_PER_CALL)
+        self.assertTrue(seen["has_page_cb"])
 
     def test_cancel_mid_file_keeps_completed_range_caches(self):
         def extract_then_stop(*a, **kw):
@@ -3602,6 +3908,43 @@ class TestPdfRangeSplitting(unittest.TestCase):
         self.assertTrue(truncated)
 
 
+class TestChatEmbedMismatchGuard(unittest.TestCase):
+    """At chat time, retrieval must embed the query with the INDEX's recorded
+    model, not whatever config says — a mismatch otherwise fuses two vector
+    spaces and silently wrecks retrieval (only the UI warning guarded it before).
+    """
+
+    def setUp(self):
+        from rag.vault import ObsidianVaultManager
+        self.manager = ObsidianVaultManager()
+
+    def test_mismatch_uses_index_model_and_warns(self):
+        msgs = []
+        with patch.object(
+            self.manager, "_read_index_meta",
+            return_value={"embed": "nomic-embed-text"},
+        ):
+            eff = self.manager._effective_embed_name("embeddinggemma:300m", msgs.append)
+        self.assertEqual(eff, "nomic-embed-text")
+        self.assertTrue(any("nomic-embed-text" in m for m in msgs), msgs)
+
+    def test_match_passes_through_without_warning(self):
+        msgs = []
+        with patch.object(
+            self.manager, "_read_index_meta", return_value={"embed": "x:1"},
+        ):
+            eff = self.manager._effective_embed_name("x:1", msgs.append)
+        self.assertEqual(eff, "x:1")
+        self.assertEqual(msgs, [])
+
+    def test_missing_meta_falls_back_to_requested(self):
+        msgs = []
+        with patch.object(self.manager, "_read_index_meta", return_value=None):
+            eff = self.manager._effective_embed_name("x:1", msgs.append)
+        self.assertEqual(eff, "x:1")
+        self.assertEqual(msgs, [])
+
+
 class TestIndexMetaCache(unittest.TestCase):
     """Regression tests for the stat-keyed obsidian_meta.json read cache.
 
@@ -3663,6 +4006,457 @@ class TestIndexMetaCache(unittest.TestCase):
         self.assertIsNone(self.manager._read_index_meta())
         self._write_meta({"partial": True})
         self.assertTrue(self.manager.is_partial_index())
+
+
+def _wl_node(source, text="", node_id="n", extension=".md"):
+    """Minimal stand-in for a llama-index TextNode for graph-builder tests."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        metadata={"source": source, "extension": extension},
+        text=text,
+        node_id=node_id,
+    )
+
+
+class _FakeWikilinkDocstore:
+    def __init__(self, docs):
+        self.docs = docs
+
+
+class _FakeWikilinkIndex:
+    def __init__(self, docs):
+        self.docstore = _FakeWikilinkDocstore(docs)
+
+
+class TestWikilinkGraph(unittest.TestCase):
+    """Phase 1: the query-time note→note wikilink graph builder.
+
+    Pure in-memory tests over fake docstore nodes — no filesystem, no
+    embeddings, no index mutation — so nothing here can trigger a reindex
+    or re-embed.  Resolution mirrors Obsidian's shortest-path link semantics
+    against the in-memory set of indexed note sources.
+    """
+
+    def _build(self, nodes):
+        from rag.vault import ObsidianVaultManager
+
+        return ObsidianVaultManager()._build_wikilink_graph(nodes)
+
+    def test_outbound_and_backlinks_both_directions(self):
+        nodes = [
+            _wl_node("a.md", "links to [[b]]", "a1"),
+            _wl_node("b.md", "links to [[c]]", "b1"),
+            _wl_node("c.md", "leaf note", "c1"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("a.md"), ["b.md"])
+        self.assertEqual(g.backlinks("b.md"), ["a.md"])
+        # neighbours unions both directions for the middle note.
+        self.assertEqual(g.neighbors("b.md"), ["a.md", "c.md"])
+        self.assertEqual(g.edge_count, 2)
+
+    def test_bare_link_resolves_central_folder(self):
+        # Parent-relative notes/concept.md is not indexed; the shortest-path
+        # basename lookup finds refs/concept.md anywhere in the vault.
+        nodes = [
+            _wl_node("notes/paper.md", "see [[concept]]", "p1"),
+            _wl_node("refs/concept.md", "the concept", "c1"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("notes/paper.md"), ["refs/concept.md"])
+        self.assertEqual(g.backlinks("refs/concept.md"), ["notes/paper.md"])
+
+    def test_local_copy_wins_over_central(self):
+        # When a note beside the linker matches, parent-relative resolution
+        # (step 1) wins outright over a vault-wide basename match (step 2).
+        nodes = [
+            _wl_node("notes/paper.md", "see [[concept]]", "p1"),
+            _wl_node("notes/concept.md", "beside", "n1"),
+            _wl_node("refs/concept.md", "central", "c1"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("notes/paper.md"), ["notes/concept.md"])
+
+    def test_ambiguous_basename_locality_tiebreak(self):
+        # Neither candidate is beside the linker, so step 2 picks by longest
+        # shared directory prefix with the linking note (a/x → a/...).
+        nodes = [
+            _wl_node("a/x/paper.md", "see [[concept]]", "p1"),
+            _wl_node("a/concept.md", "near", "a1"),
+            _wl_node("z/concept.md", "far", "z1"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("a/x/paper.md"), ["a/concept.md"])
+
+    def test_partial_path_link_not_shortest_pathed(self):
+        # Documented limitation (mirrors the b11dc65 image resolver): a link
+        # carrying a directory component is resolved parent-relative ONLY.
+        nodes = [
+            _wl_node("notes/paper.md", "see [[sub/concept]]", "p1"),
+            _wl_node("refs/concept.md", "the concept", "c1"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("notes/paper.md"), [])
+        self.assertEqual(g.edge_count, 0)
+
+    def test_self_link_ignored(self):
+        g = self._build([_wl_node("a.md", "I link to [[a]] myself", "a1")])
+        self.assertEqual(g.outbound("a.md"), [])
+        self.assertEqual(g.edge_count, 0)
+
+    def test_non_note_targets_excluded(self):
+        nodes = [
+            _wl_node(
+                "a.md",
+                "img ![[fig.png]] pdf [study](papers/study.pdf) "
+                "ext [docs](https://example.com)",
+                "a1",
+            ),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("a.md"), [])
+        self.assertEqual(g.edge_count, 0)
+
+    def test_inline_markdown_link_to_note_resolved(self):
+        nodes = [
+            _wl_node("a.md", "see [the other](other.md) note", "a1"),
+            _wl_node("other.md", "other", "o1"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("a.md"), ["other.md"])
+
+    def test_embed_transclusion_counts_as_link(self):
+        # ![[note]] transcludes another note — a real relationship.
+        nodes = [
+            _wl_node("a.md", "embed ![[b]] here", "a1"),
+            _wl_node("b.md", "b", "b1"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("a.md"), ["b.md"])
+
+    def test_alias_and_anchor_stripped(self):
+        nodes = [
+            _wl_node("a.md", "[[target|nice label]] and [[target#section]]", "a1"),
+            _wl_node("target.md", "t", "t1"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("a.md"), ["target.md"])
+
+    def test_multichunk_note_unions_links_and_node_ids(self):
+        nodes = [
+            _wl_node("a.md", "chunk one links [[b]]", "a1"),
+            _wl_node("a.md", "chunk two links [[c]]", "a2"),
+            _wl_node("b.md", "b", "b1"),
+            _wl_node("c.md", "c", "c1"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.outbound("a.md"), ["b.md", "c.md"])
+        self.assertEqual(sorted(g.node_ids_for("a.md")), ["a1", "a2"])
+
+    def test_pdf_nodes_are_not_graph_nodes(self):
+        nodes = [
+            _wl_node("a.md", "see [[b]]", "a1"),
+            _wl_node("b.md", "b", "b1"),
+            _wl_node("paper.pdf", "pdf text [[a]]", "pdf1", extension=".pdf"),
+        ]
+        g = self._build(nodes)
+        self.assertEqual(g.note_count, 2)  # the PDF is excluded
+        self.assertEqual(g.node_ids_for("paper.pdf"), [])
+        # the PDF's text is never scanned, so it creates no backlink into a.md.
+        self.assertEqual(g.backlinks("a.md"), [])
+
+    def test_unknown_note_queries_return_empty(self):
+        g = self._build([_wl_node("a.md", "x", "a1")])
+        self.assertEqual(g.neighbors("missing.md"), [])
+        self.assertEqual(g.node_ids_for("missing.md"), [])
+        self.assertEqual(g.outbound("missing.md"), [])
+
+    def test_get_wikilink_index_none_without_index(self):
+        from rag.vault import ObsidianVaultManager
+
+        m = ObsidianVaultManager()
+        m._index = None
+        self.assertIsNone(m._get_wikilink_index())
+
+    def test_get_wikilink_index_caches_by_docstore_size(self):
+        from rag.vault import ObsidianVaultManager
+
+        m = ObsidianVaultManager()
+        docs = {
+            "a1": _wl_node("a.md", "see [[b]]", "a1"),
+            "b1": _wl_node("b.md", "b", "b1"),
+        }
+        m._index = _FakeWikilinkIndex(docs)
+        g1 = m._get_wikilink_index()
+        g2 = m._get_wikilink_index()
+        self.assertIs(g1, g2)  # cached by docstore size, not rebuilt
+        self.assertEqual(g1.outbound("a.md"), ["b.md"])
+        # A docstore size change forces a rebuild.
+        docs["c1"] = _wl_node("c.md", "links [[a]]", "c1")
+        g3 = m._get_wikilink_index()
+        self.assertIsNot(g1, g3)
+        self.assertEqual(g3.backlinks("a.md"), ["c.md"])
+
+    def test_invalidate_retrieval_caches_drops_wikilink_graph(self):
+        from rag.vault import ObsidianVaultManager
+
+        m = ObsidianVaultManager()
+        m._index = _FakeWikilinkIndex({"a1": _wl_node("a.md", "x", "a1")})
+        self.assertIsNotNone(m._get_wikilink_index())
+        m._invalidate_retrieval_caches()
+        self.assertIsNone(m._wikilink_index)
+        self.assertEqual(m._wikilink_cached_doc_count, -1)
+
+
+def _tn(source, text, node_id):
+    """Real TextNode so NodeWithScore / docstore lookups behave like prod."""
+    from llama_index.core.schema import TextNode
+
+    return TextNode(
+        text=text, id_=node_id, metadata={"source": source, "extension": ".md"}
+    )
+
+
+def _seed(node, score):
+    from llama_index.core.schema import NodeWithScore
+
+    return NodeWithScore(node=node, score=score)
+
+
+class _StubInnerRetriever:
+    """Returns a fixed seed list (the wrapper only needs ``.retrieve``)."""
+
+    def __init__(self, seeds):
+        self._seeds = seeds
+
+    def retrieve(self, query_bundle):
+        return list(self._seeds)
+
+
+class _FakeExpansionDocstore:
+    def __init__(self, nodes):
+        self._by_id = {n.node_id: n for n in nodes}
+
+    def get_node(self, node_id, raise_error=True):
+        node = self._by_id.get(node_id)
+        if node is None and raise_error:
+            raise ValueError(node_id)
+        return node
+
+
+class TestWikilinkExpansionRetriever(unittest.TestCase):
+    """Phase 2: the rerank-gated wikilink expansion retriever.
+
+    Drives ``_WikilinkExpansionRetriever._retrieve`` directly over a real
+    ``_WikilinkGraph`` + a fake docstore, so the tests exercise the
+    seed→neighbour expansion without any vector store or LLM.
+    """
+
+    def _graph(self, nodes):
+        from rag.vault import ObsidianVaultManager
+
+        return ObsidianVaultManager()._build_wikilink_graph(nodes)
+
+    def _run(self, seeds, nodes, **kwargs):
+        from rag.engine import _WikilinkExpansionRetriever
+        from llama_index.core.schema import QueryBundle
+
+        graph = self._graph(nodes)
+        docstore = _FakeExpansionDocstore(nodes)
+        wrapper = _WikilinkExpansionRetriever(
+            _StubInnerRetriever(seeds), graph, docstore, **kwargs
+        )
+        return wrapper._retrieve(QueryBundle("q"))
+
+    def _ids(self, results):
+        return [nws.node.node_id for nws in results]
+
+    def test_pulls_neighbors_both_directions(self):
+        a = _tn("a.md", "see [[b]]", "a1")     # a -> b (outbound)
+        b = _tn("b.md", "leaf", "b1")
+        c = _tn("c.md", "ref [[a]]", "c1")     # c -> a  (=> a backlink)
+        out = self._run([_seed(a, 1.0)], [a, b, c])
+        # seed a, plus its outbound (b) and its backlink (c).
+        self.assertEqual(self._ids(out), ["a1", "b1", "c1"])
+
+    def test_decay_scoring_and_none_seed_score(self):
+        a = _tn("a.md", "see [[b]]", "a1")
+        b = _tn("b.md", "leaf", "b1")
+        out = self._run([_seed(a, 1.0)], [a, b], score_decay=0.25)
+        self.assertEqual(out[1].node.node_id, "b1")
+        self.assertAlmostEqual(out[1].score, 0.25)
+        # A seed with no score contributes neighbours at score 0.0.
+        out2 = self._run([_seed(a, None)], [a, b], score_decay=0.5)
+        self.assertAlmostEqual(out2[1].score, 0.0)
+
+    def test_respects_node_cap(self):
+        a = _tn("a.md", "see [[b]] and [[c]]", "a1")
+        b = _tn("b.md", "b", "b1")
+        c = _tn("c.md", "c", "c1")
+        out = self._run([_seed(a, 1.0)], [a, b, c], neighbor_node_cap=1)
+        self.assertEqual(self._ids(out), ["a1", "b1"])  # only one neighbour chunk
+
+    def test_respects_note_cap(self):
+        a = _tn("a.md", "see [[b]] and [[c]]", "a1")
+        b1 = _tn("b.md", "b chunk one", "b1")
+        b2 = _tn("b.md", "b chunk two", "b2")
+        c = _tn("c.md", "c", "c1")
+        out = self._run(
+            [_seed(a, 1.0)], [a, b1, b2, c], neighbor_note_cap=1, neighbor_node_cap=24
+        )
+        # Only the first neighbour NOTE (b.md) expands — both its chunks — and
+        # c.md is never reached.
+        self.assertEqual(set(self._ids(out)), {"a1", "b1", "b2"})
+
+    def test_skips_seed_notes(self):
+        a = _tn("a.md", "see [[b]]", "a1")     # a -> b
+        b = _tn("b.md", "leaf", "b1")
+        c = _tn("c.md", "ref [[a]]", "c1")     # c -> a
+        # Both a and b are already seeds; only the non-seed neighbour c is added.
+        out = self._run([_seed(a, 1.0), _seed(b, 0.9)], [a, b, c])
+        self.assertEqual(self._ids(out), ["a1", "b1", "c1"])
+
+    def test_dedups_shared_neighbor(self):
+        a = _tn("a.md", "see [[d]]", "a1")
+        b = _tn("b.md", "see [[d]]", "b1")
+        d = _tn("d.md", "shared", "d1")
+        out = self._run([_seed(a, 1.0), _seed(b, 0.9)], [a, b, d])
+        # d is a neighbour of both seeds but is appended exactly once.
+        self.assertEqual(self._ids(out), ["a1", "b1", "d1"])
+
+    def test_noop_when_no_neighbors(self):
+        a = _tn("a.md", "lonely note", "a1")
+        seeds = [_seed(a, 1.0)]
+        out = self._run(seeds, [a])
+        self.assertEqual(self._ids(out), ["a1"])
+
+    def test_missing_docstore_node_is_skipped(self):
+        from rag.engine import _WikilinkExpansionRetriever
+        from llama_index.core.schema import QueryBundle
+
+        a = _tn("a.md", "see [[b]]", "a1")
+        b = _tn("b.md", "leaf", "b1")
+        graph = self._graph([a, b])
+        # Docstore is missing b1 entirely; expansion must degrade gracefully.
+        docstore = _FakeExpansionDocstore([a])
+        wrapper = _WikilinkExpansionRetriever(
+            _StubInnerRetriever([_seed(a, 1.0)]), graph, docstore
+        )
+        out = wrapper._retrieve(QueryBundle("q"))
+        self.assertEqual([nws.node.node_id for nws in out], ["a1"])
+
+    def test_zero_cap_returns_seeds_unchanged(self):
+        a = _tn("a.md", "see [[b]]", "a1")
+        b = _tn("b.md", "leaf", "b1")
+        out = self._run([_seed(a, 1.0)], [a, b], neighbor_node_cap=0)
+        self.assertEqual(self._ids(out), ["a1"])
+
+    def test_pipeline_wraps_retriever_only_when_enabled(self):
+        """``_build_retrieval_pipeline`` wraps the retriever in the expansion
+        retriever only when the knob is on, a graph is present, AND a reranker
+        is active (rerank-gated, F1) — otherwise the retriever is the unwrapped
+        dense retriever, byte-identical to the pre-expansion pipeline."""
+        from types import SimpleNamespace
+        from rag.engine import SimpleQueryEngine, _WikilinkExpansionRetriever
+
+        graph = self._graph([_tn("a.md", "see [[b]]", "a1"), _tn("b.md", "b", "b1")])
+        index = SimpleNamespace(docstore=object(), vector_store=None)
+        cfg = {"context_window": 8192}
+
+        def build(*, expansion, with_graph, with_reranker):
+            with patch("rag.engine.get_provider"), patch(
+                "rag.engine.VectorIndexRetriever"
+            ) as dense_cls:
+                dense_cls.return_value = MagicMock(name="dense_retriever")
+                engine = SimpleQueryEngine(
+                    index=index,
+                    llm_name="l",
+                    embed_name="e",
+                    provider_name="ollama",
+                    # A stub reranker: _build_retrieval_pipeline only sets
+                    # .top_n and appends it as a postprocessor.
+                    reranker=SimpleNamespace(top_n=0) if with_reranker else None,
+                    wikilink_expansion=expansion,
+                    wikilink_graph=graph if with_graph else None,
+                )
+                retriever, _post, _llm = engine._build_retrieval_pipeline(cfg)
+                return retriever
+
+        # Off → unwrapped (no behaviour change).
+        self.assertNotIsInstance(
+            build(expansion=False, with_graph=True, with_reranker=True),
+            _WikilinkExpansionRetriever,
+        )
+        # On but no graph built → unwrapped (safe no-op).
+        self.assertNotIsInstance(
+            build(expansion=True, with_graph=False, with_reranker=True),
+            _WikilinkExpansionRetriever,
+        )
+        # On with a graph but NO reranker → unwrapped (F1: without a reranker
+        # to trim seeds+neighbours back to top_k, expansion would bloat the
+        # LLM context, so the wrap is skipped).
+        self.assertNotIsInstance(
+            build(expansion=True, with_graph=True, with_reranker=False),
+            _WikilinkExpansionRetriever,
+        )
+        # On with a graph AND a reranker → wrapped.
+        self.assertIsInstance(
+            build(expansion=True, with_graph=True, with_reranker=True),
+            _WikilinkExpansionRetriever,
+        )
+
+
+class TestIndexBackupPrune(unittest.TestCase):
+    """R1: ``_archive_old_index_dir`` archives the whole prior index to a
+    timestamped ``.bak`` sibling on every version bump; ``_prune_old_index_backups``
+    must bound how many accumulate so they don't grow unbounded on disk."""
+
+    def test_keeps_newest_and_prunes_older_with_audit(self):
+        import os
+        from rag.vault import obsidian_manager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index_dir = os.path.join(tmp, "obsidian_storage")
+            os.makedirs(index_dir)  # the live dir; must be left untouched
+            # Five archived siblings with strictly increasing mtimes.
+            baks = []
+            for i in range(5):
+                d = f"{index_dir}.bak.v{i}.2026010{i}-000000"
+                os.makedirs(d)
+                (Path(d) / "docstore.json").write_text("{}", encoding="utf-8")
+                os.utime(d, (1_700_000_000 + i, 1_700_000_000 + i))
+                baks.append(d)
+            # An unrelated sibling that must NOT be touched.
+            other = os.path.join(tmp, "obsidian_storage_notes")
+            os.makedirs(other)
+
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir), \
+                 patch("rag.vault.log_storage_deletion") as mock_log:
+                obsidian_manager._prune_old_index_backups(keep=2)
+
+            survivors = [d for d in baks if os.path.isdir(d)]
+            self.assertEqual(sorted(survivors), sorted(baks[3:]))  # two newest kept
+            for removed in baks[:3]:
+                self.assertFalse(os.path.isdir(removed))
+            self.assertTrue(os.path.isdir(index_dir))   # live dir untouched
+            self.assertTrue(os.path.isdir(other))       # unrelated sibling untouched
+            self.assertEqual(mock_log.call_count, 3)    # one audit line per removal
+
+    def test_noop_when_within_keep(self):
+        import os
+        from rag.vault import obsidian_manager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index_dir = os.path.join(tmp, "obsidian_storage")
+            os.makedirs(index_dir)
+            d = f"{index_dir}.bak.v0.20260101-000000"
+            os.makedirs(d)
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir), \
+                 patch("rag.vault.log_storage_deletion") as mock_log:
+                obsidian_manager._prune_old_index_backups(keep=2)
+            self.assertTrue(os.path.isdir(d))
+            mock_log.assert_not_called()
 
 
 if __name__ == "__main__":

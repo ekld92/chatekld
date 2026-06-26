@@ -1,3 +1,12 @@
+/**
+ * Single Paper tab: upload a PDF, stream a tunable summary, and export it.
+ *
+ * Per the JS module hierarchy this imports only ui.js + api.js (and config.js for
+ * getActiveProvider — config is itself a ui.js/api.js-only module). The five
+ * generation knobs (temperature/max_tokens/num_ctx/top_p/repeat_penalty) are read
+ * by id from the controls settings.js owns (paper_* persistence) and sent
+ * per-request; the server re-resolves them body → persisted paper_* → default.
+ */
 import { secureFetch, readSSE } from './api.js';
 import { showTaskError, clearTaskError } from './ui.js';
 import { getActiveProvider } from './config.js';
@@ -6,6 +15,9 @@ let _currentUploadId = null;
 let _currentFilename = 'summary';
 let _summaryAbortController = null;
 
+/** Populate the document-type <select> from /api/report-types (built-ins merged
+ * with saved custom/overridden types server-side). Falls back to a lone
+ * "Default" option on failure so the control is never empty. */
 export async function loadReportTypes() {
     const select = document.getElementById('report-type-select');
     if (!select) return;
@@ -70,6 +82,12 @@ export function wireUploadDropzone() {
     });
 }
 
+/**
+ * Upload the chosen PDF for server-side text extraction. Uses a raw fetch with
+ * FormData (NOT secureFetch — multipart must not carry secureFetch's JSON
+ * Content-Type), still sending the X-Requested-With header. On success caches the
+ * returned upload_id/filename and enables the Summarise button.
+ */
 export async function uploadPDF() {
     const fileInput = document.getElementById('pdf-upload');
     const file = fileInput.files[0];
@@ -105,6 +123,13 @@ export async function uploadPDF() {
     }
 }
 
+/**
+ * Stream a summary of the uploaded PDF. Sends the content/instruction inputs plus
+ * the generation knobs (read by id), then consumes the SSE `{token}`/`{error}`
+ * stream into the summary pane. An in-flight summarisation is aborted first
+ * (single AbortController) so re-clicking Summarise can't interleave two streams.
+ * Enables the export buttons only once non-empty text has actually arrived.
+ */
 export async function summarisePDF() {
     if (!_currentUploadId) return;
     
@@ -188,6 +213,11 @@ function parsePositiveInt(id, fallback) {
     return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+/**
+ * Export the current summary text to the user's Downloads directory via
+ * /api/export-summary. `format` is "txt" or "md"; the matching button shows
+ * transient "Exporting…" / "Exported" feedback.
+ */
 export async function exportSummary(format = 'txt') {
     const content = document.getElementById('document-summary-content');
     const text = content.textContent.trim();
@@ -215,6 +245,11 @@ export async function exportSummary(format = 'txt') {
     }
 }
 
+/**
+ * Reset the Single Paper tab to its empty state and delete the server-side
+ * upload row. Aborts any in-flight summarisation BEFORE the DELETE so the server
+ * and DOM stop touching the row the request still references.
+ */
 export async function resetUpload() {
     const id = _currentUploadId;
     // Abort any in-flight summarisation so server and DOM stop updating

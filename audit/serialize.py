@@ -27,6 +27,7 @@ from .engine.reports import (
 
 
 def _rel_to_vault(p: Path, vault_root: Path) -> str:
+    """Vault-relative string for ``p``, falling back to absolute if outside."""
     try:
         return str(p.relative_to(vault_root))
     except ValueError:
@@ -34,6 +35,11 @@ def _rel_to_vault(p: Path, vault_root: Path) -> str:
 
 
 def _path_payload(p: Path, vault_root: Path) -> dict[str, str]:
+    """Render a path as ``{abs, rel, name}`` for the browser.
+
+    The UI shows ``rel``/``name`` but the "reveal in Finder" action needs the
+    ``abs`` form, so both are emitted to spare the front end any re-resolution.
+    """
     return {
         "abs": str(p),
         "rel": _rel_to_vault(p, vault_root),
@@ -42,6 +48,13 @@ def _path_payload(p: Path, vault_root: Path) -> dict[str, str]:
 
 
 def inventory_summary(inv: eng_inventory.Inventory) -> dict[str, Any]:
+    """Serialize the headline inventory counters for the summary panel.
+
+    Computes the triangulation tallies (bib+PDF, bib+note, bib+Zotero, fully
+    triangulated, …) and unmapped/ambiguous/skipped PDF counts on the fly from
+    ``inv.records``/``inv.bridge``. ``zotero_error`` is passed straight through
+    so the UI can warn when the Zotero read failed.
+    """
     records = inv.records
     return {
         "record_count": len(records),
@@ -75,6 +88,7 @@ def inventory_summary(inv: eng_inventory.Inventory) -> dict[str, Any]:
 
 
 def _bridge_sources(b: eng_bridge.BridgeResult) -> dict[str, int]:
+    """Histogram of how PDFs were matched: ``{source_label: count}``."""
     counts: dict[str, int] = {}
     for src in b.source_per_pdf.values():
         counts[src] = counts.get(src, 0) + 1
@@ -84,6 +98,13 @@ def _bridge_sources(b: eng_bridge.BridgeResult) -> dict[str, int]:
 def inventory_records(
     inv: eng_inventory.Inventory, settings: Settings
 ) -> list[dict[str, Any]]:
+    """Serialize every per-key record into the inventory-table row shape.
+
+    Flattens each :class:`Record` (bib metadata, the four "has X" booleans,
+    PDF payloads, aggregated Finder/obs/Zotero tags and bib keywords) into a
+    JSON-able dict. Sets are emitted ``sorted`` for stable output. Rows are
+    ordered by year then citation key to match the table's default sort.
+    """
     out: list[dict[str, Any]] = []
     for rec in inv.records.values():
         bib_entry = rec.bib_entry
@@ -115,6 +136,7 @@ def inventory_records(
 def report_note_tag_drift(
     rows: list[r_note_tag_drift.NoteTagDriftRow],
 ) -> list[dict[str, Any]]:
+    """Serialize aim-(i) drift rows; the three tag sets emitted ``sorted``."""
     return [
         {
             "citation_key": r.citation_key,
@@ -131,6 +153,7 @@ def report_note_tag_drift(
 def report_unread_unzoterod(
     rep: r_unread_unzoterod.UnreadUnzoterodReport, settings: Settings
 ) -> dict[str, Any]:
+    """Serialize aim-(ii) report: threshold, ambiguous count, per-PDF rows."""
     return {
         "threshold": rep.threshold,
         "ambiguous_count": rep.ambiguous_count,
@@ -148,6 +171,7 @@ def report_unread_unzoterod(
 def report_zotero_unread(
     rep: r_zotero_unread.ZoteroUnreadReport,
 ) -> dict[str, Any]:
+    """Serialize aim-(iii) report: skip count plus the no-child-note rows."""
     return {
         "skipped_no_zotero_match": rep.skipped_no_zotero_match,
         "rows": [
@@ -165,6 +189,7 @@ def report_zotero_unread(
 def report_read_unzoterod(
     rep: r_read_unzoterod.ReadUnzoterodReport, settings: Settings
 ) -> dict[str, Any]:
+    """Serialize aim-(iv) report: suggested cutoff plus annotation-ranked rows."""
     return {
         "suggested_read_cutoff": rep.suggested_read_cutoff,
         "rows": [
@@ -181,6 +206,7 @@ def report_read_unzoterod(
 def report_zotero_no_pdf(
     rep: r_zotero_no_pdf.ZoteroNoPdfReport,
 ) -> dict[str, Any]:
+    """Serialize aim-(v) report: bib entries with no resolved PDF."""
     return {
         "rows": [
             {
@@ -198,6 +224,7 @@ def report_zotero_no_pdf(
 def report_duplicates(
     sets: list[eng_duplicates.DuplicateSet], settings: Settings
 ) -> dict[str, Any]:
+    """Serialize duplicate sets, with a precomputed total reclaimable bytes."""
     return {
         "rows": [
             {

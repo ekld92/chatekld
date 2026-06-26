@@ -182,6 +182,11 @@ class ArticleSections:
     # "figure_heavy" — text layer present but figure count exceeds page count
     #                  (slide decks, instrument manuals, image-dense reports).
     doc_type: str = "text_layer"
+    # True when extraction did not cover the whole requested range — currently
+    # set only by the OCR fallback when more pages were requested than the
+    # per-call OCR cap allowed.  Callers (vault indexer) use it to warn and to
+    # avoid caching an incomplete range as if it were complete.
+    truncated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +399,8 @@ def _extract_page_blocks(
                     pix = page.get_pixmap(clip=bbox, matrix=fitz.Matrix(1.5, 1.5), colorspace=fitz.csRGB)
                     img_data = base64.b64encode(pix.tobytes("png")).decode("utf-8")
                 except Exception:
+                    # Best-effort image render; an undecodable/unknown-format
+                    # block just contributes no base64 and is skipped.
                     pass
 
             blocks.append(_TextBlock(
@@ -721,6 +728,8 @@ def _assemble_sections(blocks: list[_TextBlock], describer_cb: Optional[Callable
                 if description:
                     sections[current_section].append(f"[IMAGE DESCRIPTION: {description}]")
             except Exception:
+                # Best-effort image description; a describer/transport failure
+                # just omits the description and continues extraction.
                 pass
         elif block.block_type == "caption":
             # Captions are also useful semantic context
@@ -957,6 +966,8 @@ def _perform_ocr_fallback(
     start_page: int,
     page_end: int,
     char_budget: int | None,
+    ocr_max_pages: int | None = None,
+    page_done_cb: Optional[Callable[[int], None]] = None,
 ) -> ArticleSections:
     """Render each page to a PNG and call ``ocr_cb`` to extract its text.
 
@@ -990,6 +1001,17 @@ def _perform_ocr_fallback(
     char_budget : int | None
         Optional character budget.  OCR stops early once the accumulated text
         meets or exceeds this limit — same semantics as primary extraction.
+    ocr_max_pages : int | None
+        Per-call cap on pages OCR'd (default ``_OCR_MAX_PAGES`` = 100 when None).
+        The vault range loader passes the full range size so a scanned range is
+        OCR'd in full instead of stopping at 100 pages; the interactive upload
+        path leaves it None.  When the cap (or ``char_budget``) stops OCR before
+        the whole requested range is covered, the returned
+        ``ArticleSections.truncated`` is set True.
+    page_done_cb : callable | None
+        Optional ``(abs_page_index) -> None`` hook invoked after each page is
+        rendered (before its OCR call), used by the vault loader to refresh the
+        operation-lock heartbeat on a long scan.  Exceptions from it are swallowed.
 
     Returns
     -------
@@ -1001,9 +1023,18 @@ def _perform_ocr_fallback(
         ``page_count`` reflects the actual document length, not just the
         OCR'd range, so callers have the true document size.
     """
-    # Clamp the number of pages to the safety cap — do not OCR more pages
-    # than _OCR_MAX_PAGES in a single call regardless of page_end.
-    pages_to_ocr = min(page_end - start_page, _OCR_MAX_PAGES)
+    # Clamp the number of pages OCR'd in this call.  ``ocr_max_pages`` lets a
+    # caller that bounds memory/time another way (the vault range loader, which
+    # heartbeats per page and processes one 1000-page range at a time) OCR the
+    # WHOLE range instead of silently stopping at the default _OCR_MAX_PAGES — the
+    # bug where a scanned 1000-page range only ever indexed its first 100 pages.
+    # ``None`` keeps the historical 100-page cap for the interactive upload path.
+    requested_pages = page_end - start_page
+    cap = ocr_max_pages if (ocr_max_pages is not None and ocr_max_pages > 0) else _OCR_MAX_PAGES
+    pages_to_ocr = min(requested_pages, cap)
+    # True if we stop before covering the whole requested range (page cap or, for
+    # callers that pass one, the char budget) — surfaced on ArticleSections.truncated.
+    ocr_truncated = pages_to_ocr < requested_pages
 
     # Build the transform matrix once; reused for every page render.
     # fitz.Matrix(s, s) applies uniform scaling by factor s.
@@ -1103,6 +1134,15 @@ def _perform_ocr_fallback(
             # reflects all attempted pages, not just successful ones.
             pages_attempted += 1
 
+            # Per-page progress hook — lets a long (now up-to-1000-page) OCR range
+            # refresh the indexer's operation-lock heartbeat so the TTL cannot
+            # expire mid-file.  Best-effort; never lets a callback abort OCR.
+            if page_done_cb is not None:
+                try:
+                    page_done_cb(abs_page)
+                except Exception:
+                    pass
+
             # Call the OCR callback, guarding against any exception the callback
             # may raise (e.g. a transient Ollama connection failure, or a test
             # stub that raises deliberately).  A failed page degrades to an
@@ -1136,6 +1176,7 @@ def _perform_ocr_fallback(
             # Honour the character budget: stop once we have enough text.
             # This prevents unbounded Ollama calls on a very long scanned book.
             if char_budget is not None and accumulated_chars >= char_budget:
+                ocr_truncated = True
                 break
 
     # Join all successfully OCR'd pages with double newlines for readability.
@@ -1164,6 +1205,7 @@ def _perform_ocr_fallback(
         ocr_confidence=ocr_confidence,
         # All pages were rendered and sent to GLM-OCR; no embedded text layer.
         doc_type="scanned",
+        truncated=ocr_truncated,
     )
 
 
@@ -1174,6 +1216,8 @@ def extract_structured_from_pdf(
     start_page: int = 0,
     end_page: int | None = None,
     ocr_cb: Optional[Callable] = None,
+    ocr_max_pages: int | None = None,
+    page_done_cb: Optional[Callable] = None,
 ) -> ArticleSections:
     """
     Extract text from a PDF with layout-aware structural parsing and resource safety.
@@ -1207,11 +1251,21 @@ def extract_structured_from_pdf(
         signature: ``(base64_png: str) -> str``.  Typically
         ``GLMOCRManager.extract_page_text`` from ``summarizer.py``.
 
+    ocr_max_pages : int | None
+        Overrides the per-call OCR page cap (default ``_OCR_MAX_PAGES`` = 100).
+        The vault indexer passes the full range size so a scanned range is OCR'd
+        in full instead of silently stopping at 100 pages; the interactive upload
+        path leaves it ``None`` (keeps the 100-page cap, bounded by its own
+        extraction timeout).
+    page_done_cb : callable | None
+        Optional ``(abs_page_index) -> None`` hook called after each OCR'd page
+        (heartbeat / progress).  Exceptions from it are swallowed.
+
     Safety limits (applied to the extracted range, not the whole document):
     - Maximum 1000 pages per extraction call.
     - Block-count cap scales with the page range (see _max_blocks_for_range):
       max(50,000, pages * 250), so large legitimate documents are not skipped.
-    - OCR fallback capped at _OCR_MAX_PAGES pages (see constant above).
+    - OCR fallback capped at ocr_max_pages (default _OCR_MAX_PAGES) pages.
     """
     MAX_PAGES = EXTRACT_MAX_PAGES_PER_CALL
 
@@ -1276,7 +1330,8 @@ def extract_structured_from_pdf(
         # at all (scanned images only).  Try GLM-OCR if available.
         if ocr_cb is not None and page_count > 0:
             return _perform_ocr_fallback(
-                file_path, ocr_cb, start_page, page_end, char_budget
+                file_path, ocr_cb, start_page, page_end, char_budget,
+                ocr_max_pages=ocr_max_pages, page_done_cb=page_done_cb,
             )
         return ArticleSections(page_count=page_count)
 
@@ -1297,7 +1352,8 @@ def extract_structured_from_pdf(
             return _mid_result
         if ocr_cb is not None and page_count > 0:
             return _perform_ocr_fallback(
-                file_path, ocr_cb, start_page, page_end, char_budget
+                file_path, ocr_cb, start_page, page_end, char_budget,
+                ocr_max_pages=ocr_max_pages, page_done_cb=page_done_cb,
             )
         return ArticleSections(page_count=page_count)
 
@@ -1315,7 +1371,8 @@ def extract_structured_from_pdf(
             return _mid_result
         if ocr_cb is not None:
             return _perform_ocr_fallback(
-                file_path, ocr_cb, start_page, page_end, char_budget
+                file_path, ocr_cb, start_page, page_end, char_budget,
+                ocr_max_pages=ocr_max_pages, page_done_cb=page_done_cb,
             )
 
     # Classify by figure density: more figure blocks than pages typically

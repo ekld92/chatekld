@@ -1,4 +1,11 @@
 /**
+ * Network / HTTP layer — a LEAF module in the JS module hierarchy: it imports
+ * nothing from this project, so every other module may depend on it freely
+ * without risking a circular import. Owns the CSRF-safe fetch wrapper, the SSE
+ * frame parser shared by every streaming route, and the global error logger.
+ */
+
+/**
  * CSRF-safe fetch wrapper; adds the X-Requested-With header required
  * by the server's local origin check on every request.
  */
@@ -72,6 +79,11 @@ export async function* readSSE(response) {
 
 /**
  * Global last-resort error logger.
+ *
+ * Logs to the console, then best-effort POSTs the message to /api/log so it
+ * lands in chatekld.log (the server truncates the line to 500 chars). The POST
+ * is fire-and-forget and swallows its own failure so logging an error can never
+ * itself throw.
  */
 export function logError(msg, error) {
     console.error(`[ChatEKLD] ${msg}`, error);

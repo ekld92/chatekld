@@ -21,6 +21,13 @@ _TRANSIENT_CATEGORIES = frozenset({
 
 
 def is_transient(err: LLMError) -> bool:
+    """Whether *err* is worth retrying.
+
+    True for the inherently-transient categories (timeout/network/rate_limit/
+    server_error) OR when the adapter explicitly flagged ``retryable``. Terminal
+    categories (auth, invalid_request, quota) are neither, so they propagate on
+    the first attempt — a bad key never costs three round-trips.
+    """
     return err.category in _TRANSIENT_CATEGORIES or err.retryable
 
 

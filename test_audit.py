@@ -2,7 +2,7 @@
 
 Covers:
 
-- the :func:`audit.config.load_settings` adapter (papermind keys ->
+- the :func:`audit.config.load_settings` adapter (ChatEKLD keys ->
   kb_harmonizer Settings, including the configurable subpaths)
 - the :class:`audit.manager.AuditManager` state machine
 - the critical regression that ``create_app()`` never starts a scan as
@@ -63,7 +63,7 @@ def _patched_config_file(tmp_dir: Path) -> mock._patch:
 
 
 class TestSettingsAdapter(unittest.TestCase):
-    """``audit.config.load_settings`` reads papermind config and produces
+    """``audit.config.load_settings`` reads ChatEKLD config and produces
     a Settings dataclass whose paths reflect the configured subdirs."""
 
     def setUp(self):
@@ -198,9 +198,10 @@ class TestAuditManagerStateMachine(unittest.TestCase):
         # short-circuit before producing any state.
         (self.vault / "Z_attachments" / "biblio_articles").mkdir(parents=True)
         (self.vault / "Z_Zotero_Notes").mkdir()
-        bib_dir = self.vault / "presentations_slides_writings_teaching"
-        bib_dir.mkdir()
-        (bib_dir / "_master.bib").write_text(
+        # _master.bib at the vault root matches the neutral default
+        # audit_master_bib_path ("_master.bib"); the config below sets only the
+        # vault path, so the scan must resolve the bib through that default.
+        (self.vault / "_master.bib").write_text(
             "@article{smith2020, title={Test}, year={2020}, author={Smith, Jane}}",
             encoding="utf-8",
         )
@@ -583,9 +584,8 @@ class TestUnmappedAnnotationPrecompute(unittest.TestCase):
         self.biblio = self.vault / "Z_attachments" / "biblio_articles"
         self.biblio.mkdir(parents=True)
         (self.vault / "Z_Zotero_Notes").mkdir()
-        bib_dir = self.vault / "presentations_slides_writings_teaching"
-        bib_dir.mkdir()
-        (bib_dir / "_master.bib").write_text(
+        # _master.bib at the vault root matches the neutral default path.
+        (self.vault / "_master.bib").write_text(
             "@article{smith2020, title={Test}, year={2020}, author={Smith, Jane}}",
             encoding="utf-8",
         )

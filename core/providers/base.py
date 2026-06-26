@@ -20,6 +20,17 @@ def local_request_timeout() -> Optional[float]:
 
 
 class Provider(ABC):
+    """Abstract base for the LOCAL backends (Ollama, LM Studio).
+
+    Predates the provider-agnostic :class:`core.llm.base.LLMProvider`; this
+    interface stays focused on what the embedding / indexing code and the legacy
+    local-chat path need: a reachability probe, model listing, LlamaIndex LLM +
+    embedding factories, and a streaming chat call. Online chat providers do NOT
+    implement this (they have no embedding interface) — see
+    :func:`core.providers.get_provider` for how an online name is transparently
+    substituted with a local embed provider.
+    """
+
     @abstractmethod
     def check_running(self) -> tuple[bool, str]:
         """Check if the provider service is running."""

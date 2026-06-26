@@ -18,6 +18,8 @@ from ..inventory import Inventory
 
 @dataclass
 class UnreadUnzoterodRow:
+    """One PDF that is both absent from the bib and below the read threshold."""
+
     pdf: Path
     annotations: int
     error: ErrorKind | None = None
@@ -25,6 +27,13 @@ class UnreadUnzoterodRow:
 
 @dataclass
 class UnreadUnzoterodReport:
+    """PDFs not in Zotero that also look unread (annotations < threshold).
+
+    ``ambiguous_count`` is a diagnostic only — PDFs the bridge matched to more
+    than one candidate key are *excluded* from the rows (they may well be in
+    the bib) but counted here so the user knows some were set aside.
+    """
+
     rows: list[UnreadUnzoterodRow] = field(default_factory=list)
     threshold: int = 5
     ambiguous_count: int = (
@@ -38,6 +47,18 @@ def find(
     *,
     annotations: dict[Path, AnnotationsResult] | None = None,
 ) -> UnreadUnzoterodReport:
+    """Reconciliation rule for aim (ii): un-Zotero'd AND apparently unread.
+
+    A PDF qualifies when (a) the bridge left it unmapped — not resolvable to
+    any bib entry and not on the confirmed-no-match list — and (b) its
+    annotation count is below ``annotations_read_threshold``. An unreadable PDF
+    (count -1) is treated as 0 annotations, i.e. unread. Ambiguous-bridge PDFs
+    are excluded from rows (only counted). Sorted fewest-annotations-first so
+    the most clearly-untouched files lead.
+
+    ``annotations`` is the scan's precomputed cache; a missing path falls back
+    to a lazy disk read (see :func:`read_unzoterod.find` for the same pattern).
+    """
     rep = UnreadUnzoterodReport(threshold=settings.annotations_read_threshold)
     rep.ambiguous_count = len(inv.bridge.ambiguous_pdfs)
     for p in inv.bridge.unmapped_pdfs:

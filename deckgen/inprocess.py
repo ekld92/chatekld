@@ -93,9 +93,15 @@ class InProcessChatRunner:
     # -- preflight parity with ChatEKLDClient -------------------------------
 
     def status(self) -> dict:
+        """Vault index status, read straight off the singleton (no HTTP).
+
+        Same shape ``ChatEKLDClient.status`` returns, so the orchestration core's
+        preflight is identical whether it runs in-process or over the API.
+        """
         return obsidian_manager.get_status_payload()
 
     def materials(self) -> dict:
+        """Indexed-materials manifest, read straight off the singleton (no HTTP)."""
         return obsidian_manager.get_indexed_materials()
 
     # -- the one method outline.py / sections.py rely on --------------------
@@ -203,6 +209,12 @@ class InProcessChatRunner:
 
 
 def _as_float(value, default: float) -> float:
+    """Coerce a config value to float, falling back to *default* on bad/None input.
+
+    Config is JSON loaded from disk and may carry a stale or hand-edited value of
+    the wrong type; this keeps a malformed ``vault_similarity_cutoff`` from
+    crashing the in-process runner.
+    """
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -210,6 +222,12 @@ def _as_float(value, default: float) -> float:
 
 
 def _as_bool(value, default: bool) -> bool:
+    """Coerce a config value to bool, accepting the usual truthy string forms.
+
+    A real ``bool`` passes through; ``None`` yields *default*; a string is true
+    only for ``1``/``true``/``yes``/``on`` (case-insensitive). Mirrors the
+    defensive parsing the route layer applies to the same ``vault_*`` knobs.
+    """
     if isinstance(value, bool):
         return value
     if value is None:

@@ -36,6 +36,16 @@ _COLOR_NAMES: dict[int, str | None] = {
 
 
 def _load_libc() -> ctypes.CDLL | None:
+    """Bind libc's macOS ``getxattr`` (6-arg form) via ctypes, or None.
+
+    The whole Finder-tag dimension hinges on this returning non-None: on any
+    non-Darwin platform (or if libc cannot be loaded) it returns ``None`` and
+    every tag read short-circuits to empty, so the audit degrades gracefully on
+    Linux/Windows CI instead of erroring. The argtypes are pinned to the
+    macOS signature, whose extra ``position``/``options`` parameters the stdlib
+    ``os.getxattr`` does not expose. ``use_errno=True`` so a failed call can be
+    distinguished, though callers here only branch on the return value.
+    """
     if sys.platform != "darwin":
         return None
     name = ctypes.util.find_library("c") or "libc.dylib"
@@ -61,6 +71,14 @@ _LIBC = _load_libc()
 
 
 def _getxattr(path: Path, key: str) -> bytes | None:
+    """Read one extended attribute's raw bytes, or None if absent/unreadable.
+
+    Two-call idiom: the first ``getxattr`` with a NULL buffer asks the kernel
+    for the value's size, then a second call reads exactly that many bytes.
+    Any negative return (attribute missing, file gone, permission denied) maps
+    to ``None``; a zero-length attribute returns ``b""``. Read-only — the file
+    is never opened for write.
+    """
     if _LIBC is None:
         return None
     cpath = str(path).encode("utf-8")
@@ -79,11 +97,23 @@ def _getxattr(path: Path, key: str) -> bytes | None:
 
 @dataclass
 class FinderTag:
+    """One Finder tag: a name plus an optional color label.
+
+    Finder encodes a colored tag as ``"Name\\nN"`` where ``N`` is the color
+    index 0-7; an uncolored tag is just the name. ``color`` is the resolved
+    color word (``None`` for index 0 / no color / a bad index).
+    """
+
     name: str
     color: str | None
 
     @classmethod
     def parse(cls, raw: str) -> FinderTag:
+        """Parse one raw plist tag string into a :class:`FinderTag`.
+
+        Splits the optional ``"\\nN"`` color suffix; a non-integer index is
+        tolerated as "no color" rather than raising.
+        """
         if "\n" in raw:
             name, idx = raw.split("\n", 1)
             try:
@@ -95,6 +125,13 @@ class FinderTag:
 
 
 def read_tags(path: Path) -> list[FinderTag]:
+    """Return the file's Finder tags as parsed :class:`FinderTag`s.
+
+    Decodes the ``_kMDItemUserTags`` xattr (a binary plist holding a list of
+    strings). Returns ``[]`` whenever the attribute is missing, the plist is
+    undecodable, or it isn't a list — so an exotic/corrupt xattr can never
+    break a scan. Read-only.
+    """
     raw = _getxattr(path, XATTR_KEY)
     if not raw:
         return []
@@ -108,4 +145,9 @@ def read_tags(path: Path) -> list[FinderTag]:
 
 
 def read_tag_names(path: Path) -> set[str]:
+    """Return just the set of tag names (color dropped) for ``path``.
+
+    The audit only reconciles tag *names*; this is the form the inventory and
+    reports consume.
+    """
     return {t.name for t in read_tags(path)}

@@ -22,6 +22,11 @@ from .prompts import OUTLINE_SYSTEM_PROMPT, build_outline_message
 
 @dataclass
 class Section:
+    """One outline section: a slide-group title plus its bullet points.
+
+    The unit the per-section generation phase (``sections.generate_section``)
+    consumes — one ``Section`` becomes one ``\\section`` worth of frames.
+    """
     title: str
     points: list = field(default_factory=list)
 
@@ -106,6 +111,13 @@ def _extract_json_array(text: str) -> Optional[str]:
 
 
 def _coerce_sections(data) -> list:
+    """Coerce a parsed JSON array into :class:`Section` objects (tolerantly).
+
+    Accepts the loose shapes a model emits: a dict per section with the title
+    under any of ``title``/``name``/``section`` and points under any of
+    ``points``/``bullets``/``items``, or a bare string (a title-only section).
+    Untitled/blank entries are dropped; a non-list input yields ``[]``.
+    """
     sections: list = []
     if not isinstance(data, list):
         return sections

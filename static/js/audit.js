@@ -8,6 +8,9 @@
  * cancelled`.
  */
 
+// Imports only ui.js + api.js (per the JS module hierarchy). All report tables
+// interpolate server data into innerHTML, so every cell is run through the _esc /
+// _attr HTML-escape helpers — there is no createElement path here.
 import { secureFetch, logError } from './api.js';
 import { setStatusA11y, closeModal, taskBegin, taskEnd } from './ui.js';
 
@@ -26,6 +29,11 @@ const _REPORT_LABELS = {
     duplicates: 'Duplicate PDFs',
 };
 
+/**
+ * Initialise the Audit tab: load + display the audit config and the reused vault
+ * path, then read status. If a prior in-memory scan left results, render them
+ * WITHOUT polling — the scan itself only ever runs on an explicit Run Scan.
+ */
 export async function initAuditTab() {
     try {
         const cfg = await fetchAuditConfig();
@@ -82,6 +90,8 @@ function _populateAuditSettingsForm(cfg) {
     }
 }
 
+/** Persist the audit path/threshold settings to /api/audit/config (NOT the
+ * generic /api/config, which strips audit_* keys), then close the modal. */
 export async function saveAuditSettings() {
     const body = {
         audit_attachments_subdir: _readInput('audit-attachments-subdir'),
@@ -123,6 +133,11 @@ function _readInt(id) {
     return Number.isFinite(n) ? n : 0;
 }
 
+/**
+ * Start a scan (the ONLY code path that triggers one) and begin status polling.
+ * Re-enables the Run button immediately on a start failure; otherwise polling
+ * owns the button state until the scan reaches a terminal state.
+ */
 export async function runAuditScan() {
     const btn = document.getElementById('audit-run-btn');
     const cancelBtn = document.getElementById('audit-cancel-btn');
@@ -148,6 +163,8 @@ export async function runAuditScan() {
     }
 }
 
+/** Request cancellation of the running scan; polling notices the state change
+ * and tears down the in-flight UI. */
 export async function cancelAuditScan() {
     try {
         await secureFetch('/api/audit/cancel', { method: 'POST' });
@@ -229,6 +246,7 @@ function _showError(msg) {
     }
 }
 
+/** Switch the active report tab (updating ARIA selection state) and load it. */
 export async function selectAuditReport(name) {
     _currentReport = name;
     document.querySelectorAll('.audit-report-tab').forEach(t => {
