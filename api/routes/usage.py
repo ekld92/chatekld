@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, jsonify, request
 
-from api.security import origin_is_local
 from api.validators import coerce_enum, coerce_int_in_range
 from core.llm.usage import PRICING_TABLE, usage_tracker
 
@@ -49,8 +48,6 @@ def api_usage():
     per-request records are returned alongside the aggregated summary.
     Local-origin gated.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     window = request.args.get("window", "month")
     since = _since_iso_for_window(window)
     summary = usage_tracker.summary(since_iso=since)
@@ -76,8 +73,6 @@ def api_pricing():
     ``llm_pricing_overrides``) into a ``{model: {input, output, cached_input}}``
     map so the UI can display/estimate costs. Local-origin gated.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     return jsonify({
         "models": {
             name: {

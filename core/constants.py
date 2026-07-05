@@ -26,6 +26,11 @@ def _get_base_dir():
     return base
 
 BASE_DIR = _get_base_dir()
+# Single source of truth for the application log path. launch.py (frozen + `python
+# launch.py`) and app.py's dev `__main__` handler both write here, and the in-app
+# log viewer (`GET /api/log/tail`) reads it, so all three agree on one location
+# under the platform app-data dir.
+LOG_FILE = os.path.join(BASE_DIR, "chatekld.log")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 FEEDBACK_FILE = os.path.join(BASE_DIR, "feedback.jsonl")
 OLLAMA_PID_FILE = os.path.join(BASE_DIR, "ollama.pid")
@@ -42,6 +47,14 @@ DB_PATH = os.path.join(BASE_DIR, "uploads.db")
 # exports this into ``TIKTOKEN_CACHE_DIR`` at startup (setdefault, so an
 # explicit user override still wins).
 TIKTOKEN_CACHE_DIR = os.path.join(BASE_DIR, "tiktoken_cache")
+
+# Durable NLTK data dir.  LlamaIndex's SentenceSplitter eagerly loads NLTK
+# punkt + stopwords (for PDF chunking and the markdown secondary-cap pass); if
+# the data is absent it falls back to a network ``nltk.download`` — which breaks
+# an OFFLINE first index on a fresh machine.  The installer pre-downloads punkt
+# + stopwords here and launch.py exports this into ``NLTK_DATA`` at startup
+# (setdefault, so a user override wins), mirroring the tiktoken-cache pin.
+NLTK_DATA_DIR = os.path.join(BASE_DIR, "nltk_data")
 
 # --- LLM & Embedding Defaults ---
 DEFAULT_LLM = "llama3.2"
@@ -70,6 +83,12 @@ DEFAULT_ONLINE_MAX_TOKENS = 4096
 DEFAULT_VISION_TIMEOUT_S = 120     # per-call HTTP timeout for vision + OCR
 DEFAULT_VISION_MAX_TOKENS = 1536   # caps image-description generation length
 DEFAULT_OCR_MAX_TOKENS = 4096      # full-page OCR can be longer than a caption
+# Negative-result cooldown after a failed vision/OCR call (fast-fail window so
+# per-image traffic can't hammer a missing model). Config-tunable via
+# ``vision_failure_cooldown_s`` (0 disables — every image retries immediately);
+# during indexing every image inside the window is silently skipped, so a
+# shorter value trades retry traffic against fewer dropped images after a blip.
+DEFAULT_VISION_FAILURE_COOLDOWN_S = 30
 VISION_MAX_RETRIES = 0             # fail fast; an empty image retries next run
 # VISION_IMAGE_MAX_SIDE MUST stay a multiple of 14: the downscaler rounds the
 # resized longest side UP to the nearest 14 px (Qwen patch alignment), so a

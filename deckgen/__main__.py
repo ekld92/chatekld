@@ -340,9 +340,10 @@ def main(argv: Optional[list] = None) -> int:
             _eprint(f"deckgen: wrote {paths['tex_path']}  "
                     f"({n_total} section(s), {len(tex)} bytes).")
             _eprint(f"deckgen: wrote {paths['makefile_path']}")
-            if not paths["sibling_common"]:
-                _eprint("deckgen: WARNING — output folder has no sibling common/ dir; "
-                        "\\usepackage{../common/...} and ../_master.bib will not resolve.")
+            if not paths["suite_root_found"]:
+                _eprint("deckgen: WARNING — no common/latex-build.mk found walking up "
+                        "from the deck folder; the Makefile cannot locate the suite "
+                        "root, so cress-style / _master.bib will not resolve.")
             _eprint(f"deckgen: compile it with:  cd {paths['project_dir']} && make view")
             return _exit_code(warnings, n_placeholder, n_total)
         _eprint("deckgen: --template set but no output dir / suite root found; "

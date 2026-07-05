@@ -6,7 +6,6 @@ embedding gives distinct, stable vectors within a process so ranking can be
 compared exactly. Skips cleanly if lancedb is not installed.
 """
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -319,6 +318,65 @@ class TestBackendAwareIndexVault(unittest.TestCase):
                 any("did not record its embedding model" in m for m in msgs), msgs
             )
 
+    def test_lancedb_index_not_clobbered_when_backend_unavailable(self):
+        """Regression: an existing LanceDB index must NOT be overwritten by a
+        fresh SimpleVectorStore build when the LanceDB backend cannot be loaded
+        (e.g. the integration's `from pandas import DataFrame` fails, so the
+        import guard sets lancedb_available() = False). The exact production
+        incident: a venv rebuilt without pandas blinded the app to a 412k-row
+        table and a fresh JSON build silently overwrote the docstore/meta. The
+        run must abort with an actionable error and leave every index file
+        byte-identical."""
+        from rag.vault import ObsidianVaultManager
+        from llama_index.core.embeddings import MockEmbedding
+
+        class FakeProvider:
+            def get_embedding(self, _name):
+                return MockEmbedding(embed_dim=8)
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vault_dir, \
+             tempfile.TemporaryDirectory() as index_dir:
+            Path(vault_dir, "a.md").write_text("# A\n\nfirst note body", encoding="utf-8")
+
+            # 1) Build a real LanceDB index on disk.
+            manager = ObsidianVaultManager()
+            manager.restore_vault_path(vault_dir)
+            self._index(manager, index_dir)
+            self.assertEqual(manager.get_status(), "done")
+            meta_path = Path(index_dir, "obsidian_meta.json")
+            docstore_path = Path(index_dir, "docstore.json")
+            self.assertEqual(
+                json.loads(meta_path.read_text())["vector_backend"], "lancedb"
+            )
+            rows_before = lancedb_table_count(index_dir)
+            self.assertGreater(rows_before, 0)
+            meta_before = meta_path.read_bytes()
+            docstore_before = docstore_path.read_bytes()
+
+            # 2) Re-run with LanceDB "unavailable" — must refuse, not clobber.
+            manager2 = ObsidianVaultManager()
+            manager2.restore_vault_path(vault_dir)
+            with (
+                patch("rag.vault.get_provider", return_value=FakeProvider()),
+                patch("rag.vault.load_config", return_value=self._full_config("lancedb")),
+                patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir),
+                patch("rag.vault.lancedb_available", return_value=False),
+            ):
+                manager2.index_vault("llm", "embed", provider_name="ollama")
+            msgs = manager2.drain_status_messages()
+
+            # Aborted with an actionable, LanceDB-specific message.
+            self.assertEqual(manager2.get_status(), "error", msgs)
+            self.assertTrue(
+                any("LanceDB" in m and "Refusing" in m for m in msgs), msgs
+            )
+            # Every on-disk index file is byte-identical (no overwrite), and no
+            # SimpleVectorStore JSON was written.
+            self.assertEqual(meta_path.read_bytes(), meta_before)
+            self.assertEqual(docstore_path.read_bytes(), docstore_before)
+            self.assertEqual(lancedb_table_count(index_dir), rows_before)
+            self.assertFalse(Path(index_dir, "default__vector_store.json").exists())
+
     def test_crash_drift_upsert_replaces_orphan_not_duplicates(self):
         """Faithful crash simulation at the indexer level: the lancedb table is
         ahead of the docstore (a chunk's row is durable but its docstore node was
@@ -326,7 +384,6 @@ class TestBackendAwareIndexVault(unittest.TestCase):
         "new"; lancedb_upsert must delete-before-insert so the row is replaced,
         not duplicated. Without the flag it would duplicate — asserted too."""
         from rag.vault import ObsidianVaultManager
-        from llama_index.core import Document
         from llama_index.core.embeddings import MockEmbedding
 
         def seed_orphan(index_dir):
@@ -368,7 +425,6 @@ class TestBackendAwareIndexVault(unittest.TestCase):
         every row.  Tests the helper directly so the assertion is deterministic
         (fragment merge does not depend on version-prune timing)."""
         from rag.vault import ObsidianVaultManager
-        from llama_index.core import Document
         from llama_index.core.embeddings import MockEmbedding
 
         with tempfile.TemporaryDirectory() as index_dir:
@@ -396,7 +452,6 @@ class TestBackendAwareIndexVault(unittest.TestCase):
         the lancedb backend (independently of the JSON checkpoint), so the live
         fragment count stays bounded mid-run rather than growing one-per-insert."""
         from rag.vault import ObsidianVaultManager
-        from llama_index.core import Document
         from llama_index.core.embeddings import MockEmbedding
 
         with tempfile.TemporaryDirectory() as index_dir:
@@ -416,6 +471,59 @@ class TestBackendAwareIndexVault(unittest.TestCase):
                 # With compaction every 4 of 12 inserts, the final fragment count
                 # is far below the 12 a no-compaction run would leave.
                 self.assertLess(len([p for p in data_dir.iterdir() if p.is_file()]), 12)
+
+    def test_lancedb_orphan_reconciliation(self):
+        """When LanceDB has more rows than the docstore has nodes (e.g. note deleted
+        during an interrupted previous index run), the drift-check reconciles by
+        deleting the orphan rows from LanceDB."""
+        from rag.vault import ObsidianVaultManager
+        from llama_index.core.embeddings import MockEmbedding
+        from rag.lancedb_store import lancedb_list_doc_ids
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vault_dir, \
+             tempfile.TemporaryDirectory() as index_dir:
+            Path(vault_dir, "a.md").write_text("# A\n\nfirst note body", encoding="utf-8")
+            Path(vault_dir, "b.md").write_text("# B\n\nsecond note body", encoding="utf-8")
+
+            # 1. Build initial index
+            manager = ObsidianVaultManager()
+            manager.restore_vault_path(vault_dir)
+            self._index(manager, index_dir)
+
+            initial_count = lancedb_table_count(index_dir)
+            self.assertGreater(initial_count, 0)
+
+            # 2. Modify docstore to simulate orphan (remove a chunk from docstore)
+            # Load the index back using a fresh manager
+            manager_mod = ObsidianVaultManager()
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir):
+                idx = manager_mod._build_index_for_backend(
+                    fresh=False, backend="lancedb", embed_model=MockEmbedding(embed_dim=8)
+                )
+            docstore = getattr(idx, "docstore")
+            # Find a node belonging to b.md
+            b_nodes = [nid for nid, node in docstore.docs.items() if node.metadata.get("source") == "b.md"]
+            self.assertGreater(len(b_nodes), 0)
+
+            # Delete one from docstore and persist
+            target_orphan = b_nodes[0]
+            docstore.delete_document(target_orphan)
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir):
+                idx.storage_context.persist(persist_dir=index_dir)
+
+            # Verify it is still in LanceDB
+            self.assertIn(target_orphan, lancedb_list_doc_ids(index_dir))
+
+            # 3. Re-run index (is_incremental = True)
+            # This triggers drift check where vec_rows > node_count
+            manager2 = ObsidianVaultManager()
+            manager2.restore_vault_path(vault_dir)
+            self._index(manager2, index_dir)
+
+            # 4. Verify that the target_orphan was deleted from LanceDB
+            lancedb_ids = lancedb_list_doc_ids(index_dir)
+            self.assertNotIn(target_orphan, lancedb_ids)
+
 
 
 class TestClientSideMMR(unittest.TestCase):
@@ -453,7 +561,7 @@ class TestClientSideMMR(unittest.TestCase):
     def test_engine_routes_lancedb_to_client_side_mmr(self):
         """A lancedb-backed index must NOT get the native vector_store_query_mode;
         a SimpleVectorStore index must."""
-        from rag.engine import SimpleQueryEngine, _ClientSideMMRRetriever
+        from rag.engine import SimpleQueryEngine
 
         def run_with_index(index):
             engine = SimpleQueryEngine(
@@ -490,3 +598,48 @@ def _build_simple_index_in_memory():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeleteIdQuoting(unittest.TestCase):
+    """Node IDs embed vault-relative paths; this vault is French, so
+    apostrophes in filenames are the COMMON case. A broken literal would
+    truncate the delete predicate — worst case deleting the wrong rows."""
+
+    def test_sql_string_literal_escapes_quotes(self):
+        from rag.lancedb_store import _sql_string_literal
+        self.assertEqual(_sql_string_literal("plain"), "'plain'")
+        self.assertEqual(
+            _sql_string_literal("l'étude.md::abc"), "'l''étude.md::abc'")
+        self.assertEqual(_sql_string_literal('say "hi"'), "'say \"hi\"'")
+
+    def test_delete_ids_with_apostrophes_and_quotes(self):
+        import lancedb as _ldb
+        from rag.lancedb_store import lancedb_delete_ids
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _ldb.connect(tmp)
+            rows = [
+                {"id": "l'étude.md::0001", "x": 1},
+                {"id": 'quote"y.md::0002', "x": 2},
+                {"id": "plain.md::0003", "x": 3},
+            ]
+            tbl = db.create_table("t", data=rows)
+
+            class _Store:
+                _table = tbl
+
+            ok, detail = lancedb_delete_ids(
+                _Store(), ["l'étude.md::0001", 'quote"y.md::0002'])
+            self.assertTrue(ok, detail)
+            remaining = tbl.to_lance().to_table(columns=["id"]).column("id").to_pylist()
+            self.assertEqual(remaining, ["plain.md::0003"])
+
+    def test_delete_ids_reports_missing_table(self):
+        from rag.lancedb_store import lancedb_delete_ids
+
+        class _NoTable:
+            _table = None
+
+        ok, detail = lancedb_delete_ids(_NoTable(), ["x"])
+        self.assertFalse(ok)
+        self.assertIn("no live LanceDB table", detail)

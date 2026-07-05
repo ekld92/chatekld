@@ -18,7 +18,8 @@ adjacent "app-management" routes:
   config + feedback files.
 - ``POST /api/log`` — rate-limited sink for frontend JS errors.
 
-Every route is gated by :func:`api.security.origin_is_local` (403 otherwise).
+All routes are gated by the app-level before_request origin guard
+(api.security.register_origin_guard; 403 otherwise).
 """
 import json
 import os
@@ -34,6 +35,8 @@ from core.constants import (
     CONFIG_FILE,
     EXACT_BLOCKED,
     FEEDBACK_FILE,
+    LOG_FILE,
+    OBSIDIAN_CACHE_DIR,
     OBSIDIAN_INDEX_DIR,
     SYSTEM_PROMPT_LIMIT,
     SYSTEM_ROOTS,
@@ -43,7 +46,7 @@ from core.constants import (
 from core.database import DB_LOCK, get_db_connection, init_db
 from core.utils import log_storage_deletion
 from core.providers.server import clear_provider_warnings
-from api.security import origin_is_local
+from api.security import sanitise_error_msg
 from api.validators import (
     coerce_bool,
     coerce_enum,
@@ -135,6 +138,32 @@ def _coerce_reranker_model(value):
     return s if _RERANKER_MODEL_RE.fullmatch(s) else None
 
 
+# An optional http(s):// scheme, then a host (alnum/dot/hyphen, or a bracketed
+# IPv6), an optional :port, and an optional single trailing slash. The resolver
+# (``core.providers.base._resolve_local_host``) prepends ``http://`` to a
+# scheme-less value, so a bare ``host:port`` is accepted here too.
+_LOCAL_HOST_RE = re.compile(r"(?:https?://)?[A-Za-z0-9._\-\[\]]+(?::\d{1,5})?/?")
+
+
+def _coerce_local_host(value):
+    """Allow "" (fall back to env/constant) or an http(s) ``host[:port]``; else None.
+
+    Used for ``ollama_host`` / ``lm_studio_host``. Shape-validated as defence in
+    depth (these become the base URL handed to httpx / the OpenAI SDK), even
+    though ``/api/config`` is local-origin gated, so a hand-edited or
+    generic-POST garbage value can never be persisted and dialed. Empty is kept
+    (disables the override → the resolver uses the env var then the constant).
+    """
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s == "":
+        return ""
+    if len(s) > 200:
+        return None
+    return s if _LOCAL_HOST_RE.fullmatch(s) else None
+
+
 def _coerce_vault_rel_subdir(value):
     """Shape-validate a vault-relative sub-folder (no traversal/abs/NUL).
 
@@ -152,6 +181,30 @@ def _coerce_vault_rel_subdir(value):
         return None
     # Reject absolute / traversal BEFORE normalising away leading slashes, so a
     # leading "/" can never be silently stripped into a valid-looking relative.
+    if os.path.isabs(s) or s.startswith("/"):
+        return None
+    parts = [p for p in s.split("/") if p]
+    if not parts or ".." in parts:
+        return None
+    return "/".join(parts)
+
+
+def _coerce_vault_rel_file(value):
+    """Allow "" (slot disabled) or a vault-relative file path (no traversal/abs/NUL).
+
+    Twin of :func:`_coerce_vault_rel_subdir` but keeps an empty string (the
+    thesaurus loader reads "" as "skip this file") instead of dropping it, so a
+    user can clear ``vault_thesaurus_abbrev_path`` / ``vault_thesaurus_tags_path``
+    back to off. Shape-only — the under-root realpath check happens at read time
+    in ``ObsidianVaultManager._get_thesaurus`` (the vault may be unset on save).
+    """
+    if not isinstance(value, str):
+        return None
+    s = value.strip().replace("\\", "/")
+    if s == "":
+        return ""
+    if len(s) > 1024 or any(ch in s for ch in ("\x00", "\n", "\r")):
+        return None
     if os.path.isabs(s) or s.startswith("/"):
         return None
     parts = [p for p in s.split("/") if p]
@@ -208,10 +261,16 @@ _CONFIG_VALIDATORS = {
     "context_window": lambda v: coerce_int_in_range(v, 512, 131072),
     "agent_wall_clock_s": lambda v: coerce_int_in_range(v, 30, 1800),
     "local_request_timeout_s": lambda v: coerce_int_in_range(v, 0, 3600),
+    # Local-backend base URLs (config → env → constant resolution in
+    # core.providers.base). Empty keeps the default; URL-shape validated.
+    "ollama_host": _coerce_local_host,
+    "lm_studio_host": _coerce_local_host,
     # Vision / OCR call bounds (always on — min 5, no "0 = off").
     "vision_timeout_s": lambda v: coerce_int_in_range(v, 5, 600),
     "vision_max_tokens": lambda v: coerce_int_in_range(v, 64, 8192),
     "ocr_max_tokens": lambda v: coerce_int_in_range(v, 64, 8192),
+    # Failed-call fast-fail window; 0 legitimately disables (retry every image).
+    "vision_failure_cooldown_s": lambda v: coerce_int_in_range(v, 0, 600),
     "fallback_provider": _coerce_fallback_provider,
     # Vault chat generation / retrieval knobs.
     "vault_top_k": lambda v: coerce_int_in_range(v, 1, 32),
@@ -220,6 +279,8 @@ _CONFIG_VALIDATORS = {
         v, ("strict", "balanced", "exploratory", "concise")),
     "vault_chat_temperature": lambda v: coerce_float_in_range(v, 0.0, 2.0),
     "vault_hybrid_enabled": coerce_bool,
+    "vault_rrf_dense_weight": lambda v: coerce_float_in_range(v, 0.0, 10.0),
+    "vault_rrf_bm25_weight": lambda v: coerce_float_in_range(v, 0.0, 10.0),
     "vault_reranker_enabled": coerce_bool,
     "vault_reranker_model": _coerce_reranker_model,
     "vault_reranker_device": lambda v: coerce_enum(v, ("auto", "cpu", "mps")),
@@ -228,10 +289,25 @@ _CONFIG_VALIDATORS = {
     "vault_query_expansion": coerce_bool,
     "vault_num_queries": lambda v: coerce_int_in_range(v, 1, 5),
     "vault_rerank_pool_ceiling": lambda v: coerce_int_in_range(v, 10, 200),
+    # Track 5.6: indexer embed-batch size; 1 = legacy per-chunk inserts.
+    "vault_embed_batch_size": lambda v: coerce_int_in_range(v, 1, 256),
     "vault_wikilink_expansion": coerce_bool,
     "vault_wikilink_neighbor_cap": lambda v: coerce_int_in_range(v, 1, 100),
     "vault_wikilink_node_cap": lambda v: coerce_int_in_range(v, 1, 200),
     "vault_wikilink_score_decay": lambda v: coerce_float_in_range(v, 0.0, 1.0),
+    "vault_thesaurus_expansion": coerce_bool,
+    "vault_thesaurus_max_variants": lambda v: coerce_int_in_range(v, 1, 8),
+    "vault_primer_enabled": coerce_bool,
+    # Floored at 500 (not 200): the primer header alone is ~231 chars, so a
+    # smaller budget would leave no room for glossary lines and silently yield an
+    # empty primer. 500 guarantees the header + several entries.
+    "vault_primer_max_chars": lambda v: coerce_int_in_range(v, 500, 8000),
+    # Curated-glossary file paths (vault-relative, "" disables the slot) and the
+    # primer content overrides ("" ⇒ built-in defaults). See _get_thesaurus.
+    "vault_thesaurus_abbrev_path": _coerce_vault_rel_file,
+    "vault_thesaurus_tags_path": _coerce_vault_rel_file,
+    "vault_primer_header": lambda v: coerce_string_max_len(v, 2000),
+    "vault_primer_core_terms": lambda v: coerce_string_max_len(v, 4000),
     "vault_agent_enabled": coerce_bool,
     "vault_agent_max_iterations": lambda v: coerce_int_in_range(v, 1, 12),
     "vault_vector_backend": lambda v: coerce_enum(v, ("simple", "lancedb")),
@@ -246,17 +322,47 @@ _CONFIG_VALIDATORS = {
     "deck_temperature": lambda v: coerce_float_in_range(v, 0.0, 2.0),
     "deck_max_sections": lambda v: coerce_int_in_range(v, 1, 20),
     "deck_agent_max_iterations": lambda v: coerce_int_in_range(v, 1, 12),
+    "deck_section_max_attempts": lambda v: coerce_int_in_range(v, 1, 5),
+    "deck_retry_backoff_s": lambda v: coerce_int_in_range(v, 0, 30),
+    "deck_section_max_tokens": lambda v: coerce_int_in_range(v, 256, 8192),
+    "deck_resume_enabled": coerce_bool,
+    # Opt-in final-stage .tex integrity review + auto-repair. review_enabled is
+    # the persisted default for the off-by-default panel toggle; review_model is
+    # the HF/provider-shaped stronger-model override (""⇒chat model); max_tokens
+    # must fit the whole re-emitted document.
+    "deck_review_enabled": coerce_bool,
+    "deck_review_model": _coerce_model_name,
+    "deck_review_max_tokens": lambda v: coerce_int_in_range(v, 256, 16384),
+    # Compile-fix bounds per the Phase 5 scoping plan (30-600s / 1-3 repairs):
+    # the SSE consumer budget is (2*iters+1)*timeout, so the pre-fix 3600x10
+    # ceiling would have permitted a ~10-hour worker. The route re-clamps both
+    # (and re-validates the engine enum) at call time for hand-edited configs.
+    "deck_compile_timeout_s": lambda v: coerce_int_in_range(v, 30, 600),
+    "deck_compile_max_iters": lambda v: coerce_int_in_range(v, 1, 3),
+    "deck_compile_engine": lambda v: coerce_enum(v, ("pdflatex", "lualatex", "xelatex")),
     # Plain Chat (RAG-free panel). chat_system_prompt is the FULL system prompt
     # (no retrieval grounding to protect), capped at the shared limit; a non-str
     # is dropped (prior kept) while an empty string is a valid "no system
     # prompt" and is persisted as-is, matching coerce_string_max_len semantics.
     "chat_temperature": lambda v: coerce_float_in_range(v, 0.0, 2.0),
     "chat_system_prompt": lambda v: coerce_string_max_len(v, SYSTEM_PROMPT_LIMIT),
+    # Prompt Hub capture toggle (read-only transparency panel). Bool-coerced;
+    # a malformed value is dropped so the prior persisted value survives.
+    "prompt_capture_enabled": coerce_bool,
     # Note Refactor. Scope shape only; existence checked at request time.
     # refactor_extract_model "" ⇒ fall back to vision_model.
     "refactor_scope_subdir": _coerce_vault_rel_subdir,
     "refactor_extract_model": _coerce_model_name,
     "refactor_table_double_read": coerce_bool,
+    # Scope-wide "strip the OCR-callout preamble" default (additive to the
+    # per-image strip flag); read by both the plan and the apply writer.
+    "refactor_strip_preamble_default": coerce_bool,
+    # Opt-in per-note LLM prose review knobs (HF-repo-id-shaped model override +
+    # token cap, both Settings-window / /api/config-set, neither a body override).
+    "refactor_review_model": _coerce_model_name,
+    "refactor_review_max_tokens": lambda v: coerce_int_in_range(v, 64, 8192),
+    # Applyable LLM formatting-rewrite token cap (re-emits the whole note/section).
+    "refactor_rewrite_max_tokens": lambda v: coerce_int_in_range(v, 256, 16384),
     # Phase 2 vault-write knobs. archive_dir is shape-only (abs or ""); the
     # not-inside-vault check is re-applied at apply time. thumb_max_side bounds
     # the in-vault thumbnail's longest side.
@@ -289,8 +395,6 @@ def api_get_config():
     ``load_config`` never includes API keys (they live only in env vars), so
     this is safe to hand to the local UI as-is. Local-origin gated.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     return jsonify(load_config())
 
 @config_bp.route("/api/config", methods=["POST"])
@@ -313,8 +417,6 @@ def api_save_config():
 
     Local-origin gated; 400 on non-JSON or an invalid vault path.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "Invalid JSON"}), 400
@@ -372,6 +474,22 @@ def api_save_config():
     audit_keys = [key for key in data if key.startswith("audit_")]
     for key in audit_keys:
         data.pop(key)
+
+    # Item 4.10: Whitelist keys against KNOWN_KEYS to prevent clients from persisting
+    # arbitrary unvalidated keys into config.json.
+    # Defect: Bypassing key validation allows malicious/junk inputs to pollute config.json.
+    # Safety: Completely backward-compatible. Only filters out non-default/unsupported keys.
+    # Invariant: Only keys defined in core.config.KNOWN_KEYS are persisted.
+    from core.config import KNOWN_KEYS
+    extra_keys = [k for k in data if k not in KNOWN_KEYS]
+    for k in extra_keys:
+        data.pop(k)
+    # Track 5.7: config_version is server-owned schema state (in KNOWN_KEYS,
+    # so the whitelist above keeps it) — a client must never set it, or a
+    # forged lower value would re-run migrations / a higher one would block
+    # them. save_config re-stamps it regardless; this strip is defence in depth.
+    data.pop("config_version", None)
+
     # Clamp/validate the LLM-parameter keys the Settings window writes; an
     # out-of-range or malformed value is dropped so the prior value survives.
     _validate_llm_config_keys(data)
@@ -449,7 +567,15 @@ def _normalise_vault_exclude_dirs(entries, vault_path: str) -> list[str]:
 
 _VAULT_IMAGE_EXT_BODY = re.compile(r"[a-z0-9]{1,16}")
 _VAULT_IMAGE_EXTS_MAX = 64
-_VAULT_RESERVED_EXTS = VAULT_MD_EXTS | VAULT_BINARY_EXTS
+# Known office/document binary extensions never belong in the image/vision
+# branch. They are added to the reserve so a hand-edited (or malicious-page)
+# config can never enumerate a document into `vault_image_exts` and route its
+# bytes to the vision model — defence-in-depth over the existing md/pdf reserve,
+# which stopped short of other document types.
+_VAULT_DOC_EXTS = frozenset({
+    ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".rtf", ".odt",
+})
+_VAULT_RESERVED_EXTS = VAULT_MD_EXTS | VAULT_BINARY_EXTS | _VAULT_DOC_EXTS
 
 def _normalise_vault_image_exts(entries) -> list[str]:
     """Coerce the image-extension allow-list to deduped, dotted, lowercase exts.
@@ -497,8 +623,6 @@ def api_get_report_types():
     hyphen form ``/api/report-types`` wraps it as ``{"report_types": [...]}``.
     ``load_report_types`` merges built-ins with custom/overridden saved types.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     report_types = load_report_types()
     if request.path.endswith("report_types"):
         return jsonify(report_types)
@@ -515,8 +639,6 @@ def api_pull():
     Each streamed chunk is a Pydantic model serialised via ``model_dump()``
     (Pydantic v2) with a ``dict()`` fallback; the stream ends with ``[DONE]``.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True) or {}
     # Don't wrap data.get("model") in str(...): coerce_regex rejects non-string
     # inputs, but stringifying first would turn JSON null into "None", which
@@ -554,14 +676,14 @@ def api_reset():
     a stray POST cannot wipe data. Sequence: stop the indexer and *wait* for its
     final persist (refuse with 503 on timeout rather than race a stray persist
     that would re-create the storage dir with partial state), release its lock,
-    reset the audit subsystem to idle, clear the ``uploads`` table, and
-    ``rmtree`` the Obsidian storage dir (logged via ``log_storage_deletion``).
+    reset the audit subsystem to idle, clear the ``uploads`` table,
+    ``rmtree`` the Obsidian storage dir (logged via ``log_storage_deletion``),
+    and ``rmtree`` the Obsidian cache dir (descriptions + OCR text — the bulk of
+    the on-disk footprint; content-hash keyed, so it self-heals on reindex).
     ``wipe_feedback`` / ``wipe_config`` optionally delete those files too — both
     resolved through the (test-patchable) ``app.FEEDBACK_FILE`` / ``CONFIG_FILE``
     attributes. Returns the list of deleted artefacts.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True) or {}
     if data.get("confirm") != "reset":
         return jsonify({"error": "Confirmation token required"}), 400
@@ -610,6 +732,15 @@ def api_reset():
         shutil.rmtree(OBSIDIAN_INDEX_DIR)
         deleted.append("obsidian_storage")
 
+    # Also reclaim the description / OCR-text cache — the LARGEST on-disk
+    # footprint (cached vision descriptions + scanned-PDF OCR text, potentially
+    # many GB). It used to survive "reset", so a teardown freed little disk and
+    # left stale cached descriptions from the previous vault. Safe to delete: the
+    # cache is content-hash keyed, so it self-heals on the next index.
+    if os.path.isdir(OBSIDIAN_CACHE_DIR):
+        shutil.rmtree(OBSIDIAN_CACHE_DIR, ignore_errors=True)
+        deleted.append("obsidian_cache")
+
     app_module = sys.modules.get("app")
     feedback_file = getattr(app_module, "FEEDBACK_FILE", FEEDBACK_FILE)
     config_file = getattr(app_module, "CONFIG_FILE", CONFIG_FILE)
@@ -641,8 +772,6 @@ def api_log():
     500 chars and routed to the ``chatekld.js`` logger — ``error`` level logs at
     WARNING, everything else at DEBUG. Local-origin gated.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
 
     # Rolling-window cap: a runaway frontend cannot saturate the log file.
     now = time.monotonic()
@@ -670,3 +799,72 @@ def api_log():
         else:
             _logger.debug("[JS] %s", msg)
     return jsonify({"ok": True})
+
+
+# Tail bounds: a generous line cap for the viewer, plus a hard byte ceiling so a
+# single pathological log line (or a huge file) can never blow up the response or
+# the renderer. The reader seeks to the end and only ever pulls the last
+# ``_LOG_TAIL_MAX_BYTES`` off disk, so cost is independent of total file size.
+_LOG_TAIL_DEFAULT_LINES = 500
+_LOG_TAIL_MAX_LINES = 5000
+_LOG_TAIL_MAX_BYTES = 1_000_000  # ~1 MB window read from the end of the file
+
+
+@config_bp.route("/api/log/tail", methods=["GET"])
+def api_log_tail():
+    """Return the tail of ``chatekld.log`` for the in-app log viewer.
+
+    Local-origin gated like every other route. Read-only: it never writes,
+    rotates, or truncates the log. Reads at most ``_LOG_TAIL_MAX_BYTES`` from the
+    end of the file (cost independent of file size), keeps the last ``lines``
+    (query param, clamped to ``_LOG_TAIL_MAX_LINES``), and runs every line
+    through ``redact()`` so an accidentally-logged API key can never surface in
+    the UI — the same "redact before it reaches the UI" discipline the JS-error
+    sink and ``sanitise_error_msg`` already follow.
+
+    Response: ``{"text", "lines", "path", "size", "truncated", "exists"}``.
+    """
+
+    from core.llm.redact import redact
+
+    lines = coerce_int_in_range(request.args.get("lines"), 1, _LOG_TAIL_MAX_LINES)
+    if lines is None:  # missing/garbage ``lines`` param → fall back to the default
+        lines = _LOG_TAIL_DEFAULT_LINES
+
+    try:
+        size = os.path.getsize(LOG_FILE)
+    except OSError:
+        # No log yet (fresh install / first run before the first write).
+        return jsonify({
+            "text": "", "lines": 0, "path": LOG_FILE,
+            "size": 0, "truncated": False, "exists": False,
+        })
+
+    truncated = size > _LOG_TAIL_MAX_BYTES
+    try:
+        with open(LOG_FILE, "rb") as fh:
+            if truncated:
+                fh.seek(size - _LOG_TAIL_MAX_BYTES)
+            raw = fh.read()
+    except OSError as exc:
+        return jsonify({"error": sanitise_error_msg(exc)}), 500
+
+    # Decode leniently — a partial multibyte char at the seek boundary must not
+    # raise. Drop the first (likely partial) line when we seeked into the middle —
+    # but only when there's more than one line. A single log line longer than the
+    # byte window would otherwise be dropped to nothing, making the viewer
+    # misreport a non-empty file as "(log is empty)"; keep the partial line instead.
+    text = raw.decode("utf-8", errors="replace")
+    all_lines = text.splitlines()
+    if truncated and len(all_lines) > 1:
+        all_lines = all_lines[1:]
+    tail = all_lines[-lines:]
+    redacted = [redact(ln) for ln in tail]
+    return jsonify({
+        "text": "\n".join(redacted),
+        "lines": len(redacted),
+        "path": LOG_FILE,
+        "size": size,
+        "truncated": truncated,
+        "exists": True,
+    })

@@ -26,6 +26,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable
@@ -291,6 +292,13 @@ def _write_text_atomic(path: Path, text: str) -> None:
             raise
         with f:
             f.write(text)
+            # fsync BEFORE the rename for crash *durability*, not just
+            # atomicity — same W6 discipline as core.utils.write_text_atomic
+            # (see the root CLAUDE.md): mapping.json holds hand-curated,
+            # unregenerable matches, so a rename-without-fsync could lose it
+            # on power loss.
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, str(path))
     except Exception:
         try:
@@ -325,18 +333,29 @@ def _rel_to_vault(pdf: Path, vault_root: Path) -> str:
         return str(pdf)
 
 
+# Item 2.9 (improvement plan 2026-07-04): mapping.json is the audit's ONLY
+# writable, hand-curated (unregenerable) file, and both writers below are
+# load→mutate→save sequences. Two concurrent /api/audit/mapping POSTs could
+# interleave the read-modify-write and silently drop one request's matches —
+# a data-loss class the atomic+fsync save alone cannot prevent. One module
+# mutex serialises the whole RMW. (Vendored-tree constraint respected:
+# threading is stdlib; no new project imports.)
+_MAPPING_RMW_LOCK = threading.Lock()
+
+
 def add_matches(
     mapping_file: Path, items: list[tuple[Path, str]], vault_root: Path
 ) -> None:
     """Append multiple manual PDF→key matches, saving once."""
-    matches, no_match = _load_mapping(mapping_file)
-    for pdf, citation_key in items:
-        rel = _rel_to_vault(pdf, vault_root)
-        paths = matches.setdefault(citation_key, [])
-        if rel not in paths:
-            paths.append(rel)
-        no_match.discard(rel)
-    save_mapping(mapping_file, matches, no_match)
+    with _MAPPING_RMW_LOCK:
+        matches, no_match = _load_mapping(mapping_file)
+        for pdf, citation_key in items:
+            rel = _rel_to_vault(pdf, vault_root)
+            paths = matches.setdefault(citation_key, [])
+            if rel not in paths:
+                paths.append(rel)
+            no_match.discard(rel)
+        save_mapping(mapping_file, matches, no_match)
 
 
 def add_match(
@@ -348,16 +367,17 @@ def add_match(
 
 def add_no_matches(mapping_file: Path, pdfs: list[Path], vault_root: Path) -> None:
     """Mark multiple PDFs as 'confirmed not in the bibliography', saving once."""
-    matches, no_match = _load_mapping(mapping_file)
-    for pdf in pdfs:
-        rel = _rel_to_vault(pdf, vault_root)
-        for key in list(matches):
-            if rel in matches[key]:
-                matches[key].remove(rel)
-                if not matches[key]:
-                    del matches[key]
-        no_match.add(rel)
-    save_mapping(mapping_file, matches, no_match)
+    with _MAPPING_RMW_LOCK:
+        matches, no_match = _load_mapping(mapping_file)
+        for pdf in pdfs:
+            rel = _rel_to_vault(pdf, vault_root)
+            for key in list(matches):
+                if rel in matches[key]:
+                    matches[key].remove(rel)
+                    if not matches[key]:
+                        del matches[key]
+            no_match.add(rel)
+        save_mapping(mapping_file, matches, no_match)
 
 
 def add_no_match(mapping_file: Path, pdf: Path, vault_root: Path) -> None:

@@ -13,7 +13,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
-import threading
 from pathlib import Path
 
 from core.config import load_config
@@ -31,6 +30,7 @@ from services.vision import (
 )
 
 from refactor import cache
+from refactor.local_model import LOCAL_MODEL_LOCK
 
 _TABLE_PROMPT = (
     "This image contains a table. Transcribe it EXACTLY as a GitHub-flavored "
@@ -85,7 +85,13 @@ _LABEL_SYNONYMS = (
 # descriptions strictly one-at-a-time, and extraction here is a deliberate,
 # low-frequency user action; full cross-subsystem serialization is out of scope
 # for Phase 1.
-_VISION_LOCK = threading.Lock()
+#
+# W5: this is now an ALIAS of the shared refactor-hub gate LOCAL_MODEL_LOCK, so a
+# vision extraction also serializes against a concurrent prose review / LLM edit
+# (all three formerly had independent locks → up to 3 concurrent local calls).
+# The double-read below still holds ONE acquisition across both reads, so a
+# single image's two calls are never interleaved. See refactor/local_model.py.
+_VISION_LOCK = LOCAL_MODEL_LOCK
 
 
 def _resolve_model(cfg: dict) -> str:

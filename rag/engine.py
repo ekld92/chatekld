@@ -32,7 +32,7 @@ of the module. It composes, in this order:
 
 All of these stages are query-time and reindex-free; the same pipeline serves
 the local-streaming path (``query``), the online path (``_query_online`` →
-``_OnlineStreamingResponse``), and the agent's pure-retrieval ``vault.search``
+``_OnlineStreamingResponse``), and the agent's pure-retrieval ``vault_search``
 tool (``retrieve``). The deep mechanics (rerank-pool sizing, cutoff semantics,
 the LanceDB MMR split, wikilink caps) are documented in ``rag/CLAUDE.md``.
 """
@@ -49,10 +49,8 @@ from llama_index.core.schema import NodeWithScore, QueryBundle
 from rag.lancedb_store import is_lancedb_store
 from core.providers import get_provider
 from core.config import load_config, is_online_provider, resolve_embed_provider
-from core.llm.factory import get_llm_provider
 from core.llm.policy import parse_policy_from_config
-from core.llm.redact import redact
-from core.llm.types import LLMError, LLMRequest, RetrievedChunk
+from core.llm.types import LLMRequest, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +239,113 @@ class _WikilinkExpansionRetriever(BaseRetriever):
         return seeds + added
 
 
+# Thesaurus query-expansion default: how many synonym-substituted query
+# variants to retrieve and fuse in, on top of the original query. Each variant
+# is one extra full retrieval, so this bounds the added cost at ~(N+1)×.
+_THESAURUS_MAX_VARIANTS = 3
+
+
+class _ThesaurusExpansionRetriever(BaseRetriever):
+    """Widen recall by retrieving deterministic synonym variants of the query.
+
+    The vault's prose is dense bilingual FR/EN shorthand (``EDC``/``isrs``/
+    ``rsq``) that the embedding model cannot bridge and the lexical BM25 leg can
+    only hit when the query literally carries the token. This wrapper asks the
+    curated :class:`rag.thesaurus.Thesaurus` for up to ``max_variants`` query
+    reformulations (each substitutes one matched concept term with a known
+    synonym), runs the **inner** retriever on each, and unions the hits with the
+    original seeds — deduped by node id, **keeping each node's best score**.
+
+    Crucially, every variant is a *separate* retrieval, so the dense leg embeds
+    a clean reformulated query rather than a synonym-stuffed one (no embedding
+    dilution). Keeping the max native score (cosine / RRF-fused) — rather than a
+    fresh RRF score — preserves the score scale the no-reranker
+    ``SimilarityPostprocessor`` cutoff expects, so this retriever is safe with or
+    without a downstream reranker (unlike wikilink expansion, which is
+    rerank-gated). The merged pool is capped to ``pool_size`` (the same candidate
+    breadth the pipeline would otherwise fetch), so the reranker / cutoff sees no
+    more candidates than usual.
+
+    Purely additive: no thesaurus, no variants, or an empty query returns the
+    seeds unchanged. A failing variant retrieval is logged and skipped — it can
+    never break the original query's results.
+
+    COST / CONCURRENCY: ``stream_chat`` runs ``engine.query()`` retrieval inside
+    ``_index_mutation_lock`` (serialising it against the indexer's
+    ``idx.insert``). Each variant here is a *separate, synchronous* inner
+    retrieval whose dense leg issues a blocking embedding HTTP call, so enabling
+    expansion turns the one embed-under-lock into ~(max_variants+1) serial
+    embeds under that lock — extending its hold time and contention with an
+    in-progress index run by the same factor. This is an accepted trade for the
+    recall gain (the default cap keeps it to ~4×); revisit the bound here before
+    raising ``vault_thesaurus_max_variants``.
+    """
+
+    def __init__(
+        self,
+        inner: BaseRetriever,
+        thesaurus: Any,
+        *,
+        max_variants: int = _THESAURUS_MAX_VARIANTS,
+        pool_size: int = 0,
+    ) -> None:
+        self._inner = inner
+        self._thesaurus = thesaurus
+        self._max_variants = max(0, int(max_variants))
+        self._pool_size = max(0, int(pool_size))
+        super().__init__()
+
+    @staticmethod
+    def _score(nws: NodeWithScore) -> float:
+        return float(nws.score) if nws.score is not None else 0.0
+
+    def _retrieve(self, query_bundle: QueryBundle) -> list:
+        seeds: list[NodeWithScore] = self._inner.retrieve(query_bundle)
+        if not self._thesaurus or self._max_variants <= 0:
+            return seeds
+        try:
+            variants = self._thesaurus.expand_query(
+                query_bundle.query_str, self._max_variants
+            )
+        except Exception:  # pragma: no cover - thesaurus is defensive already
+            logger.debug("Thesaurus expand_query failed; using seeds only.", exc_info=True)
+            return seeds
+        if not variants:
+            return seeds
+
+        # Union seeds + every variant's hits, deduped by node id, keeping the
+        # MAX native score so the score scale stays cutoff-compatible. First-seen
+        # insertion order gives a stable tie-break (seeds before variants).
+        best: dict[str, NodeWithScore] = {}
+        order: list[str] = []
+
+        def _add(nws: NodeWithScore) -> None:
+            nid = nws.node.node_id
+            cur = best.get(nid)
+            if cur is None:
+                best[nid] = nws
+                order.append(nid)
+            elif self._score(nws) > self._score(cur):
+                best[nid] = nws
+
+        for nws in seeds:
+            _add(nws)
+        for variant in variants:
+            try:
+                for nws in self._inner.retrieve(variant):
+                    _add(nws)
+            except Exception:
+                logger.debug("Thesaurus variant retrieval failed: %r", variant, exc_info=True)
+                continue
+
+        merged = [best[nid] for nid in order]
+        # Stable sort by score desc; ties keep insertion order (seeds first).
+        merged.sort(key=self._score, reverse=True)
+        if self._pool_size > 0:
+            return merged[: self._pool_size]
+        return merged
+
+
 # Vault-chat answer-mode templates. Each pairs the same safety contract (the
 # untrusted-context guard plus the {context_str}/{query_str} slots LlamaIndex
 # fills) with a different answer posture (strict / balanced / exploratory /
@@ -332,6 +437,40 @@ def _apply_custom_prefix(base_template: PromptTemplate, custom: str) -> PromptTe
     prefixed = f"USER INSTRUCTIONS:\n{escaped_custom}\n\n{base_text}"
     return PromptTemplate(prefixed)
 
+
+# Default budget for the system-prompt glossary primer (config-overridable via
+# ``vault_primer_max_chars``).  Small on purpose — it rides EVERY turn's system
+# prompt, so it is a curated header, never the whole abbreviations table.
+_PRIMER_MAX_CHARS = 1500
+
+
+def _apply_vault_primer(base_template: PromptTemplate, primer: str) -> PromptTemplate:
+    """Return *base_template* with an app-controlled glossary block prepended.
+
+    Distinct from :func:`_apply_custom_prefix`: this block is *app*-provided
+    (built from the curated vault thesaurus), not user text, and it helps the
+    model interpret the shorthand that survives into the retrieved context. Like
+    the user-prefix helper it leaves the base template's safety preamble and
+    ``{context_str}`` / ``{query_str}`` slots untouched, and brace-escapes the
+    primer so a meaning containing ``{`` / ``}`` can't break ``str.format``
+    rendering. Returns the base template unchanged when *primer* is blank so the
+    LlamaIndex prompt-cache key does not shift on the default (off) path.
+    """
+    primer = (primer or "").strip()
+    if not primer:
+        return base_template
+    base_text = getattr(base_template, "template", None) or str(base_template)
+    escaped = primer.replace("{", "{{").replace("}", "}}")
+    return PromptTemplate(f"{escaped}\n\n{base_text}")
+
+
+def _combine_system_prompt(primer: str, custom: str) -> str:
+    """Join the app primer and the user's custom system prefix for the online
+    path (provider native ``system`` field). Either may be empty."""
+    parts = [p.strip() for p in (primer, custom) if p and p.strip()]
+    return "\n\n".join(parts)
+
+
 # Candidate-pool sizing for the reranker stage.
 # The fusion / dense retriever fetches this many candidates and the
 # cross-encoder rerank narrows them down to ``final_top_k``.  Larger pools
@@ -341,6 +480,14 @@ def _apply_custom_prefix(base_template: PromptTemplate, custom: str) -> PromptTe
 _RERANK_POOL_MULTIPLIER = 4
 _RERANK_POOL_FLOOR = 20
 _RERANK_POOL_CEILING = 50
+
+# Per-call HTTP bound for the QUERY-path embed model (improvement plan
+# 2026-07-04, item 2.1). Embedding one query string takes well under a second
+# on a healthy backend; 30 s distinguishes "wedged" from "cold model load"
+# without risking a false trip. Indexing embeds are deliberately NOT bounded
+# (see Provider.get_embedding) — this constant must only ever reach embed
+# objects that serve retrieval.
+QUERY_EMBED_TIMEOUT_S = 30.0
 
 
 class SimpleQueryEngine:
@@ -390,6 +537,11 @@ class SimpleQueryEngine:
         wikilink_neighbor_cap: int = _WIKILINK_NEIGHBOR_CAP,
         wikilink_node_cap: int = _WIKILINK_NODE_CAP,
         wikilink_score_decay: float = _WIKILINK_SCORE_DECAY,
+        thesaurus: Optional[Any] = None,
+        thesaurus_expansion: bool = False,
+        thesaurus_max_variants: int = _THESAURUS_MAX_VARIANTS,
+        primer_enabled: bool = False,
+        primer_max_chars: int = _PRIMER_MAX_CHARS,
     ):
         """Capture the per-query configuration; build nothing yet.
 
@@ -448,6 +600,21 @@ class SimpleQueryEngine:
         self.wikilink_neighbor_cap = wikilink_neighbor_cap
         self.wikilink_node_cap = wikilink_node_cap
         self.wikilink_score_decay = wikilink_score_decay
+        # Deterministic thesaurus query expansion (query-time, no reindex).
+        # When enabled with a thesaurus present, each retrieval also runs a few
+        # synonym-substituted query variants and unions the hits before the
+        # postprocessor stage.  NOT rerank-gated (it preserves the native score
+        # scale and caps the pool), so it helps the reranker-off path too.
+        # Default off → the pipeline is byte-identical to the pre-feature path.
+        self.thesaurus = thesaurus
+        self.thesaurus_expansion = bool(thesaurus_expansion)
+        self.thesaurus_max_variants = max(0, int(thesaurus_max_variants))
+        # System-prompt primer (#2): inject a compact, app-controlled glossary
+        # built from the same thesaurus so the LLM can read the shorthand in the
+        # retrieved context.  Independent of expansion (its own toggle); shares
+        # the thesaurus object.  Default off → no primer block, prompt unchanged.
+        self.primer_enabled = bool(primer_enabled)
+        self.primer_max_chars = max(0, int(primer_max_chars))
         # Optional user-supplied prefix layered over the mode template's
         # safety preamble.  The placeholders / untrusted-context guard
         # remain app-controlled so a user typo cannot disable retrieval
@@ -509,8 +676,14 @@ class SimpleQueryEngine:
         cfg = load_config()
         retriever, postprocessors, llm = self._build_retrieval_pipeline(cfg)
 
+        primer = self._build_primer(message, cfg)
         base_template = _PROMPT_MODES.get(self.prompt_mode, RAG_QA_PROMPT_STRICT)
-        qa_template = _apply_custom_prefix(base_template, self.custom_system_prompt)
+        # Local path: bake the app primer (above the safety preamble) then the
+        # user prefix on top, into the QA template.  Online path: the primer
+        # rides the provider's native system field instead (see _query_online),
+        # so it gets the *unprefixed* base template, as before.
+        primed_template = _apply_vault_primer(base_template, primer)
+        qa_template = _apply_custom_prefix(primed_template, self.custom_system_prompt)
 
         if is_online_provider(self.provider_name):
             return self._query_online(
@@ -519,7 +692,26 @@ class SimpleQueryEngine:
                 postprocessors=postprocessors,
                 qa_template=base_template,
                 cfg=cfg,
+                primer=primer,
             )
+
+        # Prompt Hub capture (local bypass): the local RAG path has NO provider
+        # system field — the effective "system prompt" IS the composed QA
+        # template (safety preamble + primer + user prefix + {context_str} /
+        # {query_str} slots), baked into the LlamaIndex query engine. The
+        # factory seam never sees it, so record the template text here. Slots are
+        # filled per query at retrieval time; the note makes that explicit.
+        from core import prompt_capture
+
+        prompt_capture.record(
+            "vault_rag",
+            getattr(qa_template, "template", "") or str(qa_template),
+            provider=self.provider_name,
+            model=getattr(self, "llm_name", "") or "",
+            query=message,
+            note="Local path: composed QA template; {context_str}/{query_str} "
+            "are filled with the retrieved chunks and question at query time.",
+        )
 
         query_engine = RetrieverQueryEngine.from_args(
             retriever=retriever,
@@ -535,7 +727,7 @@ class SimpleQueryEngine:
         :meth:`query` but stop before invoking the LLM, returning the
         retrieved chunks as :class:`RetrievedChunk` instances.
 
-        Used by the agent loop's ``vault.search`` tool so a single agent
+        Used by the agent loop's ``vault_search`` tool so a single agent
         turn can issue several searches without paying the LLM-call
         overhead of ``stream_chat`` per query.
         """
@@ -551,7 +743,7 @@ class SimpleQueryEngine:
         Returns ``(retriever, postprocessors, llm)``. The LLM is
         constructed only for the local-chat path; callers on the
         online-chat path receive ``None`` and invoke the LLM
-        separately. Pure-retrieval callers (the agent's vault.search
+        separately. Pure-retrieval callers (the agent's vault_search
         tool) ignore ``llm`` entirely.
 
         Assembly order (all stages query-time, no reindex):
@@ -614,16 +806,30 @@ class SimpleQueryEngine:
             retrieval_breadth = final_top_k
 
         chat_is_online = is_online_provider(self.provider_name)
+        # QUERY-path embed bound (improvement plan 2026-07-04, item 2.1). This
+        # embed model embeds exactly one query string, and it does so while the
+        # caller holds `_index_mutation_lock` — with the contractually
+        # unbounded indexing embed defaults, one wedged local backend call held
+        # that lock forever and stranded every subsequent chat worker on it
+        # (each SSE consumer timed out ~330 s and abandoned another blocked
+        # thread; restart-only recovery). Bounding HERE (construction) rather
+        # than at the call keeps the indexing path's embed objects untouched —
+        # they are built by get_embedding WITHOUT request_timeout_s, so batch
+        # indexing stays deliberately unbounded. Invariant (pinned by
+        # TestQueryEmbedBound): every embed object built for the retrieval
+        # phase carries a finite per-call HTTP timeout.
         if chat_is_online:
             embed_provider = get_provider(resolve_embed_provider(cfg, self.provider_name))
-            embed_model = embed_provider.get_embedding(self.embed_name)
+            embed_model = embed_provider.get_embedding(
+                self.embed_name, request_timeout_s=QUERY_EMBED_TIMEOUT_S)
             llm = None
         else:
             llm_kwargs: dict[str, Any] = {"context_window": context_window}
             if self.temperature is not None:
                 llm_kwargs["temperature"] = float(self.temperature)
             llm = self._provider.get_llm(self.llm_name, **llm_kwargs)
-            embed_model = self._provider.get_embedding(self.embed_name)
+            embed_model = self._provider.get_embedding(
+                self.embed_name, request_timeout_s=QUERY_EMBED_TIMEOUT_S)
 
         dense_kwargs: dict[str, Any] = {
             "index": self.index,
@@ -663,6 +869,12 @@ class SimpleQueryEngine:
 
         if self.bm25_retriever is not None or effective_num_queries > 1:
             if self.bm25_retriever is not None:
+                # THE one tuning write for the shared BM25 singleton (item
+                # 2.7). This runs inside the caller's _index_mutation_lock
+                # hold — the same hold that executes the retrieval below — so
+                # tune and use are atomic w.r.t. concurrent requests. The
+                # manager's fetch paths are read-only by contract; adding a
+                # retune anywhere outside this window reintroduces the race.
                 try:
                     self.bm25_retriever.similarity_top_k = retrieval_breadth
                 except Exception:
@@ -671,17 +883,50 @@ class SimpleQueryEngine:
             if self.bm25_retriever is not None:
                 retrievers.append(self.bm25_retriever)
             fusion_llm = llm if llm is not None else _mock_llm()
+            mode, weights = _fusion_mode_and_weights(cfg, n_legs=len(retrievers))
+            # weights is None on the default path — passing retriever_weights
+            # under reciprocal_rerank would be a silent no-op anyway (see
+            # _fusion_mode_and_weights), and omitting it keeps the pinned RRF
+            # construction byte-identical to the pre-knob behaviour.
+            fusion_kwargs = {"retriever_weights": weights} if weights is not None else {}
             retriever = QueryFusionRetriever(
                 retrievers=retrievers,
                 llm=fusion_llm,
                 similarity_top_k=retrieval_breadth,
                 num_queries=effective_num_queries,
-                mode="reciprocal_rerank",
+                mode=mode,
                 use_async=False,
                 verbose=False,
+                **fusion_kwargs,
             )
         else:
             retriever = dense_retriever
+
+        # Thesaurus query expansion (query-time, no reindex): retrieve a few
+        # deterministic synonym-substituted variants of the query and union
+        # their hits into the candidate pool BEFORE the postprocessor stage.
+        # Sits on the single shared retriever (covers local / online / agent),
+        # and caps the merged pool to retrieval_breadth so the downstream
+        # rerank / cutoff sees no extra candidates — hence safe with OR without a
+        # reranker (unlike the rerank-gated wikilink wrap below).
+        if self.thesaurus_expansion and self.thesaurus is not None:
+            # max_variants is config-driven (Settings window), defaulting to the
+            # constructor value / module default — same defensive read as the
+            # rerank-pool / wikilink caps, so a hand-edited config can't crash
+            # retrieval.
+            try:
+                max_variants = max(0, int(cfg.get(
+                    "vault_thesaurus_max_variants", self.thesaurus_max_variants
+                )))
+            except (TypeError, ValueError):
+                max_variants = self.thesaurus_max_variants
+            if max_variants > 0:
+                retriever = _ThesaurusExpansionRetriever(
+                    retriever,
+                    self.thesaurus,
+                    max_variants=max_variants,
+                    pool_size=retrieval_breadth,
+                )
 
         # Wikilink graph expansion (query-time, no reindex): widen the
         # candidate pool with chunks from linked/back-linked neighbour notes
@@ -737,6 +982,10 @@ class SimpleQueryEngine:
 
         postprocessors: list[Any] = []
         if self.reranker is not None:
+            # THE one tuning write for the shared reranker singleton (item
+            # 2.7) — same contract as the BM25 retune above: inside the
+            # mutation-lock hold that also runs the rerank, so a concurrent
+            # request can never retrim an in-flight pass.
             try:
                 self.reranker.top_n = final_top_k
             except Exception:
@@ -791,6 +1040,38 @@ class SimpleQueryEngine:
             ))
         return chunks
 
+    def _build_primer(self, message: str, cfg: dict) -> str:
+        """Build the app-controlled glossary primer (#2), or "" when disabled.
+
+        Budget is config-driven (``vault_primer_max_chars``) with the
+        constructor value as the defensive fallback — a bad config value can't
+        crash the chat.  Shares the engine's thesaurus object with expansion.
+        """
+        if not (self.primer_enabled and self.thesaurus is not None):
+            return ""
+        try:
+            max_chars = int(cfg.get("vault_primer_max_chars", self.primer_max_chars))
+        except (TypeError, ValueError):
+            max_chars = self.primer_max_chars
+        # Optional content overrides (empty ⇒ the built-in FR/EN-tuned defaults in
+        # rag/thesaurus.py). core_terms is a comma-separated priority list.
+        header = cfg.get("vault_primer_header", "")
+        if not isinstance(header, str):
+            header = ""
+        raw_terms = cfg.get("vault_primer_core_terms", "")
+        core_terms = (
+            [t.strip() for t in raw_terms.split(",") if t.strip()]
+            if isinstance(raw_terms, str) and raw_terms.strip()
+            else None
+        )
+        try:
+            return self.thesaurus.build_primer(
+                message, max_chars, header=header, core_terms=core_terms
+            )
+        except Exception:  # pragma: no cover - build_primer is defensive
+            logger.debug("Thesaurus build_primer failed; no primer.", exc_info=True)
+            return ""
+
     def _query_online(
         self,
         *,
@@ -799,6 +1080,7 @@ class SimpleQueryEngine:
         postprocessors: list[Any],
         qa_template: Any,
         cfg: dict,
+        primer: str = "",
     ) -> Any:
         """Run retrieval locally then stream the LLM call through an online provider.
 
@@ -825,13 +1107,32 @@ class SimpleQueryEngine:
         request = LLMRequest(
             model=self.llm_name,
             messages=[{"role": "user", "content": user_message}],
-            system_prompt=self.custom_system_prompt,
+            # App primer (glossary) + user prefix, both in the provider's native
+            # system field. Primer first so the user's instructions read last.
+            system_prompt=_combine_system_prompt(primer, self.custom_system_prompt),
             # Pass temperature through as-is (including None) so the online
             # path matches the local path: when unset, each provider applies
             # its own default rather than a hard-coded 0.3.
             temperature=self.temperature,
             max_tokens=max_tokens,
             timeout_s=timeout_s,
+        )
+
+        # Prompt Hub capture (online vault RAG): record directly here rather than
+        # tagging request.workflow so we can report the retrieved-chunk count
+        # (the chunks are already rendered into the user message, so they are NOT
+        # on request.retrieved_context_chunks for the factory seam to count).
+        from core import prompt_capture
+
+        prompt_capture.record(
+            "vault_rag",
+            _combine_system_prompt(primer, self.custom_system_prompt),
+            provider=self.provider_name,
+            model=self.llm_name,
+            context_chunks=len(used_chunks),
+            query=message,
+            note="Online path: this is the native system field (primer + your "
+            "prefix); the safety preamble + retrieved context ride the user message.",
         )
 
         return _OnlineStreamingResponse(
@@ -843,6 +1144,41 @@ class SimpleQueryEngine:
 
 
 _MOCK_LLM_CACHE: dict[str, Any] = {}
+
+
+def _fusion_weight(cfg: dict, key: str) -> float:
+    """Defensive read of one ``vault_rrf_*`` leg weight.
+
+    ``/api/config`` clamps these to 0.0-10.0, but a hand-edited config can
+    hold anything; a garbage value must degrade to the neutral 1.0 rather
+    than crash the chat at query time (same posture as the pool knobs).
+    """
+    try:
+        value = float(cfg.get(key, 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    return value if 0.0 <= value <= 10.0 else 1.0
+
+
+def _fusion_mode_and_weights(cfg: dict, n_legs: int) -> tuple:
+    """Pick the QueryFusionRetriever mode for the configured leg weights.
+
+    LlamaIndex IGNORES ``retriever_weights`` under ``reciprocal_rerank``
+    (verified against the installed fusion source: only
+    ``_relative_score_fusion`` reads them) — the knobs shipped dead because
+    they were passed under RRF. Default weights (all 1.0) keep the pinned RRF
+    behaviour byte-identical and return ``(reciprocal_rerank, None)``; any
+    non-default weight opts the query into ``relative_score``, the mode that
+    actually applies weights. NOTE the two modes score on different scales
+    (RRF: rank-based; relative_score: min-max-normalised) — see rag/CLAUDE.md
+    and tune weights against tests/eval/ before trusting them.
+    """
+    weights = [_fusion_weight(cfg, "vault_rrf_dense_weight")]
+    if n_legs > 1:
+        weights.append(_fusion_weight(cfg, "vault_rrf_bm25_weight"))
+    if any(w != 1.0 for w in weights):
+        return "relative_score", weights
+    return "reciprocal_rerank", None
 
 
 def _mock_llm() -> Any:
@@ -915,39 +1251,12 @@ class _OnlineStreamingResponse:
         fallback provider (``resolve_chat_model``). Mirrors
         ``rag/summarizer.py::_stream_online`` and the plain-chat helper.
         """
-        from core.config import resolve_chat_model
+        from core.llm.factory import stream_with_fallback
         cfg = load_config()
-        primary = get_llm_provider(self.chat_provider_name, cfg=cfg)
-        yielded_any = False
-        try:
-            stream = primary.stream(self.request)
-            for token in stream.response_gen:
-                yielded_any = True
-                yield token
-            return
-        except LLMError as err:
-            # Only fall back *before* the first token reaches the client.
-            # Once ≥1 token has streamed, re-streaming the whole answer
-            # through the fallback would duplicate/garble the output, so
-            # re-raise instead and let the route emit a structured SSE
-            # error frame after the partial answer.
-            if yielded_any:
-                raise
-            if not self.policy.should_fall_back(err) or self.policy.fallback is None:
-                raise
-            logger.warning(
-                "vault chat fallback %s -> %s: %s",
-                self.chat_provider_name,
-                self.policy.fallback,
-                redact(err.message),
-            )
-        fallback = get_llm_provider(self.policy.fallback, cfg=cfg)
-        fb_request = LLMRequest(
-            model=resolve_chat_model(cfg, self.policy.fallback),
-            messages=self.request.messages,
-            system_prompt=self.request.system_prompt,
-            temperature=self.request.temperature,
-            max_tokens=self.request.max_tokens,
-            timeout_s=self.request.timeout_s,
+        yield from stream_with_fallback(
+            provider_name=self.chat_provider_name,
+            request=self.request,
+            policy=self.policy,
+            cfg=cfg,
+            log_context="vault chat fallback"
         )
-        yield from fallback.stream(fb_request).response_gen

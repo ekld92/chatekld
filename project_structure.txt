@@ -1,48 +1,59 @@
 .
 ├── CHANGELOG.md
 ├── CLAUDE.md                       (cross-cutting rules; subtree CLAUDE.md files load on demand)
-├── LICENSE
 ├── README.md
+├── PROMPTS.md                      (prompt audit/overview across every workflow)
+├── LICENSE
 ├── .env.example                   (online-provider API-key template; never commit real keys)
 ├── .gitignore
-├── app.py                         (Flask app factory; registers blueprints)
-├── launch.py                      (PyWebView entry point; logging, .env loading, HF_HUB_OFFLINE)
-├── conftest.py                    (pytest session config; pins CHATEKLD_BASE_DIR to a temp dir)
+├── .pre-commit-config.yaml         (opt-in local hooks: ruff, gitleaks, whitespace/EOF)
+├── pyproject.toml                 (ruff + mypy config)
 ├── requirements.txt
-├── install_and_build.sh           (macOS installer + PyInstaller .app builder)
+├── requirements-dev.txt            (ruff, pre-commit, dev tooling)
+├── constraints.txt                (pinned, validated dependency versions)
+├── package.json · package-lock.json · vitest.config.js   (JS unit-test tooling — dev only)
+├── app.py                         (Flask app factory; registers blueprints)
+├── launch.py                      (PyWebView entry point; logging, .env, HF_HUB_OFFLINE, --seed-models)
+├── conftest.py                    (pytest session config; pins CHATEKLD_BASE_DIR to a temp dir)
+├── install_and_build.sh           (macOS arm64 installer + PyInstaller .app/.dmg builder)
 ├── create_app_icon.py
-├── macos_entitlements.plist
 ├── pdf_extractor.py               (subprocess PDF text extraction; markitdown + OCR tiers)
 ├── project_structure.txt          (this file)
 │
+├── .github/workflows/
+│   ├── ci.yml                     (ruff + pytest gate)
+│   └── live-smoke.yml             (opt-in live-provider smoke; self-skips without keys)
+│
 ├── api/
 │   ├── security.py                (local-origin checks, sanitise_error_msg)
+│   ├── sse.py                     (shared backend SSE skeleton: run_sse_worker + _SSEOpGuard)
 │   ├── validators.py              (coerce_* request-body helpers; canonical clamp logic)
 │   └── routes/
 │       ├── about.py
 │       ├── audit.py               (/api/audit/* blueprint)
 │       ├── config.py              (/api/config; per-key LLM config validation)
-│       ├── deck.py                (/api/deck/* blueprint; SSE deck generation)
+│       ├── deck.py                (/api/deck/* blueprint; SSE generate + augment + compile-fix)
 │       ├── paper.py               (/api/summarise, /api/upload — single paper)
-│       ├── refactor.py            (/api/refactor/* blueprint; Note Refactor analyzer + hub)
-│       ├── status.py              (/api/status, /api/models, /api/pull, …)
+│       ├── plainchat.py           (/api/plainchat — RAG-free multi-turn SSE)
+│       ├── prompts.py             (/api/prompts — read-only Prompt Hub snapshot)
+│       ├── refactor.py            (/api/refactor/* blueprint; Note Refactor analyzer + hub + writers)
+│       ├── status.py              (/api/status, /api/models, /api/health, /api/pull, …)
 │       ├── usage.py               (/api/usage, /api/pricing)
 │       └── vault.py               (/api/obsidian/* incl. chat SSE)
 │
 ├── core/
-│   ├── config.py                  (config + report-type persistence)
-│   ├── constants.py               (BASE_DIR, paths, limits, extension policy)
+│   ├── config.py                  (config + report-type persistence; config_version migrations)
+│   ├── constants.py               (BASE_DIR, paths, limits, extension policy, shared SSE timing)
 │   ├── database.py                (SQLite setup + DB_LOCK)
 │   ├── feedback.py
-│   ├── utils.py                   (locks, atomic writes, parsers)
+│   ├── paths.py                   (resolve_under_root — under-a-known-root path validator)
+│   ├── prompt_capture.py          (effective-prompt capture for the Prompt Hub)
+│   ├── utils.py                   (locks, atomic writes, parsers, vault-write audit helpers)
 │   ├── providers/                 (LOCAL Ollama / LM Studio adapters — embeddings + legacy chat)
-│   │   ├── base.py
-│   │   ├── lms.py
-│   │   ├── ollama.py
-│   │   └── server.py
+│   │   └── base.py · lms.py · ollama.py · server.py
 │   ├── llm/                       (provider-agnostic chat layer)
-│   │   ├── base.py · factory.py · policy.py · usage.py · retry.py
-│   │   ├── prompt.py · redact.py · tool_schema.py · types.py
+│   │   ├── base.py · factory.py · policy.py · usage.py · retry.py · chat.py
+│   │   ├── prompt.py · redact.py · tool_schema.py · types.py · model_listing.py
 │   │   ├── CLAUDE.md
 │   │   └── adapters/
 │   │       └── local.py · openai.py · anthropic.py · google.py
@@ -54,6 +65,7 @@
 │   ├── vault.py                   (vault indexing, status messages, chat entrypoints)
 │   ├── engine.py                  (LlamaIndex query engine; hybrid retrieval + rerank)
 │   ├── summarizer.py              (summarise_stream, build_prompt)
+│   ├── thesaurus.py               (opt-in vault glossary: synonym expansion + system-prompt primer)
 │   ├── lancedb_store.py           (optional binary Apache-Arrow vector backend)
 │   └── CLAUDE.md
 │
@@ -62,8 +74,7 @@
 │   └── vision.py                  (VisionManager / GLMOCRManager singletons)
 │
 ├── audit/                         (Library Audit subsystem; vendored from kb_harmonizer)
-│   ├── __init__.py
-│   ├── __main__.py                (python -m audit --check ...)
+│   ├── __init__.py · __main__.py  (python -m audit --check ...)
 │   ├── config.py                  (ChatEKLD config -> Settings adapter)
 │   ├── manager.py                 (audit_manager singleton; manual-only scans)
 │   ├── scan.py                    (developer CLI)
@@ -81,24 +92,44 @@
 ├── deckgen/                       (Beamer deck generator; core is app-independent + requests-free)
 │   ├── template.py · outline.py · sections.py · prompts.py
 │   ├── assemble.py · scaffold.py · result.py
+│   ├── augment.py                 (deepen/extend a finished deck — pure splice core)
+│   ├── review.py                  (integrity-review prompt / parse / screen_repair)
+│   ├── retry.py                   (cancel-aware per-turn chat retry)
+│   ├── checkpoint.py              (per-section checkpoint/resume)
+│   ├── compile.py                 (latexmk discovery + log parse for the compile-fix loop)
 │   ├── client.py                  (HTTP/SSE driver for the CLI)
 │   ├── __main__.py                (deckgen CLI)
 │   ├── inprocess.py               (in-app runner over core.agent — the only app-coupled module)
 │   ├── requirements.txt
 │   ├── README.md
 │   └── tests/                     (app-independent: no server, no requests)
-│       └── test_cli_integration.py · test_deckgen.py · test_template.py
+│       ├── test_cli_integration.py · test_deckgen.py · test_template.py
+│       └── test_augment.py · test_checkpoint.py · test_retry.py
 │
-├── refactor/                      (Note Refactor analyzer; Phase 1 read-only + Phase 1.5 hub)
-│   ├── __init__.py
-│   ├── resolver.py                (embed -> file via the reused Obsidian resolver + name_index)
+├── refactor/                      (Note Refactor: read-only analyzer + hub + the app's ONLY vault writers)
+│   ├── resolver.py                (embed -> file via the reused Obsidian resolver + file index)
 │   ├── cache.py                   (image-bytes sha256 + on-disk description / per-mode reuse)
-│   ├── hints.py                   (zero-vision "likely table" heuristic)
+│   ├── hints.py                   (zero-vision "likely table" / "likely handwritten" heuristics)
+│   ├── text.py                    (strip_ocr_preamble — pure)
 │   ├── extract.py                 (the ONLY vision caller: table / redescribe / classify)
-│   ├── hygiene.py                 (advisory broken-embed / frontmatter notes)
+│   ├── hygiene.py                 (advisory broken-embed / frontmatter / link / whitespace notes)
+│   ├── normalize.py               (pure, idempotent Markdown formatting fixer)
 │   ├── discrepancy.py             (deterministic cross-note dose check)
 │   ├── ignore.py                  (sticky per-vault image ignore-list sidecar; never the vault)
+│   ├── flags.py                   (sticky per-image flag sidecar: strip / keep_handwritten)
+│   ├── sections.py                (pure heading-section splitter for sub-note scope)
+│   ├── pdfref.py                  (resolve a note's .pdf embeds -> the indexer's cached text)
+│   ├── review.py                  (opt-in advisory LLM prose review — writes nothing)
+│   ├── llm_edit.py                (on-demand LLM edits: rewrite / custom / summarize_pdf / chart)
+│   ├── local_model.py             (LOCAL_MODEL_LOCK — one local inference at a time)
+│   ├── staging.py                 (server-side cache for applyable LLM proposals)
 │   ├── plan.py                    (read-only orchestrator: 0 vision, 0 vault writes)
+│   ├── _write.py                  (journalled_write_note — shared journal-before-write primitive)
+│   ├── journal.py                 (restore manifest + scope-lock + audit)
+│   ├── apply.py                   (callout-only batch note writer)
+│   ├── format_fix.py              (deterministic formatting-fix batch writer)
+│   ├── llm_apply.py               (writer for a staged LLM proposal)
+│   ├── archive.py                 (per-image move-out + thumbnail + restore)
 │   └── result.py                  (third-party-free result dataclasses + serializers)
 │
 ├── scripts/                       (maintenance-only; run with the app closed, back up app data first)
@@ -107,40 +138,47 @@
 │   ├── prune_storage_to_vector_store.py
 │   └── repair_simple_vector_store.py
 │
+├── packaging/
+│   └── seed_models.command        (offline model-seed helper staged into the .dmg)
+│
 ├── static/
 │   ├── css/styles.css
 │   ├── img/daphne.png
 │   └── js/                        (ui.js + api.js are leaves; app.js is the root)
 │       ├── api.js · app.js · ui.js
-│       ├── audit.js · config.js · deck.js · settings.js
-│       ├── refactor.js · summarizer.js · vault.js
+│       ├── audit.js · config.js · deck.js · settings.js · prompts.js
+│       ├── plainchat.js · refactor.js · summarizer.js · vault.js
 │       └── vendor/marked.min.js   (v15.0.12, MIT — never loaded from a CDN)
 │
 ├── templates/
 │   └── index.html                 (single-page app shell)
 │
-├── docs/
-│   └── project_note_refactor.md   (Note Refactor design spec + phasing)
-│
 ├── resources/                     (.gitkeep — PyInstaller --add-data target)
 │
 └── Tests (run from the project virtualenv)
     ├── smoke_test.py
-    ├── test_agent.py · test_audit.py · test_concurrency.py
-    ├── test_deck.py · test_lancedb_migration.py · test_llm.py
-    ├── test_prompts.py · test_refactor.py · test_validators.py · test_vault_regressions.py
+    ├── test_agent.py · test_audit.py · test_compile.py · test_concurrency.py
+    ├── test_deck.py · test_health.py · test_lancedb_migration.py · test_launch.py
+    ├── test_llm.py · test_plainchat.py · test_prompts.py · test_prompts_hub.py
+    ├── test_refactor.py · test_thesaurus.py · test_validators.py · test_vault_regressions.py
     │                                  (test_prompts.py: model-free prompt invariants)
-    │                                  (test_refactor.py: hermetic Note Refactor analyzer + hub)
+    │                                  (test_refactor.py: hermetic Note Refactor analyzer + hub + writers)
     ├── tests/audit/               (ported kb_harmonizer unit tests)
     │   ├── conftest.py
     │   ├── test_bib.py · test_bridge_filename.py · test_bridge_mapping.py
     │   ├── test_hashing.py · test_inventory.py · test_naming.py
     │   └── test_obsidian.py · test_pdf_annotations.py
-    └── tests/eval/                (prompt eval net — vault-chat answer-quality golden set)
-        ├── scoring.py · test_scoring.py · run_eval.py (live; gated by RUN_LIVE_EVAL=1)
-        ├── golden_qa.json · README.md
-        └── fixtures/              (synthetic vault: cardiology/, nephrology/)
+    ├── tests/eval/                (vault-chat answer-quality golden set)
+    │   ├── scoring.py · test_scoring.py · test_eval_pipeline.py
+    │   ├── run_eval.py            (live; gated by RUN_LIVE_EVAL=1)
+    │   ├── golden_qa.json · README.md
+    │   └── fixtures/              (synthetic vault: cardiology/, nephrology/)
+    └── tests/js/                 (Vitest + jsdom; npm run test:js — *.test.js)
+        ├── readSSE · sanitiseHtml · moduleHierarchy · confirmCeremony · liveRegions
+        ├── contrastTokens · perceptualFloors · semanticsLabels · modal · vaultFlags
+        ├── configPersistence · latestWins · partialAnswer · deckShaEcho · deckCompileFix
+        └── refactorPostApply · promptsHub · basket38
 
-The project virtual environment lives OUTSIDE the repo (default ~/venvs/papermind2026,
-overridable via CHATEKLD_VENV_DIR — the legacy PAPERMIND_VENV_DIR is still honoured)
-and is never committed.
+The project virtual environment lives OUTSIDE the repo (default ~/venvs/chatekld2026,
+overridable via CHATEKLD_VENV_DIR — the legacy PAPERMIND_VENV_DIR / ~/venvs/papermind2026
+are still honoured for pre-rename installs) and is never committed.

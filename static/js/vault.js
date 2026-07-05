@@ -15,11 +15,23 @@
  *  - all user-controlled strings (paths, folder names, answers) go through
  *    createElement/textContent or sanitiseHtml — never raw innerHTML.
  */
-import { secureFetch, readSSE } from './api.js';
-import { taskBegin, taskEnd, setStatusA11y, openModal, closeModal, sanitiseHtml, copyToClipboard, showTaskError, clearTaskError } from './ui.js';
+import { secureFetch, consumeSSE } from './api.js';
+import { taskBegin, taskEnd, setStatusA11y, announceStatus, openModal, closeModal, sanitiseHtml, copyToClipboard, enhanceCodeBlocks, showTaskError, clearTaskError, makeAnswerRenderer } from './ui.js';
 import { getActiveProvider, getSelectedEmbed, getSelectedModel, saveSelectedModels } from './config.js';
 
-let _isQuerying = false;
+// Item 3.1 (improvement plan 2026-07-04): TWO flags, one per state machine.
+// A single shared in-flight flag used to serve both chat-in-flight AND the
+// indexing lifecycle — so a multi-hour index run blocked vault chat entirely
+// (the server explicitly supports chat during indexing), and cancelVaultIndex
+// force-cleared whichever guard happened to be held, including a live chat's.
+// Safe: every site belongs unambiguously to exactly one machine (chat:
+// chatWithVault/clearVaultChat; indexing: indexVault/pollVaultStatus/
+// cancelVaultIndex/refreshIndexState re-arm); the transitions within each
+// machine are unchanged. Invariant (pinned by tests/js/vaultFlags.test.js):
+// an in-flight index run never refuses a chat, and cancelling an index run
+// never clears the chat guard.
+let _isChatting = false;
+let _isIndexing = false;
 let _vaultPollDeadline = 0;
 let _chatParamsSaveTimer = null;
 let _prewarmPolling = false;
@@ -48,6 +60,8 @@ const _CHAT_PARAM_DEFAULTS = {
     num_queries: 3,
     rerank_pool_ceiling: 50,
     wikilink_expansion: false,
+    thesaurus_expansion: false,
+    primer_enabled: false,
 };
 
 const _SYSTEM_PROMPT_MAX = 4000;
@@ -80,7 +94,7 @@ function _readCheckbox(id, fallback) {
 }
 
 // Per-result snippet cap for the agent trace UI. The server already caps
-// tool outputs (vault.search snippets at 800 chars, registry-level
+// tool outputs (vault_search snippets at 800 chars, registry-level
 // truncation at the per-tool max), so this is a UI-only display limit
 // to keep the collapsed trace readable.
 const _TRACE_RESULT_SNIPPET_CHARS = 400;
@@ -99,6 +113,42 @@ function _ensureAgentTrace(traceCtx, botMsg, chat) {
     chat.scrollTop = chat.scrollHeight;
     return trace;
 }
+
+function _renderRetrievalTrace(retrieval, botMsg, chat) {
+    if (!Array.isArray(retrieval) || retrieval.length === 0) return;
+    const details = document.createElement('details');
+    details.className = 'retrieval-trace';
+    details.open = false;
+
+    const summary = document.createElement('summary');
+    summary.textContent = `Retrieval Context · ${retrieval.length} chunk${retrieval.length === 1 ? '' : 's'}`;
+    details.appendChild(summary);
+
+    const list = document.createElement('ul');
+    list.style.margin = '0';
+    list.style.paddingLeft = '20px';
+    list.style.fontSize = '0.9em';
+    list.style.color = 'var(--text-muted, #666)';
+
+    retrieval.forEach(item => {
+        const li = document.createElement('li');
+        const score = typeof item.score === 'number' ? ` (score: ${item.score.toFixed(3)})` : '';
+        const imgIndicator = item.is_image ? ' 🖼️' : '';
+        if (item.source) {
+            const span = document.createElement('span');
+            span.textContent = item.source + imgIndicator + score;
+            li.appendChild(span);
+        } else {
+            li.textContent = 'unknown source' + score;
+        }
+        list.appendChild(li);
+    });
+
+    details.appendChild(list);
+    chat.insertBefore(details, botMsg);
+    chat.scrollTop = chat.scrollHeight;
+}
+
 
 function _renderAgentIteration(index, traceCtx, botMsg, chat) {
     const trace = _ensureAgentTrace(traceCtx, botMsg, chat);
@@ -189,6 +239,8 @@ function getVaultChatParams() {
         num_queries: Math.round(_readNumber('vault-num-queries', _CHAT_PARAM_DEFAULTS.num_queries)),
         rerank_pool_ceiling: Math.round(_readNumber('vault-rerank-pool', _CHAT_PARAM_DEFAULTS.rerank_pool_ceiling)),
         wikilink_expansion: _readCheckbox('vault-wikilink-enabled', _CHAT_PARAM_DEFAULTS.wikilink_expansion),
+        thesaurus_expansion: _readCheckbox('vault-thesaurus-enabled', _CHAT_PARAM_DEFAULTS.thesaurus_expansion),
+        primer_enabled: _readCheckbox('vault-primer-enabled', _CHAT_PARAM_DEFAULTS.primer_enabled),
     };
 }
 
@@ -244,6 +296,8 @@ export function applyVaultChatParams(cfg) {
         num_queries: cfg.vault_num_queries ?? _CHAT_PARAM_DEFAULTS.num_queries,
         rerank_pool_ceiling: cfg.vault_rerank_pool_ceiling ?? _CHAT_PARAM_DEFAULTS.rerank_pool_ceiling,
         wikilink_expansion: cfg.vault_wikilink_expansion ?? _CHAT_PARAM_DEFAULTS.wikilink_expansion,
+        thesaurus_expansion: cfg.vault_thesaurus_expansion ?? _CHAT_PARAM_DEFAULTS.thesaurus_expansion,
+        primer_enabled: cfg.vault_primer_enabled ?? _CHAT_PARAM_DEFAULTS.primer_enabled,
     };
     _setRange(
         document.getElementById('vault-top-k'),
@@ -306,6 +360,10 @@ export function applyVaultChatParams(cfg) {
     );
     const wlEl = document.getElementById('vault-wikilink-enabled');
     if (wlEl) wlEl.checked = !!params.wikilink_expansion;
+    const thEl = document.getElementById('vault-thesaurus-enabled');
+    if (thEl) thEl.checked = !!params.thesaurus_expansion;
+    const prEl = document.getElementById('vault-primer-enabled');
+    if (prEl) prEl.checked = !!params.primer_enabled;
 }
 
 function _saveVaultChatParams() {
@@ -328,6 +386,8 @@ function _saveVaultChatParams() {
             vault_num_queries: p.num_queries,
             vault_rerank_pool_ceiling: p.rerank_pool_ceiling,
             vault_wikilink_expansion: p.wikilink_expansion,
+            vault_thesaurus_expansion: p.thesaurus_expansion,
+            vault_primer_enabled: p.primer_enabled,
         }),
     }).catch(() => { /* best-effort; the request body is still authoritative */ });
 }
@@ -378,6 +438,10 @@ export function wireVaultChatParamControls() {
     if (qexpCb) qexpCb.addEventListener('change', debounce);
     const wlCb = document.getElementById('vault-wikilink-enabled');
     if (wlCb) wlCb.addEventListener('change', debounce);
+    const thCb = document.getElementById('vault-thesaurus-enabled');
+    if (thCb) thCb.addEventListener('change', debounce);
+    const prCb = document.getElementById('vault-primer-enabled');
+    if (prCb) prCb.addEventListener('change', debounce);
 }
 
 function _updateIndexButtons(state) {
@@ -421,10 +485,10 @@ export async function pickVaultFolder() {
  * retryable error in the vault error boundary and resets the buttons to idle.
  */
 export async function indexVault() {
-    if (_isQuerying) return;
+    if (_isIndexing) return;
     
     const statusDiv = document.getElementById('obsidian-status-msg');
-    _isQuerying = true;
+    _isIndexing = true;
     clearTaskError(document.getElementById('vault-error-boundary'));
     taskBegin('vault-index', 'Indexing vault…');
 
@@ -440,31 +504,50 @@ export async function indexVault() {
         });
         if (resp.ok) {
             _updateIndexButtons('running');
+            _setIndexProgress(true);
             _vaultPollDeadline = Date.now() + 24 * 60 * 60 * 1000;
             pollVaultStatus();
+        } else if (resp.status === 503) {
+            // A run is already in flight (the op-lock is held, or a just-cancelled
+            // run is still finishing its final persist). Don't surface an error —
+            // re-attach to the existing run by re-syncing from the server's real
+            // state, which re-arms the activity bar + status polling when it's
+            // genuinely running (same recovery path as a page reload mid-index).
+            // If it has already settled, refreshIndexState restores idle buttons
+            // so the user can simply click Index again.
+            _isIndexing = false;
+            taskEnd('vault-index');
+            refreshIndexState();
         } else {
             const data = await resp.json().catch(() => ({}));
             setStatusA11y(statusDiv, '', false);
             _showVaultError(data.error || 'Indexing could not start.', indexVault);
-            _isQuerying = false;
-            taskEnd('vault-index');
+            _isIndexing = false;
+            taskEnd('vault-index'); _setIndexProgress(false);
             _updateIndexButtons('idle');
         }
     } catch (e) {
         setStatusA11y(statusDiv, '', false);
         _showVaultError('Index error: ' + e.message, indexVault);
-        _isQuerying = false;
-        taskEnd('vault-index');
+        _isIndexing = false;
+        taskEnd('vault-index'); _setIndexProgress(false);
         _updateIndexButtons('idle');
     }
 }
 
+// Toggle the indeterminate indexing activity bar. Driven purely by lifecycle
+// (running vs terminal) since the status payload has no processed/total counts.
+function _setIndexProgress(active) {
+    const el = document.getElementById('vault-index-progress');
+    if (el) el.hidden = !active;
+}
+
 async function pollVaultStatus() {
-    if (!_isQuerying) return;
+    if (!_isIndexing) { _setIndexProgress(false); return; }
 
     if (Date.now() > _vaultPollDeadline) {
-        _isQuerying = false;
-        taskEnd('vault-index');
+        _isIndexing = false;
+        taskEnd('vault-index'); _setIndexProgress(false);
         setStatusA11y(document.getElementById('obsidian-status-msg'), 'Indexing timed out.', true);
         return;
     }
@@ -479,28 +562,28 @@ async function pollVaultStatus() {
         renderVaultWarnings(Array.isArray(data.warnings) ? data.warnings : []);
 
         if (data.state === 'done') {
-            _isQuerying = false;
-            taskEnd('vault-index');
+            _isIndexing = false;
+            taskEnd('vault-index'); _setIndexProgress(false);
             _updateIndexButtons('done');
             setStatusA11y(document.getElementById('obsidian-status-msg'), '', false);
             refreshVaultMaterials();
             flashSidebarStatus('Indexing complete.');
             return;
         } else if (data.state === 'error') {
-            _isQuerying = false;
-            taskEnd('vault-index');
+            _isIndexing = false;
+            taskEnd('vault-index'); _setIndexProgress(false);
             _updateIndexButtons('error');
             setStatusA11y(document.getElementById('obsidian-status-msg'), '', false);
             _showVaultError('Indexing failed.', indexVault);
             return;
         } else if (data.state === 'paused' || data.state === 'paused_partial') {
-            _isQuerying = false;
-            taskEnd('vault-index');
+            _isIndexing = false;
+            taskEnd('vault-index'); _setIndexProgress(false);
             _updateIndexButtons('paused');
             return;
         } else if (data.state === 'paused_scan') {
-            _isQuerying = false;
-            taskEnd('vault-index');
+            _isIndexing = false;
+            taskEnd('vault-index'); _setIndexProgress(false);
             _updateIndexButtons('paused_scan');
             setStatusA11y(document.getElementById('obsidian-status-msg'), 'Indexing paused before embedding began. Start indexing again to continue; extraction caches were preserved.', false);
             return;
@@ -574,8 +657,18 @@ export async function pollPrewarmStatus() {
     if (_prewarmPolling) return;
     _prewarmPolling = true;
     const POLL_MS = 1500;
+    // Item 3.8: hard deadline. The loop used to retry FOREVER — a server gone
+    // away (or a prewarm wedged before its terminal state) kept this poll and
+    // its banner alive for the app's lifetime. 30 min comfortably covers a
+    // cold multi-GB index + BM25 + reranker load; past it, surface an honest
+    // terminal error instead of polling into the void.
+    const deadline = Date.now() + 30 * 60 * 1000;
     try {
         while (true) {
+            if (Date.now() > deadline) {
+                _renderPrewarmBanner('error', 'Le préchauffage ne répond plus — relancez l\u2019application ou vérifiez le serveur.');
+                return;
+            }
             let data;
             try {
                 const resp = await secureFetch('/api/obsidian/status');
@@ -604,6 +697,7 @@ export function toggleVaultMaterials() {
     if (!container || !btn) return;
     const collapsed = container.classList.toggle('collapsed');
     btn.textContent = collapsed ? 'Show' : 'Hide';
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');   // 6c
     if (!collapsed && container.childElementCount === 0) refreshVaultMaterials();
 }
 
@@ -697,16 +791,7 @@ function _attachCopyButton(messageEl, getText, ariaLabel) {
     return btn;
 }
 
-function _renderAnswer(botMsg, fullAnswer) {
-    // marked is vendored locally (static/js/vendor/marked.min.js), but a
-    // load failure must never cost the user the answer: fall back to plain
-    // text rather than throwing ReferenceError mid-stream.
-    if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
-        botMsg.innerHTML = sanitiseHtml(marked.parse(fullAnswer));
-    } else {
-        botMsg.textContent = fullAnswer;
-    }
-}
+
 
 // Surface a recoverable vault error in the shared boundary. `retry`, when
 // given, becomes a "Retry" button; a "Dismiss" button always clears it.
@@ -728,8 +813,8 @@ function _showVaultError(message, retry) {
  * into a collapsible <details>, and `{token}` answer chunks. On error the partial
  * bot bubble is replaced with a retryable error boundary that re-asks once.
  */
-export async function chatWithVault() {
-    if (_isQuerying) {
+export async function chatWithVault(retryQuestion) {
+    if (_isChatting) {
         const statusDiv = document.getElementById('obsidian-status-msg');
         if (statusDiv) setStatusA11y(statusDiv, 'Please wait for the current response to complete.', false);
         return;
@@ -743,10 +828,15 @@ export async function chatWithVault() {
         return;
     }
     const input = document.getElementById('obsidian-input');
-    const question = input.value.trim();
+    // Item 3.5: a Retry passes the failed question DIRECTLY (string guard —
+    // DOM event handlers call this with an Event as first arg) so it never
+    // has to round-trip through the input box and overwrite a fresh draft
+    // the user typed after the failure.
+    const fromRetry = typeof retryQuestion === 'string' && retryQuestion.trim() !== '';
+    const question = fromRetry ? retryQuestion.trim() : input.value.trim();
     if (!question) return;
 
-    _isQuerying = true;
+    _isChatting = true;
     clearTaskError(document.getElementById('vault-error-boundary'));
     const chat = document.getElementById('obsidian-chat');
 
@@ -755,104 +845,122 @@ export async function chatWithVault() {
     userMsg.textContent = question;
     chat.appendChild(userMsg);
     _attachCopyButton(userMsg, () => question, 'Copy question');
-    input.value = '';
+    if (!fromRetry) input.value = '';   // a retry leaves the draft untouched
 
     const botMsg = document.createElement('div');
     botMsg.className = 'message message-bot';
     botMsg.innerHTML = '<span class="typing-indicator"><span></span></span>';
     chat.appendChild(botMsg);
     chat.scrollTop = chat.scrollHeight;
+    const answerRenderer = makeAnswerRenderer(botMsg);
 
     taskBegin('vault-chat', 'Thinking…');
+    // Track 6b: the streamed answer renders silently for AT users — announce
+    // the generation lifecycle through the global polite region (errors
+    // already announce via showTaskError -> announceError).
+    announceStatus('Generating response…');
 
     const controller = new AbortController();
     const chatTimeout = setTimeout(() => controller.abort(), _chatAbortMs());
 
+    let fullAnswer = '';
     try {
         await saveSelectedModels();
         const chatParams = getVaultChatParams();
-        const resp = await secureFetch('/api/obsidian/chat', {
-            method: 'POST',
-            signal: controller.signal,
-            body: JSON.stringify({
-                message: question,
-                provider: getActiveProvider(),
-                llm: getSelectedModel(),
-                embed: getSelectedEmbed(),
-                top_k: chatParams.top_k,
-                similarity_cutoff: chatParams.similarity_cutoff,
-                prompt_mode: chatParams.prompt_mode,
-                temperature: chatParams.temperature,
-                system_prompt: chatParams.system_prompt,
-                hybrid_enabled: chatParams.hybrid_enabled,
-                reranker_enabled: chatParams.reranker_enabled,
-                agent_enabled: chatParams.agent_enabled,
-                agent_max_iterations: chatParams.agent_max_iterations,
-                mmr_enabled: chatParams.mmr_enabled,
-                mmr_lambda: chatParams.mmr_lambda,
-                query_expansion: chatParams.query_expansion,
-                num_queries: chatParams.num_queries,
-                rerank_pool_ceiling: chatParams.rerank_pool_ceiling,
-            })
+        const bodyStr = JSON.stringify({
+            message: question,
+            provider: getActiveProvider(),
+            llm: getSelectedModel(),
+            embed: getSelectedEmbed(),
+            top_k: chatParams.top_k,
+            similarity_cutoff: chatParams.similarity_cutoff,
+            prompt_mode: chatParams.prompt_mode,
+            temperature: chatParams.temperature,
+            system_prompt: chatParams.system_prompt,
+            hybrid_enabled: chatParams.hybrid_enabled,
+            reranker_enabled: chatParams.reranker_enabled,
+            agent_enabled: chatParams.agent_enabled,
+            agent_max_iterations: chatParams.agent_max_iterations,
+            mmr_enabled: chatParams.mmr_enabled,
+            mmr_lambda: chatParams.mmr_lambda,
+            query_expansion: chatParams.query_expansion,
+            num_queries: chatParams.num_queries,
+            rerank_pool_ceiling: chatParams.rerank_pool_ceiling,
+            wikilink_expansion: chatParams.wikilink_expansion,
+            thesaurus_expansion: chatParams.thesaurus_expansion,
+            primer_enabled: chatParams.primer_enabled,
         });
-        if (!resp.ok) {
-            const data = await resp.json().catch(() => ({}));
-            throw new Error(data.error || 'Vault chat failed.');
-        }
 
-        let fullAnswer = '';
-        // Agent-mode rendering state. Created lazily on the first
-        // `iteration` event so non-agent chats are visually identical
-        // to today.
         const traceCtx = { trace: null, currentIter: null, iterCount: 0 };
 
-        for await (const payload of readSSE(resp)) {
-            if (payload.error) {
-                throw new Error(payload.error);
-            } else if (payload.info) {
+        await consumeSSE('/api/obsidian/chat', { method: 'POST', signal: controller.signal, body: bodyStr }, {
+            onInfo: (info) => {
                 const note = document.createElement('div');
                 note.className = 'message message-info';
                 note.setAttribute('role', 'status');
-                note.textContent = payload.info;
+                note.textContent = info;
                 chat.insertBefore(note, botMsg);
                 chat.scrollTop = chat.scrollHeight;
-            } else if (payload.iteration !== undefined) {
-                _renderAgentIteration(payload.iteration, traceCtx, botMsg, chat);
-            } else if (typeof payload.thought === 'string') {
-                _renderAgentThought(payload.thought, traceCtx, botMsg, chat);
-            } else if (payload.tool_call) {
-                _renderAgentToolCall(payload.tool_call, traceCtx, botMsg, chat);
-            } else if (payload.tool_result) {
-                _renderAgentToolResult(payload.tool_result, traceCtx, botMsg, chat);
-            } else if (payload.token) {
+            },
+            onToken: (token) => {
                 if (fullAnswer === '') botMsg.innerHTML = '';
-                fullAnswer += payload.token;
-                _renderAnswer(botMsg, fullAnswer);
-            }
-        }
-        // Attach the copy button only after streaming completes so the
-        // per-token innerHTML re-render does not clobber it.  Copies the
-        // raw markdown (fullAnswer) rather than the rendered HTML so the
-        // user pastes something useful into their notes.
+                fullAnswer += token;
+                answerRenderer.update(fullAnswer);
+            },
+            onOther: (payload) => {
+                if (payload.retrieval) {
+                    _renderRetrievalTrace(payload.retrieval, botMsg, chat);
+                } else if (payload.iteration !== undefined) {
+                    _renderAgentIteration(payload.iteration, traceCtx, botMsg, chat);
+                } else if (typeof payload.thought === 'string') {
+                    _renderAgentThought(payload.thought, traceCtx, botMsg, chat);
+                } else if (payload.tool_call) {
+                    _renderAgentToolCall(payload.tool_call, traceCtx, botMsg, chat);
+                } else if (payload.tool_result) {
+                    _renderAgentToolResult(payload.tool_result, traceCtx, botMsg, chat);
+                }
+            },
+            onError: (errMsg) => { throw new Error(errMsg); },
+            onDone: () => {}
+        });
+
+        answerRenderer.flush();
         if (fullAnswer) {
             _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
+            enhanceCodeBlocks(botMsg);
         }
+        announceStatus('Response ready.');
     } catch (e) {
-        // Replace the empty/partial bot bubble with an actionable error
-        // boundary. Retry removes the question bubble and re-asks; the
-        // user's original text is restored to the input first.
-        botMsg.remove();
+        // Item 3.5: KEEP a partial answer. A mid-stream {error} after real
+        // tokens used to remove the whole bubble — discarding content the
+        // user watched arrive (and may already be reading). Now: with any
+        // streamed text, render it final, mark it interrupted, and offer
+        // Retry alongside; only an empty bubble is removed. Retry re-sends
+        // the ORIGINAL question directly (see retryQuestion above) instead
+        // of stuffing it back into the input, so a draft typed after the
+        // failure is never clobbered.
+        if (fullAnswer) {
+            answerRenderer.flush();
+            const note = document.createElement('div');
+            note.className = 'muted';
+            note.lang = 'fr';
+            note.textContent = '⚠ Réponse interrompue — le texte ci-dessus est partiel.';
+            botMsg.appendChild(note);
+            _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
+        } else {
+            answerRenderer.cancel();
+            botMsg.remove();
+        }
         const msg = e.name === 'AbortError'
             ? 'Response timed out. The model may be overloaded — please try again.'
             : ('Error: ' + e.message);
         _showVaultError(msg, () => {
-            userMsg.remove();
-            if (input) input.value = question;
-            chatWithVault();
+            if (!fullAnswer) userMsg.remove();   // keep the pair when a partial stays visible
+            chatWithVault(question);
         });
     } finally {
         clearTimeout(chatTimeout);
-        _isQuerying = false;
+        _isChatting = false;
         taskEnd('vault-chat');
         chat.scrollTop = chat.scrollHeight;
     }
@@ -862,7 +970,7 @@ export function clearVaultChat() {
     // Server holds no chat history (each /api/obsidian/chat call is independent),
     // so clearing is purely a DOM operation. We refuse while a query is in flight
     // so the in-progress bot message is not orphaned mid-stream.
-    if (_isQuerying) {
+    if (_isChatting) {
         const statusDiv = document.getElementById('obsidian-status-msg');
         if (statusDiv) setStatusA11y(statusDiv, 'Wait for the current response to finish before clearing.', false);
         return;
@@ -891,8 +999,9 @@ export async function cancelVaultIndex() {
     } catch (e) {
         console.error('Cancel error:', e);
     }
-    _isQuerying = false;
-    taskEnd('vault-index');
+    // Only the INDEXING machine's guard — a live chat keeps its own flag.
+    _isIndexing = false;
+    taskEnd('vault-index'); _setIndexProgress(false);
     _updateIndexButtons('idle');
     setStatusA11y(document.getElementById('obsidian-status-msg'), 'Indexing cancelled.', false);
 }
@@ -1081,6 +1190,18 @@ export async function refreshIndexState() {
             if (displayEl) displayEl.textContent = data.vault_path;
         }
         _updateIndexButtons(data.state);
+        // A run already in flight (e.g. the page was reloaded mid-index, or the
+        // run was started by a prior session) won't have gone through
+        // indexVault(), so the activity bar + status polling were never armed.
+        // Re-arm them here so the honest "working" signal reappears and status
+        // messages keep flowing until a terminal state.
+        if ((data.state === 'running' || data.state === 'scanning' || data.state === 'embedding') && !_isIndexing) {
+            _isIndexing = true;
+            _setIndexProgress(true);
+            _vaultPollDeadline = Date.now() + 24 * 60 * 60 * 1000;
+            taskBegin('vault-index', 'Indexing vault…');
+            pollVaultStatus();
+        }
         if (Array.isArray(data.warnings) && data.warnings.length) {
             renderVaultWarnings(data.warnings);
         }

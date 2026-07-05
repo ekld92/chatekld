@@ -3,9 +3,9 @@
 Exposes :func:`build_vault_tools` which returns a list of
 :class:`~core.agent.tools.ToolSpec` for the three v1 tools:
 
-* ``vault.search`` — hybrid + rerank retrieval over the indexed vault.
-* ``vault.read_note`` — full-text fetch of a single .md / .pdf by path.
-* ``vault.list_materials`` — list what's currently in the index.
+* ``vault_search`` — hybrid + rerank retrieval over the indexed vault.
+* ``vault_read_note`` — full-text fetch of a single .md / .pdf by path.
+* ``vault_list_materials`` — list what's currently in the index.
 
 The tools wrap :class:`~rag.vault.ObsidianVaultManager` only — they
 never touch the indexer's internal data structures directly, which
@@ -14,14 +14,15 @@ keeps the agent layer separable from the indexing layer.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from core.agent.tools import ToolSpec
 from core.llm.types import ToolSchema
 
 
-# Per-result snippet cap for vault.search — keeps each chunk small so a
+# Per-result snippet cap for vault_search — keeps each chunk small so a
 # top_k=12 query stays under ~10 KB total.
 _SEARCH_SNIPPET_CHARS = 800
 _LIST_MATERIALS_DEFAULT_LIMIT = 100
@@ -46,6 +47,12 @@ class VaultToolContext:
     hybrid_enabled: bool = False
     reranker_enabled: bool = False
     reranker_model: str = ""
+    # Item 2.4: the turn's wall-clock deadline (time.monotonic() scale). Long
+    # tools derive a remaining-time budget from it so an expensive operation
+    # (an uncached-PDF fresh extract) is refused up front rather than started
+    # with a nearly-exhausted budget. None (direct/test callers) ⇒ unbounded,
+    # matching run_agent_loop's own deadline contract.
+    deadline_monotonic_s: Optional[float] = None
 
 
 def build_vault_tools(manager: Any, ctx: VaultToolContext) -> list[ToolSpec]:
@@ -58,17 +65,17 @@ def build_vault_tools(manager: Any, ctx: VaultToolContext) -> list[ToolSpec]:
     """
     return [
         _build_search_tool(manager, ctx),
-        _build_read_note_tool(manager),
+        _build_read_note_tool(manager, ctx),
         _build_list_materials_tool(manager),
     ]
 
 
 # ---------------------------------------------------------------------------
-# vault.search
+# vault_search
 # ---------------------------------------------------------------------------
 
 _SEARCH_SCHEMA = ToolSchema(
-    name="vault.search",
+    name="vault_search",
     description=(
         "Search the indexed Obsidian vault for passages relevant to a query. "
         "Returns chunks with source filename, relevance score, and a snippet. "
@@ -122,6 +129,13 @@ def _build_search_tool(manager: Any, ctx: VaultToolContext) -> ToolSpec:
                 "source": chunk.source,
                 "score": round(float(chunk.score), 4),
                 "snippet": snippet,
+                # The indexer stamps is_image on every vision-described image
+                # chunk (rag/vault.py) — metadata is authoritative. No
+                # extension sniffing here: a hardcoded ext list drifts from
+                # the configurable vault_image_exts, and the retrieval-trace
+                # frame in api/routes/vault.py reads the same key, so the two
+                # surfaces stay consistent.
+                "is_image": bool(chunk.metadata.get("is_image", False)),
             })
         return json.dumps({
             "results": results,
@@ -133,14 +147,14 @@ def _build_search_tool(manager: Any, ctx: VaultToolContext) -> ToolSpec:
 
 
 # ---------------------------------------------------------------------------
-# vault.read_note
+# vault_read_note
 # ---------------------------------------------------------------------------
 
 _READ_NOTE_SCHEMA = ToolSchema(
-    name="vault.read_note",
+    name="vault_read_note",
     description=(
         "Read the full text of a markdown note or PDF in the vault by "
-        "relative path. Use this after vault.search when a snippet is not "
+        "relative path. Use this after vault_search when a snippet is not "
         "enough. Returns truncated text if the document exceeds the cap."
     ),
     parameters={
@@ -159,10 +173,18 @@ _READ_NOTE_SCHEMA = ToolSchema(
 )
 
 
-def _build_read_note_tool(manager: Any) -> ToolSpec:
+def _build_read_note_tool(manager: Any, ctx: VaultToolContext) -> ToolSpec:
     def _run(args: dict) -> str:
         rel_path = args["rel_path"]
-        text, truncated = manager.read_note(rel_path, max_chars=_READ_NOTE_MAX_CHARS)
+        # Remaining wall-clock budget for this turn (item 2.4): read_note's
+        # uncached-PDF branch refuses a fresh in-process extraction that the
+        # remaining budget cannot plausibly fit (cache hits are unaffected).
+        # None ⇒ no deadline ⇒ read_note keeps its unbounded legacy contract.
+        time_budget_s = None
+        if ctx.deadline_monotonic_s is not None:
+            time_budget_s = max(0.0, ctx.deadline_monotonic_s - time.monotonic())
+        text, truncated = manager.read_note(
+            rel_path, max_chars=_READ_NOTE_MAX_CHARS, time_budget_s=time_budget_s)
         return json.dumps({
             "rel_path": rel_path,
             "text": text,
@@ -178,11 +200,11 @@ def _build_read_note_tool(manager: Any) -> ToolSpec:
 
 
 # ---------------------------------------------------------------------------
-# vault.list_materials
+# vault_list_materials
 # ---------------------------------------------------------------------------
 
 _LIST_MATERIALS_SCHEMA = ToolSchema(
-    name="vault.list_materials",
+    name="vault_list_materials",
     description=(
         "List files currently indexed in the vault. Useful to discover "
         "what's available before searching. Optional case-insensitive "

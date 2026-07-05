@@ -7,9 +7,11 @@ without rewriting their config.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from typing import Iterator, Optional
 
@@ -31,6 +33,15 @@ from core.llm.types import (
 from core.llm.usage import usage_tracker
 
 logger = logging.getLogger(__name__)
+
+# Cached shared ``httpx.Client`` per (base_url, timeout) — same rationale as the
+# Anthropic adapter: reuse one keep-alive connection pool across generate()/stream()
+# instead of a fresh pool + TLS handshake per online round-trip (N per agent turn /
+# deck section). Auth is a per-request query param (``_params()``), so the client
+# is key-agnostic and a rotated key applies on the next request; the key is never
+# stored. The listing call keeps its own short-lived client (different timeout).
+_client_cache: dict = {}
+_client_cache_lock = threading.Lock()
 
 CURATED_MODELS: list[str] = [
     "gemini-2.5-pro",
@@ -135,6 +146,22 @@ class GoogleProvider(LLMProvider):
                 provider=self.name,
             ) from exc
         return httpx
+
+    def _client(self):
+        """Return a cached, long-lived ``httpx.Client`` for (base_url, timeout).
+
+        Reused across generate()/stream() for connection keep-alive (see the
+        module cache note). Never closed (process-lifetime); auth is per-request
+        (``_params()``), so it is key-agnostic and rotation-safe.
+        """
+        httpx = self._httpx()
+        key = (self._base_url(), self.timeout_s)
+        with _client_cache_lock:
+            client = _client_cache.get(key)
+            if client is None:
+                client = httpx.Client(timeout=self.timeout_s)
+                _client_cache[key] = client
+            return client
 
     def supports_embeddings(self) -> bool:
         """Online providers are chat-only; embeddings resolve to a local
@@ -271,12 +298,13 @@ class GoogleProvider(LLMProvider):
 
         def _do_call() -> LLMResponse:
             try:
-                with httpx.Client(timeout=self.timeout_s) as client:
-                    resp = client.post(
-                        self._build_url(request.model, stream=False),
-                        params=self._params(stream=False),
-                        json=self._build_payload(request),
-                    )
+                # Cached shared client (keep-alive) instead of a per-call pool.
+                client = self._client()
+                resp = client.post(
+                    self._build_url(request.model, stream=False),
+                    params=self._params(stream=False),
+                    json=self._build_payload(request),
+                )
             except httpx.TimeoutException as exc:
                 raise LLMError(
                     category=ErrorCategory.TIMEOUT, message=str(exc),
@@ -322,7 +350,19 @@ class GoogleProvider(LLMProvider):
             )
             return response
 
-        return retry_with_backoff(_do_call, max_attempts=self.max_retries)
+        # Deadline-aware retry (improvement plan 1.3): the agent loop sets
+        # request.timeout_s to its REMAINING wall-clock budget each iteration;
+        # deriving the retry deadline from it keeps backoff sleeps from
+        # blocking past the turn deadline. None (non-agent callers) preserves
+        # the unbounded-by-deadline behaviour.
+        deadline = (
+            start + float(request.timeout_s)
+            if request.timeout_s and request.timeout_s > 0 else None
+        )
+        return retry_with_backoff(
+            _do_call, max_attempts=self.max_retries,
+            deadline_monotonic_s=deadline,
+        )
 
     def stream(self, request: LLMRequest) -> StreamingResponse:
         """Streaming completion over Gemini's ``?alt=sse`` ``data:`` stream.
@@ -348,7 +388,10 @@ class GoogleProvider(LLMProvider):
             finish_reason = FinishReason.STOP
             stream_error: LLMError | None = None
             try:
-                with httpx.Client(timeout=self.timeout_s) as client:
+                # nullcontext wraps the CACHED client so the streaming block is
+                # unchanged but the shared client is NOT closed on exit (only the
+                # inner client.stream(...) response is) — keep-alive survives.
+                with contextlib.nullcontext(self._client()) as client:
                     with client.stream(
                         "POST",
                         self._build_url(request.model, stream=True),
@@ -439,7 +482,15 @@ def _extract_text_finish_and_calls(body: dict) -> tuple[str, FinishReason, list]
             if "text" in part:
                 text_parts.append(part.get("text") or "")
             if "functionCall" in part:
-                tc = parse_gemini_function_call(part.get("functionCall") or {})
+                # Gemini 3.x attaches an opaque part-level thoughtSignature to
+                # each functionCall and requires it echoed back verbatim in the
+                # follow-up request (else 400 "missing a thought_signature").
+                # Capture it here; build_gemini_contents re-emits it.
+                sig = part.get("thoughtSignature")
+                tc = parse_gemini_function_call(
+                    part.get("functionCall") or {},
+                    thought_signature=sig if isinstance(sig, str) else "",
+                )
                 if tc is not None:
                     tool_calls.append(tc)
         raw_finish = candidate.get("finishReason")

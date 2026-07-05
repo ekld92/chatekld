@@ -67,13 +67,50 @@ export async function* readSSE(response) {
                 }
             }
         }
+        // Item 3.5: flush the decoder's internal buffer. decode(value,
+        // {stream:true}) holds back a multi-byte UTF-8 sequence split at a
+        // chunk boundary; if the stream ENDS on that split, the held bytes
+        // were silently dropped from the tail frame below. The argless
+        // decode() emits them (as U+FFFD if genuinely incomplete — visible,
+        // not vanished).
+        buffer += decoder.decode();
         // Flush a final frame that arrived without a trailing blank line.
         const tail = payloadOf(buffer);
         if (tail && tail !== '[DONE]') {
             try { yield JSON.parse(tail); } catch (e) { /* ignore trailing partial */ }
         }
     } finally {
+        // Item 3.5: cancel BEFORE releasing the lock (cancel needs it). An
+        // early exit — a consumer breaking out of `for await` on an {error}
+        // frame, or an exception mid-loop — used to only release the lock,
+        // leaving the HTTP connection open and the server streaming into a
+        // dead pipe until its own stall guard fired. cancel() closes the
+        // underlying stream; on a normally-finished stream it is a no-op.
+        // Invariant (pinned by tests/js/readSSE.test.js): every exit path
+        // cancels the reader.
+        try { reader.cancel(); } catch (_) { /* already closed */ }
         try { reader.releaseLock(); } catch (_) { /* read in flight or already released */ }
+    }
+}
+
+/**
+ * Parse a fetch Response body as JSON without ever throwing.
+ *
+ * The action endpoints can answer with a non-JSON body — a Flask HTML error
+ * page, a proxy 502, or an origin-reject — in which case a bare `resp.json()`
+ * throws and the caller's catch block loses the real HTTP status behind a
+ * generic "parse failed". This returns `{}` on any non-JSON body so the caller
+ * can fall through to its `!resp.ok` branch and surface `HTTP <status>` (or the
+ * server's structured `{error}` when the body IS json). Never rejects.
+ *
+ * @param {Response} resp a fetch() Response
+ * @returns {Promise<object>} the parsed object, or `{}` if the body isn't JSON
+ */
+export async function safeJson(resp) {
+    try {
+        return await resp.json();
+    } catch (_) {
+        return {};
     }
 }
 
@@ -94,4 +131,43 @@ export function logError(msg, error) {
             body: JSON.stringify({ level: 'error', msg: `[JS] ${msg}: ${error?.message || String(error)}` }),
         }).catch(() => {});
     } catch (_) {}
+}
+
+/**
+ * Shared consumer for SSE streams (improvement plan 2026-07-04, item 4.4).
+ * Handles the secureFetch boilerplate, bad-response fallback, SSE stream draining,
+ * and dispatching frames to the caller's handlers.
+ *
+ * @param {string} url - The URL to POST to.
+ * @param {object} options - Fetch options (e.g. body string).
+ * @param {object} handlers - Handlers for each frame type: { onInfo, onError, onToken, onOther, onDone }
+ * @returns {Promise<void>} Resolves when the stream fully completes.
+ */
+export async function consumeSSE(url, options, handlers) {
+    try {
+        const resp = await secureFetch(url, options);
+        if (!resp.ok) {
+            const result = await safeJson(resp);
+            const err = result.error || `HTTP ${resp.status} - failed to start stream`;
+            handlers.onError?.(err);
+            return;
+        }
+
+        for await (const frame of readSSE(resp)) {
+            if (frame.error) {
+                handlers.onError?.(frame.error);
+                return; // Server {error} is terminal
+            }
+            if (frame.info) {
+                handlers.onInfo?.(frame.info);
+            } else if (frame.token !== undefined) {
+                handlers.onToken?.(frame.token);
+            } else {
+                handlers.onOther?.(frame);
+            }
+        }
+        handlers.onDone?.();
+    } catch (exc) {
+        handlers.onError?.(exc.message || String(exc));
+    }
 }

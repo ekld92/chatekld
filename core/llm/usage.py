@@ -34,9 +34,19 @@ class ModelPricing:
     cached_input: Optional[float] = None
 
 
+# Multiplier applied to Anthropic cache-WRITE tokens
+# (usage.cache_creation_input_tokens): a 5-minute-TTL cache write bills at
+# 1.25× the model's input rate (per platform.claude.com prompt-caching docs,
+# 2026-07). Only the Anthropic adapter populates that field, so the term is
+# inert for every other provider. The 1-hour TTL (2×) is not used by the app.
+ANTHROPIC_CACHE_WRITE_MULTIPLIER = 1.25
+
 PRICING_TABLE: dict[str, ModelPricing] = {
     # OpenAI — published list prices as of early 2026; treat as defaults
     # that the user can override via llm_pricing_overrides.
+    "gpt-5": ModelPricing(input=1.25, output=10.00, cached_input=0.125),
+    "gpt-5-mini": ModelPricing(input=0.25, output=2.00, cached_input=0.025),
+    "gpt-5-nano": ModelPricing(input=0.05, output=0.40, cached_input=0.005),
     "gpt-4o": ModelPricing(input=2.50, output=10.00, cached_input=1.25),
     "gpt-4o-mini": ModelPricing(input=0.15, output=0.60, cached_input=0.075),
     "gpt-4-turbo": ModelPricing(input=10.00, output=30.00),
@@ -49,23 +59,29 @@ PRICING_TABLE: dict[str, ModelPricing] = {
     "o1": ModelPricing(input=15.00, output=60.00),
     "o3-mini": ModelPricing(input=1.10, output=4.40),
 
-    # Anthropic — per platform.claude.com pricing as of 2026-05. The Opus
-    # tier dropped to $5/$25 with Opus 4.5 (2025-11); the old $15/$75 only
-    # applies to Claude 3 Opus. Retired-model entries are kept so historical
-    # usage records still cost out correctly.
-    "claude-fable-5": ModelPricing(input=10.00, output=50.00),
-    "claude-opus-4-8": ModelPricing(input=5.00, output=25.00),
-    "claude-opus-4-7": ModelPricing(input=5.00, output=25.00),
-    "claude-opus-4-6": ModelPricing(input=5.00, output=25.00),
-    "claude-opus-4-5": ModelPricing(input=5.00, output=25.00),
-    "claude-sonnet-4-6": ModelPricing(input=3.00, output=15.00),
-    "claude-sonnet-4-5": ModelPricing(input=3.00, output=15.00),
-    "claude-haiku-4-5": ModelPricing(input=1.00, output=5.00),
-    "claude-3-5-sonnet-20241022": ModelPricing(input=3.00, output=15.00),
-    "claude-3-5-sonnet-latest": ModelPricing(input=3.00, output=15.00),
-    "claude-3-5-haiku-20241022": ModelPricing(input=0.80, output=4.00),
-    "claude-3-5-haiku-latest": ModelPricing(input=0.80, output=4.00),
-    "claude-3-opus-20240229": ModelPricing(input=15.00, output=75.00),
+    # Anthropic — per platform.claude.com pricing, re-verified 2026-07-04
+    # (Track 5.5). The Opus tier dropped to $5/$25 with Opus 4.5 (2025-11);
+    # the old $15/$75 only applies to Claude 3 Opus. cached_input is the
+    # cache-READ rate = 0.1× input (the write premium is the module-level
+    # ANTHROPIC_CACHE_WRITE_MULTIPLIER, not a per-model column). Sonnet 5's
+    # $3/$15 is the list price (an intro $2/$10 runs through 2026-08-31 —
+    # use llm_pricing_overrides to cost at intro rates). Retired-model
+    # entries are kept so historical usage records still cost out correctly.
+    "claude-fable-5": ModelPricing(input=10.00, output=50.00, cached_input=1.00),
+    "claude-mythos-5": ModelPricing(input=10.00, output=50.00, cached_input=1.00),
+    "claude-opus-4-8": ModelPricing(input=5.00, output=25.00, cached_input=0.50),
+    "claude-opus-4-7": ModelPricing(input=5.00, output=25.00, cached_input=0.50),
+    "claude-opus-4-6": ModelPricing(input=5.00, output=25.00, cached_input=0.50),
+    "claude-opus-4-5": ModelPricing(input=5.00, output=25.00, cached_input=0.50),
+    "claude-sonnet-5": ModelPricing(input=3.00, output=15.00, cached_input=0.30),
+    "claude-sonnet-4-6": ModelPricing(input=3.00, output=15.00, cached_input=0.30),
+    "claude-sonnet-4-5": ModelPricing(input=3.00, output=15.00, cached_input=0.30),
+    "claude-haiku-4-5": ModelPricing(input=1.00, output=5.00, cached_input=0.10),
+    "claude-3-5-sonnet-20241022": ModelPricing(input=3.00, output=15.00, cached_input=0.30),
+    "claude-3-5-sonnet-latest": ModelPricing(input=3.00, output=15.00, cached_input=0.30),
+    "claude-3-5-haiku-20241022": ModelPricing(input=0.80, output=4.00, cached_input=0.08),
+    "claude-3-5-haiku-latest": ModelPricing(input=0.80, output=4.00, cached_input=0.08),
+    "claude-3-opus-20240229": ModelPricing(input=15.00, output=75.00, cached_input=1.50),
 
     # Google Gemini
     "gemini-2.5-pro": ModelPricing(input=1.25, output=10.00),
@@ -102,13 +118,23 @@ def estimate_cost_usd(model: str, usage: LLMUsage, overrides: Optional[dict] = N
     if pricing is None:
         return 0.0
     cost = (usage.output_tokens / 1_000_000) * pricing.output
+    # Cache accounting (Track 5.5). ``input_tokens`` is the TOTAL prompt size
+    # (the adapters normalise Anthropic's exclusive counts — see
+    # LLMUsage's field notes); the cached subset bills at the model's
+    # cached_input (read) rate and the Anthropic cache-write subset at
+    # 1.25× input. ``getattr`` default keeps legacy call sites passing a
+    # pre-field LLMUsage (or a test stub) costing out as before.
     cached = usage.cached_input_tokens
+    creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    if creation:
+        cost += (creation / 1_000_000) * pricing.input * ANTHROPIC_CACHE_WRITE_MULTIPLIER
     if cached and pricing.cached_input is not None:
-        regular_input = max(0, usage.input_tokens - cached)
+        regular_input = max(0, usage.input_tokens - cached - creation)
         cost += (regular_input / 1_000_000) * pricing.input
         cost += (cached / 1_000_000) * pricing.cached_input
     else:
-        cost += (usage.input_tokens / 1_000_000) * pricing.input
+        regular_input = max(0, usage.input_tokens - creation)
+        cost += (regular_input / 1_000_000) * pricing.input
     return round(cost, 6)
 
 
@@ -131,6 +157,9 @@ class UsageRecord:
     stream: bool
     success: bool = True
     error_category: str = ""
+    # Anthropic cache-write tokens (Track 5.5); defaulted so legacy JSONL
+    # rows written before this field still deserialize via UsageRecord(**data).
+    cache_creation_input_tokens: int = 0
     # Per-record unique id used to de-duplicate the in-memory ring against
     # the on-disk JSONL in summary().  Defaults to "" so legacy records
     # written before this field still deserialize via UsageRecord(**data).
@@ -215,8 +244,26 @@ class UsageTracker:
         (no charge for a call that produced nothing) and a fresh ``uid`` is minted
         for cross-store de-duplication. A disk-write failure is swallowed (the
         in-memory ring still has it); recording must never break the caller's path.
+
+        Cost write-back (improvement plan 0.3): the computed cost is also
+        assigned to ``usage.estimated_cost_usd``. Every adapter passes the SAME
+        ``LLMUsage`` object it attaches to its ``LLMResponse``, so this one line
+        is what makes the agent loop's per-turn ``UsageBudget`` (and any other
+        response-side consumer) see real dollars instead of the dataclass's 0.0
+        default — no per-adapter costing code needed. When the caller supplies
+        no ``pricing_overrides``, the persisted ``llm_pricing_overrides`` config
+        is resolved here (stat-cached read; best-effort) so the documented knob
+        actually applies to recorded costs.
         """
+        if pricing_overrides is None:
+            try:
+                from core.config import load_config_readonly
+                overrides = load_config_readonly().get("llm_pricing_overrides")
+                pricing_overrides = dict(overrides) if isinstance(overrides, dict) else None
+            except Exception:  # noqa: BLE001 — costing must never break recording
+                pricing_overrides = None
         cost = estimate_cost_usd(model, usage, pricing_overrides) if success else 0.0
+        usage.estimated_cost_usd = cost
         record = UsageRecord(
             timestamp=datetime.now(timezone.utc).isoformat(),
             provider=provider,
@@ -224,6 +271,7 @@ class UsageTracker:
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cached_input_tokens=usage.cached_input_tokens,
+            cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
             cost_usd=cost,
             latency_ms=int(latency_ms),
             stream=stream,
@@ -370,6 +418,47 @@ usage_tracker = UsageTracker()
 def configure_default_usage_tracker(base_dir: str) -> None:
     """Point the singleton tracker at ``<base_dir>/llm_usage.jsonl``."""
     usage_tracker.configure(os.path.join(base_dir, "llm_usage.jsonl"))
+
+
+def unpriced_curated_models() -> list[tuple[str, str]]:
+    """``(provider, model_id)`` pairs for curated ids with no pricing entry.
+
+    Track 5.5 guard: a curated model missing from :data:`PRICING_TABLE`
+    silently costs out at $0 (the deliberate unknown-model fallback in
+    :func:`estimate_cost_usd`) — fine for arbitrary live-listed ids, but the
+    CURATED lists are the app's own defaults, so a gap there means every
+    request on a default model under-reports to zero. The adapters are
+    imported lazily because they import this module at load time (usage
+    recording) — a top-level import here would be a cycle.
+    Pinned empty by ``test_all_curated_models_are_priced``.
+    """
+    pairs: list[tuple[str, str]] = []
+    try:
+        from core.llm.adapters.anthropic import CURATED_MODELS as anthropic_models
+        from core.llm.adapters.google import CURATED_MODELS as google_models
+        from core.llm.adapters.openai import CURATED_MODELS as openai_models
+    except Exception:  # noqa: BLE001 — a broken adapter must not break costing
+        return pairs
+    for provider, models in (
+        ("openai", openai_models),
+        ("anthropic", anthropic_models),
+        ("google", google_models),
+    ):
+        for model_id in models:
+            if model_id not in PRICING_TABLE:
+                pairs.append((provider, model_id))
+    return pairs
+
+
+def log_unpriced_curated_models() -> None:
+    """Startup advisory: name every curated model that would cost out at $0."""
+    for provider, model_id in unpriced_curated_models():
+        logger.warning(
+            "PRICING_TABLE has no entry for curated %s model %r — its usage "
+            "will cost out at $0.00 until an entry (or an llm_pricing_overrides "
+            "row) is added.",
+            provider, model_id,
+        )
 
 
 @functools.lru_cache(maxsize=1)

@@ -1,9 +1,9 @@
 import ollama
 import logging
 import threading
+from collections import OrderedDict
 from typing import Any, Optional
-from core.providers.base import Provider, local_request_timeout
-from core.constants import OLLAMA_HOST
+from core.providers.base import Provider, local_request_timeout, resolve_ollama_host
 
 logger = logging.getLogger(__name__)
 
@@ -13,9 +13,19 @@ logger = logging.getLogger(__name__)
 # FRESH OllamaProvider each call, so the cache must live at module scope rather
 # than on the instance. httpx.Client is safe for concurrent use, so sharing one
 # across the SSE worker threads is fine. The key also carries the timeout, so a
-# change to local_request_timeout_s yields a new client (the old one lingers
-# idle, but the key space is tiny — one host, a handful of timeout values).
-_client_cache: "dict[tuple, ollama.Client]" = {}
+# change to local_request_timeout_s yields a new client. Item 2.6
+# (improvement plan 2026-07-04): the old "key space is tiny" claim was wrong —
+# the agent loop keys by its per-iteration REMAINING budget (rounded to whole
+# seconds), i.e. up to ~agent_wall_clock_s distinct integer timeouts per host,
+# each pinning an idle httpx pool forever. The cache is therefore a small LRU
+# (_CLIENT_CACHE_MAX entries): the steady-state working set is genuinely tiny
+# (configured timeout + a few agent buckets — see loop.py's quantisation), so
+# eviction is rare, and an evicted client is deliberately NOT closed here — a
+# concurrent call may still be streaming on it; dropping the reference lets it
+# close via GC once the in-flight request finishes. Invariant (pinned by
+# TestClientCacheBound): the cache never exceeds _CLIENT_CACHE_MAX entries.
+_CLIENT_CACHE_MAX = 8
+_client_cache: "OrderedDict[tuple, ollama.Client]" = OrderedDict()
 _client_cache_lock = threading.Lock()
 
 # Sentinel for ``OllamaProvider._client(timeout=...)``: distinguishes "caller
@@ -34,8 +44,9 @@ def _ollama_client(host: str, timeout: Optional[float]) -> "ollama.Client":
     keying/constructing: the agent loop passes the turn's remaining wall-clock
     budget — a near-continuous float (297.4, 296.1, …) — so an unrounded key
     would mint a fresh ``ollama.Client`` (each owning an httpx pool) on every
-    call and never evict it. Rounding collapses the keyspace back to the
-    "handful of values" the cache is designed for. The 1 s floor stops a
+    call and never evict it. Rounding collapses the keyspace (and loop.py's
+    bucket quantisation collapses it further); the LRU bound above is the
+    backstop for whatever keys still arrive. The 1 s floor stops a
     sub-second value — a near-exhausted agent budget, or a hand-set sub-second
     ``local_request_timeout_s`` — from rounding to 0.0, which httpx reads as
     "time out immediately" and would fail the call outright; sub-second
@@ -53,6 +64,10 @@ def _ollama_client(host: str, timeout: Optional[float]) -> "ollama.Client":
                 else ollama.Client(host=host, timeout=timeout)
             )
             _client_cache[key] = client
+            while len(_client_cache) > _CLIENT_CACHE_MAX:
+                _client_cache.popitem(last=False)   # evict LRU; GC closes it
+        else:
+            _client_cache.move_to_end(key)
         return client
 
 
@@ -65,14 +80,17 @@ class OllamaProvider(Provider):
     objects for the indexer and engine, and the legacy ``stream_chat`` path the
     local LLM adapter flattens onto. HTTP transport is shared through the
     module-level ``(host, timeout)``-keyed client cache (see
-    :func:`_ollama_client`); health/list calls intentionally use the module-level
-    ``ollama.*`` default client instead.
+    :func:`_ollama_client`); health/list calls go through that same host-bound
+    client (``self._client()``) so the reachability probe and generation can
+    never target different endpoints (the OLLAMA_HOST split-brain fix).
     """
 
-    def __init__(self, host: str = OLLAMA_HOST):
-        self.host = host
-        # Configure ollama client if needed, but it usually uses env OLLAMA_HOST
-        # or defaults to localhost:11434
+    def __init__(self, host: Optional[str] = None):
+        # Resolve at CONSTRUCTION time (not as a default-arg value, which would
+        # bind once at import). get_provider() mints a fresh provider per call,
+        # so the host re-resolves from config/env on each request — no restart
+        # needed. host=config(ollama_host) → env(OLLAMA_HOST) → constant.
+        self.host = host if host is not None else resolve_ollama_host()
 
     def _client(self, timeout: Any = _USE_CONFIG_TIMEOUT):
         """A cached ``ollama.Client`` for our host carrying a per-call timeout
@@ -89,18 +107,28 @@ class OllamaProvider(Provider):
         return _ollama_client(self.host, timeout)
 
     def check_running(self) -> tuple[bool, str]:
-        """Reachability probe: ``(True, "")`` if ``ollama.list()`` succeeds,
-        else ``(False, error)``."""
+        """Reachability probe against OUR resolved host: ``(True, "")`` on success.
+
+        Uses ``self._client().list()`` (host-bound), NOT the module-level
+        ``ollama.list()`` — the latter resolves ``OLLAMA_HOST`` independently and
+        produced the split-brain where the status badge probed one endpoint while
+        generation/embedding used another. Now the probe and generation share one
+        host, so a green badge means generation will actually reach a server.
+        """
         try:
-            ollama.list()
+            self._client().list()
             return True, ""
         except Exception as e:
             return False, str(e)
 
     def get_models(self) -> tuple[list[str], str]:
-        """List installed model tags, or ``([], error)`` if unreachable."""
+        """List installed model tags from OUR resolved host, or ``([], error)``.
+
+        Host-bound via ``self._client()`` for the same reason as
+        :meth:`check_running` — see that method's note on the split-brain fix.
+        """
         try:
-            resp = ollama.list()
+            resp = self._client().list()
             return [m.model for m in resp.models], ""
         except Exception as e:
             return [], str(e)
@@ -131,15 +159,27 @@ class OllamaProvider(Provider):
             kwargs["request_timeout"] = timeout
         return Ollama(model=resolved, base_url=self.host, **kwargs)
 
-    def get_embedding(self, model_name: str, **kwargs) -> Any:
-        """Return a LlamaIndex ``OllamaEmbedding`` for the indexer.
+    def get_embedding(self, model_name: str, *, request_timeout_s: Optional[float] = None, **kwargs) -> Any:
+        """Return a LlamaIndex ``OllamaEmbedding``.
 
         Note no ``local_request_timeout_s`` is applied — embeddings are
         deliberately excluded from that bound, since timing out an indexing batch
         would cause spurious failures rather than recovery.
+
+        ``request_timeout_s`` (improvement plan 2026-07-04, item 2.1) is the
+        QUERY-path exception to that rule: retrieval embeds the user's query
+        while holding the index mutation lock, so one wedged embed HTTP call
+        used to strand every subsequent chat worker on the lock (restart-only
+        recovery). Callers embedding a single query pass a bound (the engine
+        passes ``QUERY_EMBED_TIMEOUT_S``); the INDEXING path omits it and stays
+        unbounded — the two contracts differ on purpose, so never default this.
         """
         from llama_index.embeddings.ollama import OllamaEmbedding
         resolved = self.resolve_model(model_name)
+        if request_timeout_s is not None and request_timeout_s > 0:
+            # client_kwargs reaches ollama.Client(host=..., **client_kwargs) —
+            # the underlying httpx timeout, bounding each embed HTTP call.
+            kwargs = {**kwargs, "client_kwargs": {"timeout": float(request_timeout_s)}}
         return OllamaEmbedding(model_name=resolved, base_url=self.host, **kwargs)
 
     def stream_chat(self, model: str, prompt: str, system_prompt: Optional[str] = None,

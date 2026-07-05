@@ -19,6 +19,8 @@ text cannot escalate via the tool-result channel.
 """
 from __future__ import annotations
 
+import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -27,6 +29,16 @@ from core.llm.types import ToolCall, ToolSchema
 
 # Default per-tool output cap. Most tools should set their own.
 _DEFAULT_MAX_OUTPUT_CHARS = 8000
+
+# Strictest intersection of the providers' tool-name rules, enforced at
+# registry construction so an illegal name fails loudly at build time instead
+# of as a per-request provider 400. OpenAI requires ^[a-zA-Z0-9_-]+$ and
+# Anthropic ^[a-zA-Z0-9_-]{1,128}$ (neither allows a dot — the original
+# ``vault.search`` names 400'd every tool-enabled request on both, which is
+# why only Gemini "worked"); Gemini caps at 64 chars and requires a
+# letter/underscore start. The mocked test suite can't see provider-side
+# validation, so this gate is the in-process stand-in.
+VALID_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -49,14 +61,20 @@ class ToolArgError(Exception):
 class ToolRegistry:
     """Name-indexed collection of tool specs.
 
-    Duplicate names raise ``ValueError`` at construction. Lookup by an
-    unknown name raises ``ToolArgError`` so the loop can record the
-    failure as a structured tool result.
+    Duplicate names — and names outside :data:`VALID_TOOL_NAME_RE` (the
+    strictest provider name rule) — raise ``ValueError`` at construction.
+    Lookup by an unknown name raises ``ToolArgError`` so the loop can
+    record the failure as a structured tool result.
     """
 
     def __init__(self, specs: list[ToolSpec]) -> None:
         self._by_name: dict[str, ToolSpec] = {}
         for spec in specs:
+            if not VALID_TOOL_NAME_RE.match(spec.schema.name or ""):
+                raise ValueError(
+                    f"invalid tool name {spec.schema.name!r}: must match "
+                    f"{VALID_TOOL_NAME_RE.pattern} (providers reject anything else)"
+                )
             if spec.schema.name in self._by_name:
                 raise ValueError(f"duplicate tool name: {spec.schema.name!r}")
             self._by_name[spec.schema.name] = spec
@@ -119,13 +137,21 @@ def wrap_untrusted(tool_name: str, content: str, *, truncated: bool = False) -> 
     before placing it in ``ToolResult.content`` so the same protection
     applies regardless of which provider's tool_result channel
     delivers the bytes to the model.
+
+    The tag carries a per-call random nonce (improvement plan 1.4) so
+    vault content containing a literal ``</tool_output>`` cannot close
+    the wrapper early and pass off injected text as trusted
+    outside-the-wrapper material — the attacker cannot predict the
+    closing tag. Nothing parses this wrapper back; it exists only for
+    the model.
     """
     trunc_attr = "true" if truncated else "false"
+    tag = f"tool_output-{uuid.uuid4().hex[:8]}"
     return (
         f"{_UNTRUSTED_PREAMBLE}"
-        f"<tool_output tool=\"{tool_name}\" truncated=\"{trunc_attr}\">\n"
+        f"<{tag} tool=\"{tool_name}\" truncated=\"{trunc_attr}\">\n"
         f"{content}\n"
-        f"</tool_output>"
+        f"</{tag}>"
     )
 
 

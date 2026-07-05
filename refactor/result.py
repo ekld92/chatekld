@@ -40,6 +40,10 @@ class ImageRef:
     size: int = -1            # file size in bytes (-1 unknown)
     classification: str = ""  # cached classify label ("" if not classified)
     ignored: bool = False     # on the sticky ignore-list (greyed, no callout)
+    likely_handwritten: bool = False       # zero-vision handwritten heuristic fired
+    likely_handwritten_reason: str = ""
+    metadata_stripped: bool = False        # "strip" flag: callout drops the preamble
+    kept_handwritten: bool = False         # "keep_handwritten" override: force the callout
 
     @property
     def extracted(self) -> bool:
@@ -50,6 +54,22 @@ class ImageRef:
         not a "not extracted" candidate.
         """
         return bool(self.description) or self.has_table
+
+    @property
+    def handwritten(self) -> bool:
+        """True when this image looks handwritten — either a confirmed
+        ``handwritten`` classify label or the zero-vision heuristic firing."""
+        return self.classification == "handwritten" or self.likely_handwritten
+
+    @property
+    def handwritten_hidden(self) -> bool:
+        """True when this image's OCR callout is auto-hidden as handwritten.
+
+        Handwritten **and** not force-kept. Drives the "OCR hidden" badge and is
+        excluded (like ``ignored``) from the not-extracted / likely-table
+        candidate counts — a callout the user can't trust isn't a candidate to
+        act on."""
+        return self.handwritten and not self.kept_handwritten
 
     def to_jsonable(self) -> dict:
         """Flatten to a plain JSON dict for the SSE ``note`` frame.
@@ -70,6 +90,14 @@ class ImageRef:
             "size": self.size,
             "classification": self.classification,
             "ignored": self.ignored,
+            "likely_handwritten": self.likely_handwritten,
+            "likely_handwritten_reason": self.likely_handwritten_reason,
+            "metadata_stripped": self.metadata_stripped,
+            "kept_handwritten": self.kept_handwritten,
+            # Materialized (not just properties) so the UI doesn't recompute the
+            # handwritten / hidden rules client-side.
+            "handwritten": self.handwritten,
+            "handwritten_hidden": self.handwritten_hidden,
             "extracted": self.extracted,
         }
 
@@ -107,6 +135,14 @@ class NoteProposal:
     # (Phase 1 tests) that build a proposal without the hashes.
     content_sha256: str = ""
     proposed_sha256: str = ""
+    # Deterministic formatting-fix variant (refactor.normalize), independent of
+    # the callout ``proposed`` body — the second Phase 2 batch action. Empty for
+    # Phase-1 test callers that build a proposal without it; the planner always
+    # sets all three. ``normalized_sha256`` is the WYSIWYG guard for the
+    # /api/refactor/normalize writer, exactly like ``proposed_sha256`` for apply.
+    normalized: str = ""
+    normalized_sha256: str = ""
+    normalize_diff: str = ""
 
     @property
     def changed(self) -> bool:
@@ -116,6 +152,16 @@ class NoteProposal:
         changed note is worth an Apply (an unchanged note's write would be a no-op).
         """
         return self.proposed != self.original
+
+    @property
+    def normalize_changed(self) -> bool:
+        """True when the deterministic formatting fix would change the note.
+
+        Guarded on ``normalized`` being non-empty so a Phase-1 proposal built
+        without a normalized body (the field defaults to "") never reads as a
+        spurious change against a non-empty original.
+        """
+        return bool(self.normalized) and self.normalized != self.original
 
     def frame(self) -> dict:
         """SSE frame for one note.
@@ -137,6 +183,11 @@ class NoteProposal:
             "proposed": self.proposed,
             "content_sha256": self.content_sha256,
             "proposed_sha256": self.proposed_sha256,
+            # Deterministic formatting-fix variant (independent batch action).
+            "normalize_changed": self.normalize_changed,
+            "normalized": self.normalized,
+            "normalized_sha256": self.normalized_sha256,
+            "normalize_diff": self.normalize_diff,
             "images": [im.to_jsonable() for im in self.images],
             "hygiene_notes": [h.to_jsonable() for h in self.hygiene_notes],
         }
@@ -217,17 +268,19 @@ class PlanResult:
         # before constructing one), so "not extracted" means simply: no cached
         # description AND no cached table (``ImageRef.extracted``). Missing /
         # dataless / too-big images count here too — they have nothing extracted
-        # and are precisely what the user may want to act on. Ignored images are
-        # excluded: the user deliberately set them aside.
+        # and are precisely what the user may want to act on. Ignored and
+        # auto-hidden-handwritten images are excluded: the user set them aside (or
+        # the heuristic did, pending an override), so they aren't "go extract me".
         return sum(1 for n in self.notes for im in n.images
-                   if not im.extracted and not im.ignored)
+                   if not im.extracted and not im.ignored and not im.handwritten_hidden)
 
     @property
     def likely_table_count(self) -> int:
         # Images whose existing prose tripped the zero-vision table heuristic —
-        # the candidates worth a manual "Extract table" pass (ignored excluded).
+        # the candidates worth a manual "Extract table" pass (ignored + hidden
+        # handwritten excluded).
         return sum(1 for n in self.notes for im in n.images
-                   if im.likely_table and not im.ignored)
+                   if im.likely_table and not im.ignored and not im.handwritten_hidden)
 
     @property
     def ignored_count(self) -> int:
@@ -241,10 +294,30 @@ class PlanResult:
                    if im.classification == "handwritten")
 
     @property
+    def handwritten_hidden_count(self) -> int:
+        # Images whose OCR callout is auto-hidden as handwritten (heuristic or
+        # cached label, and not force-kept) — the zero-vision win the user asked
+        # for. Surfaced so they know how many callouts were suppressed.
+        return sum(1 for n in self.notes for im in n.images if im.handwritten_hidden)
+
+    @property
+    def stripped_count(self) -> int:
+        # Images whose extracted-text callout had its descriptive preamble
+        # stripped via the per-image "strip metadata" opt-in.
+        return sum(1 for n in self.notes for im in n.images if im.metadata_stripped)
+
+    @property
     def changed_count(self) -> int:
         # Notes whose proposed body differs from the original (i.e. at least one
         # cached description was inlined as a preview callout).
         return sum(1 for n in self.notes if n.changed)
+
+    @property
+    def normalize_changed_count(self) -> int:
+        # Notes the deterministic formatting fix would change (blank-line /
+        # trailing-whitespace / final-newline normalization) — the second,
+        # independent Phase 2 batch action.
+        return sum(1 for n in self.notes if n.normalize_changed)
 
     def summary_frame(self) -> dict:
         """Terminal SSE frame: counts + the advisory discrepancy report."""
@@ -253,9 +326,12 @@ class PlanResult:
             "note_count": self.note_count,
             "image_count": self.image_count,
             "changed_count": self.changed_count,
+            "normalize_changed_count": self.normalize_changed_count,
             "not_extracted_count": self.not_extracted_count,
             "likely_table_count": self.likely_table_count,
             "ignored_count": self.ignored_count,
             "handwritten_count": self.handwritten_count,
+            "handwritten_hidden_count": self.handwritten_hidden_count,
+            "stripped_count": self.stripped_count,
             "discrepancies": [d.to_jsonable() for d in self.discrepancies],
         }

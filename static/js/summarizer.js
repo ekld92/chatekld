@@ -7,8 +7,8 @@
  * by id from the controls settings.js owns (paper_* persistence) and sent
  * per-request; the server re-resolves them body → persisted paper_* → default.
  */
-import { secureFetch, readSSE } from './api.js';
-import { showTaskError, clearTaskError } from './ui.js';
+import { secureFetch, consumeSSE } from './api.js';
+import { showTaskError, clearTaskError, copyToClipboard, announceStatus } from './ui.js';
 import { getActiveProvider } from './config.js';
 
 let _currentUploadId = null;
@@ -109,6 +109,15 @@ export async function uploadPDF() {
         });
         const data = await resp.json();
         if (data.upload_id) {
+            // Item 3.8: free the superseded server-side upload. Re-uploading
+            // used to just overwrite the id — the old extraction lingered on
+            // disk until app reset. Fire-and-forget AFTER the new upload
+            // succeeded (never delete the current doc on a failed replace).
+            const prevId = _currentUploadId;
+            if (prevId && prevId !== data.upload_id) {
+                secureFetch('/api/upload/' + encodeURIComponent(prevId), { method: 'DELETE' })
+                    .catch(() => { /* best-effort cleanup */ });
+            }
             _currentUploadId = data.upload_id;
             _currentFilename = data.filename || file.name || 'summary';
             content.textContent = 'Paper processed. Ready to summarise.';
@@ -143,11 +152,19 @@ export async function summarisePDF() {
     const exportMdBtn = document.getElementById('export-summary-md-btn');
     btn.disabled = true;
     btn.textContent = 'Generating...';
+    // Track 6b: streamed summary is silent to AT — announce start/ready.
+    announceStatus('Generating summary…');
     exportBtn.disabled = true;
     exportMdBtn.disabled = true;
 
     if (_summaryAbortController) _summaryAbortController.abort();
-    _summaryAbortController = new AbortController();
+    // Item 3.3: keep a LOCAL handle. The old code's finally nulled the
+    // module field unconditionally — so when run B superseded run A, A's
+    // late finally nulled B's controller, and a third run could no longer
+    // abort B (two streams writing the same pane). The finally below only
+    // clears the field if it still owns it (identity check).
+    const controller = new AbortController();
+    _summaryAbortController = controller;
 
     const payload = {
         upload_id: _currentUploadId,
@@ -168,30 +185,27 @@ export async function summarisePDF() {
     if (systemPrompt) payload.system_prompt = systemPrompt;
 
     try {
-        const resp = await secureFetch('/api/summarise', {
+        let receivedText = false;
+        await consumeSSE('/api/summarise', {
             method: 'POST',
             body: JSON.stringify(payload),
-            signal: _summaryAbortController.signal
-        });
-        if (!resp.ok) {
-            const data = await resp.json().catch(() => ({}));
-            throw new Error(data.error || 'Summary request failed.');
-        }
-
-        let receivedText = false;
-
-        for await (const d of readSSE(resp)) {
-            if (d.error) throw new Error(d.error);
-            if (d.token) {
-                if (!receivedText) content.textContent = '';  // clear the waiting indicator
-                content.textContent += d.token;
+            signal: controller.signal
+        }, {
+            onInfo: () => {},
+            onToken: (token) => {
+                if (!receivedText) content.textContent = '';
+                content.textContent += token;
                 receivedText = true;
-            }
-        }
+            },
+            onOther: () => {},
+            onError: (err) => { throw new Error(err); }
+        });
+
         if (!receivedText) content.textContent = 'No summary was generated. Please try again.';
         const canExport = !(!receivedText || !content.textContent.trim());
         exportBtn.disabled = !canExport;
         exportMdBtn.disabled = !canExport;
+        announceStatus(receivedText ? 'Summary ready.' : 'No summary was generated.');
     } catch (e) {
         if (e.name !== 'AbortError') {
             content.textContent = '';
@@ -204,8 +218,17 @@ export async function summarisePDF() {
     } finally {
         btn.disabled = false;
         btn.textContent = 'Summarise';
-        _summaryAbortController = null;
+        if (_summaryAbortController === controller) _summaryAbortController = null;
     }
+}
+
+/** Copy the generated summary text to the clipboard. No-op when empty. */
+export function copySummary() {
+    const content = document.getElementById('document-summary-content');
+    const btn = document.getElementById('summary-copy-btn');
+    const text = content ? content.textContent.trim() : '';
+    if (!text || !btn) return;
+    copyToClipboard(text, btn);
 }
 
 function parsePositiveInt(id, fallback) {
@@ -238,7 +261,13 @@ export async function exportSummary(format = 'txt') {
         btn.textContent = 'Exported';
         setTimeout(() => { btn.textContent = original; }, 1600);
     } catch (e) {
-        content.textContent = 'Export error: ' + e.message;
+        // Item 3.8: never write the error INTO the summary pane — that
+        // destroyed the generated text the user was trying to export. The
+        // pane keeps the summary; the failure goes to the error boundary.
+        const el = document.getElementById('doc-error-boundary');
+        showTaskError(el, 'Export error: ' + e.message, [
+            { label: 'Dismiss', onClick: () => clearTaskError(el) },
+        ]);
         btn.textContent = original;
     } finally {
         btn.disabled = false;

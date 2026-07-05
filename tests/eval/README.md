@@ -11,7 +11,7 @@ contract, and the system-prompt length cap. When you intentionally change a
 prompt, update the matching assertion in the same commit.
 
 ```bash
-~/venvs/papermind2026/bin/python -m pytest test_prompts.py -q
+~/venvs/chatekld2026/bin/python -m pytest test_prompts.py -q
 ```
 
 ## 2. `tests/eval/` — answer-quality golden set
@@ -27,7 +27,7 @@ catch ungrounded answers).
 ```bash
 RUN_LIVE_EVAL=1 \
 EVAL_PROVIDER=ollama EVAL_MODEL=llama3.2 EVAL_EMBED=nomic-embed-text \
-~/venvs/papermind2026/bin/python -m tests.eval.run_eval
+~/venvs/chatekld2026/bin/python -m tests.eval.run_eval
 ```
 It writes only to a throwaway `CHATEKLD_BASE_DIR`, never your real app data.
 

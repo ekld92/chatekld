@@ -84,11 +84,23 @@ class InProcessChatRunner:
         capability_state: Optional[AgentCapabilityState] = None,
         cancel_event=None,
         turn_timeout_s: float = _TURN_TIMEOUT_S,
+        max_tokens: Optional[int] = None,
+        workflow: str = "vault_agent",
     ) -> None:
         self._cfg = cfg if cfg is not None else load_config()
         self._capability_state = capability_state or AgentCapabilityState()
         self._cancel_event = cancel_event
         self._turn_timeout_s = turn_timeout_s
+        # Prompt Hub workflow id threaded into run_agent_loop so the deck route's
+        # agent turns are attributed to "deck_generate" / "deck_augment" in the
+        # panel rather than the default "vault_agent".
+        self._workflow = workflow
+        # Per-turn output cap. The agent loop reads its token budget from the
+        # ``online_max_tokens`` cfg key (local included), so an explicit cap is
+        # injected there in ``chat`` (alongside the temperature override). ``None``
+        # leaves the configured ``online_max_tokens``. Used by the deck route to
+        # bound section length without touching any other path's config.
+        self._max_tokens = max_tokens
 
     # -- preflight parity with ChatEKLDClient -------------------------------
 
@@ -130,13 +142,19 @@ class InProcessChatRunner:
         hybrid = _as_bool(cfg.get("vault_hybrid_enabled"), True)
         rerank = _as_bool(cfg.get("vault_reranker_enabled"), True)
         rerank_model = cfg.get("vault_reranker_model") or ""
+        # The agent loop reads its sampling temperature from the
+        # ``vault_chat_temperature`` cfg key (see core/agent/loop.py), NOT a
+        # generic ``temperature`` key, and its output cap from ``online_max_tokens``
+        # — so per-turn overrides must land on those exact keys or they are
+        # silently ignored. Copy cfg once so we don't mutate the caller's dict (the
+        # runner is reused across outline + every section).
+        _overrides = {}
         if temperature is not None:
-            # The agent loop reads its sampling temperature from the
-            # ``vault_chat_temperature`` cfg key (see core/agent/loop.py), NOT a
-            # generic ``temperature`` key — so the per-turn override must land
-            # there or it is silently ignored. Copy cfg so we don't mutate the
-            # caller's dict (the runner is reused across outline + every section).
-            cfg = {**cfg, "vault_chat_temperature": temperature}
+            _overrides["vault_chat_temperature"] = temperature
+        if self._max_tokens is not None:
+            _overrides["online_max_tokens"] = self._max_tokens
+        if _overrides:
+            cfg = {**cfg, **_overrides}
 
         result = ChatResult()
 
@@ -201,6 +219,7 @@ class InProcessChatRunner:
                 rag_fallback_fn=_rag_fallback,
                 capability_state=self._capability_state,
                 cancel_event=self._cancel_event,
+                workflow=self._workflow,
             )
         except Exception as exc:  # pragma: no cover - defensive
             if result.error is None:

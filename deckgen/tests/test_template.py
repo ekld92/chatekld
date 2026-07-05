@@ -6,6 +6,8 @@ prompt wiring. Run with:  python -m pytest deckgen/tests/ -v
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 
 import pytest
 
@@ -197,6 +199,47 @@ def test_resolve_bib_ignores_commented_addbibresource(suite):
     assert idx == {}
 
 
+def test_bib_and_sty_caches_hit_and_self_invalidate(suite, monkeypatch):
+    """Track 5.2 invariant: a signature-cache hit yields byte-identical scan
+    results to a fresh read, and an edited file is always re-read."""
+    import deckgen.template as template_mod
+
+    base_dir = os.path.dirname(suite["template"])
+    first = load_template_parts(_TEMPLATE, suite["template"])
+    assert set(first.bib_index) == {"smith2020depression", "jones2019methods"}
+    assert "citefoot" in {m.name for m in first.macros}
+
+    # Second pass must be served from the caches — prove it by making any
+    # capped read explode. Same (path, size, mtime_ns) ⇒ identical results.
+    real_read_capped = template_mod._read_capped
+
+    def _boom(path, cap):
+        raise AssertionError(f"unexpected read of {path}")
+
+    monkeypatch.setattr(template_mod, "_read_capped", _boom)
+    second = load_template_parts(_TEMPLATE, suite["template"])
+    assert second.bib_index == first.bib_index
+    assert [m.name for m in second.macros] == [m.name for m in first.macros]
+
+    # The per-call bib dict is a fresh merge: mutating it must not poison the
+    # shared cached entry.
+    second.bib_index["injected"] = ("X", "1999", "Bogus")
+    third = load_template_parts(_TEMPLATE, suite["template"])
+    assert "injected" not in third.bib_index
+    monkeypatch.setattr(template_mod, "_read_capped", real_read_capped)
+
+    # Edit the bib (different size + forced distinct mtime_ns): the signature
+    # changes, so the next resolve re-parses and sees the new entry.
+    bib_path = os.path.join(suite["root"], "refs.bib")
+    with open(bib_path, "a", encoding="utf-8") as fh:
+        fh.write("@article{new2024key,\n  author = {New, Ann},\n"
+                 "  year = {2024},\n  title = {Fresh entry},\n}\n")
+    st = os.stat(bib_path)
+    os.utime(bib_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    fresh = resolve_bib(_TEMPLATE, base_dir)
+    assert "new2024key" in fresh
+
+
 def test_resolve_bib_rejects_absolute_path(tmp_path):
     """An absolute \\addbibresource must not be followed (it would leak an
     arbitrary file's parsed author/title into the prompt)."""
@@ -299,15 +342,28 @@ def test_newdoccommand_arity_not_inflated_by_default_values():
 
 # --- scaffold --------------------------------------------------------------
 
+def _make_suite_root(root):
+    """Create a minimal LaTeX-suite marker (``common/latex-build.mk``) under *root*."""
+    common = root / "common"
+    common.mkdir(parents=True, exist_ok=True)
+    (common / "latex-build.mk").write_text("# suite build rules\n", encoding="utf-8")
+
+
 def test_scaffold_deck_writes_project(tmp_path):
-    (tmp_path / "common").mkdir()
+    _make_suite_root(tmp_path)
     res = scaffold_deck(str(tmp_path), "my_deck", "\\documentclass{beamer}\n")
     assert os.path.isfile(res["tex_path"])
     assert os.path.isfile(res["makefile_path"])
-    assert res["sibling_common"] is True
+    assert res["suite_root_found"] is True
     mk = open(res["makefile_path"], encoding="utf-8").read()
     assert "DOC = my_deck" in mk
-    assert "include ../common/latex-build.mk" in mk
+    # Depth-independent walk-up, NOT the old hardcoded ``include ../common/...``.
+    assert "include ../common/latex-build.mk" not in mk
+    assert "SUITE_ROOT := $(shell" in mk
+    assert "include $(SUITE_ROOT)/common/latex-build.mk" in mk
+    # The shell ``$$`` must survive verbatim (Make collapses them to literal $).
+    assert '[ ! -e "$$d/common/latex-build.mk" ]' in mk
+    assert "n=$$((n+1))" in mk
 
 
 def test_scaffold_rejects_unsafe_slug(tmp_path):
@@ -324,9 +380,69 @@ def test_scaffold_refuses_existing_without_overwrite(tmp_path):
     assert "two" in open(res["tex_path"], encoding="utf-8").read()
 
 
-def test_scaffold_sibling_common_false(tmp_path):
+def test_scaffold_suite_root_found_false(tmp_path):
+    # No common/latex-build.mk anywhere up the tree → the walk-up finds nothing.
     res = scaffold_deck(str(tmp_path), "deck", "x")
-    assert res["sibling_common"] is False
+    assert res["suite_root_found"] is False
+    assert res["suite_root"] == ""
+
+
+def test_scaffold_suite_root_found_one_level_deep(tmp_path):
+    # Classic layout: the deck sits one level below the suite root.
+    _make_suite_root(tmp_path)
+    res = scaffold_deck(str(tmp_path), "deck", "x")
+    assert res["suite_root_found"] is True
+    assert res["suite_root"] == os.path.realpath(str(tmp_path))
+
+
+def test_scaffold_makefile_resolves_suite_root_two_levels_deep(tmp_path):
+    # Regression: a deck nested TWO levels below the suite root (e.g.
+    # <suite>/cours/<slug>/) must still locate common/latex-build.mk. The old
+    # hardcoded ``include ../common/...`` broke here; the walk-up must not.
+    _make_suite_root(tmp_path)
+    cours = tmp_path / "cours"
+    cours.mkdir()
+    res = scaffold_deck(str(cours), "schizophrenia", "\\documentclass{beamer}\n")
+    # The scaffold's advisory agrees the suite is findable from this depth...
+    assert res["suite_root_found"] is True
+    assert res["suite_root"] == os.path.realpath(str(tmp_path))
+
+    # ...and so does GNU make, evaluating the real generated Makefile from the
+    # deck folder. Skip cleanly if `make` is unavailable on the runner.
+    make = shutil.which("make")
+    if make is None:
+        pytest.skip("GNU make not available")
+    project_dir = res["project_dir"]
+    # A tiny throwaway target that just prints the resolved SUITE_ROOT, so we
+    # exercise the walk-up without needing a real LaTeX toolchain. We append it
+    # to a copy of the generated Makefile (the real one `include`s the suite mk,
+    # which only defines build targets), keeping the generated walk-up verbatim.
+    generated = open(res["makefile_path"], encoding="utf-8").read()
+    # Drop the trailing `include` (the stub marker has no real targets to pull in)
+    # but keep the SUITE_ROOT walk-up line we are testing.
+    walkup = "\n".join(
+        ln for ln in generated.splitlines() if not ln.startswith("include ")
+    )
+    probe = walkup + "\nshow-root:\n\t@echo $(SUITE_ROOT)\n"
+    probe_path = os.path.join(project_dir, "Makefile.probe")
+    with open(probe_path, "w", encoding="utf-8") as fh:
+        fh.write(probe)
+    out = subprocess.run(
+        [make, "-f", "Makefile.probe", "show-root"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    resolved = out.stdout.strip()
+    # SUITE_ROOT is relative to the deck folder; it must point at the suite root
+    # that actually holds common/latex-build.mk.
+    assert os.path.realpath(os.path.join(project_dir, resolved)) == os.path.realpath(
+        str(tmp_path)
+    )
+    assert os.path.isfile(
+        os.path.join(project_dir, resolved, "common", "latex-build.mk")
+    )
 
 
 def test_slugify():
@@ -351,3 +467,100 @@ def test_build_section_message_includes_candidates():
     )
     assert "Candidate references" in msg
     assert "key1" in msg
+
+
+# --- bare-name (suite-root) resolution + % @deckgen annotations -------------
+# The house convention references shared files by BARE name (\usepackage{cress-style},
+# \addbibresource{_master.bib}) and lets kpathsea find them via TEXINPUTS/BIBINPUTS.
+# deckgen must resolve them the same way — against the suite root — or the macros/bib
+# stay invisible to the model (the 2026-07 audit bug).
+
+_BARE_STY = r"""\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{cress-style}
+% @deckgen: custom-cite-desc-xyz
+\newcommand{\citefoot}[1]{\cite{#1}}
+% @deckgen \commonlogo: custom-logo-desc-xyz
+\newcommand{\commonlogo}[2][]{\includegraphics[#1]{#2}}
+% @deckgen: highlight important text
+\newcommand{\myhighlight}[1]{\textbf{#1}}
+\newcommand{\plainmacro}{plain}
+"""
+
+_BARE_TEMPLATE = r"""\documentclass[aspectratio=169]{beamer}
+\usepackage{cress-style}
+\usepackage{amsmath}
+\usetheme{Boadilla}
+\addbibresource{_master.bib}
+\title{T}
+\author{Me}
+\begin{document}
+\begin{frame}\titlepage\end{frame}
+\section{Ex}
+\begin{frame}{x}y\end{frame}
+\end{document}
+"""
+
+
+@pytest.fixture
+def bare_suite(tmp_path):
+    """A suite that references shared files by BARE name (the house convention):
+    <root>/common/cress-style.sty, <root>/_master.bib, <root>/template/deck.tex.
+
+    The template sits in a SIBLING folder of common/ (as the real suite's
+    template/ does), so nothing resolves relative to the template dir alone."""
+    (tmp_path / "common").mkdir()
+    (tmp_path / "common" / "cress-style.sty").write_text(_BARE_STY, encoding="utf-8")
+    (tmp_path / "_master.bib").write_text(_BIB, encoding="utf-8")
+    (tmp_path / "template").mkdir()
+    tpl = tmp_path / "template" / "deck.tex"
+    tpl.write_text(_BARE_TEMPLATE, encoding="utf-8")
+    return {"root": str(tmp_path), "template": str(tpl)}
+
+
+def test_bare_usepackage_resolved_via_suite_root(bare_suite):
+    """\\usepackage{cress-style} (bare name) is followed into <root>/common/, so
+    its house macros surface — while a real CTAN name (amsmath) resolves to
+    nothing and is skipped (no crash, no phantom macro)."""
+    parts = load_template_parts(_BARE_TEMPLATE, bare_suite["template"])
+    names = {m.name for m in parts.macros}
+    assert {"citefoot", "commonlogo", "myhighlight"} <= names
+    assert parts.suite_root == os.path.realpath(bare_suite["root"])
+
+
+def test_bare_addbibresource_resolved_via_suite_root(bare_suite):
+    """\\addbibresource{_master.bib} at the suite root is found even though the
+    template lives in a sibling template/ folder (the core audit bug)."""
+    parts = load_template_parts(_BARE_TEMPLATE, bare_suite["template"])
+    assert set(parts.bib_index) == {"smith2020depression", "jones2019methods"}
+
+
+def test_deckgen_annotation_overrides_builtin_and_describes_new_macro(bare_suite):
+    """A vault-side ``% @deckgen`` comment describes a macro WITHOUT touching app
+    code, overrides the built-in house description, and works for a macro the app
+    has never heard of (positional AND explicit forms)."""
+    parts = load_template_parts(_BARE_TEMPLATE, bare_suite["template"])
+    sheet = macro_cheatsheet(parts.macros)
+    assert "custom-cite-desc-xyz" in sheet     # positional form, beats builtin citefoot desc
+    assert "custom-logo-desc-xyz" in sheet     # explicit "\name: desc" form
+    assert "highlight important text" in sheet  # brand-new macro, no code change
+
+
+def test_described_macros_ordered_before_undescribed(bare_suite):
+    """An undescribed macro sorts after every described one, so the cheatsheet
+    leads with the macros the model most needs guidance on."""
+    parts = load_template_parts(_BARE_TEMPLATE, bare_suite["template"])
+    names = [m.name for m in parts.macros]
+    assert names.index("plainmacro") == len(names) - 1
+
+
+def test_scan_annotations_positional_does_not_bleed_across_code():
+    """A dangling positional annotation is dropped by an intervening code line, so
+    it never mis-attaches to a much later macro."""
+    from deckgen.template import _scan_annotations
+    src = (
+        "% @deckgen: orphan description\n"
+        "\\usepackage{something}\n"          # code line clears the pending annotation
+        "\\newcommand{\\later}[1]{#1}\n"
+    )
+    ann = _scan_annotations(src)
+    assert "later" not in ann

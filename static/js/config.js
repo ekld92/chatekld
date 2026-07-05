@@ -11,8 +11,8 @@
  * remembers its own chat model in a distinct config field
  * (openai_model/anthropic_model/google_model), resolved by _resolveSavedChatModel.
  */
-import { secureFetch, readSSE } from './api.js';
-import { updateProviderBadge, taskBegin, taskEnd, isOnlineProvider } from './ui.js';
+import { secureFetch, consumeSSE } from './api.js';
+import { updateProviderBadge, taskBegin, taskEnd, isOnlineProvider, announceStatus, announceError } from './ui.js';
 
 let _activeProvider = 'ollama';
 let _configModel = '';
@@ -22,6 +22,17 @@ let _configOcrModel = '';
 let _configVisionProvider = 'ollama';
 let _configVisionModel = '';
 let _configEmbedProvider = 'ollama';
+// Item 3.2 (improvement plan 2026-07-04): generation tokens serialising the
+// two multi-await flows that used to race. A rapid double provider-switch
+// interleaved onProviderChange's 4 async steps, letting switch A's late
+// loadModels/save land AFTER B became active — persisting A's model into
+// B's config key (the test_03b clobber family, this time client-side). Each
+// run captures ++gen and abandons itself after any await if a newer run
+// started. Invariant (pinned by tests/js/configPersistence.test.js): only
+// the LATEST switch's model list survives into the DOM.
+let _providerSwitchGen = 0;
+let _loadModelsGen = 0;
+
 const _ONLINE_MODEL_KEYS = {
     openai: 'openai_model',
     anthropic: 'anthropic_model',
@@ -83,12 +94,19 @@ function _resolveSavedChatModel(config, provider) {
 export async function onProviderChange() {
     const providerSelect = document.getElementById('provider-select');
     const newProvider = providerSelect.value;
-    
+    // Item 3.2: capture this switch's generation; abandon after any await if
+    // a newer switch started (see the token declaration for the clobber this
+    // prevents). The trailing saveSelectedModels() is GONE: a provider switch
+    // is a load, and loads never save — the new provider's saved model is
+    // re-read from config and restored by loadModels; only an explicit user
+    // change event persists a model.
+    const gen = ++_providerSwitchGen;
     try {
         const saveResp = await secureFetch('/api/config', {
             method: 'POST',
             body: JSON.stringify({ provider: newProvider })
         });
+        if (gen !== _providerSwitchGen) return;
         if (saveResp.ok) {
             _activeProvider = newProvider;
             // When switching providers, refresh the saved chat model
@@ -97,14 +115,15 @@ export async function onProviderChange() {
             try {
                 const cfgResp = await secureFetch('/api/config');
                 const cfgData = await cfgResp.json();
+                if (gen !== _providerSwitchGen) return;
                 _configModel = _resolveSavedChatModel(cfgData, newProvider);
             } catch (_) { /* best-effort */ }
+            if (gen !== _providerSwitchGen) return;
             updateProviderBadge(newProvider);
             const pullBtn = document.getElementById('pull-model-btn');
             if (pullBtn) pullBtn.style.display = newProvider === 'ollama' ? '' : 'none';
             window.dispatchEvent(new CustomEvent('providerChanged', { detail: { provider: newProvider } }));
             await loadModels();
-            await saveSelectedModels();
         }
     } catch (e) {
         console.error('Provider change failed:', e);
@@ -129,9 +148,16 @@ async function onEmbedProviderChange() {
     if (isOnlineProvider(_activeProvider)) {
         const embedSelect = document.getElementById('embed-select');
         if (embedSelect) {
-            _configEmbed = '';
+            // Item 3.2: repopulate WITHOUT clearing the saved embed or
+            // saving. The old code blanked _configEmbed then persisted the
+            // new provider's first listed model — an automatic adoption the
+            // user never chose. Restore the saved embed when the new
+            // provider still offers it; otherwise the user picks (the
+            // select's change handler is the persist path).
             await _populateEmbeddingsFromLocal(embedSelect);
-            await saveSelectedModels();
+            if (_configEmbed && [...embedSelect.options].some(opt => opt.value === _configEmbed)) {
+                embedSelect.value = _configEmbed;
+            }
         }
     }
 }
@@ -144,8 +170,13 @@ async function onEmbedProviderChange() {
  * persisted selection when it is still a valid option, then saves.
  */
 export async function loadModels() {
+    // Item 3.2: latest-wins — a stale concurrent load (rapid provider
+    // switches, pull-completion refresh racing boot) must not rebuild the
+    // selectors with an outdated list.
+    const gen = ++_loadModelsGen;
     const resp = await secureFetch('/api/models');
     const data = await resp.json();
+    if (gen !== _loadModelsGen) return;
     const modelSelect = document.getElementById('model-select');
     const embedSelect = document.getElementById('embed-select');
     if (!modelSelect || !embedSelect) return;
@@ -188,28 +219,39 @@ export async function loadModels() {
         // online provider's chat-only list.
         await _populateEmbeddingsFromLocal(embedSelect);
     } else {
-        let embeddingModels = allModels.filter(m =>
+        const embeddingModels = allModels.filter(m =>
             typeof m === 'string' &&
             (m.toLowerCase().includes('embed') || m.toLowerCase().includes('nomic') || m.toLowerCase().includes('mxbai'))
         );
-        if (embeddingModels.length === 0 && allModels.length > 0) embeddingModels = allModels;
+        // Item 3.2: the old fallback dumped the WHOLE model list (i.e. chat
+        // models) into the embed selector when nothing embed-shaped existed —
+        // and the load-time save then PERSISTED a chat model as `embed`,
+        // which the indexer would faithfully embed the whole vault with.
+        // An honest empty state ("No embedding models available", selector
+        // disabled) beats a silently wrong persisted default.
         populate(embedSelect, embeddingModels, 'No embedding models available');
     }
 
+    // Item 3.2 — LOADS NEVER SAVE. This function used to (a) silently ADOPT
+    // the first listed option into the in-memory selection whenever the saved
+    // model was missing from the list, and (b) unconditionally end with
+    // saveSelectedModels() — so booting against a degraded/offline backend
+    // (empty or partial model list) REWROTE the user's persisted model with
+    // whatever happened to be first. Now: restore the saved selection when
+    // present; otherwise the <select> merely DISPLAYS its first option
+    // without adopting or persisting anything. The ONLY persist paths are
+    // the explicit user change handlers below (and deliberate actions like
+    // indexVault that read the live selects). Invariant (pinned by
+    // tests/js/configPersistence.test.js): loadModels never POSTs /api/config.
     if (_configModel && [...modelSelect.options].some(opt => opt.value === _configModel)) {
         modelSelect.value = _configModel;
-    } else if (!modelSelect.disabled && modelSelect.value) {
-        _configModel = modelSelect.value;
     }
     if (_configEmbed && [...embedSelect.options].some(opt => opt.value === _configEmbed)) {
         embedSelect.value = _configEmbed;
-    } else if (!embedSelect.disabled && embedSelect.value) {
-        _configEmbed = embedSelect.value;
     }
 
     modelSelect.onchange = saveSelectedModels;
     embedSelect.onchange = saveSelectedModels;
-    await saveSelectedModels();
 }
 
 async function _populateEmbeddingsFromLocal(embedSelect) {
@@ -221,11 +263,12 @@ async function _populateEmbeddingsFromLocal(embedSelect) {
         const resp = await secureFetch(`/api/vision-models?provider=${encodeURIComponent(provider)}&kind=ocr`);
         const data = await resp.json();
         const allModels = Array.isArray(data.models) ? data.models : [];
-        let embeddingModels = allModels.filter(m =>
+        const embeddingModels = allModels.filter(m =>
             typeof m === 'string' &&
             (m.toLowerCase().includes('embed') || m.toLowerCase().includes('nomic') || m.toLowerCase().includes('mxbai'))
         );
-        if (embeddingModels.length === 0 && allModels.length > 0) embeddingModels = allModels;
+        // Same fallback kill as loadModels (item 3.2): never offer chat
+        // models as embedding candidates — an honest empty state instead.
         embedSelect.innerHTML = '';
         if (embeddingModels.length === 0) {
             const opt = document.createElement('option');
@@ -399,24 +442,32 @@ export async function pullModel() {
     taskBegin('pull-model', `Pulling ${model}\u2026`);
 
     try {
-        const resp = await secureFetch('/api/pull', {
+        await consumeSSE('/api/pull', {
             method: 'POST',
             body: JSON.stringify({model})
+        }, {
+            onInfo: () => {},
+            onToken: () => {},
+            onOther: (d) => {
+                if (d.status) statusEl.textContent = d.status;
+                if (d.total && d.completed) {
+                    const pct = Math.round((d.completed / d.total) * 100);
+                    progressFill.style.width = pct + '%';
+                    if (progressWrap) progressWrap.setAttribute('aria-valuenow', String(pct));
+                }
+            },
+            onError: (err) => { throw new Error(err); }
         });
 
-        for await (const d of readSSE(resp)) {
-            if (d.error) { statusEl.textContent = 'Error: ' + d.error; return; }
-            if (d.status) statusEl.textContent = d.status;
-            if (d.total && d.completed) {
-                const pct = Math.round((d.completed / d.total) * 100);
-                progressFill.style.width = pct + '%';
-                if (progressWrap) progressWrap.setAttribute('aria-valuenow', String(pct));
-            }
-        }
         statusEl.textContent = 'Done!';
+        // Track 6b: TERMINAL-only announcements. #pull-status is deliberately
+        // NOT a live region — the per-chunk progress writes above would spam
+        // a screen reader on every download chunk.
+        announceStatus('Model download complete.');
         await loadModels();
     } catch (e) {
         statusEl.textContent = 'Error: ' + e.message;
+        announceError('Model download failed: ' + e.message);
     } finally {
         btn.disabled = false;
         taskEnd('pull-model');

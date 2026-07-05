@@ -22,7 +22,6 @@ import json
 import os
 import tempfile
 import unittest
-from typing import Iterator
 from unittest.mock import MagicMock, patch
 
 
@@ -112,7 +111,7 @@ class TestToolSchemaSerializers(unittest.TestCase):
     def _spec(self):
         from core.llm.types import ToolSchema
         return ToolSchema(
-            name="vault.search",
+            name="vault_search",
             description="Search the vault.",
             parameters={
                 "type": "object",
@@ -129,20 +128,20 @@ class TestToolSchemaSerializers(unittest.TestCase):
         from core.llm.tool_schema import jsonschema_to_openai_tool
         out = jsonschema_to_openai_tool(self._spec())
         self.assertEqual(out["type"], "function")
-        self.assertEqual(out["function"]["name"], "vault.search")
+        self.assertEqual(out["function"]["name"], "vault_search")
         self.assertIn("properties", out["function"]["parameters"])
         self.assertEqual(out["function"]["parameters"]["required"], ["query"])
 
     def test_anthropic_serialiser(self):
         from core.llm.tool_schema import jsonschema_to_anthropic_tool
         out = jsonschema_to_anthropic_tool(self._spec())
-        self.assertEqual(out["name"], "vault.search")
+        self.assertEqual(out["name"], "vault_search")
         self.assertIn("properties", out["input_schema"])
 
     def test_gemini_serialiser_strips_unsupported_fields(self):
         from core.llm.tool_schema import jsonschema_to_gemini_tool
         out = jsonschema_to_gemini_tool(self._spec())
-        self.assertEqual(out["name"], "vault.search")
+        self.assertEqual(out["name"], "vault_search")
         params = out["parameters"]
         self.assertNotIn("additionalProperties", params)
         self.assertNotIn("default", params["properties"]["top_k"])
@@ -162,12 +161,12 @@ class TestToolSchemaSerializers(unittest.TestCase):
         raw = {
             "id": "call_abc",
             "type": "function",
-            "function": {"name": "vault.search", "arguments": '{"query":"x"}'},
+            "function": {"name": "vault_search", "arguments": '{"query":"x"}'},
         }
         tc = parse_openai_tool_call(raw)
         self.assertIsNotNone(tc)
         self.assertEqual(tc.id, "call_abc")
-        self.assertEqual(tc.name, "vault.search")
+        self.assertEqual(tc.name, "vault_search")
         self.assertEqual(tc.arguments, {"query": "x"})
         self.assertEqual(tc.raw_arguments, '{"query":"x"}')
 
@@ -212,7 +211,7 @@ class TestToolSchemaSerializers(unittest.TestCase):
         raw = {
             "type": "tool_use",
             "id": "toolu_x",
-            "name": "vault.search",
+            "name": "vault_search",
             "input": {"query": "y"},
         }
         tc = parse_anthropic_tool_use(raw)
@@ -231,16 +230,164 @@ class TestToolSchemaSerializers(unittest.TestCase):
 
     def test_parse_gemini_function_call_synthesises_id(self):
         from core.llm.tool_schema import parse_gemini_function_call
-        raw = {"name": "vault.search", "args": {"query": "z"}}
+        raw = {"name": "vault_search", "args": {"query": "z"}}
         tc = parse_gemini_function_call(raw)
         self.assertIsNotNone(tc)
         self.assertTrue(tc.id.startswith("call_"))
-        self.assertEqual(tc.name, "vault.search")
+        self.assertEqual(tc.name, "vault_search")
         self.assertEqual(tc.arguments, {"query": "z"})
 
     def test_parse_gemini_function_call_rejects_missing_name(self):
         from core.llm.tool_schema import parse_gemini_function_call
         self.assertIsNone(parse_gemini_function_call({"args": {"x": 1}}))
+
+
+class TestProviderToolPayloadContract(unittest.TestCase):
+    """Provider-side constraints on OUTGOING payloads.
+
+    The suite mocks all HTTP transports, so provider-side request validation
+    (tool-name regexes, Gemini 3 thought signatures, the ollama client's own
+    pydantic request models) is otherwise invisible — the exact blind spot
+    that let the dotted ``vault.search`` names ship and 400 every
+    tool-enabled request on OpenAI + Anthropic (2026-07-02). These tests are
+    the in-process stand-in for that provider validation.
+    """
+
+    # Documented provider rules (from the providers' own 400 messages/docs).
+    _OPENAI_NAME_RE = r"^[a-zA-Z0-9_-]+$"
+    _ANTHROPIC_NAME_RE = r"^[a-zA-Z0-9_-]{1,128}$"
+    _GEMINI_NAME_RE = r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
+
+    def _builtin_schemas(self):
+        from unittest.mock import MagicMock
+        from core.agent.vault_tools import VaultToolContext, build_vault_tools
+        ctx = VaultToolContext(llm_name="m", embed_name="e", provider_name="ollama")
+        return [s.schema for s in build_vault_tools(MagicMock(), ctx)]
+
+    def test_builtin_tool_names_satisfy_every_provider(self):
+        schemas = self._builtin_schemas()
+        self.assertEqual(len(schemas), 3)
+        for schema in schemas:
+            for pattern in (self._OPENAI_NAME_RE, self._ANTHROPIC_NAME_RE,
+                            self._GEMINI_NAME_RE):
+                self.assertRegex(schema.name, pattern)
+            self.assertNotIn(".", schema.name)  # the 2026-07-02 regression
+
+    def test_serializers_pass_names_through_unchanged(self):
+        from core.llm.tool_schema import (
+            jsonschema_to_anthropic_tool,
+            jsonschema_to_gemini_tool,
+            jsonschema_to_openai_tool,
+        )
+        for schema in self._builtin_schemas():
+            self.assertEqual(jsonschema_to_openai_tool(schema)["function"]["name"], schema.name)
+            self.assertEqual(jsonschema_to_anthropic_tool(schema)["name"], schema.name)
+            self.assertEqual(jsonschema_to_gemini_tool(schema)["name"], schema.name)
+
+    def test_registry_rejects_dotted_tool_name(self):
+        from core.agent.tools import ToolRegistry, ToolSpec
+        from core.llm.types import ToolSchema
+        bad = ToolSpec(
+            schema=ToolSchema(name="vault.search", description="d"),
+            runner=lambda args: "",
+        )
+        with self.assertRaises(ValueError):
+            ToolRegistry([bad])
+
+    def test_registry_rejects_leading_digit_tool_name(self):
+        # Gemini requires a letter/underscore start; the registry enforces
+        # the strictest intersection of all providers' rules.
+        from core.agent.tools import ToolRegistry, ToolSpec
+        from core.llm.types import ToolSchema
+        bad = ToolSpec(
+            schema=ToolSchema(name="1search", description="d"),
+            runner=lambda args: "",
+        )
+        with self.assertRaises(ValueError):
+            ToolRegistry([bad])
+
+    def test_gemini_thought_signature_captured_from_part(self):
+        # Gemini 3.x: the signature rides on the PART, next to functionCall.
+        from core.llm.adapters.google import _extract_text_finish_and_calls
+        body = {
+            "candidates": [{
+                "content": {"parts": [{
+                    "functionCall": {"name": "vault_search", "args": {"query": "x"}},
+                    "thoughtSignature": "sig-abc123",
+                }]},
+                "finishReason": "STOP",
+            }],
+        }
+        _text, _finish, calls = _extract_text_finish_and_calls(body)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].thought_signature, "sig-abc123")
+
+    def test_gemini_thought_signature_reemitted_on_part(self):
+        from core.llm.tool_schema import build_gemini_contents
+        from core.llm.types import LLMRequest, ToolCall, ToolResult, ToolTurn
+        call = ToolCall(id="c1", name="vault_search", arguments={"query": "x"},
+                        thought_signature="sig-abc123")
+        req = LLMRequest(
+            model="gemini-3.1-pro-preview",
+            messages=[{"role": "user", "content": "q"}],
+            tool_history=[ToolTurn(
+                calls=[call],
+                results=[ToolResult(tool_call_id="c1", content="r")],
+            )],
+        )
+        contents = build_gemini_contents(req)
+        call_part = contents[1]["parts"][0]
+        self.assertEqual(call_part["functionCall"]["name"], "vault_search")
+        self.assertEqual(call_part["thoughtSignature"], "sig-abc123")
+
+    def test_gemini_no_signature_emits_no_key(self):
+        # Older Gemini models never set it — the key must stay absent (an
+        # empty-string signature is not "no signature" to the endpoint).
+        from core.llm.tool_schema import build_gemini_contents
+        from core.llm.types import LLMRequest, ToolCall, ToolResult, ToolTurn
+        req = LLMRequest(
+            model="gemini-2.5-pro",
+            messages=[{"role": "user", "content": "q"}],
+            tool_history=[ToolTurn(
+                calls=[ToolCall(id="c1", name="vault_search", arguments={})],
+                results=[ToolResult(tool_call_id="c1", content="r")],
+            )],
+        )
+        contents = build_gemini_contents(req)
+        self.assertNotIn("thoughtSignature", contents[1]["parts"][0])
+
+    def test_ollama_messages_arguments_become_dicts(self):
+        # The ollama client's request-side Message model types
+        # tool_calls[].function.arguments as Mapping — the OpenAI-shape JSON
+        # string failed its pydantic validation on every multi-turn agent
+        # conversation (iteration 2+).
+        from core.llm.adapters.local import _ollama_messages
+        msgs = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "vault_search",
+                             "arguments": '{"query": "humeur"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+        out = _ollama_messages(msgs)
+        args = out[1]["tool_calls"][0]["function"]["arguments"]
+        self.assertIsInstance(args, dict)
+        self.assertEqual(args, {"query": "humeur"})
+        # role=tool gains ollama's native tool_name
+        self.assertEqual(out[2]["tool_name"], "vault_search")
+        # input list is not mutated
+        self.assertIsInstance(msgs[1]["tool_calls"][0]["function"]["arguments"], str)
+
+    def test_ollama_messages_malformed_arguments_degrade_to_empty(self):
+        from core.llm.adapters.local import _ollama_messages
+        msgs = [{"role": "assistant", "content": None, "tool_calls": [{
+            "id": "c", "type": "function",
+            "function": {"name": "t", "arguments": "{not json"},
+        }]}]
+        out = _ollama_messages(msgs)
+        self.assertEqual(out[0]["tool_calls"][0]["function"]["arguments"], {})
 
 
 class TestRedaction(unittest.TestCase):
@@ -561,6 +708,47 @@ class TestUsageTracking(unittest.TestCase):
         )
         self.assertAlmostEqual(cost, 1.00, places=4)
 
+    def test_record_writes_cost_back_onto_usage(self):
+        # Improvement plan 0.3: record() must set estimated_cost_usd on the
+        # SAME LLMUsage object the adapter attaches to its response — that is
+        # what the agent loop's UsageBudget sums, and it was always 0.0.
+        from core.llm.usage import UsageTracker
+        from core.llm.types import LLMUsage
+        tracker = UsageTracker()  # no log path — memory only
+        usage = LLMUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+        tracker.record(provider="openai", model="gpt-4o-mini", usage=usage,
+                       latency_ms=10, stream=False)
+        self.assertAlmostEqual(usage.estimated_cost_usd, 0.75, places=4)
+
+    def test_record_costs_zero_for_local_and_failed(self):
+        from core.llm.usage import UsageTracker
+        from core.llm.types import LLMUsage
+        tracker = UsageTracker()
+        local = LLMUsage(input_tokens=5000, output_tokens=5000)
+        tracker.record(provider="ollama", model="qwen2.5:7b", usage=local,
+                       latency_ms=10, stream=False)
+        self.assertEqual(local.estimated_cost_usd, 0.0)
+        failed = LLMUsage(input_tokens=1_000_000, output_tokens=0)
+        tracker.record(provider="openai", model="gpt-4o-mini", usage=failed,
+                       latency_ms=10, stream=False, success=False,
+                       error_category="timeout")
+        self.assertEqual(failed.estimated_cost_usd, 0.0)
+
+    def test_agent_budget_sums_recorded_cost(self):
+        # End-to-end for the "$0 agent cost" bug: adapter records usage →
+        # write-back → UsageBudget.record sums real dollars.
+        from core.agent.budget import UsageBudget
+        from core.llm.usage import UsageTracker
+        from core.llm.types import LLMUsage
+        tracker = UsageTracker()
+        budget = UsageBudget()
+        for _ in range(2):
+            usage = LLMUsage(input_tokens=500_000, output_tokens=0)
+            tracker.record(provider="openai", model="gpt-4o-mini", usage=usage,
+                           latency_ms=5, stream=False)
+            budget.record(usage)
+        self.assertAlmostEqual(budget.estimated_cost_usd, 0.15, places=4)
+
     def test_summary_dedup_by_uid_not_timestamp_provider(self):
         """Row 4: a ring record whose disk write failed must still be counted
         even when a *different* on-disk record shares its (timestamp,
@@ -683,6 +871,49 @@ class TestRetry(unittest.TestCase):
         with patch("core.llm.retry.time.sleep"), self.assertRaises(LLMError):
             retry_with_backoff(fn, max_attempts=2, base_delay_s=0.01)
 
+    def test_deadline_stops_retries_immediately(self):
+        # Improvement plan 1.3: once the deadline has passed, a transient error
+        # re-raises instead of sleeping into another attempt.
+        import time as _time
+        from core.llm.retry import retry_with_backoff
+        from core.llm.types import ErrorCategory, LLMError
+        attempts = {"count": 0}
+
+        def fn():
+            attempts["count"] += 1
+            raise LLMError(category=ErrorCategory.SERVER_ERROR, message="boom",
+                           provider="x", retryable=True)
+
+        with patch("core.llm.retry.time.sleep") as slept, self.assertRaises(LLMError):
+            retry_with_backoff(
+                fn, max_attempts=5, base_delay_s=10.0,
+                deadline_monotonic_s=_time.monotonic() - 1.0,  # already expired
+            )
+        self.assertEqual(attempts["count"], 1)   # no second attempt
+        slept.assert_not_called()
+
+    def test_deadline_truncates_backoff_sleep(self):
+        import time as _time
+        from core.llm.retry import retry_with_backoff
+        from core.llm.types import ErrorCategory, LLMError
+        attempts = {"count": 0}
+
+        def fn():
+            attempts["count"] += 1
+            if attempts["count"] < 2:
+                raise LLMError(category=ErrorCategory.SERVER_ERROR, message="boom",
+                               provider="x", retryable=True)
+            return "ok"
+
+        with patch("core.llm.retry.time.sleep") as slept:
+            result = retry_with_backoff(
+                fn, max_attempts=5, base_delay_s=60.0,   # would sleep ~60s...
+                deadline_monotonic_s=_time.monotonic() + 2.0,  # ...but only 2s left
+            )
+        self.assertEqual(result, "ok")
+        (sleep_arg,), _ = slept.call_args
+        self.assertLessEqual(sleep_arg, 2.0)
+
 
 # ---------------------------------------------------------------------------
 # Adapter behaviour: OpenAI (mocked SDK)
@@ -771,23 +1002,44 @@ class TestOpenAIAdapter(unittest.TestCase):
 
     def test_reasoning_model_param_contract(self):
         # o-series reasoning models reject temperature/top_p and require
-        # max_completion_tokens (verified vs platform.openai.com 2026-06).
+        # max_completion_tokens (re-verified vs platform.openai.com 2026-07).
         from core.llm.adapters.openai import OpenAIProvider
         from core.llm.types import LLMRequest
-        p = OpenAIProvider()
-        rp = p._common_params(LLMRequest(model="o3-mini", temperature=0.3, top_p=0.9, max_tokens=500))
-        self.assertNotIn("temperature", rp)
-        self.assertNotIn("top_p", rp)
-        self.assertNotIn("max_tokens", rp)
-        self.assertEqual(rp["max_completion_tokens"], 500)
-        # gpt-* keep the legacy shape (and compat-endpoint friendliness)
-        gp = p._common_params(LLMRequest(model="gpt-4o-mini", temperature=0.3, max_tokens=500))
-        self.assertEqual(gp["temperature"], 0.3)
+        with patch.object(OpenAIProvider, "_base_url", return_value=None):
+            p = OpenAIProvider()
+            rp = p._common_params(LLMRequest(model="o3-mini", temperature=0.3, top_p=0.9, max_tokens=500))
+            self.assertNotIn("temperature", rp)
+            self.assertNotIn("top_p", rp)
+            self.assertNotIn("max_tokens", rp)
+            self.assertEqual(rp["max_completion_tokens"], 500)
+            # On the OFFICIAL endpoint every model now gets max_completion_tokens
+            # (max_tokens deprecated 2024-09, hard-rejected by gpt-5.x — the
+            # field-reported "Unsupported parameter: 'max_tokens'" 400) but keeps
+            # its sampling params (gpt-4o/gpt-5-chat accept them).
+            gp = p._common_params(LLMRequest(model="gpt-4o-mini", temperature=0.3, max_tokens=500))
+            self.assertEqual(gp["temperature"], 0.3)
+            self.assertEqual(gp["max_completion_tokens"], 500)
+            self.assertNotIn("max_tokens", gp)
+            g5 = p._common_params(LLMRequest(model="gpt-5.4", temperature=0.3, max_tokens=500))
+            self.assertEqual(g5["max_completion_tokens"], 500)
+            self.assertNotIn("max_tokens", g5)
+            self.assertEqual(g5["temperature"], 0.3)
+            # gpt-4o must NOT be misdetected as reasoning (it ends in 'o', not o\d)
+            self.assertFalse(OpenAIProvider._is_reasoning_model("gpt-4o"))
+            self.assertTrue(OpenAIProvider._is_reasoning_model("o1-preview"))
+
+    def test_compat_base_url_keeps_legacy_max_tokens(self):
+        # A custom OpenAI-compatible base_url may predate max_completion_tokens
+        # — those endpoints keep the legacy shape (except for model families
+        # known to hard-reject it, e.g. someone proxying gpt-5/o-series).
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.types import LLMRequest
+        p = OpenAIProvider(base_url="http://localhost:1234/v1")
+        gp = p._common_params(LLMRequest(model="some-local-model", max_tokens=500))
         self.assertEqual(gp["max_tokens"], 500)
         self.assertNotIn("max_completion_tokens", gp)
-        # gpt-4o must NOT be misdetected as reasoning (it ends in 'o', not o\d)
-        self.assertFalse(OpenAIProvider._is_reasoning_model("gpt-4o"))
-        self.assertTrue(OpenAIProvider._is_reasoning_model("o1-preview"))
+        g5 = p._common_params(LLMRequest(model="gpt-5.4", max_tokens=500))
+        self.assertEqual(g5["max_completion_tokens"], 500)
 
     def test_health_check_requires_key(self):
         from core.llm.adapters.openai import OpenAIProvider
@@ -893,10 +1145,11 @@ class TestOpenAIAdapter(unittest.TestCase):
 class TestLocalAdapter(unittest.TestCase):
     def test_effective_local_timeout_quantizes_to_bound_client_cache(self):
         # Audit finding #1: the agent feeds a continuously-varying remaining-
-        # deadline float as the ollama client timeout, and OllamaProvider._client
-        # caches one client+httpx pool per distinct (host, timeout). Without ceil
-        # quantization that cache grows unboundedly (fd/memory leak). Verify the
-        # varying sub-second floats collapse to a single integer-second bucket.
+        # deadline float as the local client timeout, and the client caches keep one
+        # client+httpx pool per distinct (host, timeout). Without quantization that
+        # cache grows unboundedly (fd/memory leak). Verify varying sub-second floats
+        # collapse to a single integer-second bucket. (C3: uses round, matching the
+        # downstream caches' own rounding, instead of ceil which overran the deadline.)
         from core.llm.adapters.local import _effective_local_timeout
         from core.llm.types import LLMRequest
         # Pin the configured local timeout to "unset" so only request.timeout_s
@@ -907,10 +1160,42 @@ class TestLocalAdapter(unittest.TestCase):
                 for t in (29.8, 29.831, 29.861, 29.89, 29.918, 29.999, 30.0)
             }
             self.assertEqual(buckets, {30.0})  # all collapse → bounded cache key space
-            # ceil never rounds DOWN (a call is never cut shorter than intended)
-            self.assertEqual(_effective_local_timeout(LLMRequest(model="m", timeout_s=12.01)), 13.0)
+            # round (matches OllamaProvider._client / lms.get_lmstudio_client), so it
+            # never overshoots the remaining deadline by a full second the way ceil did
+            self.assertEqual(_effective_local_timeout(LLMRequest(model="m", timeout_s=12.01)), 12.0)
+            # a near-exhausted budget floors at 1 s, never 0 (= "time out immediately")
+            self.assertEqual(_effective_local_timeout(LLMRequest(model="m", timeout_s=0.3)), 1.0)
             # no timeout anywhere → None (leave the SDK default)
             self.assertIsNone(_effective_local_timeout(LLMRequest(model="m", timeout_s=None)))
+
+    def test_classify_local_error_is_type_based_not_message_based(self):
+        # Audit follow-up C1: classification must key on the exception TYPE, not a
+        # substring scan of str(exc). A real transport error → retryable
+        # NETWORK/TIMEOUT (fallback-eligible); a non-transport error whose MESSAGE
+        # merely contains "connection"/"timeout" → UNKNOWN, not retryable (no
+        # spurious failover to a paid online provider).
+        import httpx
+        from core.llm.adapters.local import _classify_local_error
+        from core.llm.types import ErrorCategory
+
+        net = _classify_local_error(httpx.ConnectError("refused"), provider="ollama")
+        self.assertEqual(net.category, ErrorCategory.NETWORK)
+        self.assertTrue(net.retryable)
+
+        tmo = _classify_local_error(httpx.ReadTimeout("slow"), provider="ollama")
+        self.assertEqual(tmo.category, ErrorCategory.TIMEOUT)
+        self.assertTrue(tmo.retryable)
+
+        builtin = _classify_local_error(ConnectionRefusedError("x"), provider="ollama")
+        self.assertEqual(builtin.category, ErrorCategory.NETWORK)
+
+        # NOT a transport error, but its message contains the trigger words:
+        decoy = _classify_local_error(
+            ValueError("lost connection to model; request timeout in body"),
+            provider="ollama",
+        )
+        self.assertEqual(decoy.category, ErrorCategory.UNKNOWN)
+        self.assertFalse(decoy.retryable)
 
     def test_health_check_delegates(self):
         from core.llm.adapters.local import LocalLLMProvider
@@ -958,12 +1243,12 @@ def _make_request_with_tool_history():
         LLMRequest, ToolCall, ToolResult, ToolSchema, ToolTurn,
     )
     spec = ToolSchema(
-        name="vault.search",
+        name="vault_search",
         description="Search the vault.",
         parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
     )
     call = ToolCall(
-        id="call_001", name="vault.search",
+        id="call_001", name="vault_search",
         arguments={"query": "anti-D"},
         raw_arguments='{"query":"anti-D"}',
     )
@@ -991,7 +1276,7 @@ class TestMessageBuilders(unittest.TestCase):
         self.assertIsNone(assistant["content"])
         self.assertEqual(len(assistant["tool_calls"]), 1)
         self.assertEqual(assistant["tool_calls"][0]["id"], "call_001")
-        self.assertEqual(assistant["tool_calls"][0]["function"]["name"], "vault.search")
+        self.assertEqual(assistant["tool_calls"][0]["function"]["name"], "vault_search")
         tool_msg = msgs[3]
         self.assertEqual(tool_msg["role"], "tool")
         self.assertEqual(tool_msg["tool_call_id"], "call_001")
@@ -1044,11 +1329,11 @@ class TestMessageBuilders(unittest.TestCase):
         # Second: model with functionCall.
         self.assertEqual(contents[1]["role"], "model")
         self.assertIn("functionCall", contents[1]["parts"][0])
-        self.assertEqual(contents[1]["parts"][0]["functionCall"]["name"], "vault.search")
+        self.assertEqual(contents[1]["parts"][0]["functionCall"]["name"], "vault_search")
         # Third: user with functionResponse.
         self.assertEqual(contents[2]["role"], "user")
         self.assertIn("functionResponse", contents[2]["parts"][0])
-        self.assertEqual(contents[2]["parts"][0]["functionResponse"]["name"], "vault.search")
+        self.assertEqual(contents[2]["parts"][0]["functionResponse"]["name"], "vault_search")
         self.assertIn("content", contents[2]["parts"][0]["functionResponse"]["response"])
 
     def test_gemini_contents_marks_tool_error_under_error_key(self):
@@ -1059,7 +1344,7 @@ class TestMessageBuilders(unittest.TestCase):
         req = LLMRequest(
             model="m",
             tool_history=[ToolTurn(
-                calls=[ToolCall(id="c1", name="vault.read_note")],
+                calls=[ToolCall(id="c1", name="vault_read_note")],
                 results=[ToolResult(tool_call_id="c1", content="not found", is_error=True)],
             )],
         )
@@ -1091,7 +1376,18 @@ def _fake_httpx_module(response_body, status_code=200):
 
     client_mock = MagicMock()
     client_mock.post.return_value = resp_mock
-    fake_httpx.Client.return_value.__enter__.return_value = client_mock
+    # The Anthropic/Google adapters now use a cached, long-lived httpx client used
+    # DIRECTLY (client = self._client()), not only via `with httpx.Client() as c`.
+    # Make Client() yield client_mock in BOTH shapes: returned directly AND via
+    # __enter__ (the streaming path still wraps it in contextlib.nullcontext).
+    client_mock.__enter__.return_value = client_mock
+    fake_httpx.Client.return_value = client_mock
+    # Isolate the module-level client caches: the adapters key a client by
+    # (base_url, timeout), so without this a mock cached by one test would leak
+    # into the next (same default base_url + timeout) and shadow its fresh fake.
+    from core.llm.adapters import anthropic as _anthropic, google as _google
+    _anthropic._client_cache.clear()
+    _google._client_cache.clear()
     return fake_httpx, client_mock, resp_mock
 
 
@@ -1124,8 +1420,8 @@ class TestAdapterToolUse(unittest.TestCase):
         from core.llm.adapters.openai import OpenAIProvider
         from core.llm.types import LLMRequest, ToolSchema
 
-        function = MagicMock(name="vault.search", arguments='{"query":"x"}')
-        function.name = "vault.search"
+        function = MagicMock(name="vault_search", arguments='{"query":"x"}')
+        function.name = "vault_search"
         function.arguments = '{"query":"x"}'
         tool_call_obj = MagicMock(id="call_xyz", type="function", function=function)
         choice = MagicMock()
@@ -1138,7 +1434,7 @@ class TestAdapterToolUse(unittest.TestCase):
         client.chat.completions.create.return_value = resp
 
         spec = ToolSchema(
-            name="vault.search", description="d",
+            name="vault_search", description="d",
             parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
         )
         req = LLMRequest(
@@ -1154,14 +1450,14 @@ class TestAdapterToolUse(unittest.TestCase):
         # Outgoing payload should have tools + tool_choice.
         sent_kwargs = client.chat.completions.create.call_args.kwargs
         self.assertIn("tools", sent_kwargs)
-        self.assertEqual(sent_kwargs["tools"][0]["function"]["name"], "vault.search")
+        self.assertEqual(sent_kwargs["tools"][0]["function"]["name"], "vault_search")
         self.assertEqual(sent_kwargs["tool_choice"], "auto")
         # Response should be parsed into a tool_call.
         from core.llm.types import FinishReason
         self.assertEqual(out.finish_reason, FinishReason.TOOL_USE)
         self.assertEqual(len(out.tool_calls), 1)
         self.assertEqual(out.tool_calls[0].id, "call_xyz")
-        self.assertEqual(out.tool_calls[0].name, "vault.search")
+        self.assertEqual(out.tool_calls[0].name, "vault_search")
         self.assertEqual(out.tool_calls[0].arguments, {"query": "x"})
 
     def test_openai_tool_history_round_trips_through_messages(self):
@@ -1196,7 +1492,7 @@ class TestAdapterToolUse(unittest.TestCase):
         from core.llm.types import LLMRequest, ToolSchema, FinishReason
 
         function = MagicMock()
-        function.name = "vault.search"
+        function.name = "vault_search"
         function.arguments = "{not json"
         tool_call_obj = MagicMock(id="call_bad", type="function", function=function)
         choice = MagicMock()
@@ -1208,7 +1504,7 @@ class TestAdapterToolUse(unittest.TestCase):
         client = MagicMock()
         client.chat.completions.create.return_value = resp
 
-        spec = ToolSchema(name="vault.search", description="d", parameters={})
+        spec = ToolSchema(name="vault_search", description="d", parameters={})
         req = LLMRequest(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": "x"}],
@@ -1233,7 +1529,7 @@ class TestAdapterToolUse(unittest.TestCase):
                 {
                     "type": "tool_use",
                     "id": "toolu_abc",
-                    "name": "vault.search",
+                    "name": "vault_search",
                     "input": {"query": "anti-D"},
                 },
             ],
@@ -1243,7 +1539,7 @@ class TestAdapterToolUse(unittest.TestCase):
         fake_httpx, client_mock, _ = _fake_httpx_module(body)
 
         spec = ToolSchema(
-            name="vault.search", description="d",
+            name="vault_search", description="d",
             parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
         )
         req = LLMRequest(
@@ -1257,7 +1553,7 @@ class TestAdapterToolUse(unittest.TestCase):
 
         sent_json = client_mock.post.call_args.kwargs["json"]
         self.assertIn("tools", sent_json)
-        self.assertEqual(sent_json["tools"][0]["name"], "vault.search")
+        self.assertEqual(sent_json["tools"][0]["name"], "vault_search")
         self.assertEqual(sent_json["tool_choice"], {"type": "auto"})
         self.assertEqual(out.finish_reason, FinishReason.TOOL_USE)
         self.assertEqual(len(out.tool_calls), 1)
@@ -1280,8 +1576,10 @@ class TestAdapterToolUse(unittest.TestCase):
         with patch.object(p, "_httpx", return_value=fake_httpx):
             p.generate(req)
         sent_json = client_mock.post.call_args.kwargs["json"]
-        # system goes top-level; messages start with the user turn.
-        self.assertEqual(sent_json["system"], "You are an agent.")
+        # system goes top-level as a cache_control block array (Track 5.5);
+        # messages start with the user turn.
+        self.assertEqual(sent_json["system"][0]["text"], "You are an agent.")
+        self.assertEqual(sent_json["system"][0]["cache_control"], {"type": "ephemeral"})
         msgs = sent_json["messages"]
         # Expect: user, assistant(tool_use), user(tool_result)
         self.assertEqual(msgs[0]["role"], "user")
@@ -1291,11 +1589,13 @@ class TestAdapterToolUse(unittest.TestCase):
         self.assertEqual(msgs[2]["content"][0]["type"], "tool_result")
         self.assertEqual(msgs[2]["content"][0]["tool_use_id"], "call_001")
 
-    def test_anthropic_tool_choice_none_omits_tools_payload(self):
-        """Anthropic's tool_choice union has no ``none`` variant — to
-        honour the cross-provider ``tool_choice="none"`` semantic, the
-        adapter must omit ``tools`` from the request entirely so the
-        model cannot emit tool_use blocks via the auto default."""
+    def test_anthropic_tool_choice_none_keeps_tools_payload(self):
+        """``tool_choice="none"`` must keep ``tools`` in the payload with the
+        ``{"type": "none"}`` choice (supported since 2025; verified vs
+        platform.claude.com 2026-07). The pre-fix behaviour — omitting the
+        tools entirely — 400s whenever the history already contains
+        ``tool_use`` blocks, which is exactly the state the agent loop's
+        forced-final iteration arrives in."""
         from core.llm.adapters.anthropic import AnthropicProvider
         from core.llm.types import LLMRequest, ToolSchema
 
@@ -1306,7 +1606,7 @@ class TestAdapterToolUse(unittest.TestCase):
         }
         fake_httpx, client_mock, _ = _fake_httpx_module(body)
 
-        spec = ToolSchema(name="vault.search", description="d", parameters={})
+        spec = ToolSchema(name="vault_search", description="d", parameters={})
         req = LLMRequest(
             model="claude-opus-4-7",
             messages=[{"role": "user", "content": "hi"}],
@@ -1317,8 +1617,8 @@ class TestAdapterToolUse(unittest.TestCase):
         with patch.object(p, "_httpx", return_value=fake_httpx):
             p.generate(req)
         sent_json = client_mock.post.call_args.kwargs["json"]
-        self.assertNotIn("tools", sent_json)
-        self.assertNotIn("tool_choice", sent_json)
+        self.assertIn("tools", sent_json)
+        self.assertEqual(sent_json["tool_choice"], {"type": "none"})
 
     # ---- Google --------------------------------------------------------
 
@@ -1329,7 +1629,7 @@ class TestAdapterToolUse(unittest.TestCase):
         body = {
             "candidates": [{
                 "content": {"parts": [
-                    {"functionCall": {"name": "vault.search", "args": {"query": "z"}}},
+                    {"functionCall": {"name": "vault_search", "args": {"query": "z"}}},
                 ]},
                 "finishReason": "STOP",
             }],
@@ -1338,7 +1638,7 @@ class TestAdapterToolUse(unittest.TestCase):
         fake_httpx, client_mock, _ = _fake_httpx_module(body)
 
         spec = ToolSchema(
-            name="vault.search", description="d",
+            name="vault_search", description="d",
             parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
         )
         req = LLMRequest(
@@ -1354,13 +1654,13 @@ class TestAdapterToolUse(unittest.TestCase):
         self.assertIn("tools", sent_json)
         self.assertEqual(
             sent_json["tools"][0]["function_declarations"][0]["name"],
-            "vault.search",
+            "vault_search",
         )
         self.assertEqual(sent_json["toolConfig"]["functionCallingConfig"]["mode"], "AUTO")
         # Finish reason promoted from STOP to TOOL_USE because tool_calls are present.
         self.assertEqual(out.finish_reason, FinishReason.TOOL_USE)
         self.assertEqual(len(out.tool_calls), 1)
-        self.assertEqual(out.tool_calls[0].name, "vault.search")
+        self.assertEqual(out.tool_calls[0].name, "vault_search")
         self.assertEqual(out.tool_calls[0].arguments, {"query": "z"})
 
     def test_google_tool_history_round_trips(self):
@@ -1384,11 +1684,11 @@ class TestAdapterToolUse(unittest.TestCase):
         self.assertEqual(contents[0]["role"], "user")
         self.assertIn("text", contents[0]["parts"][0])
         self.assertEqual(contents[1]["role"], "model")
-        self.assertEqual(contents[1]["parts"][0]["functionCall"]["name"], "vault.search")
+        self.assertEqual(contents[1]["parts"][0]["functionCall"]["name"], "vault_search")
         self.assertEqual(contents[2]["role"], "user")
         self.assertEqual(
             contents[2]["parts"][0]["functionResponse"]["name"],
-            "vault.search",
+            "vault_search",
         )
 
     # ---- Local (Ollama) ------------------------------------------------
@@ -1402,7 +1702,7 @@ class TestAdapterToolUse(unittest.TestCase):
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
-                    {"function": {"name": "vault.search", "arguments": {"query": "y"}}},
+                    {"function": {"name": "vault_search", "arguments": {"query": "y"}}},
                 ],
             },
             "done_reason": "stop",
@@ -1415,7 +1715,7 @@ class TestAdapterToolUse(unittest.TestCase):
         # local_request_timeout_s bounds the call; drive that client's .chat.
         mock_provider._client.return_value.chat = MagicMock(return_value=ollama_response)
 
-        spec = ToolSchema(name="vault.search", description="d", parameters={})
+        spec = ToolSchema(name="vault_search", description="d", parameters={})
         req = LLMRequest(
             model="llama3.1",
             messages=[{"role": "user", "content": "search y"}],
@@ -1429,11 +1729,11 @@ class TestAdapterToolUse(unittest.TestCase):
         call_kwargs = mock_provider._client.return_value.chat.call_args.kwargs
         self.assertEqual(call_kwargs["model"], "llama3.1:latest")
         self.assertIn("tools", call_kwargs)
-        self.assertEqual(call_kwargs["tools"][0]["function"]["name"], "vault.search")
+        self.assertEqual(call_kwargs["tools"][0]["function"]["name"], "vault_search")
         self.assertFalse(call_kwargs["stream"])
         self.assertEqual(out.finish_reason, FinishReason.TOOL_USE)
         self.assertEqual(len(out.tool_calls), 1)
-        self.assertEqual(out.tool_calls[0].name, "vault.search")
+        self.assertEqual(out.tool_calls[0].name, "vault_search")
         self.assertEqual(out.tool_calls[0].arguments, {"query": "y"})
 
     def test_local_ollama_no_tools_keeps_legacy_stream_path(self):
@@ -1464,7 +1764,7 @@ class TestAdapterToolUse(unittest.TestCase):
         from core.llm.types import FinishReason, LLMRequest, ToolSchema
 
         function = MagicMock()
-        function.name = "vault.search"
+        function.name = "vault_search"
         function.arguments = '{"query":"w"}'
         tc_obj = MagicMock(id="call_lms", type="function", function=function)
         choice = MagicMock()
@@ -1480,7 +1780,7 @@ class TestAdapterToolUse(unittest.TestCase):
         mock_provider = MagicMock()
         mock_provider.base_url = "http://localhost:1234/v1"
 
-        spec = ToolSchema(name="vault.search", description="d", parameters={})
+        spec = ToolSchema(name="vault_search", description="d", parameters={})
         req = LLMRequest(
             model="qwen2.5-7b-instruct",
             messages=[{"role": "user", "content": "search w"}],
@@ -1488,21 +1788,93 @@ class TestAdapterToolUse(unittest.TestCase):
         )
 
         p = LocalLLMProvider("lm_studio")
+        from core.providers import lms as _lms
+        _lms._client_cache.clear()   # cached factory is module-global; isolate this assert
         with patch.dict("sys.modules", {"openai": fake_openai}), \
              patch.object(p, "_provider", return_value=mock_provider):
             out = p.generate(req)
 
+        # max_retries=0: the SDK's internal retries are disabled so a single
+        # call stays bounded by one timeout (see core/providers/lms.py); recovery
+        # is owned at the application level (deckgen per-section retry).
         fake_openai.OpenAI.assert_called_once_with(
-            base_url="http://localhost:1234/v1", api_key="lm-studio",
+            base_url="http://localhost:1234/v1", api_key="lm-studio", max_retries=0,
         )
         call_kwargs = oai_client.chat.completions.create.call_args.kwargs
         self.assertIn("tools", call_kwargs)
-        self.assertEqual(call_kwargs["tools"][0]["function"]["name"], "vault.search")
+        self.assertEqual(call_kwargs["tools"][0]["function"]["name"], "vault_search")
         self.assertEqual(call_kwargs["tool_choice"], "auto")
         self.assertFalse(call_kwargs["stream"])
         self.assertEqual(out.finish_reason, FinishReason.TOOL_USE)
         self.assertEqual(out.tool_calls[0].id, "call_lms")
         self.assertEqual(out.tool_calls[0].arguments, {"query": "w"})
+
+    def test_get_lmstudio_client_caches_and_floors_timeout(self):
+        # C2: the LM Studio client is cached per (base_url, timeout) instead of
+        # leaking a fresh httpx pool per call; a non-positive timeout leaves the
+        # SDK default (never 0 = "time out immediately").
+        from core.providers import lms as _lms
+
+        fake_openai = MagicMock()
+        fake_openai.OpenAI.side_effect = lambda **kw: MagicMock(_kw=kw)
+        _lms._client_cache.clear()
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            c1 = _lms.get_lmstudio_client("http://h/v1", 5)
+            c2 = _lms.get_lmstudio_client("http://h/v1", 5)      # same key → cached
+            c3 = _lms.get_lmstudio_client("http://h/v1", 5.2)    # rounds to 5 → same key
+            self.assertIs(c1, c2)
+            self.assertIs(c1, c3)
+            self.assertEqual(fake_openai.OpenAI.call_count, 1)   # constructed once
+            # A non-positive timeout omits the kwarg entirely (SDK default).
+            _lms.get_lmstudio_client("http://h/v1", 0)
+            self.assertNotIn("timeout", fake_openai.OpenAI.call_args.kwargs)
+
+    def test_online_httpx_client_is_cached_across_calls(self):
+        # W4: the Anthropic/Google adapters reuse ONE cached httpx client per
+        # (base_url, timeout) instead of opening a fresh pool per round-trip, so
+        # keep-alive survives across agent iterations / deck sections.
+        from core.llm.adapters import anthropic as _a, google as _g
+
+        for mod, provider_cls, keyenv in (
+            (_a, _a.AnthropicProvider, "ANTHROPIC_API_KEY"),
+            (_g, _g.GoogleProvider, "GOOGLE_API_KEY"),
+        ):
+            mod._client_cache.clear()
+            os.environ[keyenv] = "k-test"
+            try:
+                fake_httpx = MagicMock()
+                fake_httpx.Client.side_effect = lambda **kw: MagicMock(_kw=kw)
+                p = provider_cls()
+                with patch.object(p, "_httpx", return_value=fake_httpx):
+                    c1 = p._client()
+                    c2 = p._client()               # same (base_url, timeout) → cached
+                self.assertIs(c1, c2)
+                self.assertEqual(fake_httpx.Client.call_count, 1)  # constructed once
+            finally:
+                os.environ.pop(keyenv, None)
+                mod._client_cache.clear()
+
+    def test_openai_client_cache_keys_on_key_fingerprint(self):
+        # W4: the OpenAI client bakes the key in at construction, so a rotated key
+        # must mint a NEW client (fingerprint is part of the cache key) — never
+        # silently reuse a stale-auth client.
+        from core.llm.adapters import openai as _o
+
+        _o._client_cache.clear()
+        fake_openai = MagicMock()
+        fake_openai.OpenAI.side_effect = lambda **kw: MagicMock(_kw=kw)
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            os.environ["OPENAI_API_KEY"] = "sk-one"
+            p = _o.OpenAIProvider()
+            c1 = p._client()
+            c2 = p._client()                       # same key → cached
+            self.assertIs(c1, c2)
+            os.environ["OPENAI_API_KEY"] = "sk-two"  # rotate the key
+            c3 = p._client()                       # new fingerprint → new client
+            self.assertIsNot(c1, c3)
+            self.assertEqual(fake_openai.OpenAI.call_count, 2)
+        os.environ.pop("OPENAI_API_KEY", None)
+        _o._client_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1632,6 +2004,9 @@ class TestProviderConfigRoute(unittest.TestCase):
 # Regression: existing offline summarise path must not invoke online layer
 # ---------------------------------------------------------------------------
 
+# NOTE (Track 4.7): online provider construction now lives in
+# core.llm.factory.stream_with_fallback, so the online-factory patches below
+# target core.llm.factory.get_llm_provider (the single lookup point).
 class TestOfflineRegression(unittest.TestCase):
     def test_offline_summariser_does_not_call_online_factory(self):
         from rag.summarizer import summarise_stream
@@ -1641,7 +2016,7 @@ class TestOfflineRegression(unittest.TestCase):
         mock_provider.stream_chat.return_value = fake_stream
 
         with patch("rag.summarizer.get_provider", return_value=mock_provider), \
-             patch("rag.summarizer.get_llm_provider") as get_online:
+             patch("core.llm.factory.get_llm_provider") as get_online:
             tokens = list(summarise_stream(
                 text="hello",
                 model="llama3.2",
@@ -1668,7 +2043,6 @@ class TestOfflineRegression(unittest.TestCase):
 class TestEngineOnlineBranch(unittest.TestCase):
     def test_query_takes_online_branch_for_online_provider(self):
         from rag.engine import SimpleQueryEngine
-        from core.llm.types import RetrievedChunk
 
         fake_index = MagicMock()
         engine = SimpleQueryEngine(
@@ -1681,7 +2055,7 @@ class TestEngineOnlineBranch(unittest.TestCase):
         # Capture the online branch hand-off
         captured = {}
 
-        def fake_query_online(self, *, message, retriever, postprocessors, qa_template, cfg):
+        def fake_query_online(self, *, message, retriever, postprocessors, qa_template, cfg, primer=""):
             captured["called"] = True
             captured["retriever"] = retriever
             return MagicMock(response_gen=iter([]))
@@ -1706,11 +2080,9 @@ class TestEngineOnlineBranch(unittest.TestCase):
         from core.llm.policy import FallbackPolicy
         from core.llm.types import (
             ErrorCategory,
-            FinishReason,
             LLMError,
             LLMRequest,
             LLMResponse,
-            LLMUsage,
         )
         from core.llm.base import StreamingResponse
 
@@ -1759,7 +2131,7 @@ class TestEngineOnlineBranch(unittest.TestCase):
             chat_provider_name="openai",
         )
 
-        with patch("rag.engine.get_llm_provider", side_effect=fake_get_llm_provider), \
+        with patch("core.llm.factory.get_llm_provider", side_effect=fake_get_llm_provider), \
              patch("rag.engine.load_config", return_value=fake_cfg):
             list(wrapper.response_gen)
 
@@ -1819,7 +2191,7 @@ class TestEngineOnlineBranch(unittest.TestCase):
         )
 
         collected = []
-        with patch("rag.engine.get_llm_provider", side_effect=fake_get_llm_provider), \
+        with patch("core.llm.factory.get_llm_provider", side_effect=fake_get_llm_provider), \
              patch("rag.engine.load_config", return_value=fake_cfg):
             with self.assertRaises(LLMError):
                 for tok in wrapper.response_gen:
@@ -1993,6 +2365,341 @@ class TestLiveProviders(unittest.TestCase):
         from core.llm.factory import get_llm_provider
         ok, err = get_llm_provider("openai").health_check()
         self.assertTrue(ok, err)
+
+
+class TestParamContractAndRetryAfter(unittest.TestCase):
+    """Field-reported 2026-07 provider failures: parameter-shape 400s on new
+    model families (gpt-5.x max_tokens, Fable-5 temperature) and 429s whose
+    retry-after hint the retry layers ignored. These pin the fixes: proactive
+    family predicates, the reactive strip/rename heal pass, and retry-after
+    capture + honoring."""
+
+    def setUp(self):
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test"
+
+    def tearDown(self):
+        for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            os.environ.pop(k, None)
+
+    # ---- proactive family guards ----------------------------------------
+
+    def test_anthropic_new_families_omit_sampling_params(self):
+        from core.llm.adapters.anthropic import AnthropicProvider
+        from core.llm.types import LLMRequest
+        p = AnthropicProvider()
+        for model in (
+            "claude-fable-5", "claude-mythos-5", "claude-opus-4-8",
+            "claude-opus-4-7", "claude-sonnet-5",
+        ):
+            payload = p._build_payload(
+                LLMRequest(model=model, messages=[{"role": "user", "content": "hi"}],
+                           temperature=0.4, top_p=0.9),
+                stream=False,
+            )
+            self.assertNotIn("temperature", payload, model)
+            self.assertNotIn("top_p", payload, model)
+        # Older families keep them, temperature clamped to Anthropic's 1.0 cap.
+        legacy = p._build_payload(
+            LLMRequest(model="claude-sonnet-4-6",
+                       messages=[{"role": "user", "content": "hi"}], temperature=1.7),
+            stream=False,
+        )
+        self.assertEqual(legacy["temperature"], 1.0)
+        # "claude-sonnet-4-5" must NOT be caught by the "claude-sonnet-5" prefix.
+        ok = p._build_payload(
+            LLMRequest(model="claude-sonnet-4-5",
+                       messages=[{"role": "user", "content": "hi"}], temperature=0.4),
+            stream=False,
+        )
+        self.assertEqual(ok["temperature"], 0.4)
+
+    # ---- reactive heal passes --------------------------------------------
+
+    def test_anthropic_param_heal_strips_and_retries_once(self):
+        """A 400 naming a sampling param (an unknown future family) strips it
+        and retries the SAME request once — instead of the terminal error the
+        user saw on claude-fable-5."""
+        from core.llm.adapters.anthropic import AnthropicProvider
+        from core.llm.types import LLMRequest
+
+        ok_body = {
+            "content": [{"type": "text", "text": "healed answer"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        fake_httpx, client_mock, ok_resp = _fake_httpx_module(ok_body)
+        err_body = {"error": {"type": "invalid_request_error",
+                              "message": "`temperature` is deprecated for this model."}}
+        resp_400 = MagicMock()
+        resp_400.status_code = 400
+        resp_400.text = json.dumps(err_body)
+        resp_400.headers = {}
+        client_mock.post.side_effect = [resp_400, ok_resp]
+
+        # claude-sonnet-4-6 is NOT in the removed-family list, so the payload
+        # carries temperature — exactly the drift scenario the heal covers.
+        req = LLMRequest(model="claude-sonnet-4-6",
+                         messages=[{"role": "user", "content": "hi"}], temperature=0.5)
+        p = AnthropicProvider()
+        with patch.object(p, "_httpx", return_value=fake_httpx):
+            resp = p.generate(req)
+        self.assertEqual(resp.text, "healed answer")
+        self.assertEqual(client_mock.post.call_count, 2)
+        second_payload = client_mock.post.call_args_list[1].kwargs["json"]
+        self.assertNotIn("temperature", second_payload)
+
+    def test_openai_param_heal_renames_max_tokens(self):
+        """The gpt-5.x failure shape: 400 'Unsupported parameter: max_tokens'
+        → renamed to max_completion_tokens and retried once. Exercised via a
+        compat base_url (the only path that still sends the legacy name)."""
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.types import LLMRequest
+
+        class _Bad400(Exception):
+            status_code = 400
+            body = {"message": "Unsupported parameter: 'max_tokens' is not supported "
+                               "with this model. Use 'max_completion_tokens' instead.",
+                    "type": "invalid_request_error", "param": "max_tokens",
+                    "code": "unsupported_parameter"}
+
+        choice = MagicMock()
+        choice.message.content = "healed"
+        choice.message.tool_calls = None
+        choice.finish_reason = "stop"
+        ok_resp = MagicMock()
+        ok_resp.choices = [choice]
+        ok_resp.usage = MagicMock(prompt_tokens=1, completion_tokens=1)
+
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [_Bad400("unsupported"), ok_resp]
+
+        p = OpenAIProvider(base_url="http://localhost:9999/v1")
+        with patch.object(p, "_client", return_value=client):
+            resp = p.generate(LLMRequest(
+                model="some-proxy-model",
+                messages=[{"role": "user", "content": "hi"}], max_tokens=123,
+            ))
+        self.assertEqual(resp.text, "healed")
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        second_kwargs = client.chat.completions.create.call_args_list[1].kwargs
+        self.assertEqual(second_kwargs["max_completion_tokens"], 123)
+        self.assertNotIn("max_tokens", second_kwargs)
+
+    def test_openai_heal_gives_up_on_unrelated_400(self):
+        """A 400 that names no healable param must classify and raise — the
+        heal pass must not mask genuine caller bugs with silent retries."""
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.types import LLMError, LLMRequest
+
+        class _Bad400(Exception):
+            status_code = 400
+            body = {"message": "messages: roles must alternate", "param": None}
+
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _Bad400("bad roles")
+        p = OpenAIProvider()
+        with patch.object(p, "_client", return_value=client):
+            with self.assertRaises(LLMError):
+                p.generate(LLMRequest(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": "hi"}], max_tokens=50,
+                ))
+        self.assertEqual(client.chat.completions.create.call_count, 1)
+
+    # ---- retry-after capture + honoring ----------------------------------
+
+    def test_parse_retry_after_s(self):
+        from core.llm.retry import parse_retry_after_s
+        self.assertEqual(parse_retry_after_s("", {"retry-after": "7"}), 7.0)
+        self.assertEqual(
+            parse_retry_after_s(
+                "Rate limit reached for o3 … Please try again in 5.764s. Visit …",
+                None,
+            ),
+            5.764,
+        )
+        # Header wins over the message when both are present.
+        self.assertEqual(
+            parse_retry_after_s("try again in 3s", {"Retry-After": "9"}), 9.0
+        )
+        # HTTP-date header degrades to the message, then to None.
+        self.assertEqual(
+            parse_retry_after_s("try again in 3s",
+                                {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            3.0,
+        )
+        self.assertIsNone(parse_retry_after_s("no hint here", {}))
+
+    def test_anthropic_429_captures_retry_after_header(self):
+        from core.llm.adapters.anthropic import _http_error_to_llm_error
+        from core.llm.types import ErrorCategory
+        resp = MagicMock()
+        resp.status_code = 429
+        resp.text = json.dumps({"error": {"message": "rate limited"}})
+        resp.headers = {"retry-after": "42"}
+        err = _http_error_to_llm_error(resp, "anthropic", "claude-fable-5")
+        self.assertEqual(err.category, ErrorCategory.RATE_LIMIT)
+        self.assertEqual(err.retry_after_s, 42.0)
+
+    def test_openai_429_captures_retry_after_from_message(self):
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.types import ErrorCategory
+
+        class _RateLimited(Exception):
+            status_code = 429
+        exc = _RateLimited(
+            "Rate limit reached for o1 on tokens per min (TPM): Limit 30000, "
+            "Used 28500, Requested 4382. Please try again in 5.764s."
+        )
+        err = OpenAIProvider()._classify_error(exc, "o1")
+        self.assertEqual(err.category, ErrorCategory.RATE_LIMIT)
+        self.assertEqual(err.retry_after_s, 5.764)
+
+    def test_retry_with_backoff_floors_sleep_on_hint(self):
+        from core.llm.retry import retry_with_backoff
+        from core.llm.types import ErrorCategory, LLMError
+        sleeps = []
+        calls = {"n": 0}
+
+        def _fn():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise LLMError(category=ErrorCategory.RATE_LIMIT, message="429",
+                               retryable=True, retry_after_s=10.0)
+            return "ok"
+
+        with patch("core.llm.retry.time.sleep", side_effect=sleeps.append):
+            result = retry_with_backoff(_fn, max_attempts=3,
+                                        base_delay_s=0.01, max_delay_s=0.05)
+        self.assertEqual(result, "ok")
+        # Backoff schedule alone would sleep ≤ 0.0625s; the 10s hint (+0.5
+        # margin) must floor it — a shorter sleep is a guaranteed second 429.
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 10.0)
+
+    def test_retry_with_backoff_raises_when_hint_exceeds_deadline(self):
+        import time as _time
+        from core.llm.retry import retry_with_backoff
+        from core.llm.types import ErrorCategory, LLMError
+        calls = {"n": 0}
+
+        def _fn():
+            calls["n"] += 1
+            raise LLMError(category=ErrorCategory.RATE_LIMIT, message="429",
+                           retryable=True, retry_after_s=60.0)
+
+        with patch("core.llm.retry.time.sleep") as sleep_mock:
+            with self.assertRaises(LLMError):
+                retry_with_backoff(_fn, max_attempts=3,
+                                   deadline_monotonic_s=_time.monotonic() + 2.0)
+        # The 60s hint can never fit the 2s budget: surface after the FIRST
+        # attempt with no futile sleep at all.
+        self.assertEqual(calls["n"], 1)
+        sleep_mock.assert_not_called()
+
+
+class TestAnthropicPromptCaching(unittest.TestCase):
+    """Track 5.5 pinning: cache_control payload shape + cache-token accounting.
+
+    Invariants: (1) the system prompt is sent as a block array carrying one
+    ephemeral cache_control breakpoint (prefix-caches tools + system); (2) the
+    adapter NORMALISES Anthropic's exclusive usage semantics — recorded
+    input_tokens is the TOTAL prompt (api input + cache_read + cache_creation),
+    with the read/write subsets on their own fields; (3) the pricing layer
+    bills reads at the model's cached_input rate and writes at 1.25x input;
+    (4) every curated model id has a PRICING_TABLE entry (a gap silently
+    costs usage out at $0).
+    """
+
+    def setUp(self):
+        self._prev_key = os.environ.get("ANTHROPIC_API_KEY")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test"
+
+    def tearDown(self):
+        if self._prev_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = self._prev_key
+
+    def test_system_prompt_sent_as_cache_control_block(self):
+        from core.llm.adapters.anthropic import AnthropicProvider
+        from core.llm.types import LLMRequest
+
+        p = AnthropicProvider()
+        payload = p._build_payload(
+            LLMRequest(
+                model="claude-opus-4-8",
+                system_prompt="stable system",
+                messages=[{"role": "user", "content": "hi"}],
+            ),
+            stream=False,
+        )
+        self.assertEqual(payload["system"], [{
+            "type": "text",
+            "text": "stable system",
+            "cache_control": {"type": "ephemeral"},
+        }])
+        # No system prompt -> no system key (a marked empty block would be noise).
+        payload2 = p._build_payload(
+            LLMRequest(model="claude-opus-4-8",
+                       messages=[{"role": "user", "content": "hi"}]),
+            stream=False,
+        )
+        self.assertNotIn("system", payload2)
+
+    def test_generate_normalises_cache_usage_semantics(self):
+        """Anthropic input_tokens EXCLUDES cache tokens; the recorded usage
+        must be the inclusive total or costs/psize under-report."""
+        from core.llm.adapters.anthropic import AnthropicProvider
+        from core.llm.types import LLMRequest
+
+        body = {
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,            # uncached remainder only
+                "output_tokens": 5,
+                "cache_read_input_tokens": 90,
+                "cache_creation_input_tokens": 40,
+            },
+        }
+        fake_httpx, _client, _ = _fake_httpx_module(body)
+        p = AnthropicProvider()
+        with patch.object(p, "_httpx", return_value=fake_httpx):
+            out = p.generate(LLMRequest(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "hi"}],
+            ))
+        self.assertEqual(out.usage.input_tokens, 140)   # 10 + 90 + 40
+        self.assertEqual(out.usage.cached_input_tokens, 90)
+        self.assertEqual(out.usage.cache_creation_input_tokens, 40)
+
+    def test_estimate_cost_prices_cache_reads_and_writes(self):
+        from core.llm.types import LLMUsage
+        from core.llm.usage import estimate_cost_usd
+
+        # claude-opus-4-8: $5 in / $25 out / $0.50 cached-read per MTok.
+        # 1M total prompt = 400k regular + 400k cache-read + 200k cache-write.
+        usage = LLMUsage(
+            input_tokens=1_000_000,
+            output_tokens=100_000,
+            cached_input_tokens=400_000,
+            cache_creation_input_tokens=200_000,
+        )
+        cost = estimate_cost_usd("claude-opus-4-8", usage)
+        # regular 0.4*5 + read 0.4*0.5 + write 0.2*5*1.25 + out 0.1*25
+        self.assertAlmostEqual(cost, 2.0 + 0.2 + 1.25 + 2.5, places=6)
+        # Without cache fields the formula is unchanged (legacy records).
+        plain = LLMUsage(input_tokens=1_000_000, output_tokens=100_000)
+        self.assertAlmostEqual(
+            estimate_cost_usd("claude-opus-4-8", plain), 5.0 + 2.5, places=6)
+
+    def test_all_curated_models_are_priced(self):
+        """Every curated id (the app's own defaults) must have a pricing
+        entry — a gap silently costs that model's usage out at $0.00."""
+        from core.llm.usage import unpriced_curated_models
+        self.assertEqual(unpriced_curated_models(), [])
 
 
 if __name__ == "__main__":

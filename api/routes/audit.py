@@ -15,7 +15,7 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 
-from api.security import origin_is_local, sanitise_error_msg
+from api.security import sanitise_error_msg
 from api.validators import (
     coerce_bool,
     coerce_int_in_range,
@@ -23,6 +23,7 @@ from api.validators import (
     coerce_string_max_len,
 )
 from core.config import load_config, save_config
+from core.paths import resolve_under_root
 
 from audit.config import (
     DEFAULT_ANNOTATIONS_READ_THRESHOLD,
@@ -171,8 +172,6 @@ def _audit_config_view(cfg: dict | None = None) -> dict[str, Any]:
 @audit_bp.route("/api/audit/config")
 def api_audit_get_config():
     """Return the current audit settings (with defaults filled in)."""
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     return jsonify(_audit_config_view())
 
 
@@ -188,8 +187,6 @@ def api_audit_save_config():
     shape/range checked). Any single invalid value 400s the whole request rather
     than being silently dropped; only the validated subset is then saved.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Invalid JSON"}), 400
@@ -244,8 +241,6 @@ def api_audit_save_config():
 @audit_bp.route("/api/audit/status")
 def api_audit_status():
     """Return the audit manager's lifecycle/progress payload (read-only poll)."""
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     return jsonify(audit_manager.get_status_payload())
 
 
@@ -260,8 +255,6 @@ def api_audit_scan():
     409 when a scan is already running, 400 when the manager rejects the config,
     else ok. The scan itself is read-only against all external stores.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     # An empty body is valid (use defaults). A non-object payload (list,
     # number, string, null) is not — coerce to {} so subsequent .get()
     # calls cannot raise AttributeError and bubble out as a 500.
@@ -286,8 +279,6 @@ def api_audit_scan():
 @audit_bp.route("/api/audit/cancel", methods=["POST"])
 def api_audit_cancel():
     """Request cancellation of an in-flight scan (no-op if none is running)."""
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     cancelled = audit_manager.request_cancel()
     return jsonify({"ok": True, "cancelled": cancelled})
 
@@ -299,8 +290,6 @@ def api_audit_inventory():
     404 with a "Run a scan first" message when no completed scan is cached
     (also the post-reset empty state) — there is no implicit scan on read.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     inv, settings = audit_manager.get_inventory()
     if inv is None or settings is None:
         return jsonify({"error": "No scan results. Run a scan first."}), 404
@@ -322,8 +311,6 @@ def api_audit_report(name: str):
     request thread, with a lazy per-path disk fallback. ``duplicates`` 404s if
     that phase was skipped on the last run.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     if name not in _REPORT_NAMES:
         return jsonify({"error": "Unknown report"}), 404
     inv, settings = audit_manager.get_inventory()
@@ -384,8 +371,6 @@ def api_audit_mapping():
 
     The path is interpreted relative to the configured vault root.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Invalid JSON"}), 400
@@ -399,11 +384,10 @@ def api_audit_mapping():
     except AuditConfigError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    pdf_abs = (settings.vault_root / pdf_rel).resolve()
-    try:
-        pdf_abs.relative_to(settings.vault_root.resolve())
-    except ValueError:
+    pdf_rel_resolved = resolve_under_root(pdf_rel, settings.vault_root)
+    if not pdf_rel_resolved:
         return jsonify({"error": "pdf path escapes vault root"}), 400
+    pdf_abs = settings.vault_root / pdf_rel_resolved
 
     no_match = coerce_bool(data.get("no_match"))
     citation_key = coerce_non_empty_string(data.get("citation_key"), max_len=128)
@@ -442,8 +426,6 @@ def api_audit_reveal():
     outside the configured vault root (or Zotero storage) to keep the
     blast radius bounded.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     if sys.platform != "darwin":
         return jsonify({"error": "Reveal is supported on macOS only"}), 501
 
@@ -483,7 +465,7 @@ def api_audit_reveal():
         allowed_roots.append(settings.zotero_storage.resolve())
     except OSError:
         pass
-    if not any(_is_within(target, root) for root in allowed_roots):
+    if not any(resolve_under_root(str(target), str(root)) is not None for root in allowed_roots):
         return jsonify({"error": "Path is outside the configured roots"}), 400
     if not target.exists():
         return jsonify({"error": "File not found"}), 404
@@ -497,20 +479,6 @@ def api_audit_reveal():
     except OSError as exc:
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     return jsonify({"ok": True, "action": action})
-
-
-def _is_within(path: Path, root: Path) -> bool:
-    """Return True iff *path* is *root* or a descendant of it.
-
-    Both should be resolved before calling; used to bound ``reveal`` to the
-    vault / Zotero-storage roots. ``relative_to`` raising ``ValueError`` means
-    *path* escapes *root*.
-    """
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
 
 
 # Re-export so tests can patch the module-level singleton if needed.

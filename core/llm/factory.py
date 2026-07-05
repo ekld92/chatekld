@@ -1,8 +1,9 @@
 """Factory + thin policy-aware wrapper for LLM providers."""
 from __future__ import annotations
 
+import dataclasses
 import logging
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 from core.llm.base import LLMProvider, StreamingResponse, coerce_error
 from core.llm.policy import FallbackPolicy
@@ -64,6 +65,36 @@ def get_llm_provider(name: str, cfg: Optional[dict] = None) -> LLMProvider:
     )
 
 
+def _capture_request(request: LLMRequest, provider_name: str) -> None:
+    """Record a request's effective system prompt for the Prompt Hub.
+
+    Reads the layered view straight off the request — ``system_prompt`` is the
+    exact system field, ``retrieved_context_chunks`` gives the grounding size,
+    and the last user turn is the query — so no per-caller enrichment is needed.
+    Only tagged requests (``request.workflow`` set) are recorded; the capture
+    module itself never raises, so this is a cheap, safe passthrough.
+    """
+    if not getattr(request, "workflow", ""):
+        return
+    from core import prompt_capture
+
+    # The last user-role message is the "query" for RAG/plain-chat requests; an
+    # empty messages list (some prompt-only requests) just yields "".
+    last_user = ""
+    for msg in reversed(request.messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user = str(msg.get("content", ""))
+            break
+    prompt_capture.record(
+        request.workflow,
+        request.system_prompt,
+        provider=provider_name,
+        model=request.model,
+        context_chunks=len(request.retrieved_context_chunks or []),
+        query=last_user,
+    )
+
+
 def resolve_chat_provider(
     policy: FallbackPolicy,
     *,
@@ -86,6 +117,10 @@ def resolve_chat_provider(
     surface to the caller regardless of policy.
     """
     primary = get_llm_provider(policy.primary, cfg=cfg)
+    # Prompt Hub capture: record the effective system prompt BEFORE dispatch so
+    # the panel reflects what we sent even if the call then errors. Tagged by
+    # request.workflow (the agent loop sets it); no-op for untagged requests.
+    _capture_request(request, policy.primary)
     try:
         response = primary.stream(request) if stream else primary.generate(request)
         return response, policy.primary
@@ -111,6 +146,68 @@ def resolve_chat_provider(
         raise coerce_error(exc, provider=policy.primary, model=request.model)
 
 
+def stream_with_fallback(
+    provider_name: str,
+    request: LLMRequest,
+    policy: FallbackPolicy,
+    *,
+    cfg: Optional[dict] = None,
+    on_fallback: Optional[Callable[[str, str], None]] = None,
+    log_context: str = "fallback",
+) -> Iterator[str]:
+    """Stream tokens through the primary provider, falling back before token 1.
+
+    Yields tokens from the primary provider; on an ``LLMError`` it consults
+    the fallback ``policy`` and retries on the fallback provider **only if no
+    token has yet streamed** (``yielded_any``). Once >=1 token has streamed,
+    re-streaming the whole answer would duplicate the output, so the error
+    is re-raised. The fallback request mirrors the primary one but re-resolves
+    the model name for the fallback provider.
+    """
+    from core.config import resolve_chat_model
+    from core.llm.redact import redact
+
+    primary = get_llm_provider(provider_name, cfg=cfg)
+    # Prompt Hub capture (see resolve_chat_provider): record what the primary
+    # provider is about to receive. This one seam covers plain chat, online
+    # single-paper summarise, online vault RAG, the deck review/compile-fix
+    # prompts, and the refactor review/edit prompts — every stream_chat_messages
+    # and _stream_online caller — via their request.workflow tag.
+    _capture_request(request, provider_name)
+    yielded_any = False
+    try:
+        for token in primary.stream(request).response_gen:
+            yielded_any = True
+            yield token
+        return
+    except LLMError as err:
+        if yielded_any:
+            raise
+        if not policy.should_fall_back(err) or policy.fallback is None:
+            raise
+            
+        if on_fallback is not None:
+            try:
+                on_fallback(err.category.value, policy.fallback)
+            except Exception:
+                logger.debug("on_fallback callback failed", exc_info=True)
+                
+        logger.warning(
+            "%s %s -> %s: %s",
+            log_context,
+            provider_name,
+            policy.fallback,
+            redact(err.message),
+        )
+
+    fallback = get_llm_provider(policy.fallback, cfg=cfg)
+    fallback_model = resolve_chat_model(cfg or {}, policy.fallback)
+    fallback_request = dataclasses.replace(request, model=fallback_model)
+    
+    yield from fallback.stream(fallback_request).response_gen
+
+
+
 def iter_with_fallback(
     response_or_stream,
 ) -> Iterator[str]:
@@ -131,6 +228,7 @@ __all__ = [
     "ALL_PROVIDER_NAMES",
     "get_llm_provider",
     "resolve_chat_provider",
+    "stream_with_fallback",
     "iter_with_fallback",
 ]
 

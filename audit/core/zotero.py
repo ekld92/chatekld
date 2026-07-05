@@ -14,7 +14,9 @@ Returned items distinguish:
 from __future__ import annotations
 
 import datetime as _dt
+import shutil
 import sqlite3
+import tempfile
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -109,34 +111,80 @@ class ZoteroItem:
     child_notes: list[ZoteroChildNote] = field(default_factory=list)
 
 
+# Ceiling for the copy-based snapshot (sqlite + -wal + -shm combined). A
+# Zotero DB is typically tens of MB; past this we fall back to the direct
+# mode=ro backup rather than duplicating gigabytes on every scan.
+_SNAPSHOT_COPY_MAX_BYTES = 2 * 1024**3
+
+
 @contextmanager
 def _open_snapshot(sqlite_path: Path) -> Iterator[sqlite3.Connection]:
     """Yield an in-memory read-only snapshot of the Zotero database.
 
-    The read-only posture in two steps: the source is opened with the
-    ``mode=ro`` URI flag, then ``backup()``-copied into a throwaway
-    ``:memory:`` connection that all queries run against. This is load-bearing
-    — Zotero holds a write lock on the live ``zotero.sqlite`` (and its hot WAL)
-    while running, and querying it directly can fail or, worse, perturb it.
-    Snapshotting decouples us entirely: the live database is never read past
-    the single ``backup()`` and never written. Both connections are closed in
-    ``finally`` so a query error cannot leak a handle onto the live file.
+    Hardened technique (improvement plan 0.7 — adopted from the
+    ``zotero-debug`` CLI helper, which never exhibited the hot-WAL issues the
+    direct path did): copy ``zotero.sqlite`` plus any ``-wal``/``-shm``
+    siblings to a temp dir, open the COPY with ``mode=ro&immutable=1``, and
+    ``backup()`` that into a throwaway ``:memory:`` connection all queries
+    run against. The live database is only ever touched by ``shutil.copy2``
+    (plain file reads) — no SQLite locks are taken on it at all, so a
+    running Zotero (write lock + hot WAL) can neither block us nor be
+    perturbed. The copy is deleted before the snapshot is used.
+
+    Fallback: if the files exceed ``_SNAPSHOT_COPY_MAX_BYTES``, the previous
+    direct technique (``mode=ro`` open + ``backup()``) is used — weaker
+    against a hot WAL, but proven adequate and copy-free.
     """
     if not sqlite_path.exists():
         raise FileNotFoundError(f"Zotero DB not found at {sqlite_path}")
 
-    uri = f"file:{sqlite_path}?mode=ro"
-    source_conn = sqlite3.connect(uri, uri=True)
+    siblings = [
+        sqlite_path.with_name(sqlite_path.name + suffix)
+        for suffix in ("-wal", "-shm")
+    ]
     try:
-        mem_conn = sqlite3.connect(":memory:")
-        source_conn.backup(mem_conn)
+        total = sqlite_path.stat().st_size + sum(
+            s.stat().st_size for s in siblings if s.exists()
+        )
+    except OSError:
+        total = None
+
+    mem_conn = sqlite3.connect(":memory:")
+    try:
+        copied = False
+        if total is not None and total <= _SNAPSHOT_COPY_MAX_BYTES:
+            try:
+                with tempfile.TemporaryDirectory(prefix="chatekld-zotero-") as td:
+                    tmp = Path(td) / "zotero.sqlite"
+                    shutil.copy2(sqlite_path, tmp)
+                    for suffix in ("-wal", "-shm"):
+                        sib = sqlite_path.with_name(sqlite_path.name + suffix)
+                        if sib.exists():
+                            shutil.copy2(sib, tmp.with_name(tmp.name + suffix))
+                    source_conn = sqlite3.connect(
+                        f"file:{tmp}?mode=ro&immutable=1", uri=True,
+                    )
+                    try:
+                        source_conn.backup(mem_conn)
+                    finally:
+                        source_conn.close()
+                copied = True
+            except (sqlite3.Error, OSError):
+                # A copy of a HOT WAL can be torn mid-checkpoint (or the copy
+                # itself can fail); degrade to the direct path below rather
+                # than failing the scan. A full backup() overwrites the whole
+                # destination, so any partial copy-branch content is replaced.
+                copied = False
+        if not copied:
+            source_conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+            try:
+                source_conn.backup(mem_conn)
+            finally:
+                source_conn.close()
         mem_conn.row_factory = sqlite3.Row
-        try:
-            yield mem_conn
-        finally:
-            mem_conn.close()
+        yield mem_conn
     finally:
-        source_conn.close()
+        mem_conn.close()
 
 
 def _resolve_storage_path(

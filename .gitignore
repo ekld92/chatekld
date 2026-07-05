@@ -4,9 +4,16 @@
 
 .vscode/
 
+# Claude Code per-machine permission allowlist — contains the author's absolute
+# /Users/<name>/... paths and legacy dir names; machine-local, must not ship.
+.claude/settings.local.json
+
 # Local-only operator notes — kept out of BOTH remotes so the private→public
 # mirror workflow is never advertised in the public snapshot. See PUBLISHING.md.
 PUBLISHING.md
+
+# JS test harness (Vitest) — dev-only; runtime JS stays vendored under static/js/vendor/
+node_modules/
 
 # Python
 venv/
@@ -25,6 +32,8 @@ AppIcon.icns
 
 # Built app bundles (dated builds)
 ChatEKLD_*.app/
+# Packaged distribution images (dated builds)
+ChatEKLD_*.dmg
 
 # User data — contains API keys, personal library paths, and indexed vectors.
 # These live in ~/Library/Application Support/ChatEKLD/ when the app runs

@@ -48,6 +48,7 @@ from core.constants import OBSIDIAN_INDEX_DIR  # noqa: E402
 from core.utils import write_text_atomic  # noqa: E402
 from rag.lancedb_store import (  # noqa: E402
     VECTOR_BACKEND_LANCEDB,
+    compact_lancedb_vector_store,
     lancedb_available,
     lancedb_dir,
     lancedb_table_count,
@@ -154,6 +155,16 @@ def migrate(index_dir: str, *, batch_size: int, keep_json: bool) -> int:
         return 1
     if missing:
         print(f"Note: skipped {missing} embedding(s) with no matching docstore node.")
+
+    # Compact once after the bulk load. Each batch add() was its own LanceDB
+    # transaction → a version manifest per batch that re-lists every fragment, so
+    # a freshly-migrated index starts life UN-compacted and only self-heals on the
+    # next live indexing run's checkpoint/2000-insert cadence — which for a static
+    # vault may not happen for a long time. Best-effort (never raises); it prunes
+    # superseded versions + merges fragments, changing neither row count nor query
+    # results, so it runs safely AFTER the parity check has verified the table.
+    print("Compacting LanceDB (pruning interim version manifests)…")
+    compact_lancedb_vector_store(vector_store)
 
     if not keep_json:
         bak = vec_json.with_suffix(".json.bak")

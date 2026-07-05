@@ -68,6 +68,9 @@ def _sse_frames(raw: bytes) -> list:
 # stream_chat_messages
 # --------------------------------------------------------------------------- #
 
+# NOTE (Track 4.7): provider construction moved into
+# core.llm.factory.stream_with_fallback, so these tests patch the factory's
+# get_llm_provider (the single lookup point for all three fallback sites).
 def test_stream_chat_messages_passes_full_messages_to_request():
     from core.llm import chat
 
@@ -77,7 +80,7 @@ def test_stream_chat_messages_passes_full_messages_to_request():
         {"role": "user", "content": "tell me more"},
     ]
     primary = _provider_yielding(["a", "b", "c"])
-    with mock.patch.object(chat, "get_llm_provider", return_value=primary):
+    with mock.patch("core.llm.factory.get_llm_provider", return_value=primary):
         out = list(chat.stream_chat_messages(
             messages=msgs, system_prompt="SP", provider_name="ollama",
             model="llama3.2", temperature=0.5, cfg={},
@@ -105,7 +108,7 @@ def test_stream_chat_messages_falls_back_before_first_token():
         return primary if name == "openai" else fallback
 
     cfg = {"fallback_provider": "ollama", "llm": "llama3.2"}
-    with mock.patch.object(chat, "get_llm_provider", side_effect=fake_get):
+    with mock.patch("core.llm.factory.get_llm_provider", side_effect=fake_get):
         out = list(chat.stream_chat_messages(
             messages=[{"role": "user", "content": "hi"}], system_prompt="",
             provider_name="openai", model="gpt-4o", temperature=0.3,
@@ -135,7 +138,7 @@ def test_stream_chat_messages_no_fallback_after_first_token():
 
     cfg = {"fallback_provider": "ollama", "llm": "llama3.2"}
     collected: list = []
-    with mock.patch.object(chat, "get_llm_provider", side_effect=fake_get):
+    with mock.patch("core.llm.factory.get_llm_provider", side_effect=fake_get):
         with pytest.raises(LLMError):
             for tok in chat.stream_chat_messages(
                 messages=[{"role": "user", "content": "hi"}], system_prompt="",
@@ -160,7 +163,7 @@ def test_stream_chat_messages_terminal_error_does_not_fall_back():
         return primary
 
     cfg = {"fallback_provider": "ollama", "llm": "llama3.2"}
-    with mock.patch.object(chat, "get_llm_provider", side_effect=fake_get):
+    with mock.patch("core.llm.factory.get_llm_provider", side_effect=fake_get):
         with pytest.raises(LLMError):
             list(chat.stream_chat_messages(
                 messages=[{"role": "user", "content": "hi"}], system_prompt="",

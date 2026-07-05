@@ -79,13 +79,42 @@ def clear_provider_warnings() -> None:
     with _provider_warnings_lock:
         _provider_warnings.clear()
 
+def _pid_is_ollama(pid: int) -> bool:
+    """Best-effort: True if *pid* is a live process whose command is ``ollama``.
+
+    Guards :func:`shutdown_ollama`'s ``os.kill`` against a STALE / recycled PID —
+    a prior run that crashed before cleanup leaves a PID file, and the OS may
+    have reassigned that PID to an unrelated process. Uses POSIX
+    ``ps -p <pid> -o comm=``. On ANY failure returns False, so we never signal a
+    process we cannot confirm is ollama.
+    """
+    if pid <= 0:
+        return False
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return False
+    return out.returncode == 0 and "ollama" in out.stdout.lower()
+
+
 def start_ollama_server() -> Tuple[bool, str]:
     """Start the Ollama server if it is not already running."""
     global _ollama_process
-    
+
     provider = get_provider("ollama")
     is_running, _ = provider.check_running()
     if is_running:
+        # Already running and we did not spawn it this run: a leftover PID file
+        # from a prior (possibly crashed) run is stale, so drop it now — shutdown
+        # must never SIGTERM whatever PID a dead session left behind.
+        if _ollama_process is None and os.path.exists(OLLAMA_PID_FILE):
+            try:
+                os.unlink(OLLAMA_PID_FILE)
+            except OSError:
+                pass
         return True, ""
 
     with _ollama_process_lock:
@@ -135,7 +164,18 @@ def start_ollama_server() -> Tuple[bool, str]:
         if is_running:
             return True, ""
         time.sleep(1)
-    
+
+    # Readiness never reached. Reset the handle (so a later caller cannot trust a
+    # dead Popen via the early-return short-circuit) and terminate the spawned-
+    # but-unreachable process so it is not orphaned. start_ollama_server runs
+    # once per process today, but this keeps it correct if that ever changes.
+    with _ollama_process_lock:
+        proc, _ollama_process = _ollama_process, None
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
     return False, "Ollama did not respond in time."
 
 def shutdown_ollama():
@@ -155,10 +195,20 @@ def shutdown_ollama():
                 with open(OLLAMA_PID_FILE, "r") as f:
                     pid = int(f.read().strip())
                 import signal
-                os.kill(pid, signal.SIGTERM)
-                os.unlink(OLLAMA_PID_FILE)
+                # Only signal a PID we can confirm is still an ollama process —
+                # a stale file pointing at a recycled PID would otherwise SIGTERM
+                # an unrelated process.
+                if _pid_is_ollama(pid):
+                    os.kill(pid, signal.SIGTERM)
             except Exception:
                 pass
+            finally:
+                # Always remove the file (ours to clean on shutdown) so a dead /
+                # unverifiable PID does not linger to mislead the next run.
+                try:
+                    os.unlink(OLLAMA_PID_FILE)
+                except OSError:
+                    pass
 
 def start_lm_studio_server() -> Tuple[bool, str]:
     """LM Studio typically requires manual start, but we can check if it's reachable."""

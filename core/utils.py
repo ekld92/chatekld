@@ -20,6 +20,7 @@ may depend on this module.
 import contextlib
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -58,6 +59,22 @@ def write_text_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
             raise
         with f:
             f.write(text)
+            # Durability: flush the Python buffer, then fsync the file's data
+            # blocks to stable storage BEFORE the rename. os.replace() is atomic
+            # w.r.t. *ordering* (a reader sees old-or-new, never torn) but NOT
+            # durability — without this, a power loss/kernel panic right after the
+            # rename can leave the rename visible while the data blocks are still
+            # unwritten (the classic rename-without-fsync hazard), yielding an
+            # empty/stale file on reboot. That is the exact corruption these
+            # writers exist to prevent for vault writes (apply/archive snapshots),
+            # config, and the deletion marker. Must fsync inside the `with` (fd
+            # still open); the file is closed on block exit, then promoted. Parent
+            # directory fsync is intentionally omitted — overkill for this
+            # single-user desktop tier, and these are all low-frequency writes so
+            # the per-write fsync cost is negligible. (Hot-path, regenerable
+            # caches use their own non-fsync writers by design.)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except Exception:
         try:
@@ -86,6 +103,12 @@ def write_bytes_atomic(path: str, data: bytes) -> None:
             raise
         with f:
             f.write(data)
+            # Durability fsync before the rename — see write_text_atomic. This is
+            # the one true data-loss window: the Note Refactor archiver moves a
+            # user's ONLY copy of an image out of the vault via this writer, so a
+            # crash between the rename and the data hitting disk could lose it.
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except Exception:
         try:
@@ -153,15 +176,24 @@ def cap(value: str, limit: int = 8_000) -> str:
 def parse_temperature(raw, default: float = 0.3) -> float:
     """Safely parse and clamp temperature to [0.0, 2.0]."""
     try:
-        return max(0.0, min(2.0, float(raw)))
+        val = float(raw)
     except (TypeError, ValueError):
         return default
+    # float("nan")/("inf") parse fine but defeat the clamp: min/max return the
+    # first operand on an unordered NaN compare, so NaN would silently pin to a
+    # bound. Reject non-finite and fall back to the default (these helpers feed
+    # /api/summarise, which does NOT route through api.validators' isfinite guard).
+    if not math.isfinite(val):
+        return default
+    return max(0.0, min(2.0, val))
 
 def parse_num_ctx(raw, default: int = 32768) -> int:
     """Safely parse and clamp num_ctx to [512, 131072]."""
     try:
         return max(512, min(131072, int(raw)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(inf) raises it; without catching, a non-finite value
+        # would 500 the route instead of falling back to the default.
         return default
 
 def parse_num_predict(raw, default: int = 4096) -> int:
@@ -170,23 +202,29 @@ def parse_num_predict(raw, default: int = 4096) -> int:
         mt = int(raw) if raw is not None else None
         if mt is not None:
             return max(64, min(32768, mt))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pass
     return default
 
 def parse_top_p(raw, default: float = 0.9) -> float:
     """Safely parse and clamp top_p to [0.0, 1.0]."""
     try:
-        return max(0.0, min(1.0, float(raw)))
+        val = float(raw)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(val):  # reject NaN/Inf — see parse_temperature
+        return default
+    return max(0.0, min(1.0, val))
 
 def parse_repeat_penalty(raw, default: float = 1.1) -> float:
     """Safely parse and clamp repeat_penalty to [0.5, 2.0]."""
     try:
-        return max(0.5, min(2.0, float(raw)))
+        val = float(raw)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(val):  # reject NaN/Inf — see parse_temperature
+        return default
+    return max(0.5, min(2.0, val))
 
 class ReaderWriterLock:
     """A writer-preferring, reentrant multiple-reader / single-writer lock.
@@ -313,32 +351,43 @@ class RagOperationLock:
         self._meta_lock = threading.Lock()           # guards all fields below
         self._holder_since: Optional[float] = None   # monotonic time of last acquire/heartbeat; None = free
         self._ttl: float = 0.0                       # seconds the current holder is granted
-        self._owner_thread: Optional[int] = None     # ident of acquirer (diagnostic only; see note)
+        # (_owner_thread removed — it was written on every acquire/release but never
+        # read anywhere, so it was pure dead state; see the 2026-05 Known Issues.)
         self._epoch: int = 0                         # bumped each acquire; the anti-zombie token
 
-    def try_acquire(self, ttl_seconds: float) -> bool:
-        """Acquire iff free or the prior holder's TTL has lapsed; bump the epoch.
+    def try_acquire_epoch(self, ttl_seconds: float) -> Optional[int]:
+        """Acquire and return THIS acquisition's epoch token ATOMICALLY.
 
-        Returns ``True`` and grants the lock for *ttl_seconds* when it is free or
-        the previous acquisition has expired; ``False`` when a live holder still
-        owns it. The returned acquisition's token is :attr:`epoch` — capture it and
-        pass it to ``heartbeat``/``release``.
+        The epoch bump and its read happen in ONE ``_meta_lock`` critical
+        section, so no ``force_release`` + re-acquire by another operation can
+        interleave between the bump and the read and hand the caller a *newer*
+        acquisition's token — the item-1.5 zombie-release class that a
+        two-statement ``try_acquire()`` + ``.epoch`` capture reintroduced
+        (2026-07-05 audit m2). Returns the epoch (int ≥ 1, truthy) on success,
+        ``None`` when a live holder still owns the lock.
         """
         with self._meta_lock:
             now = time.monotonic()
             # A still-live holder (acquired/heartbeated within its TTL) blocks us.
             # Once elapsed >= ttl the holder is considered dead and we steal it.
-            if self._holder_since is not None:
-                elapsed = now - self._holder_since
-                if elapsed < self._ttl:
-                    return False
+            if self._holder_since is not None and (now - self._holder_since) < self._ttl:
+                return None
             self._holder_since = now
             self._ttl = ttl_seconds
-            self._owner_thread = threading.get_ident()
             # New epoch: any heartbeat/release carrying the OLD epoch now no-ops,
             # so a zombie worker from the stolen acquisition can't touch this one.
             self._epoch += 1
-            return True
+            return self._epoch
+
+    def try_acquire(self, ttl_seconds: float) -> bool:
+        """Acquire iff free or the prior holder's TTL has lapsed; bump the epoch.
+
+        Boolean convenience over :meth:`try_acquire_epoch` for callers that do
+        not need the token. Prefer ``try_acquire_epoch`` whenever you will later
+        ``release``/``heartbeat``, so the token is captured atomically with the
+        acquire (never a separate ``.epoch`` read that could race a re-acquire).
+        """
+        return self.try_acquire_epoch(ttl_seconds) is not None
 
     @property
     def epoch(self) -> int:
@@ -368,7 +417,6 @@ class RagOperationLock:
                 return
             self._holder_since = None
             self._ttl = 0.0
-            self._owner_thread = None
 
     def force_release(self) -> bool:
         """Unconditionally free the lock (admin/recovery escape hatch).
@@ -381,7 +429,6 @@ class RagOperationLock:
             was_held = self._holder_since is not None
             self._holder_since = None
             self._ttl = 0.0
-            self._owner_thread = None
         return was_held
 
     @property
@@ -391,3 +438,31 @@ class RagOperationLock:
             if self._holder_since is None:
                 return False
             return (time.monotonic() - self._holder_since) < self._ttl
+
+def put_done_resilient(event_q, done_sentinel, cancel) -> bool:
+    """Deliver an SSE worker's terminal sentinel, surviving a full queue.
+
+    Defect this replaces (improvement plan 2026-07-04, item 2.5): every SSE
+    worker's ``finally`` used a one-shot ``event_q.put(_DONE, timeout=5)`` that
+    silently DROPPED the sentinel when the queue stayed full for 5 s — a
+    slow-but-alive consumer then blocked out its full stall timeout and
+    reported "Generation timed out" on an answer the worker had already
+    completed. Retry until delivered or the consumer is provably gone
+    (*cancel* set): a live consumer drains the queue so a slot always frees;
+    a dead one sets *cancel* on every exit path, so this never spins forever.
+
+    Safe: same thread, same queue, no lock held; the only behavioural change
+    is that the sentinel now always reaches a live consumer. Returns whether
+    the sentinel was delivered. Invariant (pinned by
+    ``test_concurrency.py::TestPutDoneResilient``): a finished worker's
+    sentinel reaches a live consumer whatever the queue depth; a dead
+    consumer never traps the worker thread.
+    """
+    import queue as _queue
+    while True:
+        try:
+            event_q.put(done_sentinel, timeout=1)
+            return True
+        except _queue.Full:
+            if cancel.is_set():
+                return False

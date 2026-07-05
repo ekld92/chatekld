@@ -42,6 +42,11 @@ from llama_index.core import (
     Document as LlamaDocument,
 )
 from llama_index.core.indices.base import BaseIndex
+# Track 5.6: the batched insert path replicates BaseIndex.insert() (which is
+# run_transformations + insert_nodes + set_document_hash — verified against
+# llama-index-core 0.14.22) over K documents at once, so it needs the same
+# transformation runner insert() uses.
+from llama_index.core.ingestion import run_transformations
 from llama_index.core.schema import TextNode
 from llama_index.core.node_parser import MarkdownNodeParser as _MarkdownNodeParser
 from llama_index.core.node_parser import SentenceSplitter as _SentenceSplitter
@@ -60,7 +65,7 @@ from core.constants import (
     VAULT_BINARY_EXTS,
     VAULT_IMAGE_EXTS,
 )
-from core.config import load_config, save_config
+from core.config import load_config, load_config_readonly
 from core.utils import ReaderWriterLock, RagOperationLock, log_storage_deletion
 from core.providers import get_provider
 from rag.lancedb_store import (
@@ -71,6 +76,8 @@ from rag.lancedb_store import (
     lancedb_dir,
     lancedb_table_count,
     make_lancedb_vector_store,
+    lancedb_list_doc_ids,
+    lancedb_delete_ids,
 )
 from services.vision import glm_ocr_manager, vision_manager
 from pdf_extractor import (
@@ -100,6 +107,14 @@ _LLAMAINDEX_PERSIST_FILES = (
 # and therefore never touches it.
 _BM25_SIDECAR_DIRNAME = "bm25_index"
 _BM25_SIDECAR_META_FILENAME = "sidecar_meta.json"
+
+# On-disk sidecar for the wikilink note→note graph — the BM25 sidecar's
+# sibling (same placement rationale: inside the index dir so /api/reset and
+# the version-bump archive cover it, and _persist_index_checkpoint never
+# touches it).  A single atomic JSON file rather than a dir + meta-last
+# dance: the graph serializes to one document and _write_json_atomic makes
+# a torn write impossible, so no separate meta file is needed.
+_WIKILINK_SIDECAR_FILENAME = "wikilink_sidecar.json"
 
 
 # Obsidian wikilinks: ![[image.png]], [[note]], [[note|alias]], [[note#heading]].
@@ -191,12 +206,57 @@ class _WikilinkGraph:
     def edge_count(self) -> int:
         return sum(len(targets) for targets in self._forward.values())
 
+    def to_payload(self) -> dict:
+        """JSON-serializable adjacency for the on-disk sidecar.
+
+        Backlinks are deliberately omitted — they are a pure inversion of
+        ``forward`` and are recomputed by ``from_payload``, so the two maps
+        can never desync on disk.  Target sets are sorted for deterministic
+        output (byte-stable sidecar across rebuilds of the same graph).
+        """
+        return {
+            "forward": {s: sorted(t) for s, t in self._forward.items()},
+            "note_to_node_ids": {
+                s: list(ids) for s, ids in self._note_to_node_ids.items()
+            },
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "_WikilinkGraph":
+        """Rebuild a graph from ``to_payload`` output (raises on bad shape)."""
+        forward_raw = payload["forward"]
+        ids_raw = payload["note_to_node_ids"]
+        if not isinstance(forward_raw, dict) or not isinstance(ids_raw, dict):
+            raise ValueError("wikilink sidecar payload malformed")
+        forward = {
+            str(source): {str(t) for t in (targets or ())}
+            for source, targets in forward_raw.items()
+        }
+        backward: dict[str, set[str]] = {}
+        for source, targets in forward.items():
+            for target in targets:
+                backward.setdefault(target, set()).add(source)
+        note_to_node_ids = {
+            str(source): [str(i) for i in (ids or ())]
+            for source, ids in ids_raw.items()
+        }
+        return cls(forward, backward, note_to_node_ids)
+
 
 def _write_json_atomic(path: str, data: dict) -> None:
     """Write *data* as JSON to *path* atomically using a sibling temp file.
 
     Uses the same tempfile+os.replace() pattern as _save_pdf_cache_file so
     a crash or SIGTERM mid-write can never leave the file empty or corrupt.
+
+    Adds a flush+fsync before the rename for crash *durability* (not just
+    atomicity): this writer persists the index meta / indexed-materials manifest /
+    PDF-signature cache — low-frequency (checkpoint cadence + final persist), so
+    the fsync cost is negligible, and a torn meta on power loss could leave the
+    on-disk index state unrecoverable. The per-image/per-PDF *description* cache
+    (regenerable) uses the separate _atomic_write_text writer, which deliberately
+    does NOT fsync — it runs per document during a multi-hour index and its loss
+    only costs a re-extraction, not correctness.
     """
     dir_ = os.path.dirname(path) or "."
     os.makedirs(dir_, exist_ok=True)
@@ -209,6 +269,8 @@ def _write_json_atomic(path: str, data: dict) -> None:
             raise
         with f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except Exception:
         try:
@@ -255,6 +317,93 @@ def _simple_vector_store_has_any_embedding(path: Path) -> bool:
     return False
 
 
+# Chat-path bound on waiting for _index_mutation_lock (item 2.1): above the
+# longest legitimate holder (a mid-run checkpoint re-serialising the store),
+# below the SSE consumer stall floor (SSE_SINGLE_SHOT_FLOOR_S + margin) so the
+# clean error beats the generic stall message. Patched down in tests.
+_RETRIEVAL_LOCK_TIMEOUT_S = 120.0
+
+# Minimum remaining agent budget (s) below which read_note refuses to START a
+# fresh uncached-PDF extraction (item 2.4). Typical extracts finish in seconds;
+# the floor only rejects starts that would mostly run past the turn's death.
+_FRESH_EXTRACT_MIN_BUDGET_S = 20.0
+
+
+def _iter_vault_scan_files(vault_root: Path, user_excluded_dirs: set):
+    """Yield ``(path, apparent-rel)`` for every regular file under *vault_root*,
+    pruning excluded directories at descent time (Track 5.4, 2026-07-04).
+
+    DEFECT this replaces: the scan pass ran ``sorted(vault_root.rglob("*"))`` +
+    a per-file ``p.resolve()`` — it materialised and sorted the WHOLE tree
+    (including every file inside ``.git``/``.obsidian``/``.trash`` and the
+    user's ``vault_exclude_dirs``, which were listed and then discarded one by
+    one) and paid a symlink-resolving syscall chain per entry. Worst on iCloud
+    vaults, where merely listing a large excluded folder can be slow.
+
+    Equivalence with the old ``rglob`` + ``_should_skip_path`` filter:
+    * Reserved-name dirs (``OBSIDIAN_EXCLUDED_DIR_NAMES``) and user exclusions
+      (vault-relative prefixes) are pruned BEFORE descent, so their contents are
+      simply never generated — same surviving file set, since a skipped dir's
+      descendants were all individually skipped before. *vault_root* arrives
+      ``.resolve()``d, so for non-symlink entries the apparent rel used here
+      equals the resolved rel the old check compared (deliberate divergence: a
+      reserved name in the path of *vault_root itself* no longer blanks the
+      whole vault — the old full-``p.parts`` check scanned above the root too).
+    * Symlinked FILES keep the old resolve-gate: yielded only when their target
+      resolves under the (resolved) root and outside user exclusions — a vault
+      symlink can still not pull outside content into the index.
+    * Symlinked DIRS are not descended (matches ``os.walk`` and Python 3.13+
+      ``rglob`` defaults). The old 3.12 ``rglob`` descended them, but every file
+      inside either resolved outside the root (skipped by the old per-file
+      check) or resolved inside it (indexed TWICE, under both the real and the
+      symlinked rel — a duplicate-chunk footgun, not a feature). The real files
+      still index at their real paths.
+
+    Yield order is scandir order — the consumer sorts its per-type buckets,
+    which reproduces the old globally-sorted order per bucket (a sorted list's
+    subsequence order equals the sorted subsequence; posix Path ordering is
+    plain string ordering, and rel-key sorting equals full-path sorting under a
+    shared root prefix). Pinned by TestVaultScanWalk.
+    """
+    def _rel_excluded(rel: str) -> bool:
+        for excluded in user_excluded_dirs:
+            if rel == excluded or rel.startswith(excluded + "/"):
+                return True
+        return False
+
+    stack = [(str(vault_root), "")]
+    while stack:
+        dir_abs, dir_rel = stack.pop()
+        try:
+            entries = os.scandir(dir_abs)
+        except OSError:
+            continue  # unreadable dir: the old walk silently skipped it too
+        with entries:
+            for entry in entries:
+                rel = f"{dir_rel}{entry.name}"
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name in OBSIDIAN_EXCLUDED_DIR_NAMES or _rel_excluded(rel):
+                            continue
+                        stack.append((entry.path, rel + "/"))
+                    elif entry.is_file(follow_symlinks=False):
+                        if _rel_excluded(rel):
+                            continue
+                        yield Path(entry.path), rel
+                    elif entry.is_symlink():
+                        # Symlink-to-file: old resolve-gate preserved (see
+                        # docstring); symlink-to-dir falls through un-descended.
+                        try:
+                            resolved = Path(entry.path).resolve()
+                            resolved_rel = resolved.relative_to(vault_root).as_posix()
+                        except (OSError, ValueError):
+                            continue
+                        if resolved.is_file() and not _rel_excluded(resolved_rel):
+                            yield Path(entry.path), rel
+                except OSError:
+                    continue
+
+
 class ObsidianVaultManager:
     """Singleton owning the vault index, its caches, and the chat/indexing entrypoints.
 
@@ -264,9 +413,14 @@ class ObsidianVaultManager:
 
     * ``_op_lock`` (:class:`RagOperationLock`) — coarse admission control: only one
       long operation (an index run, or a Note-Refactor write) at a time, with a TTL
-      so a crashed worker self-expires. ``try_acquire_lock`` captures the epoch into
-      ``_lock_epoch``; ``release_lock`` passes it back so a zombie cannot release a
-      newer holder's lock.
+      so a crashed worker self-expires. ``try_acquire_lock`` RETURNS the acquisition
+      epoch (a per-operation token the caller must hold on its own stack) and
+      ``release_lock``/``heartbeat`` take it back as a required argument. The epoch
+      is deliberately NOT stored on this shared singleton: a manager-level
+      ``_lock_epoch`` attribute meant any new acquisition overwrote the token a
+      still-running previous holder would later release with — e.g. cancel an index
+      run, start a refactor Apply, and the indexer's ``finally`` released the
+      *refactor's* lock mid-batch (improvement plan 2026-07-04, item 1.5).
     * ``_rw_lock`` (:class:`ReaderWriterLock`) — guards ``self._index`` *publication*.
       Chat takes the read lock; the indexer takes the write lock only to publish the
       index, to checkpoint, and for the final persist — the multi-hour insert loop
@@ -316,7 +470,15 @@ class ObsidianVaultManager:
         self._last_warning: str = ""
         self._index_integrity_error: str = ""
         self._skipped_image_count: int = 0
-        self._lock_epoch: int = 0
+        # Item 2.8b: vault-relative sources whose READ failed this run (iCloud
+        # dataless miss, transient I/O). Written only by _load_vault_documents
+        # (single indexing thread), read by the stale-doc sweep so a
+        # transiently unreadable file is never treated as deleted.
+        self._scan_failed_sources: set[str] = set()
+        # NOTE: no ``_lock_epoch`` field. The op-lock epoch is a per-operation
+        # token returned by ``try_acquire_lock`` and passed back explicitly to
+        # ``release_lock``/``heartbeat`` — storing it here let one operation
+        # clobber another's token (see the class docstring's ``_op_lock`` entry).
         # P0.4: throttle cache-write warnings to one per indexing run per
         # cache type.  A chronic disk-full or permissions issue would
         # otherwise emit a warning per file, flooding the status feed.
@@ -367,10 +529,28 @@ class ObsidianVaultManager:
         self._wikilink_index: Optional[Any] = None
         self._wikilink_cached_doc_count: int = -1
         self._wikilink_build_lock: threading.Lock = threading.Lock()
+        # Persisted PDF-signature read cache (pdf_signatures.json).  The
+        # read paths (read_note → _read_pdf_text, refactor pdf-refs) consult
+        # the map the indexer persists so an unchanged multi-hundred-MB PDF
+        # is not re-hashed on every call just to locate its text cache.
+        # Stat-keyed on the signature files so an indexing run's rewrite is
+        # picked up on the next read; read-only (the indexer owns writes).
+        self._pdf_sig_read_cache: dict = {}
+        self._pdf_sig_read_cache_key: Optional[tuple] = None
+        self._pdf_sig_read_lock: threading.Lock = threading.Lock()
+        # Vault thesaurus cache (query expansion + system-prompt primer).
+        # Parsed from the raw `_abreviations.md` / `_tags.md` files at the vault
+        # root — NOT from the index — so it is keyed by those files' mtimes
+        # (rebuilt when the user edits either), independent of the docstore and
+        # of any reindex. None until first use / when neither file exists.
+        self._thesaurus: Optional[Any] = None
+        self._thesaurus_cache_key: Optional[tuple] = None
+        self._thesaurus_build_lock: threading.Lock = threading.Lock()
         # Cross-encoder reranker cache.  The model load is one-shot (the
         # weights are kept in memory) so the first chat pays the download +
-        # warm-up cost and subsequent ones reuse the same object with only
-        # ``top_n`` retuned per query.
+        # warm-up cost and subsequent ones reuse the same object. ``top_n``
+        # is tuned per query by the engine's locked pipeline build ONLY
+        # (item 2.7) — never at fetch time.
         self._reranker: Optional[Any] = None
         self._reranker_model_loaded: str = ""
         # Sticky failure flag.  A failed load logs once and is not retried
@@ -415,11 +595,10 @@ class ObsidianVaultManager:
             except Exception as e:
                 logger.error("Status callback error: %s", e)
 
-    def set_vault_path(self, path: str) -> None:
-        self._vault_path = self._normalise_vault_path(path)
-        cfg = load_config()
-        cfg["obsidian_vault_path"] = self._vault_path
-        save_config(cfg)
+    # (set_vault_path removed 2026-07-05 audit D8: the 4.10 "delete/defang"
+    # item only defanged it; it had zero callers. The canonical in-memory
+    # setter is restore_vault_path; config persistence is owned by POST
+    # /api/config — never a manager-side whole-config save.)
 
     def restore_vault_path(self, path: str) -> None:
         self._vault_path = self._normalise_vault_path(path)
@@ -531,6 +710,60 @@ class ObsidianVaultManager:
                     pass
             return self._index_state
 
+    def docstore_doc_count(self) -> Optional[int]:
+        """Loaded-docstore size for the health probe, or ``None``.
+
+        ``None`` means "no loaded index" OR "index busy" — the probe uses a
+        NON-blocking acquire of ``_index_mutation_lock`` because a 15 s UI
+        poll must never stall behind (or stall) an insert/checkpoint; reading
+        ``_index.docstore.docs`` without the lock would race the streaming
+        indexer's mutations. Callers distinguish "not loaded" from "no index
+        on disk" via the persisted docstore file, not this accessor.
+        """
+        if not self._index_mutation_lock.acquire(blocking=False):
+            return None
+        try:
+            idx = self._index
+            if idx is None:
+                return None
+            try:
+                return len(idx.docstore.docs)
+            except Exception:
+                return None
+        finally:
+            self._index_mutation_lock.release()
+
+    def _acquire_retrieval_lock(self) -> None:
+        """Timed acquire of ``_index_mutation_lock`` for the CHAT path (item 2.1).
+
+        Defect this guards: the retrieval phase (``engine.query``/``retrieve``)
+        embeds the query over HTTP while holding this lock. Before the embed
+        call itself was bounded, one wedged local-backend call held the lock
+        FOREVER — and because the old acquire here was also unbounded, every
+        subsequent chat worker blocked on it in turn: each SSE consumer timed
+        out (~330 s), abandoned its still-blocked worker thread, and the user
+        retried into the same wall. Restart-only recovery.
+
+        The timeout is generous on purpose: a legitimate holder can be a
+        mid-run CHECKPOINT (which re-serialises the whole store under this
+        lock — minutes on a multi-GB simple-backend store), so tripping early
+        would false-error healthy chats during indexing. 120 s sits above any
+        observed checkpoint yet below the SSE consumer stall floor (300 s+30),
+        so the user gets THIS actionable message, not the generic
+        "Generation timed out". Safe: acquire semantics unchanged on success
+        (caller releases in its ``finally``); on timeout nothing was acquired
+        and the raise surfaces through the worker's normal ``{"error"}`` path.
+        Invariant (pinned by ``test_acquire_retrieval_lock_times_out_cleanly``):
+        a chat can wait at most ``_RETRIEVAL_LOCK_TIMEOUT_S`` on the mutation
+        lock before failing with an explanatory error instead of hanging.
+        """
+        if not self._index_mutation_lock.acquire(timeout=_RETRIEVAL_LOCK_TIMEOUT_S):
+            raise RuntimeError(
+                "The vault index is busy (a long-running index operation is "
+                "holding the retrieval lock). Please try again shortly; if this "
+                "persists, cancel or restart the indexing run."
+            )
+
     def get_status_payload(self) -> dict:
         messages = self.drain_status_messages()
         warning = self.get_index_warning()
@@ -561,29 +794,83 @@ class ObsidianVaultManager:
         with self._messages_lock:
             self._status_messages.clear()
 
-    def try_acquire_lock(self, ttl: int = 3600) -> bool:
-        """Admit one long operation; cache its epoch for the matching release.
+    def try_acquire_lock(self, ttl: int = 3600) -> Optional[int]:
+        """Admit one long operation; return its epoch token (None if refused).
 
-        Returns ``True`` and records ``_lock_epoch`` on success. The epoch is what
-        makes :meth:`release_lock` safe: a worker whose acquisition already expired
-        (TTL lapsed, another caller stole the lock) will pass a stale epoch and so
-        cannot release the new holder's lock.
+        Per-operation token fix (improvement plan 2026-07-04, item 1.5). The
+        previous version cached the epoch in a shared ``self._lock_epoch``
+        attribute that ``release_lock``/``heartbeat`` read *at call time* — so
+        any NEW acquisition overwrote the token a still-running previous holder
+        would later release with. Concrete failure: cancel an index run
+        (``force_release``), start a refactor Apply (new epoch stored on the
+        singleton), and the cancelled indexer's ``finally`` then released the
+        *refactor's* lock mid-batch, letting a second writer in. The docstring
+        claimed exactly the zombie-safety the shared field destroyed.
+
+        Now the epoch lives only on the caller's stack: it is RETURNED here and
+        must be passed back to :meth:`release_lock` / :meth:`heartbeat`. Safe
+        w.r.t. existing state: epochs start at 1 (``RagOperationLock`` bumps
+        from 0 on first acquire) so the return is truthy exactly when the old
+        ``True`` was — every ``if not try_acquire_lock(...)`` guard keeps its
+        behaviour — and no on-disk state or lock-acquisition ORDER changes.
+        Invariant (pinned by ``test_concurrency.py::TestOpLockEpochToken``): a
+        holder can only release/extend the acquisition whose epoch it captured
+        at acquire time; a stale holder's release/heartbeat is a no-op.
         """
-        acquired = self._op_lock.try_acquire(ttl)
-        if acquired:
-            self._lock_epoch = self._op_lock.epoch
-        return acquired
+        # Atomic acquire+epoch capture (2026-07-05 audit m2): reading the epoch
+        # in a SEPARATE critical section (the old `try_acquire()` then `.epoch`)
+        # left a window where a force_release + re-acquire by another operation
+        # could hand back a NEWER acquisition's token — reintroducing the item
+        # 1.5 zombie-release class. One call, one `_meta_lock` critical section.
+        # Returns None on refusal, the caller's own epoch (≥1, truthy) on grant.
+        return self._op_lock.try_acquire_epoch(ttl)
 
-    def release_lock(self):
-        """Release the op-lock using the epoch captured at acquire time (no-op if stale)."""
-        self._op_lock.release(self._lock_epoch)
+    def release_lock(self, epoch: int) -> None:
+        """Release the op-lock acquisition identified by *epoch* (no-op if stale).
+
+        *epoch* is the token :meth:`try_acquire_lock` returned to THIS caller —
+        never a value read from shared state. A falsy epoch is refused outright:
+        ``RagOperationLock.release(0)`` would be an unconditional release, which
+        must never be reachable from the normal caller path (that is what
+        :meth:`force_release` is for).
+        """
+        if not epoch:
+            return
+        self._op_lock.release(epoch)
+
+    def heartbeat(self, epoch: int) -> None:
+        """Push the op-lock deadline out for the acquisition identified by *epoch*.
+
+        Long external holders (the Note Refactor batch writers) must call this
+        periodically so their lock does not passively expire mid-operation and
+        get stolen by a concurrent indexing run — exactly the way the indexer
+        heartbeats inside its own insert loop. *epoch* is the caller's own
+        captured token; a stale/foreign epoch is a no-op inside
+        ``RagOperationLock.heartbeat``, so a zombie can never extend the
+        deadline of whoever holds the lock now. Exposed as a public method so
+        ``refactor/`` never reaches into the private lock.
+        """
+        self._op_lock.heartbeat(epoch)
 
     def force_release(self) -> bool:
         """Unconditionally free the op-lock (recovery path, e.g. cancel); was-it-held."""
         return self._op_lock.force_release()
 
-    def index_vault(self, llm_name: str, embed_name: str, provider_name: str = "ollama") -> None:
+    def index_vault(
+        self,
+        llm_name: str,
+        embed_name: str,
+        provider_name: str = "ollama",
+        op_epoch: int = 0,
+    ) -> None:
         """Run a full incremental (re)index of the configured vault — the main orchestrator.
+
+        ``op_epoch`` is the op-lock token the admitting route captured from
+        ``try_acquire_lock`` — threaded through to the loader/streaming-insert
+        heartbeats so this run can only ever extend its OWN acquisition (item
+        1.5; ``0`` — e.g. a direct test call holding no lock — makes every
+        heartbeat an inert no-op rather than an accidental extension of a
+        foreign holder).
 
         Called on the daemon thread admitted by ``/api/obsidian/index`` (which already
         holds the op-lock). Drives the streaming pipeline documented in ``rag/CLAUDE.md``:
@@ -625,13 +912,83 @@ class ObsidianVaultManager:
         else:
             self._emit(f"LLM: {llm_name} | Embeddings: {embed_name} ({provider_name})")
 
+        # Preflight: a reachable local backend that simply has not pulled the
+        # embed model otherwise fails per-chunk and only surfaces a GENERIC abort
+        # ~87 s later (the consecutive-failure breaker's backoff window). Probe
+        # the installed-model list and fail fast with an ACTIONABLE message. Only
+        # aborts when the backend is reachable (no list error) and returns a
+        # non-empty list that lacks the model by exact or base-name match — so an
+        # unreachable backend (empty list + error) falls through to the existing
+        # init/insert error paths rather than mis-reporting "not installed".
+        try:
+            _installed, _list_err = provider.get_models()
+        except Exception:
+            _installed, _list_err = [], "probe failed"
+        if not _list_err and _installed:
+            _base = embed_name.split(":")[0]
+            if embed_name not in _installed and not any(
+                m.split(":")[0] == _base for m in _installed
+            ):
+                self._emit(
+                    f"ERROR: Embedding model '{embed_name}' is not installed on "
+                    f"'{embed_provider_name}'. Pull or load it (e.g. "
+                    f"`ollama pull {embed_name}`) in the Models panel, then reindex."
+                )
+                with self._status_lock:
+                    self._index_state = "error"
+                return
+
         try:
             embed_model = provider.get_embedding(embed_name)
+            # Track 5.6: size the LlamaIndex-level sub-batching to the app's
+            # embed batch, so one flushed batch is one provider HTTP call
+            # (BaseEmbedding.get_text_embedding_batch otherwise re-splits our
+            # K-chunk batches at its default embed_batch_size of 10). Set
+            # post-construction (best-effort) rather than via a new
+            # get_embedding kwarg so provider fakes/mocks and both real
+            # adapters keep their existing signatures; the QUERY-path
+            # constructions (prewarm/chat) deliberately keep the default —
+            # they embed one text at a time.
+            try:
+                embed_model.embed_batch_size = self._embed_batch_size()
+            except Exception:  # noqa: BLE001 — batching is an optimization only
+                pass
         except Exception as e:
             self._emit(f"ERROR: Failed to initialize embedding model: {e}")
             with self._status_lock:
                 self._index_state = "error"
             return
+
+        # Preflight: refuse to overwrite an existing LanceDB index when the
+        # LanceDB backend cannot be constructed in this environment (e.g. the
+        # integration's `from pandas import DataFrame` fails, so the import guard
+        # in rag/lancedb_store.py sets lancedb_available() = False). Without this
+        # gate, _index_dir_has_vector_data() reports the intact LanceDB table as
+        # "no data" (lancedb_table_count() -> -1), the run falls through to a
+        # FRESH build, and the new SimpleVectorStore JSON silently OVERWRITES the
+        # docstore/index-store/meta that the LanceDB table depends on — turning a
+        # recoverable dependency gap into data loss. The vectors are fine; the
+        # environment is the problem, so fail fast with an actionable message
+        # instead of mutating the index. Mirrors the embed-model preflight above.
+        _meta_path = os.path.join(OBSIDIAN_INDEX_DIR, "obsidian_meta.json")
+        if os.path.exists(_meta_path):
+            try:
+                with open(_meta_path) as _f:
+                    _existing_backend = (json.load(_f) or {}).get("vector_backend")
+            except Exception:
+                _existing_backend = None
+            if _existing_backend == VECTOR_BACKEND_LANCEDB and not lancedb_available():
+                self._emit(
+                    "ERROR: The existing vault index uses the LanceDB backend, but "
+                    "LanceDB cannot be loaded in this environment (its dependencies — "
+                    "e.g. pandas — are missing). Refusing to reindex, which would "
+                    "overwrite the existing index. Reinstall the dependencies "
+                    "(pip install -r requirements.txt -c constraints.txt) and "
+                    "restart, then reindex."
+                )
+                with self._status_lock:
+                    self._index_state = "error"
+                return
 
         try:
             # Setup phase: load or create the index under a brief write lock
@@ -682,6 +1039,21 @@ class ObsidianVaultManager:
                                 "fresh vector index."
                             )
 
+                # Item 2.8a follow-up (2026-07-05): the reindex/writer path must
+                # honor the promotion marker the READERS enforce. A store torn by
+                # a crash mid-promotion would otherwise be loaded incrementally
+                # (the hash-skip can never repair its stranded chunks) and then
+                # sealed by this run's fresh "complete" marker — defeating the
+                # exact recovery the load-time integrity error tells the user to
+                # take. Degrade a torn store to a fresh rebuild instead.
+                if is_incremental and not self._incremental_store_is_intact(prev_meta):
+                    is_incremental = False
+                    self._emit(
+                        "WARNING: the existing index checkpoint was interrupted "
+                        "mid-promotion (mixed-generation store); rebuilding the "
+                        "vector index from scratch to guarantee consistency."
+                    )
+
                 if not is_incremental:
                     if self._index_dir_has_vector_data(OBSIDIAN_INDEX_DIR):
                         self._migrate_legacy_caches()
@@ -718,7 +1090,7 @@ class ObsidianVaultManager:
             # memory cost no longer scales with the entire vault.  The
             # empty-vault check moves below — see the "no work done" branch
             # after `_index_documents_streaming` returns.
-            raw_docs = self._load_vault_documents(vault)
+            raw_docs = self._load_vault_documents(vault, op_epoch=op_epoch)
 
             with self._status_lock:
                 self._index_state = "embedding"
@@ -767,13 +1139,36 @@ class ObsidianVaultManager:
             if vector_backend == VECTOR_BACKEND_LANCEDB and is_incremental:
                 try:
                     vec_rows = lancedb_table_count(OBSIDIAN_INDEX_DIR)
-                    node_count = len(getattr(idx, "docstore").docs)
+                    node_count = len(idx.docstore.docs)
                     if vec_rows > node_count:
                         lancedb_upsert = True
                         self._emit(
                             "Detected an interrupted previous run (vector store ahead of "
                             "docstore); reconciling to avoid duplicate chunks."
                         )
+                        # Reconcile orphan rows (chunks whose docstore record —
+                        # or whole source note — vanished in the crash window):
+                        # the delete-before-insert upsert only heals chunks that
+                        # get RE-PROCESSED, so rows for deleted notes need this
+                        # explicit sweep. Fires only on this drift branch —
+                        # offsetting add/delete drift is not detected (see
+                        # Known Issues in the root CLAUDE.md).
+                        lancedb_ids = lancedb_list_doc_ids(OBSIDIAN_INDEX_DIR)
+                        docstore_keys = set(idx.docstore.docs.keys())
+                        orphans = [i for i in lancedb_ids if i not in docstore_keys]
+                        if orphans:
+                            logger.info("Found %d LanceDB orphan rows to delete", len(orphans))
+                            ok, detail = lancedb_delete_ids(idx.vector_store, orphans)
+                            if ok:
+                                self._emit(f"Reconciled {len(orphans)} LanceDB orphan rows.")
+                            else:
+                                # Orphans linger (duplicate retrieval hits until a
+                                # full reindex) — that must be visible, not silent.
+                                logger.warning("LanceDB orphan reconciliation failed: %s", detail)
+                                self._emit(
+                                    f"WARNING: could not reconcile {len(orphans)} LanceDB "
+                                    f"orphan rows ({detail}); a full reindex will resync."
+                                )
                     elif 0 <= vec_rows < node_count:
                         self._emit(
                             "WARNING: vector store has fewer rows than docstore nodes "
@@ -788,6 +1183,7 @@ class ObsidianVaultManager:
                     idx, chunks_iter, _persist_callback,
                     lancedb_upsert=lancedb_upsert,
                     vector_backend=vector_backend,
+                    op_epoch=op_epoch,
                 )
             )
 
@@ -825,10 +1221,6 @@ class ObsidianVaultManager:
             with self._rw_lock.write_lock():
                 with self._index_mutation_lock:
                     self._persist_index_checkpoint(idx, vector_backend)
-                # Resync the BM25 cache to the freshly-persisted docstore.
-                # Done inside the write lock so a concurrent chat cannot
-                # rebuild against a stale snapshot mid-persist.
-                self._invalidate_retrieval_caches()
                 has_vector_data = bool(manifest_counts) or self._index_has_vector_data(idx)
                 if self._stop_event.is_set() and has_vector_data:
                     self._emit(
@@ -865,6 +1257,26 @@ class ObsidianVaultManager:
                     vector_backend=vector_backend,
                 )
                 self._write_index_manifest(manifest_counts, vault)
+
+            # Resync the BM25/wikilink caches to the freshly-persisted docstore
+            # — OUTSIDE the rw write lock, matching the mid-run checkpoint path
+            # (item 2.8c, improvement plan 2026-07-04). The previous inline
+            # position held the WRITE lock while _invalidate_retrieval_caches
+            # contended the BM25 build lock: a concurrent chat mid-way through
+            # a minutes-long BM25 rebuild made the invalidation wait on the
+            # build lock while every reader (all chats) waited on the write
+            # lock — the whole app froze for the rebuild's duration (the
+            # mid-run path documented exactly this hazard and stayed outside;
+            # the two paths had drifted). Safe: the invalidation itself is
+            # idempotent and ordering-tolerant — a chat that rebuilt against
+            # the pre-persist docstore inside the window keeps a stale cache
+            # only until this call lands (the same eventual-consistency
+            # contract the mid-run checkpoint has always run under; staleness
+            # means "yesterday's BM25 corpus", never corruption). Invariant
+            # (pinned by test_final_persist_invalidates_caches_outside_write_lock):
+            # no _invalidate_retrieval_caches call runs while the rw write
+            # lock is held.
+            self._invalidate_retrieval_caches()
 
             with self._status_lock:
                 if not self._stop_event.is_set():
@@ -942,8 +1354,10 @@ class ObsidianVaultManager:
         Each ``_archive_old_index_dir`` call renames the entire prior index dir
         to a timestamped ``.bak`` sibling; without this sweep they grow without
         bound. Best-effort and never raises — a failed prune must not abort a
-        reindex. Every removal is routed through ``log_storage_deletion`` per the
-        deletion-audit invariant (see the root ``CLAUDE.md``).
+        reindex. Each confirmed removal is routed through ``log_storage_deletion``
+        per the deletion-audit invariant (see the root ``CLAUDE.md``) — logged
+        **after** the ``rmtree`` succeeds, because ``ignore_errors=True`` would
+        otherwise let the audit line claim a removal that silently failed.
         """
         try:
             index_dir = Path(OBSIDIAN_INDEX_DIR)
@@ -959,8 +1373,16 @@ class ObsidianVaultManager:
             )
             for stale in baks[keep:]:
                 try:
-                    log_storage_deletion(f"prune_old_index_backup:{stale.name}")
                     shutil.rmtree(stale, ignore_errors=True)
+                    # rmtree swallowed any error (ignore_errors), so confirm the
+                    # dir is actually gone before recording the deletion — the
+                    # audit trail must never assert a removal that didn't happen.
+                    if stale.exists():
+                        logger.warning(
+                            "Could not fully prune stale index backup %s", stale.name,
+                        )
+                    else:
+                        log_storage_deletion(f"prune_old_index_backup:{stale.name}")
                 except Exception:
                     logger.warning(
                         "Could not prune stale index backup %s", stale.name,
@@ -1012,6 +1434,43 @@ class ObsidianVaultManager:
         """
         backend = (prev_meta or {}).get("vector_backend") or VECTOR_BACKEND_SIMPLE
         return backend if backend in (VECTOR_BACKEND_LANCEDB, VECTOR_BACKEND_SIMPLE) else VECTOR_BACKEND_SIMPLE
+
+    def _incremental_store_is_intact(self, prev_meta: Optional[dict]) -> bool:
+        """Whether the on-disk store is safe to LOAD incrementally — the
+        WRITER-side twin of the readers' promotion-marker check (item 2.8a
+        follow-up, 2026-07-05).
+
+        Defect it guards: checkpoint promotion replaces the store files one
+        ``os.replace`` at a time, so a hard crash (SIGKILL/power loss) between
+        two replaces leaves a MIXED-generation ("torn") store. The READERS
+        (``_ensure_index_loaded`` / ``prewarm``) already refuse a torn store via
+        ``_validate_persisted_index_files(check_promotion_marker=True)`` and
+        surface "Re-run indexing to rebuild a consistent checkpoint." But the
+        WRITER (``index_vault``'s incremental branch) skipped that check, so the
+        documented recovery re-loaded the torn store INCREMENTALLY — the
+        document-hash skip never re-inserts the stranded chunks — and then
+        stamped a fresh ``"complete"`` marker over it, permanently sealing the
+        inconsistency from every future load-time check. Honoring the marker
+        here forces ``is_incremental=False`` so the run archives + rebuilds
+        fresh: the recovery actually rebuilds.
+
+        Safe w.r.t. existing state: reuses the SAME validator, files, and
+        ``full=False`` tail-only check the readers use (no vector re-scan), so a
+        normal store passes exactly as it does for chat/prewarm; only a torn (or
+        structurally-incomplete) store returns False. No on-disk format changes.
+        Pinned by ``TestReindexHonorsPromotionMarker``.
+        """
+        try:
+            self._validate_persisted_index_files(
+                OBSIDIAN_INDEX_DIR,
+                full=False,
+                backend=self._resolve_existing_backend(prev_meta),
+                require_vector_data=False,
+                check_promotion_marker=True,
+            )
+            return True
+        except Exception:
+            return False
 
     def _resolve_fresh_backend(self) -> str:
         """Backend to use for a brand-new index build.
@@ -1087,11 +1546,19 @@ class ObsidianVaultManager:
         but each raw ``lancedb_table_count`` opens a fresh ``lancedb.connect()``
         that re-lists the fragment manifest — avoidable per-poll churn during a
         reindex (exactly the RAM-pressure window). Cache by the lancedb dir's
-        ``(st_size, st_mtime_ns)`` with a short monotonic TTL backstop. The dir
-        going away (``/api/reset``, version-bump archive) changes the stat key →
-        immediate miss → fresh count; a missing dir falls back to the raw call.
-        Only the monotonic ``count > 0`` gate uses this; exact-count callers do
-        not.
+        ``(st_size, st_mtime_ns)`` with a short monotonic TTL backstop.
+
+        The stat key reliably catches the dir *going away* (``/api/reset``,
+        version-bump archive): ``os.stat`` then raises and we fall back to the
+        raw count. It does NOT reliably catch row *inserts*, though — LanceDB
+        writes fragments into nested subdirs, which need not bump the top dir's
+        mtime — so the ``_LANCEDB_COUNT_TTL_S`` TTL is the effective invalidator
+        for the empty→non-empty flip during a fresh build. That is fine here: the
+        only consumer is the monotonic ``count > 0`` status gate, so the worst
+        case is a ≤TTL-second cosmetic lag before the status banner reflects the
+        first inserted row; it never reports stale *non-empty* (count only drops
+        to 0 on a reset, which the stat key catches). Exact-count callers do not
+        use this path.
         """
         db_dir = lancedb_dir(index_dir)
         try:
@@ -1151,6 +1618,8 @@ class ObsidianVaultManager:
             and _simple_vector_store_has_any_embedding(vector_store)
         )
 
+    _PROMOTION_MARKER = "promotion_state.json"
+
     def _validate_persisted_index_files(
         self,
         index_dir: str,
@@ -1158,6 +1627,7 @@ class ObsidianVaultManager:
         full: bool = True,
         backend: str = VECTOR_BACKEND_SIMPLE,
         require_vector_data: bool = True,
+        check_promotion_marker: bool = False,
     ) -> None:
         """Validate the files that make up a LlamaIndex checkpoint.
 
@@ -1166,8 +1636,38 @@ class ObsidianVaultManager:
         nor expected. ``require_vector_data`` is set False when validating a
         *temporary* checkpoint dir (the lancedb table is already durable in the
         live index dir and is not copied into the temp dir).
+
+        ``check_promotion_marker`` (improvement plan 2026-07-04, item 2.8a) is
+        set by the LOAD-time callers only: checkpoint promotion replaces the
+        store files one ``os.replace`` at a time — per-file atomic, but not
+        transactional across files — so a crash between the docstore replace
+        and the index_store replace left a MIXED-generation store that parsed
+        cleanly and loaded silently; chunks recorded in one file but not the
+        other were then stranded forever (the document-hash skip never
+        re-inserts what the docstore claims to have). The promotion now brackets
+        the replaces with a marker file ("promoting" before the first replace,
+        "complete" after the last, both fsync'd atomic writes): a load that
+        finds the marker still saying "promoting" refuses with THIS clear error
+        instead of silently serving the torn store, and the existing
+        integrity-error recovery (paused_scan + rebuild guidance) takes over.
+        A missing marker is accepted — every pre-marker checkpoint is legacy
+        and grandfathered. The temp-dir validation during checkpointing never
+        passes this flag (no marker exists there by design).
         """
         root = Path(index_dir)
+        if check_promotion_marker:
+            marker = root / self._PROMOTION_MARKER
+            if marker.exists():
+                try:
+                    state = json.loads(marker.read_text(encoding="utf-8")).get("state")
+                except (OSError, json.JSONDecodeError, AttributeError):
+                    state = "unreadable"
+                if state != "complete":
+                    raise RuntimeError(
+                        "The index checkpoint was interrupted mid-promotion "
+                        "(store files may be from mixed generations). Re-run "
+                        "indexing to rebuild a consistent checkpoint."
+                    )
         required = ["docstore.json", "index_store.json"]
         if backend != VECTOR_BACKEND_LANCEDB:
             required.append("default__vector_store.json")
@@ -1249,16 +1749,57 @@ class ObsidianVaultManager:
                 if path.is_file() and path.name in _LLAMAINDEX_PERSIST_FILES
             ]
             if persisted:
+                # full=False: keep the cheap structural tail-check + the vector-data
+                # check, but SKIP the full json.load() sweep of every persisted file.
+                # On the simple backend that sweep re-parsed the ~3 GB
+                # default__vector_store.json (and the ~620 MB docstore.json) into a
+                # throwaway object graph on EVERY checkpoint — with the GIL + rw
+                # write lock held, so chat stalled for the whole parse.
+                #
+                # Why this is safe (no integrity guarantee lost):
+                #   1. These files were just written by LlamaIndex's own json.dump
+                #      moments earlier; json.dump writes a complete document or the
+                #      process died mid-write — and a truncated tail is exactly what
+                #      _json_file_has_complete_tail (still run) catches.
+                #   2. The read-back happens immediately after the write, so a
+                #      json.load() served from the page cache re-parses the very
+                #      bytes we just wrote — it never validated the ON-DISK bytes, so
+                #      it never actually guarded against disk/FS corruption.
+                #   3. The real parse still happens at LOAD time: _ensure_index_loaded
+                #      and prewarm already validate with full=False and then let
+                #      _build_index_for_backend do the authoritative parse, converting
+                #      any JSONDecodeError into a checkpoint-integrity error + a
+                #      paused_scan recovery. So genuine corruption is still caught —
+                #      at load, where the parse cost is paid once, not on every
+                #      write-lock-blocking checkpoint.
                 self._validate_persisted_index_files(
                     str(tmp_dir),
+                    full=False,
                     backend=backend,
                     require_vector_data=(backend != VECTOR_BACKEND_LANCEDB),
                 )
             target.mkdir(parents=True, exist_ok=True)
+            # Item 2.8a: the per-file os.replace loop is atomic per FILE but
+            # not transactional across files. Bracket it with a marker so a
+            # crash inside the loop is detectable at load instead of silently
+            # serving a mixed-generation store (see the validator docstring).
+            # Marker writes are fsync'd (_write_json_atomic); this guards the
+            # process-crash/SIGKILL window (where rename ordering holds) —
+            # power-loss rename reordering is out of scope, same as the
+            # documented no-parent-fsync stance of the atomic writers.
+            marker_path = str(target / self._PROMOTION_MARKER)
+            _write_json_atomic(marker_path, {
+                "state": "promoting",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            })
             for name in _LLAMAINDEX_PERSIST_FILES:
                 src = tmp_dir / name
                 if src.exists():
                     os.replace(src, target / name)
+            _write_json_atomic(marker_path, {
+                "state": "complete",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
             if backend == VECTOR_BACKEND_LANCEDB:
                 # Both callers hold _index_mutation_lock, so compaction here is
                 # safe without re-locking.  Compact + prune superseded versions so
@@ -1341,6 +1882,9 @@ class ObsidianVaultManager:
     _PERSIST_EVERY = 500
     _PERSIST_MIN_INTERVAL_S = 600
     _MAX_CONSECUTIVE_FAILURES = 20
+    # Track 5.6: fallback embed-batch size when the config knob is missing or
+    # garbage. Class attr so tests can patch it (like the cadence knobs above).
+    _EMBED_BATCH_DEFAULT = 16
     # Backoff between *consecutive* insert failures: wait
     # min(BASE * 2**(streak-1), CAP) seconds before retrying the next chunk.
     # A single failure followed by success costs one BASE pause, then the streak
@@ -1726,6 +2270,19 @@ class ObsidianVaultManager:
         meta = doc.metadata or {}
         return str(meta.get("source") or meta.get("file_path") or "")
 
+    def _embed_batch_size(self) -> int:
+        """``vault_embed_batch_size``, clamped 1-256; garbage → the default.
+
+        ≤1 selects the legacy per-chunk ``idx.insert`` path byte-for-byte
+        (the escape hatch if a provider's batch endpoint ever misbehaves).
+        """
+        try:
+            raw = load_config_readonly().get("vault_embed_batch_size")
+            val = int(raw)  # type: ignore[arg-type]
+        except Exception:
+            return self._EMBED_BATCH_DEFAULT
+        return max(1, min(val, 256))
+
     def _index_documents_streaming(
         self,
         idx,
@@ -1733,6 +2290,7 @@ class ObsidianVaultManager:
         persist_callback: Optional[Callable[[dict], None]] = None,
         lancedb_upsert: bool = False,
         vector_backend: str = VECTOR_BACKEND_SIMPLE,
+        op_epoch: int = 0,
     ) -> tuple[int, int, int, int, dict[str, int]]:
         """Stream chunks into the index with per-insert fault tolerance and
         optional periodic persistence.
@@ -1786,11 +2344,223 @@ class ObsidianVaultManager:
         last_emit_time = time.monotonic()
         last_persist_time = time.monotonic()
 
+        # ── Track 5.6: batched embedding ────────────────────────────────────
+        # DEFECT: every chunk was inserted alone (`idx.insert(doc)`), and each
+        # insert embeds its node(s) in a dedicated provider HTTP round-trip —
+        # one call per chunk for the whole vault (and, on lancedb, one
+        # transaction per chunk, the very churn the compaction cadence exists
+        # to clean up). FIX: chunks needing (re-)embedding are buffered and
+        # flushed as ONE `insert_nodes` call per batch — its `embed_nodes`
+        # hands the entire batch to `get_text_embedding_batch`, whose
+        # sub-batching is sized to the same knob via the indexing embed
+        # model's `embed_batch_size`, so a flush is one HTTP call.
+        # REINDEX-NEUTRAL: chunk doc_ids and hashes are untouched, and the
+        # batch path replicates `BaseIndex.insert()` exactly
+        # (run_transformations → insert_nodes → set_document_hash, verified
+        # against llama-index-core 0.14.22), so the docstore/vector rows are
+        # what K individual inserts would have produced.
+        # FAILURE SEMANTICS PRESERVED: a failed batch is retried chunk-by-
+        # chunk on the ORIGINAL per-doc path (after an idempotency cleanup),
+        # so the consecutive-failure breaker, interruptible backoff, and
+        # reinsert_failed gap-tracking still count per chunk — one bad batch
+        # costs one extra HTTP call, never K breaker strikes.
+        # INVARIANT (pinned by TestEmbedBatchParity): a batched run produces
+        # an identical docstore (node texts, doc hashes, added/skipped
+        # counts) to a batch-size-1 run, with strictly fewer embed calls.
+        embed_batch: list = []          # [(doc, deleted_old), ...]
+        # Cap at _PERSIST_EVERY so a batch can never straddle the checkpoint
+        # cadence (the cadence gates are evaluated per flush, between batches).
+        # For shipping config the cap never actually binds — _embed_batch_size()
+        # is clamped to <=256 and _PERSIST_EVERY is 500 — so it exists ONLY to
+        # keep the never-straddle invariant true for a test that patches
+        # _PERSIST_EVERY down below the knob to force count-only checkpoints.
+        batch_target = min(self._embed_batch_size(), self._PERSIST_EVERY)
+
+        def _insert_docs_individually(batch_docs) -> bool:
+            """Per-doc inserts with the original failure bookkeeping.
+
+            Returns False when the run must abort (breaker fired, or a
+            backoff sleep / stop check observed a cancel).
+            """
+            nonlocal added, failed, consecutive_failures
+            nonlocal pending_since_persist, pending_since_compact
+
+            def _record_unprocessed_gaps(start_idx: int) -> None:
+                # Track 5.6 gap-report completeness: on an early abort
+                # (stop/breaker/cancel) the docs from start_idx onward never got
+                # (re-)inserted. Any of them whose OLD copy was already deleted at
+                # buffer time (deleted_old) is a content gap until the next run
+                # re-yields it — the tail-flush gap report (below) cannot catch
+                # these because _flush_embed_batch already clear()ed the buffer,
+                # so record them here to keep "reinsert_failed counts per chunk"
+                # true. reinsert_failed is a set, so re-recording a doc already
+                # counted in the except-branch above is a harmless no-op (which
+                # is why every early return can safely pass its own idx).
+                for g_doc, g_deleted_old in batch_docs[start_idx:]:
+                    if g_deleted_old and g_doc.doc_id:
+                        reinsert_failed.add(g_doc.doc_id)
+
+            for idx_in_batch, (b_doc, b_deleted_old) in enumerate(batch_docs):
+                if self._stop_event.is_set():
+                    _record_unprocessed_gaps(idx_in_batch)
+                    return False
+                try:
+                    with self._index_mutation_lock:
+                        idx.insert(b_doc)
+                    source = self._manifest_source(b_doc)
+                    manifest_counts[source] = manifest_counts.get(source, 0) + 1
+                    added += 1
+                    pending_since_persist += 1
+                    pending_since_compact += 1
+                    consecutive_failures = 0
+                except Exception as exc:
+                    failed += 1
+                    consecutive_failures += 1
+                    if b_deleted_old and b_doc.doc_id:
+                        # Old copy already removed but the re-embed failed:
+                        # this chunk is now absent until the next run
+                        # re-yields it. Record the gap explicitly.
+                        reinsert_failed.add(b_doc.doc_id)
+                    logger.warning("Insert failed for %s: %s", b_doc.doc_id, exc)
+                    if failed == 1 or failed % 5 == 0:
+                        self._emit(
+                            f"WARNING: insertion failure ({failed} total). "
+                            f"Latest: {type(exc).__name__}: {exc}"
+                        )
+                    if consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES:
+                        self._emit(
+                            f"ERROR: {self._MAX_CONSECUTIVE_FAILURES} consecutive insert failures — "
+                            "embedding backend appears unavailable. Aborting indexing run; "
+                            "partial work has been preserved."
+                        )
+                        self._stop_event.set()
+                        _record_unprocessed_gaps(idx_in_batch)
+                        return False
+                    # Interruptible exponential backoff — identical to the
+                    # historical per-doc loop (see the breaker notes at the
+                    # class attrs): recovery window for a transiently-failing
+                    # backend, cancel-aware via _stop_event.wait().
+                    if consecutive_failures == 1 and failed > 1:
+                        self._emit(
+                            "WARNING: embedding insert failed — pausing briefly before "
+                            "continuing (transient backend error; will abort if it persists)."
+                        )
+                    backoff_s = min(
+                        self._FAILURE_BACKOFF_BASE_S * (2 ** (consecutive_failures - 1)),
+                        self._FAILURE_BACKOFF_CAP_S,
+                    )
+                    if backoff_s > 0 and self._stop_event.wait(backoff_s):
+                        _record_unprocessed_gaps(idx_in_batch)
+                        return False
+            return True
+
+        def _flush_embed_batch() -> bool:
+            """Insert the buffered chunks; True = keep going, False = abort."""
+            nonlocal added, consecutive_failures
+            nonlocal pending_since_persist, pending_since_compact
+            if not embed_batch:
+                return True
+            batch_docs = list(embed_batch)
+            embed_batch.clear()
+            # One long embed call follows — keep the op-lock TTL fed.
+            self._op_lock.heartbeat(op_epoch)
+            if len(batch_docs) == 1 or batch_target <= 1:
+                return _insert_docs_individually(batch_docs)
+            # Stage 1 — NO writes: run the same transformation pipeline
+            # insert() would, outside the mutation lock (pure CPU; the legacy
+            # path parsed inside the lock as part of insert()). A failure here
+            # (including a test double lacking _transformations) needs no
+            # cleanup — nothing was touched — so it degrades straight to the
+            # per-doc path.
+            try:
+                nodes = run_transformations(
+                    [b_doc for b_doc, _ in batch_docs], idx._transformations,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Batch transformation of %d chunk(s) failed (%s: %s); "
+                    "inserting individually.",
+                    len(batch_docs), type(exc).__name__, exc,
+                )
+                return _insert_docs_individually(batch_docs)
+            # Stage 2 — the store mutation + hash records, under the lock,
+            # exactly like K sequential insert() calls would be.
+            try:
+                with self._index_mutation_lock:
+                    idx.insert_nodes(nodes)
+                    for b_doc, _ in batch_docs:
+                        idx.docstore.set_document_hash(b_doc.id_, b_doc.hash)
+            except Exception as exc:
+                logger.warning(
+                    "Batched insert of %d chunk(s) failed (%s: %s); retrying individually.",
+                    len(batch_docs), type(exc).__name__, exc,
+                )
+                # Idempotency cleanup before the per-doc retry: an embed HTTP
+                # failure (the overwhelmingly likely case) raises before any
+                # store write, but a mid-add failure is indistinguishable from
+                # outside — delete whatever partially landed so the retry can
+                # never duplicate nodes. delete_ref_doc on a never-inserted
+                # doc raises internally; ignored.
+                for b_doc, _ in batch_docs:
+                    try:
+                        with self._index_mutation_lock:
+                            idx.delete_ref_doc(b_doc.doc_id, delete_from_docstore=True)
+                    except Exception:
+                        pass
+                return _insert_docs_individually(batch_docs)
+            for b_doc, _ in batch_docs:
+                source = self._manifest_source(b_doc)
+                manifest_counts[source] = manifest_counts.get(source, 0) + 1
+            added += len(batch_docs)
+            pending_since_persist += len(batch_docs)
+            pending_since_compact += len(batch_docs)
+            consecutive_failures = 0
+            return True
+
+        def _maybe_checkpoint_and_compact() -> None:
+            """The historical post-insert cadence blocks, now run per flush."""
+            nonlocal pending_since_persist, pending_since_compact, last_persist_time
+            if (
+                persist_callback is not None
+                and pending_since_persist >= self._PERSIST_EVERY
+                and time.monotonic() - last_persist_time >= self._PERSIST_MIN_INTERVAL_S
+            ):
+                try:
+                    persist_callback(manifest_counts)
+                    self._emit(
+                        f"Checkpoint saved: {added} embedded, {skipped} unchanged."
+                    )
+                    pending_since_persist = 0
+                    # The checkpoint persist already compacted the lancedb table
+                    # (_persist_index_checkpoint), so reset the compaction gate too.
+                    pending_since_compact = 0
+                    last_persist_time = time.monotonic()
+                except Exception as exc:
+                    self._emit(f"WARNING: mid-run checkpoint failed: {exc}")
+                    # Reset both gates so we don't spin: wait another full
+                    # _PERSIST_EVERY inserts AND _PERSIST_MIN_INTERVAL_S before
+                    # the next attempt.
+                    pending_since_persist = 0
+                    last_persist_time = time.monotonic()
+
+            # Interim lancedb compaction — independent of the JSON checkpoint so a
+            # fast embedder cannot accumulate a large O(n²) version-manifest spike
+            # between the (≥10-min) checkpoints. Batching already cut the
+            # transaction count ~K-fold; this bounds what remains.
+            if (
+                vector_backend == VECTOR_BACKEND_LANCEDB
+                and pending_since_compact >= self._LANCEDB_COMPACT_EVERY
+            ):
+                vector_store = self._lancedb_vector_store_of(idx)
+                with self._index_mutation_lock:
+                    compact_lancedb_vector_store(vector_store)
+                pending_since_compact = 0
+
         for i, doc in enumerate(chunks_iter):
             if self._stop_event.is_set():
                 break
             if i % 10 == 0:
-                self._op_lock.heartbeat(self._lock_epoch)
+                self._op_lock.heartbeat(op_epoch)
 
             now = time.monotonic()
             if now - last_emit_time >= 5.0:
@@ -1831,104 +2601,64 @@ class ObsidianVaultManager:
                 except Exception:
                     pass
 
-            try:
-                with self._index_mutation_lock:
-                    idx.insert(doc)
-                source = self._manifest_source(doc)
-                manifest_counts[source] = manifest_counts.get(source, 0) + 1
-                added += 1
-                pending_since_persist += 1
-                pending_since_compact += 1
-                consecutive_failures = 0
-            except Exception as exc:
-                failed += 1
-                consecutive_failures += 1
-                if deleted_old and doc.doc_id:
-                    # Old copy already removed but the re-embed failed: this chunk
-                    # is now absent until the next run re-yields it (hash will not
-                    # match the now-missing docstore entry).  Record it so the gap
-                    # is reported, not just folded into ``failed``.
-                    reinsert_failed.add(doc.doc_id)
-                logger.warning("Insert failed for %s: %s", doc.doc_id, exc)
-                if failed == 1 or failed % 5 == 0:
-                    self._emit(
-                        f"WARNING: insertion failure ({failed} total). "
-                        f"Latest: {type(exc).__name__}: {exc}"
-                    )
-                if consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES:
-                    self._emit(
-                        f"ERROR: {self._MAX_CONSECUTIVE_FAILURES} consecutive insert failures — "
-                        "embedding backend appears unavailable. Aborting indexing run; "
-                        "partial work has been preserved."
-                    )
-                    self._stop_event.set()
+            # Track 5.6: buffer for the next batched flush (all insert
+            # bookkeeping — counters, breaker, backoff — lives in the flush
+            # helpers above). deleted_old rides with the doc so a failed
+            # re-embed of a changed chunk is still reported as a gap.
+            embed_batch.append((doc, deleted_old))
+            if len(embed_batch) >= batch_target:
+                if not _flush_embed_batch():
                     break
-                # Interruptible exponential backoff before the next attempt, so a
-                # transiently-failing backend (instant 400s while the embed model
-                # reloads) gets wall-clock time to recover rather than burning the
-                # whole breaker budget in milliseconds.  Holds no lock (the insert
-                # ``with`` block already exited) and runs off the chat path (the
-                # indexer released the rw write lock for the insert loop).  A
-                # Cancel/Pause sets _stop_event mid-sleep → wait() returns True →
-                # abort promptly, mirroring the top-of-loop stop check.
-                if consecutive_failures == 1:
-                    self._emit(
-                        "WARNING: embedding insert failed — pausing briefly before "
-                        "continuing (transient backend error; will abort if it persists)."
-                    )
-                backoff_s = min(
-                    self._FAILURE_BACKOFF_BASE_S * (2 ** (consecutive_failures - 1)),
-                    self._FAILURE_BACKOFF_CAP_S,
-                )
-                if backoff_s > 0 and self._stop_event.wait(backoff_s):
-                    break
-                continue
+                _maybe_checkpoint_and_compact()
 
-            if (
-                persist_callback is not None
-                and pending_since_persist >= self._PERSIST_EVERY
-                and time.monotonic() - last_persist_time >= self._PERSIST_MIN_INTERVAL_S
-            ):
-                try:
-                    persist_callback(manifest_counts)
-                    self._emit(
-                        f"Checkpoint saved: {added} embedded, {skipped} unchanged."
-                    )
-                    pending_since_persist = 0
-                    # The checkpoint persist already compacted the lancedb table
-                    # (_persist_index_checkpoint), so reset the compaction gate too.
-                    pending_since_compact = 0
-                    last_persist_time = time.monotonic()
-                except Exception as exc:
-                    self._emit(f"WARNING: mid-run checkpoint failed: {exc}")
-                    # Reset both gates so we don't spin: instead of retrying the
-                    # checkpoint on every subsequent insert, wait another full
-                    # _PERSIST_EVERY inserts AND _PERSIST_MIN_INTERVAL_S before
-                    # the next attempt.
-                    pending_since_persist = 0
-                    last_persist_time = time.monotonic()
-
-            # Interim lancedb compaction — independent of the JSON checkpoint so a
-            # fast embedder cannot accumulate a large O(n²) version-manifest spike
-            # between the (≥10-min) checkpoints.  Under the mutation lock only
-            # (no docstore/JSON work), so it is far cheaper than a checkpoint.
-            if (
-                vector_backend == VECTOR_BACKEND_LANCEDB
-                and pending_since_compact >= self._LANCEDB_COMPACT_EVERY
-            ):
-                # Fetch the store OUTSIDE the lock (read-only ref grab, guarded so
-                # a property raise can't abort the run), compact UNDER the mutation
-                # lock so retrieval can't read the table mid-optimize.
-                vector_store = self._lancedb_vector_store_of(idx)
-                with self._index_mutation_lock:
-                    compact_lancedb_vector_store(vector_store)
-                pending_since_compact = 0
+        # Tail flush: the stream ended (or a stop was requested) with a
+        # partial batch buffered.
+        if embed_batch and not self._stop_event.is_set():
+            if _flush_embed_batch():
+                _maybe_checkpoint_and_compact()
+        if embed_batch:
+            # Cancelled with chunks still buffered: any whose OLD copy was
+            # already deleted at buffer time is a content gap until the next
+            # run re-yields it — surface it exactly like a failed re-insert
+            # (the legacy path had no such window because delete and insert
+            # were adjacent; the buffer opens one, so it must be reported).
+            for pending_doc, pending_deleted_old in embed_batch:
+                if pending_deleted_old and pending_doc.doc_id:
+                    reinsert_failed.add(pending_doc.doc_id)
 
         if can_increment and not self._stop_event.is_set():
-            stale_doc_ids = previous_doc_ids - current_doc_ids
+            # Stale-sweep protection (improvement plan 2026-07-04, item 2.8b).
+            # "previous - current" conflates two very different absences: a
+            # file DELETED from the vault (sweep it) and a file whose READ
+            # failed this run — an iCloud dataless placeholder, a transient
+            # I/O error (keep it!). The loader records read/extract failures
+            # in _scan_failed_sources; chunks whose doc_id prefix ("{rel}::")
+            # matches a failed source are withheld from the sweep, so a blip
+            # costs one run of staleness instead of a silent de-index that
+            # only a full re-embed would repair. Safe: withheld ids are
+            # re-examined next run (the sweep is re-derived from scratch);
+            # genuinely deleted files still sweep normally. Invariant (pinned
+            # by TestStaleSweepSparesScanFailures): a source that failed to
+            # read is never deleted by the sweep of the same run.
+            failed_sources = self._scan_failed_sources
+            candidate_ids = previous_doc_ids - current_doc_ids
+            if failed_sources:
+                stale_doc_ids = {
+                    d for d in candidate_ids
+                    if d.split("::", 1)[0] not in failed_sources
+                }
+                withheld = len(candidate_ids) - len(stale_doc_ids)
+                if withheld:
+                    self._emit(
+                        f"Note: {withheld} chunk(s) from {len(failed_sources)} "
+                        f"unreadable file(s) were kept in the index (read failure "
+                        f"≠ deletion); they will resync on the next run."
+                    )
+            else:
+                stale_doc_ids = candidate_ids
             for i, doc_id in enumerate(sorted(stale_doc_ids)):
                 if i % 25 == 0:
-                    self._op_lock.heartbeat(self._lock_epoch)
+                    self._op_lock.heartbeat(op_epoch)
                 try:
                     with self._index_mutation_lock:
                         idx.delete_ref_doc(doc_id, delete_from_docstore=True)
@@ -1953,7 +2683,7 @@ class ObsidianVaultManager:
 
         return added, skipped, deleted, failed, manifest_counts
 
-    def _load_vault_documents(self, vault_path: str):
+    def _load_vault_documents(self, vault_path: str, op_epoch: int = 0):
         """Yield one ``LlamaDocument`` at a time, streaming through the vault.
 
         Yield order (preserved from the previous list-based loader): all
@@ -1975,6 +2705,9 @@ class ObsidianVaultManager:
         consumes only the first N yields).
         """
         cfg = load_config()
+        # Per-run reset (2.8b): this generator runs once per indexing run on
+        # the single indexer thread; the sweep reads the set after iteration.
+        self._scan_failed_sources = set()
         vault_root = Path(vault_path).resolve()
         user_excluded_dirs = self._normalised_excluded_dirs(vault_root, cfg.get("vault_exclude_dirs", []))
         raw_image_exts = cfg.get("vault_image_exts")
@@ -2047,29 +2780,41 @@ class ObsidianVaultManager:
             # what makes it available when the MD-attachment loop runs.
             name_index: dict[str, list[str]] = {}
 
-            for scan_index, path in enumerate(sorted(vault_root.rglob("*"))):
+            # Pruned single-pass walk (Track 5.4): excluded dirs are never
+            # descended and no per-file resolve() runs — see
+            # _iter_vault_scan_files for the equivalence argument. Buckets are
+            # sorted below, reproducing the old sorted(rglob) per-type order.
+            image_entries: list[tuple[Path, str]] = []
+            for scan_index, (path, rel) in enumerate(
+                _iter_vault_scan_files(vault_root, user_excluded_dirs)
+            ):
                 if self._stop_event.is_set():
                     break
                 if scan_index % 25 == 0:
-                    self._op_lock.heartbeat(self._lock_epoch)
-                if not path.is_file() or _should_skip_path(path):
-                    continue
+                    self._op_lock.heartbeat(op_epoch)
                 ext = path.suffix.lower()
                 if ext in configured_image_exts:
                     # Images enter the pipeline only via the MD-attachment
                     # branch, so they are indexed for name resolution but not
                     # buffered as standalone source documents.
-                    name_index.setdefault(path.name.lower(), []).append(
-                        path.relative_to(vault_root).as_posix()
-                    )
+                    image_entries.append((path, rel))
                     continue
                 if ext not in allowed_exts:
                     continue
-                rel = path.relative_to(vault_root).as_posix()
                 if ext in VAULT_MD_EXTS:
                     md_paths_buffered.append((path, rel))
                 elif ext in VAULT_BINARY_EXTS:
                     pdf_paths.append((path, rel))
+
+            # Deterministic order parity with the old globally-sorted walk:
+            # sorting each bucket by rel equals the old full-path sort order
+            # (shared root prefix), so MD/PDF yield order and name_index bucket
+            # order are byte-identical to the rglob era.
+            md_paths_buffered.sort(key=lambda pr: pr[1])
+            pdf_paths.sort(key=lambda pr: pr[1])
+            image_entries.sort(key=lambda pr: pr[1])
+            for path, rel in image_entries:
+                name_index.setdefault(path.name.lower(), []).append(rel)
 
             # Stream MD docs.  Reading and yielding interleaved so each
             # file's bytes can be freed once the chunker consumes its chunks
@@ -2082,6 +2827,9 @@ class ObsidianVaultManager:
                     text = path.read_text(encoding="utf-8", errors="replace")
                 except OSError as exc:
                     self._emit(f"WARNING: Failed to read {rel}: {exc}")
+                    # 2.8b: a read failure is NOT a deletion — keep the file's
+                    # indexed chunks out of this run's stale sweep.
+                    self._scan_failed_sources.add(rel)
                     continue
                 for attachment in self._extract_md_attachments(
                     text, path, vault_root, name_index=name_index
@@ -2108,12 +2856,15 @@ class ObsidianVaultManager:
                 if self._stop_event.is_set():
                     break
                 if image_index % 10 == 0:
-                    self._op_lock.heartbeat(self._lock_epoch)
+                    self._op_lock.heartbeat(op_epoch)
                 try:
                     text = self._extract_image_description(path, vault_root, rel)
                 except Exception as exc:
                     self._emit(f"WARNING: Vision indexing failed for {rel}: {exc}")
                     self._skipped_image_count += 1
+                    # 2.8b: a vision hiccup must not delete the image's
+                    # previously-indexed description chunks.
+                    self._scan_failed_sources.add(rel)
                     continue
                 if text:
                     yield LlamaDocument(
@@ -2126,6 +2877,17 @@ class ObsidianVaultManager:
                         },
                     )
                 else:
+                    # Empty description. For a format a raster vision model simply
+                    # cannot read (SVG is XML; ``.img`` is not a real image),
+                    # name the cause so a second user is not left wondering why a
+                    # referenced figure never indexed — vs. the generic
+                    # vision-model-unavailable case handled elsewhere.
+                    if path.suffix.lower() in (".svg", ".img"):
+                        self._emit(
+                            f"WARNING: Skipped {rel}: '{path.suffix.lower()}' is not "
+                            f"a raster image a vision model can read — convert it to "
+                            f"PNG/JPEG to index it."
+                        )
                     self._skipped_image_count += 1
 
             # Stream PDFs.  This is where the memory win is largest: a
@@ -2137,7 +2899,7 @@ class ObsidianVaultManager:
                 if self._stop_event.is_set():
                     break
                 if pdf_index % 10 == 0:
-                    self._op_lock.heartbeat(self._lock_epoch)
+                    self._op_lock.heartbeat(op_epoch)
                 ext = path.suffix.lower()
                 if ext not in VAULT_BINARY_EXTS:
                     continue
@@ -2177,7 +2939,7 @@ class ObsidianVaultManager:
                                 str(path),
                                 ocr_cb=glm_ocr_manager.extract_page_text,
                                 ocr_max_pages=_VAULT_PDF_CHUNK,
-                                page_done_cb=lambda _n: self._op_lock.heartbeat(self._lock_epoch),
+                                page_done_cb=lambda _n: self._op_lock.heartbeat(op_epoch),
                             )
                             text = sections.full_text
                             if getattr(sections, "truncated", False):
@@ -2196,7 +2958,8 @@ class ObsidianVaultManager:
                             # extracted and cached independently — see the
                             # helper for the full rationale.
                             yield from self._load_pdf_range_documents(
-                                path, rel, ext, vault_root, signature, page_count
+                                path, rel, ext, vault_root, signature, page_count,
+                                op_epoch=op_epoch,
                             )
                             continue
                     if text:
@@ -2206,6 +2969,8 @@ class ObsidianVaultManager:
                         )
                 except Exception as exc:
                     self._emit(f"WARNING: Failed to extract {rel}: {exc}")
+                    # 2.8b: extraction failure ≠ deletion — protect its chunks.
+                    self._scan_failed_sources.add(rel)
             # The PDF for-loop exited via its normal clause (no exception,
             # no early consumer close).  This still doesn't mean every PDF
             # was visited — a stop event raised mid-run causes inner loops
@@ -2237,6 +3002,7 @@ class ObsidianVaultManager:
         vault_root: Path,
         signature: dict,
         page_count: int,
+        op_epoch: int = 0,
     ):
         """Yield one ``LlamaDocument`` per 1000-page range of a large PDF.
 
@@ -2275,7 +3041,7 @@ class ObsidianVaultManager:
                 # P1.6: refresh the operation-lock heartbeat between ranges so
                 # multi-hour extractions of textbook PDFs don't let the TTL
                 # expire while we are mid-file.
-                self._op_lock.heartbeat(self._lock_epoch)
+                self._op_lock.heartbeat(op_epoch)
                 self._emit(
                     f"Extracting {rel} (pages {start + 1}-{end} of {page_count})…"
                 )
@@ -2288,7 +3054,7 @@ class ObsidianVaultManager:
                     # up to 1000 pages and cache that partial as complete).  The
                     # per-page heartbeat keeps the op-lock TTL alive on a long scan.
                     ocr_max_pages=EXTRACT_MAX_PAGES_PER_CALL,
-                    page_done_cb=lambda _n: self._op_lock.heartbeat(self._lock_epoch),
+                    page_done_cb=lambda _n: self._op_lock.heartbeat(op_epoch),
                 )
                 text = sections.full_text
                 if getattr(sections, "truncated", False):
@@ -2359,7 +3125,16 @@ class ObsidianVaultManager:
         return ""
 
     def _atomic_write_text(self, cache_file: Path, text: str) -> None:
-        """Write *text* to *cache_file* atomically via a sibling temp file."""
+        """Write *text* to *cache_file* atomically via a sibling temp file.
+
+        Deliberately does NOT fsync (unlike _write_json_atomic / core.utils
+        writers): this is the per-document PDF-text / image-description cache,
+        written once per document during a multi-hour index run. Its contents are
+        regenerable (re-extract / re-describe), so trading crash-durability for
+        the per-write fsync latency across thousands of documents is the right
+        call — a lost cache entry costs a re-extraction, never correctness.
+        os.replace still guarantees no torn/partial cache file.
+        """
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(cache_file.parent), suffix=".txt")
         try:
@@ -2505,6 +3280,35 @@ class ObsidianVaultManager:
             _write_json_atomic(self._pdf_signatures_path(), cache)
         except Exception as exc:
             logger.debug("Could not persist pdf_signatures.json: %s", exc)
+
+    def _persisted_pdf_signatures(self) -> dict:
+        """Stat-cached view of the persisted PDF-signature map, for read paths.
+
+        ``_read_pdf_text`` (read_note, agent ``vault_read_note``) and
+        ``refactor/pdfref.py`` pass this to ``_pdf_file_signature`` so an
+        unchanged multi-hundred-MB PDF is not fully re-hashed on every call
+        just to locate its extracted-text cache.  Keyed by both signature
+        files' ``(size, mtime_ns)`` so the indexer's rewrite (or a first
+        persist) is picked up on the next call.  The returned dict is shared
+        — callers must treat it as read-only; only the indexer writes the
+        persisted map.
+        """
+        key_parts: list = []
+        for path in (self._legacy_pdf_signatures_path(), self._pdf_signatures_path()):
+            try:
+                st = os.stat(path)
+                key_parts.append((st.st_size, st.st_mtime_ns))
+            except OSError:
+                key_parts.append(None)
+        key = tuple(key_parts)
+        with self._pdf_sig_read_lock:
+            if key == self._pdf_sig_read_cache_key:
+                return self._pdf_sig_read_cache
+        cache = self._load_pdf_signature_cache()
+        with self._pdf_sig_read_lock:
+            self._pdf_sig_read_cache = cache
+            self._pdf_sig_read_cache_key = key
+            return self._pdf_sig_read_cache
 
     def _pdf_file_signature(self, path: Path, sig_cache: dict | None = None, rel: str | None = None) -> dict:
         """Compute (or recover) the size/mtime/sha256 fingerprint of a PDF.
@@ -2690,16 +3494,15 @@ class ObsidianVaultManager:
         return source
 
     def _invalidate_retrieval_caches(self) -> None:
-        """Drop the cached BM25 retriever (in memory AND the on-disk sidecar)
-        and the wikilink graph so the next chat rebuilds against the
+        """Drop the cached BM25 retriever and wikilink graph (in memory AND
+        their on-disk sidecars) so the next chat rebuilds against the
         freshly-persisted docstore.
 
         Called after each successful ``idx.storage_context.persist(...)`` —
         both the mid-run checkpoint and the final persist — so concurrent
         chats observe the new chunks once indexing publishes them.  The
         reranker is unaffected: it depends on the model name only, not on
-        index contents.  The wikilink graph has no on-disk sidecar, so it is
-        a pure in-memory drop.
+        index contents.
         """
         with self._bm25_build_lock:
             self._bm25_retriever = None
@@ -2708,6 +3511,10 @@ class ObsidianVaultManager:
         with self._wikilink_build_lock:
             self._wikilink_index = None
             self._wikilink_cached_doc_count = -1
+            try:
+                os.remove(self._wikilink_sidecar_path())
+            except OSError:
+                pass
 
     def _bm25_sidecar_dir(self) -> str:
         return os.path.join(OBSIDIAN_INDEX_DIR, _BM25_SIDECAR_DIRNAME)
@@ -2839,10 +3646,19 @@ class ObsidianVaultManager:
         current_count = len(docs)
         cached = self._bm25_retriever
         if cached is not None and self._bm25_cached_doc_count == current_count:
-            try:
-                cached.similarity_top_k = top_k
-            except Exception:
-                logger.debug("Could not retune cached BM25 top_k", exc_info=True)
+            # Retune race fix (improvement plan 2026-07-04, item 2.7): this
+            # fast path used to write ``cached.similarity_top_k = top_k`` here
+            # — with NO lock — while a concurrent chat could be mid-retrieval
+            # on the SAME shared object under ``_index_mutation_lock`` (a deck
+            # run's vault_search k=12 retuned a concurrent user chat k=8
+            # mid-flight). Tuning now happens in exactly ONE place: the
+            # engine's ``_build_retrieval_pipeline`` sets ``similarity_top_k``
+            # to the per-query breadth INSIDE the same mutation-lock hold that
+            # runs the retrieval, so no other request can interleave a write
+            # between tune and use. This fetch is read-only on purpose — do
+            # not "restore" the convenience retune. Invariant (pinned by
+            # ``TestSharedRetunerRace``): fetching a cached BM25/reranker
+            # never mutates its tuning fields.
             return cached
 
         with self._bm25_build_lock:
@@ -2852,10 +3668,9 @@ class ObsidianVaultManager:
                 self._bm25_retriever is not None
                 and self._bm25_cached_doc_count == current_count
             ):
-                try:
-                    self._bm25_retriever.similarity_top_k = top_k
-                except Exception:
-                    logger.debug("Could not retune cached BM25 top_k", exc_info=True)
+                # Read-only return (item 2.7) — see the fast path above: the
+                # build lock is NOT the lock that serialises retrieval, so a
+                # retune here raced an in-flight query the same way.
                 return self._bm25_retriever
             # Sidecar fast path: mmap-load the retriever persisted by a
             # previous build instead of re-tokenising the whole docstore.
@@ -3064,6 +3879,94 @@ class ObsidianVaultManager:
 
         return _WikilinkGraph(forward, backward, note_to_node_ids)
 
+    def _wikilink_sidecar_path(self) -> str:
+        return os.path.join(OBSIDIAN_INDEX_DIR, _WIKILINK_SIDECAR_FILENAME)
+
+    def _load_wikilink_sidecar(self, live_count: int) -> Optional[_WikilinkGraph]:
+        """Try to load the persisted wikilink graph from the sidecar file.
+
+        Returns None (after deleting the sidecar) when it is missing, torn,
+        or stale.  Staleness mirrors ``_load_bm25_sidecar`` — the live
+        docstore size AND the index meta's ``indexed_at`` stamp must both
+        match — with one deliberate tightening: ``indexed_at`` must be
+        *truthy* on both sides.  A sidecar written without a real index meta
+        (None == None would pass the BM25-style check) proves nothing about
+        which docstore state it came from, so it is treated as unusable.
+        Any failure degrades to a rebuild from the docstore; deleting the
+        sidecar by hand is always safe.
+        """
+        path = self._wikilink_sidecar_path()
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                payload = json.load(f)
+            if payload.get("doc_count") != live_count:
+                raise RuntimeError(
+                    f"sidecar has {payload.get('doc_count')} nodes, "
+                    f"docstore has {live_count}"
+                )
+            index_meta = self._read_index_meta() or {}
+            stamp = payload.get("indexed_at")
+            if not stamp or stamp != index_meta.get("indexed_at"):
+                raise RuntimeError("sidecar predates the current index meta")
+            graph = _WikilinkGraph.from_payload(payload)
+            logger.info(
+                "Wikilink graph loaded from sidecar (%d notes, %d edges).",
+                graph.note_count, graph.edge_count,
+            )
+            return graph
+        except Exception as exc:
+            logger.info(
+                "Wikilink sidecar unusable (%s); rebuilding from docstore.", exc
+            )
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return None
+
+    def _persist_wikilink_sidecar(self, graph: _WikilinkGraph, doc_count: int) -> None:
+        """Persist a freshly-built wikilink graph to the sidecar file.
+
+        Skipped while an indexing run is active (mirrors
+        ``_persist_bm25_sidecar`` — ``_invalidate_retrieval_caches`` fires at
+        every mid-run checkpoint, so persisting then would churn writes on
+        every mid-run chat) and when the index meta has no ``indexed_at``
+        stamp (no real on-disk index → the loader could never validate the
+        sidecar, so writing one is pure waste; this also keeps docstore-only
+        unit tests write-free).  A failed write removes the partial file —
+        best-effort, worth only the next launch's rebuild.
+        """
+        with self._status_lock:
+            state = self._index_state
+        if state not in ("idle", "done"):
+            return
+        index_meta = self._read_index_meta() or {}
+        stamp = index_meta.get("indexed_at")
+        if not stamp:
+            return
+        path = self._wikilink_sidecar_path()
+        try:
+            payload = graph.to_payload()
+            payload.update(
+                {
+                    "doc_count": doc_count,
+                    "indexed_at": stamp,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            _write_json_atomic(path, payload)
+            logger.info(
+                "Wikilink graph persisted to sidecar (%d nodes).", doc_count
+            )
+        except Exception as exc:
+            logger.warning("Could not persist wikilink sidecar: %s", exc)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     def _get_wikilink_index(self) -> Optional[_WikilinkGraph]:
         """Return the cached note→note wikilink graph, building it on demand.
 
@@ -3073,9 +3976,13 @@ class ObsidianVaultManager:
         snapshot taken under ``_index_mutation_lock`` so an in-flight indexer
         insert/delete cannot mutate the dict mid-iteration.  The build itself
         (regex parse of node text) runs OUTSIDE the mutation lock, like BM25's
-        tokenisation, so it never stalls the indexer.  Returns None when no
-        index/docstore is loaded.  Reindex-free and re-embed-free — reads only
-        the docstore.
+        tokenisation, so it never stalls the indexer.  Process-cold misses
+        consult the on-disk sidecar first (``_load_wikilink_sidecar``) —
+        skipping both the O(N) docstore snapshot and the regex sweep — and a
+        successful in-process build is persisted back
+        (``_persist_wikilink_sidecar``) unless an indexing run is active.
+        Returns None when no index/docstore is loaded.  Reindex-free and
+        re-embed-free — reads only the docstore.
         """
         if self._index is None:
             return None
@@ -3095,6 +4002,15 @@ class ObsidianVaultManager:
                 and self._wikilink_cached_doc_count == current_count
             ):
                 return self._wikilink_index
+            # Sidecar first: a hit avoids the O(N) node-list copy and the
+            # regex sweep entirely.  The unlocked len(docs) matches the BM25
+            # caller's discipline; the loader's doc_count + indexed_at gates
+            # keep a racing mutation from ever validating a stale graph.
+            loaded = self._load_wikilink_sidecar(current_count)
+            if loaded is not None:
+                self._wikilink_index = loaded
+                self._wikilink_cached_doc_count = current_count
+                return loaded
             # Snapshot the docstore under _index_mutation_lock so an in-flight
             # indexer insert/delete cannot mutate the dict while we iterate;
             # record the size from the same locked window so the fingerprint
@@ -3107,7 +4023,114 @@ class ObsidianVaultManager:
             graph = self._build_wikilink_graph(nodes)
             self._wikilink_index = graph
             self._wikilink_cached_doc_count = snapshot_count
+            self._persist_wikilink_sidecar(graph, snapshot_count)
             return graph
+
+    # Historical default curated-thesaurus filenames (see `_get_thesaurus`). The
+    # active paths are config-driven (`vault_thesaurus_abbrev_path` /
+    # `vault_thesaurus_tags_path`); these are only the fallbacks.
+    _THESAURUS_DEFAULT_ABBREV = "_abreviations.md"
+    _THESAURUS_DEFAULT_TAGS = "_tags.md"
+
+    def _resolve_thesaurus_rel(self, vault_root: str, rel: Any) -> Optional[str]:
+        """Resolve a configured vault-relative thesaurus path under *vault_root*.
+
+        Returns the absolute real path when *rel* is a safe vault-relative file,
+        or ``None`` for an empty/disabled slot or any traversal/absolute/escaping
+        value (defence in depth — `/api/config` already shape-checks it). Mirrors
+        the refactor route's `_resolve_scope` posture.
+        """
+        if not isinstance(rel, str):
+            return None
+        s = rel.strip().replace("\\", "/")
+        if not s or any(ch in s for ch in ("\x00", "\n", "\r")):
+            return None
+        if os.path.isabs(s) or ".." in s.split("/"):
+            return None
+        real = os.path.realpath(os.path.join(vault_root, s))
+        if real != vault_root and not real.startswith(vault_root + os.sep):
+            return None
+        return real
+
+    def _get_thesaurus(self) -> Optional[Any]:
+        """Return the cached vault :class:`rag.thesaurus.Thesaurus`, parsing the
+        configured curated glossary files on demand.
+
+        The two source files are config-driven, vault-relative, and resolved
+        under the vault root: ``vault_thesaurus_abbrev_path`` (default
+        ``_abreviations.md``) and ``vault_thesaurus_tags_path`` (default
+        ``_tags.md``); an empty/invalid value disables that slot. Independent of
+        the index: cached by the resolved paths plus each file's ``(size, mtime)``
+        signature — so an edit to either file *or* a config change to either path
+        refreshes it on the next chat. Returns ``None`` when no vault path is set
+        or neither configured file exists (the caller then degrades to no
+        expansion / no primer). Reindex-free and re-embed-free — touches no
+        LlamaIndex state.
+        """
+        vault = self._vault_path
+        if not vault:
+            return None
+        vault_root = os.path.realpath(vault)
+        # Read-only view (no deepcopy): this per-query helper only .get()s scalars.
+        cfg = load_config_readonly()
+        abbrev_rel = cfg.get("vault_thesaurus_abbrev_path", self._THESAURUS_DEFAULT_ABBREV)
+        tags_rel = cfg.get("vault_thesaurus_tags_path", self._THESAURUS_DEFAULT_TAGS)
+        abbrev_path = self._resolve_thesaurus_rel(vault_root, abbrev_rel)
+        tags_path = self._resolve_thesaurus_rel(vault_root, tags_rel)
+        # Build the (rel, abs-path, size, mtime) signature; a missing/disabled
+        # file contributes a None stat slot so creating it later — or changing
+        # the configured path — busts the cache too.
+        sig_parts: list[tuple] = []
+        present = False
+        for rel, path in (("abbrev", abbrev_path), ("tags", tags_path)):
+            if path is None:
+                sig_parts.append((rel, None, None, None))
+                continue
+            try:
+                st = os.stat(path)
+                sig_parts.append((rel, path, st.st_size, st.st_mtime_ns))
+                present = True
+            except OSError:
+                sig_parts.append((rel, path, None, None))
+        if not present:
+            return None
+        cache_key = tuple(sig_parts)
+        cached = self._thesaurus
+        if cached is not None and self._thesaurus_cache_key == cache_key:
+            return cached
+
+        # Read + parse OUTSIDE the lock. The vault lives under iCloud
+        # (~/Library/Mobile Documents), where open().read() of a dataless
+        # placeholder can block on a network materialisation; doing it under the
+        # build lock would stall every other first-time caller. Two concurrent
+        # misses may each read+parse (cheap, idempotent) — the lock below only
+        # guards the compare-and-set, so the result is still consistent.
+        from .thesaurus import Thesaurus
+
+        def _read(path: Optional[str]) -> str:
+            if not path:
+                return ""
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    return fh.read()
+            except OSError:
+                return ""
+        try:
+            thes = Thesaurus.from_files(
+                abbrev_text=_read(abbrev_path),
+                tags_text=_read(tags_path),
+            )
+        except Exception:
+            logger.debug("Thesaurus parse failed; expansion/primer disabled.", exc_info=True)
+            return None
+
+        with self._thesaurus_build_lock:
+            # Re-check: a concurrent miss may have already stored this signature.
+            if self._thesaurus is not None and self._thesaurus_cache_key == cache_key:
+                return self._thesaurus
+            self._thesaurus = thes
+            self._thesaurus_cache_key = cache_key
+            return thes
 
     # Accepted vault_reranker_device values; anything else behaves as "auto".
     _RERANKER_DEVICE_MODES = ("auto", "cpu", "mps")
@@ -3123,7 +4146,8 @@ class ObsidianVaultManager:
         requires Metal (and still degrades to CPU on failure).
         """
         try:
-            raw = load_config().get("vault_reranker_device", "auto")
+            # Read-only view (no deepcopy): scalar .get() only, invoked per query.
+            raw = load_config_readonly().get("vault_reranker_device", "auto")
         except Exception:
             return "auto"
         mode = str(raw or "auto").strip().lower()
@@ -3187,8 +4211,9 @@ class ObsidianVaultManager:
         None if the package or model cannot be loaded.
 
         The model itself is loaded once (sentence-transformers downloads
-        weights to ~/.cache/huggingface/hub on first use); we mutate
-        ``top_n`` per query rather than rebuilding the reranker.  A sticky
+        weights to ~/.cache/huggingface/hub on first use); the cached fetch
+        is READ-ONLY (item 2.7 — ``top_n`` is tuned per query by the
+        engine's locked pipeline build, never here).  A sticky
         failure flag prevents a hot-loop of re-attempted downloads when the
         configured model is unavailable — the user must change the model
         name or the ``vault_reranker_device`` knob (both are folded into
@@ -3204,10 +4229,13 @@ class ObsidianVaultManager:
                 self._reranker is not None
                 and self._reranker_model_loaded == cache_key
             ):
-                try:
-                    self._reranker.top_n = top_n
-                except Exception:
-                    logger.debug("Could not retune cached reranker top_n", exc_info=True)
+                # Read-only return (item 2.7): ``top_n`` used to be written
+                # here under ``_reranker_load_lock`` — a DIFFERENT lock from
+                # the ``_index_mutation_lock`` under which a concurrent
+                # query's rerank executes, so an in-flight rerank could be
+                # retrimmed to another request's top_n mid-pass. The engine's
+                # ``_build_retrieval_pipeline`` (inside the mutation-lock
+                # hold) is now the only writer of ``top_n``.
                 return self._reranker
             # Reset the sticky failure flag when the requested model or
             # device differs from the last attempt — a config change is the
@@ -3300,7 +4328,8 @@ class ObsidianVaultManager:
                     backend = self._resolve_existing_backend(self._read_index_meta())
                     try:
                         self._validate_persisted_index_files(
-                            OBSIDIAN_INDEX_DIR, full=False, backend=backend
+                            OBSIDIAN_INDEX_DIR, full=False, backend=backend,
+                            check_promotion_marker=True,
                         )
                     except RuntimeError as exc:
                         self._index_integrity_error = str(exc)
@@ -3322,14 +4351,15 @@ class ObsidianVaultManager:
                     raise RuntimeError("Index not found. Please index the vault first.")
             return self._index
 
-    def stream_chat(
+
+    def _build_engine(
         self,
-        message: str,
+        *,
         llm_name: str,
         embed_name: str,
-        top_k: int = 6,
-        provider_name: str = "ollama",
-        similarity_cutoff: float = 0.25,
+        top_k: int,
+        provider_name: str,
+        similarity_cutoff: float,
         prompt_mode: str = "strict",
         temperature: float | None = None,
         top_k_explicit: bool = False,
@@ -3338,36 +4368,45 @@ class ObsidianVaultManager:
         reranker_model: str = "",
         custom_system_prompt: str = "",
         mmr_enabled: bool = False,
-        mmr_lambda: Optional[float] = None,
+        mmr_lambda: float | None = None,
         query_expansion: bool = False,
         num_queries: int = 1,
-        rerank_pool_ceiling: Optional[int] = None,
+        rerank_pool_ceiling: int | None = None,
         wikilink_expansion: bool = False,
-        stage_cb: Optional[Callable[[str], None]] = None,
+        thesaurus_expansion: bool = False,
+        primer_enabled: bool = False,
+        stage_cb: Callable[[str], None] | None = None,
+        log_label: str = "Vault chat",
     ):
-        """Single-shot RAG: retrieve, then return a streaming LLM response.
+        """Shared retrieval-engine build for stream_chat/retrieve (item 4.8).
 
-        The public chat entrypoint for non-agent vault chat (the agent's RAG
-        fallback also calls it). Every keyword is a query-time knob already resolved
-        body→config→default by the route's ``_resolve_chat_params`` — none of them
-        touches the index, so they are all reindex-free. Ordering chosen for
-        concurrency: the index is lazy-loaded under the rw write lock (double-checked),
-        then the BM25 build and first-time reranker load happen **before** the read
-        lock so they don't block other readers or the indexer's persist; retrieval
-        runs under ``_index_mutation_lock`` (so it can't race an insert) while the LLM
-        token stream runs lock-free after retrieval returns. Always retrieves with the
-        index's *own* recorded embed model (``_effective_embed_name``) so a config-only
-        model switch can't fuse two vector spaces. ``stage_cb`` surfaces stage labels
-        as SSE ``{info}`` frames. Returns a streaming response object (``.response_gen``).
+        DEFECT this consolidates: the two entrypoints carried ~70 duplicated
+        build lines that had already drifted (the thesaurus/primer stages were
+        missing from ``retrieve``) — and the first 4.8 extraction (d06cd73)
+        shipped a self-recursive stub in place of this body, killing vault
+        chat with a RecursionError on the first message. This is the real
+        extraction, line-identical to the pre-d06cd73 ``stream_chat`` build.
+        ``retrieve`` gains the thesaurus/primer knobs (defaults off; the
+        agent's ``vault_search`` never passes them, so the documented "no
+        thesaurus on the agent's active search" contract is unchanged).
+
+        Lock ordering preserved exactly (it is what rag/CLAUDE.md documents):
+        index lazy-load under the rw write lock (double-checked), BM25 build +
+        first-time reranker load BEFORE the read lock so they don't block
+        other readers or the indexer's persist, engine construction under the
+        read lock — and NO retrieval here: callers wrap engine.query()/
+        .retrieve() in ``_acquire_retrieval_lock`` themselves so the lock is
+        held only for the brief retrieval phase. Returns ``(engine, stage)``
+        so callers emit their stage labels through the same guarded callback.
         """
         from .engine import SimpleQueryEngine
 
-        def _stage(message: str) -> None:
+        def _stage(msg: str) -> None:
             if stage_cb is not None:
                 try:
-                    stage_cb(message)
+                    stage_cb(msg)
                 except Exception:
-                    logger.debug("Vault chat stage callback failed.", exc_info=True)
+                    logger.debug("%s stage callback failed.", log_label, exc_info=True)
 
         # Retrieve with the index's own embed model, not whatever config says,
         # so a config switch without a re-index cannot mix vector spaces (M1).
@@ -3407,6 +4446,19 @@ class ObsidianVaultManager:
             _stage("Building wikilink graph…")
         wikilink_graph = self._get_wikilink_index() if want_wikilink else None
 
+        # Vault thesaurus (query expansion + system-prompt primer).  Parsed
+        # from the curated root files, cached by mtime, index-independent.
+        # Built once if either feature is on; None degrades to no expansion.
+        # Unlike wikilink it is NOT rerank-gated (it preserves the score scale
+        # and caps the pool), so no reranker precondition here.
+        want_thesaurus = thesaurus_expansion or primer_enabled
+        thesaurus = self._get_thesaurus() if want_thesaurus else None
+        # Emit the stage label only AFTER a successful build: a missing
+        # _abreviations.md/_tags.md makes _get_thesaurus() return None, and we
+        # must not tell the user we expanded the query when we did not.
+        if thesaurus_expansion and thesaurus is not None:
+            _stage("Expanding query via vault thesaurus…")
+
         # Re-read self._index inside a read lock to guard against a concurrent
         # reset nulling it between the slow-path write lock and here.  Only
         # the engine construction needs the lock; the actual query (embedding
@@ -3435,7 +4487,74 @@ class ObsidianVaultManager:
                 rerank_pool_ceiling=rerank_pool_ceiling,
                 wikilink_graph=wikilink_graph,
                 wikilink_expansion=wikilink_expansion,
+                thesaurus=thesaurus,
+                thesaurus_expansion=thesaurus_expansion,
+                primer_enabled=primer_enabled,
             )
+        return engine, _stage
+
+    def stream_chat(
+        self,
+        message: str,
+        llm_name: str,
+        embed_name: str,
+        top_k: int = 6,
+        provider_name: str = "ollama",
+        similarity_cutoff: float = 0.25,
+        prompt_mode: str = "strict",
+        temperature: float | None = None,
+        top_k_explicit: bool = False,
+        hybrid_enabled: bool = False,
+        reranker_enabled: bool = False,
+        reranker_model: str = "",
+        custom_system_prompt: str = "",
+        mmr_enabled: bool = False,
+        mmr_lambda: Optional[float] = None,
+        query_expansion: bool = False,
+        num_queries: int = 1,
+        rerank_pool_ceiling: Optional[int] = None,
+        wikilink_expansion: bool = False,
+        thesaurus_expansion: bool = False,
+        primer_enabled: bool = False,
+        stage_cb: Optional[Callable[[str], None]] = None,
+    ):
+        """Single-shot RAG: retrieve, then return a streaming LLM response.
+
+        The public chat entrypoint for non-agent vault chat (the agent's RAG
+        fallback also calls it). Every keyword is a query-time knob already resolved
+        body→config→default by the route's ``_resolve_chat_params`` — none of them
+        touches the index, so they are all reindex-free. The engine build (and its
+        concurrency-ordering rationale) lives in :meth:`_build_engine`; retrieval
+        runs under ``_index_mutation_lock`` (so it can't race an insert) while the
+        LLM token stream runs lock-free after retrieval returns. Always retrieves
+        with the index's *own* recorded embed model (``_effective_embed_name``) so a
+        config-only model switch can't fuse two vector spaces. ``stage_cb`` surfaces
+        stage labels as SSE ``{info}`` frames. Returns a streaming response object
+        (``.response_gen``).
+        """
+        engine, _stage = self._build_engine(
+            llm_name=llm_name,
+            embed_name=embed_name,
+            top_k=top_k,
+            provider_name=provider_name,
+            similarity_cutoff=similarity_cutoff,
+            prompt_mode=prompt_mode,
+            temperature=temperature,
+            top_k_explicit=top_k_explicit,
+            hybrid_enabled=hybrid_enabled,
+            reranker_enabled=reranker_enabled,
+            reranker_model=reranker_model,
+            custom_system_prompt=custom_system_prompt,
+            mmr_enabled=mmr_enabled,
+            mmr_lambda=mmr_lambda,
+            query_expansion=query_expansion,
+            num_queries=num_queries,
+            rerank_pool_ceiling=rerank_pool_ceiling,
+            wikilink_expansion=wikilink_expansion,
+            thesaurus_expansion=thesaurus_expansion,
+            primer_enabled=primer_enabled,
+            stage_cb=stage_cb,
+        )
 
         # Serialise retrieval against the indexer's idx.insert() calls.  With
         # streaming=True, query_engine.query() runs retrieval synchronously
@@ -3443,8 +4562,11 @@ class ObsidianVaultManager:
         # lazily, so this lock is held only for the brief retrieval phase —
         # the LLM streaming itself runs outside the lock.
         _stage("Retrieving context…")
-        with self._index_mutation_lock:
+        self._acquire_retrieval_lock()
+        try:
             return engine.query(message)
+        finally:
+            self._index_mutation_lock.release()
 
     def retrieve(
         self,
@@ -3465,6 +4587,8 @@ class ObsidianVaultManager:
         num_queries: int = 1,
         rerank_pool_ceiling: Optional[int] = None,
         wikilink_expansion: bool = False,
+        thesaurus_expansion: bool = False,
+        primer_enabled: bool = False,
         stage_cb: Optional[Callable[[str], None]] = None,
     ):
         """Retrieve evidence chunks for *message* without invoking the LLM.
@@ -3472,83 +4596,48 @@ class ObsidianVaultManager:
         Mirrors the retrieval phase of :meth:`stream_chat`: lazy-loads
         the saved index, optionally builds BM25 + reranker, then returns
         the retrieved :class:`RetrievedChunk` list. Designed for the
-        agent loop's ``vault.search`` tool so a single agent turn can
+        agent loop's ``vault_search`` tool so a single agent turn can
         issue several searches without paying ``stream_chat``'s LLM
         round-trip per query.
 
         Holds :attr:`_index_mutation_lock` for the brief retrieval
         phase, matching :meth:`stream_chat`'s discipline.
         """
-        from .engine import SimpleQueryEngine
-
-        def _stage(msg: str) -> None:
-            if stage_cb is not None:
-                try:
-                    stage_cb(msg)
-                except Exception:
-                    logger.debug("Vault retrieve stage callback failed.", exc_info=True)
-
-        # Retrieve with the index's own embed model, not whatever config says (M1).
-        effective_embed = self._effective_embed_name(embed_name, _stage)
-        self._ensure_index_loaded(
+        engine, _stage = self._build_engine(
+            llm_name=llm_name,
+            embed_name=embed_name,
+            top_k=top_k,
             provider_name=provider_name,
-            embed_name=effective_embed,
+            similarity_cutoff=similarity_cutoff,
+            top_k_explicit=top_k_explicit,
+            hybrid_enabled=hybrid_enabled,
+            reranker_enabled=reranker_enabled,
+            reranker_model=reranker_model,
+            mmr_enabled=mmr_enabled,
+            mmr_lambda=mmr_lambda,
+            query_expansion=query_expansion,
+            num_queries=num_queries,
+            rerank_pool_ceiling=rerank_pool_ceiling,
+            wikilink_expansion=wikilink_expansion,
+            thesaurus_expansion=thesaurus_expansion,
+            primer_enabled=primer_enabled,
             stage_cb=stage_cb,
+            log_label="Vault retrieve",
         )
-
-        if hybrid_enabled:
-            _stage("Building lexical BM25 retriever…")
-        bm25_retriever = (
-            self._get_bm25_retriever(top_k=top_k)
-            if hybrid_enabled
-            else None
-        )
-        if reranker_enabled and reranker_model:
-            _stage("Loading cross-encoder reranker…")
-        reranker = (
-            self._get_reranker(model_name=reranker_model, top_n=top_k)
-            if reranker_enabled and reranker_model
-            else None
-        )
-        # Rerank-gated, same as stream_chat: only build the graph when a
-        # reranker is active (the engine skips the wrap otherwise).
-        want_wikilink = wikilink_expansion and reranker is not None
-        if want_wikilink:
-            _stage("Building wikilink graph…")
-        wikilink_graph = self._get_wikilink_index() if want_wikilink else None
-
-        with self._rw_lock.read_lock():
-            local_index = self._index
-            if local_index is None:
-                raise RuntimeError("Index not found. Please index the vault first.")
-            engine = SimpleQueryEngine(
-                local_index,
-                llm_name,
-                effective_embed,
-                top_k,
-                provider_name=provider_name,
-                similarity_cutoff=similarity_cutoff,
-                top_k_explicit=top_k_explicit,
-                bm25_retriever=bm25_retriever,
-                reranker=reranker,
-                mmr_enabled=mmr_enabled,
-                mmr_lambda=mmr_lambda,
-                query_expansion=query_expansion,
-                num_queries=num_queries,
-                rerank_pool_ceiling=rerank_pool_ceiling,
-                wikilink_graph=wikilink_graph,
-                wikilink_expansion=wikilink_expansion,
-            )
 
         _stage("Retrieving context…")
-        with self._index_mutation_lock:
+        self._acquire_retrieval_lock()
+        try:
             return engine.retrieve(message)
+        finally:
+            self._index_mutation_lock.release()
 
     def read_note(
         self,
         rel_path: str,
         *,
         max_chars: int = 32000,
+        time_budget_s: Optional[float] = None,
     ) -> tuple[str, bool]:
         """Read the full text of a vault note (.md or .pdf) by vault-relative path.
 
@@ -3564,6 +4653,18 @@ class ObsidianVaultManager:
         Returns ``(text, truncated)``. ``truncated`` is True when the
         file exceeded ``max_chars`` or, for PDFs, when the bounded
         extract did not consume the whole file.
+
+        ``time_budget_s`` (improvement plan 2026-07-04, item 2.4): the agent's
+        remaining wall-clock budget. The fresh-extract fallback for an
+        UNCACHED PDF is the one code path here whose cost is minutes, not
+        milliseconds — the agent loop's deadline bounds only LLM calls, so a
+        near-expired turn used to start a 1000-page in-process extraction it
+        could never use. When a budget is given and it is below
+        ``_FRESH_EXTRACT_MIN_BUDGET_S``, the fresh extract is REFUSED with an
+        explanatory ``IOError`` (which the agent surfaces as a recoverable
+        tool-error observation); cache and range-cache hits are served
+        regardless (they are fast). ``None`` — every non-agent caller —
+        keeps the legacy unbounded contract byte-identically.
 
         Raises:
             ValueError: invalid / disallowed path, unsupported extension.
@@ -3617,7 +4718,8 @@ class ObsidianVaultManager:
                 raise IOError(f"Could not read {rel_path!r}: {exc}") from exc
             extract_truncated = False
         else:
-            text, extract_truncated = self._read_pdf_text(candidate, vault_root, max_chars)
+            text, extract_truncated = self._read_pdf_text(
+                candidate, vault_root, max_chars, time_budget_s=time_budget_s)
 
         size_truncated = len(text) > max_chars
         if size_truncated:
@@ -3629,6 +4731,7 @@ class ObsidianVaultManager:
         path: Path,
         vault_root: Path,
         char_budget: int,
+        time_budget_s: Optional[float] = None,
     ) -> tuple[str, bool]:
         """Return cached PDF text if present, otherwise a bounded fresh extract.
 
@@ -3636,9 +4739,16 @@ class ObsidianVaultManager:
         bounded fresh extract did not cover the whole document (page or
         char limit reached). Cache hits are never reported as truncated
         — the caller still applies its own ``max_chars`` cap.
+
+        The persisted signature map is consulted (same as the indexer) so an
+        unchanged large PDF skips the full content re-hash on every call.
         """
         try:
-            sig = self._pdf_file_signature(path)
+            rel = path.relative_to(vault_root).as_posix()
+        except ValueError:
+            rel = None
+        try:
+            sig = self._pdf_file_signature(path, self._persisted_pdf_signatures(), rel)
         except OSError as exc:
             raise IOError(f"Could not stat PDF {path.name}: {exc}") from exc
         cache_file = self._pdf_cache_file(vault_root, sig)
@@ -3655,6 +4765,20 @@ class ObsidianVaultManager:
         if range_found:
             return range_text, range_truncated
 
+        # Item 2.4 budget floor: a fresh extract is the only expensive branch
+        # (everything above is cache reads). Refusing to START one on a
+        # nearly-exhausted budget is the whole protection — extraction cannot
+        # be interrupted mid-flight, so a check here is the last opportunity.
+        # Residual (documented): an extract started with budget above the
+        # floor can still overrun it; the floor + the loop's per-dispatch
+        # deadline gate bound how stale such a start can be.
+        if time_budget_s is not None and time_budget_s < _FRESH_EXTRACT_MIN_BUDGET_S:
+            raise IOError(
+                f"{path.name} is not in the PDF text cache and the remaining "
+                f"time budget ({time_budget_s:.0f}s) is too small for a fresh "
+                f"extraction. It will be cached by the next indexing run; "
+                f"try vault_search snippets instead."
+            )
         try:
             sections = extract_structured_from_pdf(
                 str(path),
@@ -3745,10 +4869,20 @@ class ObsidianVaultManager:
         # Goes through the stat-keyed meta cache: this runs on every status
         # poll alongside get_status/is_partial_index, which used to cost
         # three independent open+parse cycles of the same small file.
+        #
+        # Item 4.6: Switch to load_config_readonly() to avoid deep-copying the
+        # config dictionary on this ~1 Hz UI status poll hot path.
+        # Defect/Scenario: deep-copying the dict on high-frequency status polls
+        # wastes CPU and generates garbage collection overhead for read-only access.
+        # Safe: get_index_warning only reads the "embed" model preference and never
+        # mutates it; load_config_readonly() returns a MappingProxyType over the
+        # cache that guarantees value parity.
+        # Invariant: get_index_warning returns the same mismatch warning message
+        # without mutating or deep-copying config state.
         meta = self._read_index_meta()
         if meta is None:
             return ""
-        cfg = load_config()
+        cfg = load_config_readonly()
         current_embed = cfg.get("embed", "")
         indexed_embed = meta.get("embed", "")
         if indexed_embed and current_embed and indexed_embed != current_embed:
@@ -3902,7 +5036,8 @@ class ObsidianVaultManager:
                     backend = self._resolve_existing_backend(self._read_index_meta())
                     try:
                         self._validate_persisted_index_files(
-                            OBSIDIAN_INDEX_DIR, full=False, backend=backend
+                            OBSIDIAN_INDEX_DIR, full=False, backend=backend,
+                            check_promotion_marker=True,
                         )
                     except RuntimeError as exc:
                         self._index_integrity_error = str(exc)
@@ -3970,6 +5105,12 @@ class ObsidianVaultManager:
         # The reranker is index-independent and is kept so /api/reset does
         # not trigger another model download for the next vault.
         self._invalidate_retrieval_caches()
+        # Drop the thesaurus cache too: a vault switch points at different
+        # curated files (or none). Mtime-keyed, so a stale object would
+        # otherwise survive a switch to a same-signature file by coincidence.
+        with self._thesaurus_build_lock:
+            self._thesaurus = None
+            self._thesaurus_cache_key = None
         self.reset_prewarm()
         # Hygiene: the just-dropped index/BM25 objects sit in reference
         # cycles (LlamaIndex stores back-reference their context); collect

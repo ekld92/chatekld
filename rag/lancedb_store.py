@@ -254,3 +254,72 @@ def compact_lancedb_vector_store(vector_store: Any) -> bool:
         return True
     except Exception:
         return False
+
+
+def lancedb_list_doc_ids(index_dir: str) -> list[str]:
+    """Return all node IDs stored in the LanceDB table ([] when absent/error).
+
+    Projects the ``id`` column through the underlying lance dataset
+    (``to_lance().to_table(columns=[...])``) — a bare ``Table.to_arrow()``
+    materialises EVERY column including the embedding vectors, i.e. the whole
+    multi-GB store in RAM, which is exactly what the binary backend exists to
+    avoid. The id column alone is a few MB even on large vaults.
+    """
+    if lancedb is None:
+        return []
+    db_dir = lancedb_dir(index_dir)
+    if not os.path.isdir(db_dir):
+        return []
+    try:
+        tbl = lancedb.connect(db_dir).open_table(LANCEDB_TABLE)
+        return tbl.to_lance().to_table(columns=["id"]).column("id").to_pylist()
+    except Exception:
+        return []
+
+
+def _sql_string_literal(value: str) -> str:
+    """Quote *value* as a DataFusion SQL string literal for a delete predicate.
+
+    Single quotes with ``''`` doubling — the standard SQL string form. Node
+    IDs embed vault-relative paths, and this vault is French: apostrophes in
+    filenames (``l'étude.md::…``) are the common case, stray double quotes
+    the rare one; both must survive quoting rather than truncate the
+    predicate (a truncated predicate could delete the WRONG rows).
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
+def lancedb_delete_ids(vector_store: Any, ids: list[str]) -> tuple[bool, str]:
+    """Delete rows by ID from the live LanceDB table (batches of 500).
+
+    Returns ``(ok, detail)`` — *detail* is "" on success and a short
+    diagnostic otherwise, so the caller can LOG the failure instead of
+    silently carrying on with orphan rows still in the table. A failed batch
+    falls back to per-id deletes so one malformed id cannot block the other
+    499 in its batch.
+    """
+    tbl = getattr(vector_store, "_table", None)
+    if tbl is None:
+        return False, "vector store has no live LanceDB table"
+    if not ids:
+        return True, ""
+    failed: list[str] = []
+    last_error = ""
+    batch_size = 500
+    for i in range(0, len(ids), batch_size):
+        chunk = ids[i : i + batch_size]
+        id_str = ", ".join(_sql_string_literal(val) for val in chunk)
+        try:
+            tbl.delete(f"id IN ({id_str})")
+        except Exception as exc:
+            last_error = str(exc)
+            for val in chunk:
+                try:
+                    tbl.delete(f"id = {_sql_string_literal(val)}")
+                except Exception as one_exc:
+                    last_error = str(one_exc)
+                    failed.append(val)
+    if failed:
+        return False, f"{len(failed)} id(s) failed to delete (last error: {last_error})"
+    return True, ""
+

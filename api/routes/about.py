@@ -11,7 +11,6 @@ constant — cannot inject script even if it later became dynamic.
 import html
 import re
 from flask import Blueprint, jsonify
-from ..security import origin_is_local
 
 about_bp = Blueprint('about', __name__)
 
@@ -117,8 +116,6 @@ def api_about():
     instance, since the parser is single-use) into ``{"html": ...}``.
     Local-origin gated.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     
     # Example about text
     about_md = """

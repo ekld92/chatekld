@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import io
 import os
+import threading
 from pathlib import Path
+
+from typing import Callable, Optional
 
 from PIL import Image
 
@@ -28,7 +31,12 @@ from core.constants import VAULT_IMAGE_EXTS
 from core.utils import write_bytes_atomic, write_text_atomic
 
 from refactor import extract, journal
-from refactor.resolver import build_name_index, excluded_dirs, scan_embeds
+from refactor.resolver import (
+    build_name_index,
+    excluded_dirs,
+    link_target_basenames,
+    scan_embeds,
+)
 from refactor.result import sha256_bytes, sha256_text
 
 
@@ -40,54 +48,177 @@ from refactor.result import sha256_bytes, sha256_text
 # `other_referencing_notes`).
 _REF_WALK_SKIP_DIRS = frozenset({".git", ".obsidian"})
 
+# --- reference-sweep index (Track 5.3, 2026-07-04) ---------------------------
+# DEFECT: every archive click full-read every `.md` AND `.canvas` in the vault
+# (tens of thousands of files on a large vault, worst on iCloud where a read
+# can trigger a download) just to prove the image is not referenced elsewhere —
+# and a user archiving N images from one note paid that whole-vault read N times.
+# FIX: a per-session reverse-reference index. Each sweep stat-walks the tree
+# (cheap: directory listings + one stat per file, no reads), re-reads ONLY files
+# whose (size, mtime_ns) signature changed since the last sweep, and stores per
+# `.md` file the set of link-target basenames (`resolver.link_target_basenames`)
+# / per `.canvas` file its lowered text. Candidates — files whose stored data
+# mentions the image's basename — are then re-read fresh and verified with the
+# full resolver-accurate scan, exactly as before.
+# SAFETY (this gate refuses a destructive move, so it must never under-report):
+# the index can only serve data validated against the file's CURRENT
+# (size, mtime_ns) in THIS sweep — a changed/new file is always re-read, a
+# deleted file's entry is dropped because the sweep rebuilds the root's map from
+# what it actually walked. The candidate set is a provable superset of anything
+# the verify scan could resolve (see link_target_basenames' docstring); indeed
+# it is *stricter* than the old whole-text substring prune, which missed
+# percent-encoded targets (`![](Fig%201.png)`) that the resolver decodes — the
+# index catches those, so a genuinely shared image is now refused in a case the
+# old sweep let through. The remaining read-then-move TOCTOU window is the same
+# one the old full-read sweep had. mtime_ns is nanosecond-resolution on APFS; a
+# same-size same-mtime_ns content swap is not achievable by normal editing.
+# INVARIANT (pinned by test_refactor.py::test_ref_sweep_index_*): a sweep's
+# result equals a from-scratch full-read sweep's result for the current on-disk
+# state — the index is a pure read-amplification optimization.
+_REF_INDEX_MAX_ROOTS = 2
+_ref_index_lock = threading.Lock()
+# {vault_root_str: {"md": {rel: (size, mtime_ns, frozenset_basenames)},
+#                   "canvas": {rel: (size, mtime_ns, lowered_text)}}}
+_ref_index: dict[str, dict] = {}
+
+
+def clear_ref_index() -> None:
+    """Drop the reverse-reference index (tests / explicit resets)."""
+    with _ref_index_lock:
+        _ref_index.clear()
+
+
+def _walk_ref_files(vault_root: Path, heartbeat: Optional[Callable[[], None]]):
+    """Yield ``(rel, kind, size, mtime_ns)`` for every ``.md``/``.canvas`` file.
+
+    One pruned ``os.scandir`` walk (no reads): ``_REF_WALK_SKIP_DIRS`` are never
+    descended (the old ``rglob`` listed their contents and part-checked each
+    path). Symlinked dirs ARE followed (a symlinked notes folder may hold real
+    referencers) with a realpath cycle guard; symlinked files are included via
+    a follow-symlinks stat — both match what the old ``rglob``+``is_file()``
+    walk saw on Python ≤3.12. Heartbeats every 200 entries so a huge vault
+    cannot let the caller's op-lock TTL lapse mid-sweep.
+    """
+    seen_dirs = {os.path.realpath(str(vault_root))}
+    stack = [(str(vault_root), "")]
+    seen_entries = 0
+    while stack:
+        dir_abs, dir_rel = stack.pop()
+        try:
+            entries = os.scandir(dir_abs)
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                seen_entries += 1
+                if heartbeat is not None and seen_entries % 200 == 0:
+                    heartbeat()
+                rel = f"{dir_rel}{entry.name}"
+                try:
+                    if entry.is_dir(follow_symlinks=True):
+                        if entry.name in _REF_WALK_SKIP_DIRS:
+                            continue
+                        real = os.path.realpath(entry.path)
+                        if real in seen_dirs:
+                            continue  # symlink cycle / duplicate route
+                        seen_dirs.add(real)
+                        stack.append((entry.path, rel + "/"))
+                        continue
+                    if not entry.name.endswith((".md", ".canvas")):
+                        continue
+                    if not entry.is_file(follow_symlinks=True):
+                        continue
+                    st = entry.stat(follow_symlinks=True)
+                except OSError:
+                    continue
+                kind = "md" if entry.name.endswith(".md") else "canvas"
+                yield rel, kind, st.st_size, st.st_mtime_ns
+
 
 def other_referencing_notes(
     vault_root: Path,
     image_rel: str,
     note_rel: str,
     name_index: dict,
+    heartbeat: Optional[Callable[[], None]] = None,
 ) -> list[str]:
     """Vault-relative notes **other than** *note_rel* that embed/link *image_rel*.
 
     The move-safety gate: a non-empty result means the image is shared and must
-    NOT be archived. Walks every ``.md`` in the vault but cheaply prunes any note
-    whose text does not even contain the image's basename before doing the full
-    (resolver-accurate) embed scan, so the common case is fast.
+    NOT be archived. Served through the reference-sweep index (see the Track 5.3
+    notes above): a stat-walk validates/refreshes the per-file index, candidate
+    notes are located by the image's basename in their stored link targets, and
+    only those candidates get the full fresh-read resolver-accurate embed scan.
 
-    SAFETY — this walk is intentionally **more conservative than the planner's
+    SAFETY — this sweep is intentionally **more conservative than the planner's
     view**: archiving physically *moves* the file out of the vault, so an embed in
     ANY note breaks, including notes inside the user's ``vault_exclude_dirs`` or
     ``.trash`` (which the analyzer would skip). Excluding a folder from *indexing*
     must never weaken *move-safety*, so this gate does NOT apply ``vault_exclude_dirs``
-    — it scans every ``.md`` except ``.git``/``.obsidian`` (which structurally hold
+    — it sweeps every ``.md`` except ``.git``/``.obsidian`` (which structurally hold
     no user image embeds). The shared resolver ``name_index`` still maps bare
     ``![[img.png]]`` to the central attachment, so references from excluded notes
     resolve correctly here even though those notes are not indexed.
     """
     basename = os.path.basename(image_rel)
     bn_lower = basename.lower()
-    out: list[str] = []
-    for p in vault_root.rglob("*.md"):
-        if not p.is_file():
-            continue
-        if any(part in _REF_WALK_SKIP_DIRS for part in p.parts):
+    root_key = str(vault_root)
+
+    # Sweep: stat-walk the tree, reuse signature-matched index entries, re-read
+    # only new/changed files. The fresh maps are rebuilt from what this walk
+    # actually saw, so deleted files drop out naturally.
+    with _ref_index_lock:
+        prev = _ref_index.get(root_key) or {"md": {}, "canvas": {}}
+    fresh_md: dict = {}
+    fresh_canvas: dict = {}
+    for rel, kind, size, mtime_ns in _walk_ref_files(vault_root, heartbeat):
+        bucket = fresh_md if kind == "md" else fresh_canvas
+        cur = prev[kind].get(rel)
+        if cur is not None and cur[0] == size and cur[1] == mtime_ns:
+            bucket[rel] = cur
             continue
         try:
-            rel = p.relative_to(vault_root).as_posix()
-        except ValueError:
+            text = (vault_root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
             continue
+        if kind == "md":
+            bucket[rel] = (size, mtime_ns, link_target_basenames(text))
+        else:
+            bucket[rel] = (size, mtime_ns, text.lower())
+    with _ref_index_lock:
+        _ref_index.pop(root_key, None)
+        _ref_index[root_key] = {"md": fresh_md, "canvas": fresh_canvas}
+        while len(_ref_index) > _REF_INDEX_MAX_ROOTS:
+            _ref_index.pop(next(iter(_ref_index)))
+
+    out: list[str] = []
+    # Verify pass on candidates only: a fresh read + the same resolver-accurate
+    # scan the old whole-vault sweep ran, so the decision bytes are current.
+    for rel, (_size, _mt, basenames) in fresh_md.items():
         if rel == note_rel:          # the note being edited is allowed to embed it
             continue
+        if bn_lower not in basenames:
+            continue
+        p = vault_root / rel
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if bn_lower not in text.lower():
-            continue  # cheap prune: the file can't reference it
         for occ in scan_embeds(text, p, vault_root, name_index):
             if occ["rel_path"] == image_rel:
                 out.append(rel)
                 break
+
+    # Obsidian .canvas files are JSON (not markdown), so the resolver's embed scan
+    # does not apply — but a canvas node can embed the image, and moving the file
+    # out would break that canvas. The canvas stores the vault-relative path as a
+    # JSON string, so a conservative basename substring match (over the lowered
+    # text this sweep validated) is enough to REFUSE the move. A false positive
+    # only makes archiving more cautious (never less safe), which is the right
+    # bias for a destructive move.
+    for rel, (_size, _mt, lowered) in fresh_canvas.items():
+        if bn_lower in lowered:
+            out.append(rel)
     return out
 
 
@@ -112,15 +243,30 @@ def make_thumbnail(img_bytes: bytes, max_side: int) -> bytes:
         im.load()
         w, h = im.size
         longest = max(w, h)
+        # resize()/convert() each allocate a NEW PIL image; the `with` only closes
+        # the ORIGINAL opened image, so track the derived ones and close them in a
+        # finally (they would otherwise linger until GC). Low-frequency path, but
+        # keeps the close-discipline consistent with vision._downscale_base64_png.
+        cur = im
+        derived: list = []
         if longest > max_side and longest > 0:
             scale = max_side / float(longest)
-            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            cur = cur.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            derived.append(cur)
         # PNG can't save every PIL mode (e.g. CMYK); normalise the exotic ones.
-        if im.mode not in ("RGB", "RGBA", "L", "LA", "P"):
-            im = im.convert("RGBA")
-        out = io.BytesIO()
-        im.save(out, format="PNG")
-        return out.getvalue()
+        if cur.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+            cur = cur.convert("RGBA")
+            derived.append(cur)
+        try:
+            out = io.BytesIO()
+            cur.save(out, format="PNG")
+            return out.getvalue()
+        finally:
+            for d in derived:
+                try:
+                    d.close()
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
 
 
 # --- embed rewrite ---------------------------------------------------------
@@ -185,21 +331,42 @@ def _unique_dest(path: Path, suffix_seed: str) -> Path:
     return path.with_name(f"{path.stem}-{suffix_seed[:8]}{path.suffix}")
 
 
-def _rollback_artifacts(manifest: dict, op: dict, *paths: Path) -> None:
+def _unlink_and_audit(path, vault_root: Path, detail: str) -> None:
+    """``os.unlink`` *path* (best-effort); if it was an IN-VAULT file that is now
+    gone, emit ``log_vault_write("delete_thumb", …)`` so the removal is
+    attributable even if the restore manifest is lost (2026-07-05 audit m4 — the
+    thumbnail WRITE was already logged, the DELETE was not). Out-of-vault paths
+    (the archive copy — ``archive_dir`` is refused inside the vault) unlink
+    silently: vault-write auditing covers vault mutations only. All callers are
+    cleanup/rollback/restore paths, so a failed unlink is swallowed.
+    """
+    p = Path(path)
+    try:
+        rel = p.resolve().relative_to(Path(vault_root).resolve()).as_posix()
+    except ValueError:
+        rel = None  # not under the vault (archive copy) — unlink without an audit line
+    try:
+        if p.exists():
+            os.unlink(p)
+            if rel is not None:
+                journal.log_vault_write("delete_thumb", rel, detail)
+    except OSError:
+        pass
+
+
+def _rollback_artifacts(manifest: dict, op: dict, vault_root: Path, *paths: Path) -> None:
     """Undo a partial archive after a pre-write abort: delete the durable files
     we wrote (thumbnail + archive copy) and drop the just-appended ``op`` from the
     manifest so the vault + manifest are left exactly as we found them.
 
     Safe because the caller holds the obsidian op-lock (single writer) and ``op``
     is the op it appended moments earlier and nothing else references — popping it
-    cannot disturb another operation. Caller persists the manifest afterward.
+    cannot disturb another operation. Caller persists the manifest afterward. The
+    in-vault thumbnail deletion is audited (m4); the archive copy is out of scope.
     """
     for p in paths:
-        try:
-            if p is not None and Path(p).exists():
-                os.unlink(p)
-        except OSError:
-            pass
+        if p is not None:
+            _unlink_and_audit(p, vault_root, "archive rollback")
     try:
         manifest["ops"].remove(op)
     except ValueError:
@@ -209,12 +376,16 @@ def _rollback_artifacts(manifest: dict, op: dict, *paths: Path) -> None:
 # --- archive ---------------------------------------------------------------
 
 def archive_image(vault_root: Path, cfg: dict, scope: str, note_rel: str,
-                  image_rel: str, content_sha256: str) -> dict:
+                  image_rel: str, content_sha256: str,
+                  heartbeat: Optional[Callable[[], None]] = None) -> dict:
     """Archive one image referenced by exactly one in-scope note.
 
     Caller holds the obsidian operation lock and has scope-validated *note_rel*
     (a ``.md`` under *scope*) and *image_rel* (an image under the vault root).
     Returns a result dict; on the shared/refused paths it makes **no** writes.
+
+    *heartbeat* (optional) is forwarded to the whole-vault reference walk so a
+    large vault cannot let the caller's op-lock expire during the move-safety scan.
     """
     vault_root = Path(vault_root)
     res = {"ok": False, "status": "failed", "message": "", "shared": False}
@@ -260,7 +431,7 @@ def archive_image(vault_root: Path, cfg: dict, scope: str, note_rel: str,
     if has_plain:
         res["message"] = "note also plain-links the image; refusing to rewrite a link into an embed"
         return res
-    others = other_referencing_notes(vault_root, image_rel, note_rel, name_index)
+    others = other_referencing_notes(vault_root, image_rel, note_rel, name_index, heartbeat)
     if others:
         res["status"] = "shared"
         res["shared"] = True
@@ -301,10 +472,7 @@ def archive_image(vault_root: Path, cfg: dict, scope: str, note_rel: str,
         # Nothing was journalled and the original is untouched; tidy the failed
         # copy AND the now-orphan thumbnail so a retry starts clean.
         for stray in (arch_abs, thumb_abs):
-            try:
-                os.unlink(stray)
-            except OSError:
-                pass
+            _unlink_and_audit(stray, vault_root, "archive verify-fail cleanup")
         return res
     archive_rel = arch_abs.relative_to(arch_root).as_posix()
 
@@ -341,12 +509,12 @@ def archive_image(vault_root: Path, cfg: dict, scope: str, note_rel: str,
     try:
         raw_now = note_path.read_bytes()
     except OSError as exc:
-        _rollback_artifacts(manifest, op, thumb_abs, arch_abs)
+        _rollback_artifacts(manifest, op, vault_root, thumb_abs, arch_abs)
         journal.save(vault_root, cfg, manifest)
         res["message"] = f"note became unreadable ({type(exc).__name__}); aborted (no changes made)"
         return res
     if sha256_bytes(raw_now) != content_sha256:
-        _rollback_artifacts(manifest, op, thumb_abs, arch_abs)
+        _rollback_artifacts(manifest, op, vault_root, thumb_abs, arch_abs)
         journal.save(vault_root, cfg, manifest)
         res["status"] = "skipped"
         res["message"] = "note changed during archiving; aborted (no changes made)"
@@ -369,15 +537,33 @@ def archive_image(vault_root: Path, cfg: dict, scope: str, note_rel: str,
     #    unlink target must provably stay under the vault root.
     try:
         orig_abs = journal.assert_under(vault_root / image_rel, vault_root)
-        os.unlink(orig_abs)
-        op["original_deleted"] = True
-        journal.log_vault_write("move_out", image_rel, f"→ {archive_rel}")
+        # TOCTOU guard (improvement plan 1.2): `digest` is the hash of the bytes
+        # read at the top — the bytes the archive copy holds. The thumbnail /
+        # copy work above is a window in which an external editor could have
+        # replaced the image; re-hash the on-disk original immediately before
+        # the unlink and, on mismatch, LEAVE IT IN PLACE (deleting it would
+        # destroy the only copy of the post-change bytes — the archive has the
+        # pre-change version). The note now embeds the thumbnail either way, so
+        # the changed original is merely unreferenced, never lost.
+        if sha256_bytes(Path(orig_abs).read_bytes()) != digest:
+            op["original_deleted"] = False
+            res["warning"] = (
+                "original image changed during archiving; left in place "
+                "(the archive holds the pre-change copy)"
+            )
+        else:
+            os.unlink(orig_abs)
+            op["original_deleted"] = True
+            journal.log_vault_write("move_out", image_rel, f"→ {archive_rel}")
     except (OSError, journal.ScopeError) as exc:
         # Archive copy is durable + the note no longer embeds the original, so a
         # lingering (now-unreferenced) original is harmless; report a warning.
         op["original_deleted"] = False
         res["warning"] = f"original could not be deleted ({type(exc).__name__}); it is now unreferenced"
     op["state"] = "applied"
+    # Prune spent/over-cap ops before the final persist (this applied archive op is
+    # never evicted — it holds the only restore mapping for the moved-out original).
+    journal.prune(vault_root, cfg, manifest)
     journal.save(vault_root, cfg, manifest)
 
     res.update({
@@ -406,8 +592,14 @@ def _ensure_thumbs_excluded(vault_root: Path, scope: str, cfg: dict) -> None:
         if rel in excl:
             return
         excl.append(rel)
-        live["vault_exclude_dirs"] = excl
-        save_config(live)
+        # Item 2.9 (improvement plan 2026-07-04): pass ONLY the delta.
+        # save_config re-loads fresh under its write lock and merges the given
+        # keys — the previous ``save_config(live)`` handed it the WHOLE
+        # pre-load snapshot, so any key another thread changed between our
+        # load_config() and the save (a Settings write, a config POST) was
+        # silently reverted to this snapshot's stale value. One key in, one
+        # key merged; every other key keeps whatever is freshest on disk.
+        save_config({"vault_exclude_dirs": excl})
     except Exception:  # noqa: BLE001 — non-fatal
         pass
 
@@ -509,17 +701,36 @@ def revert_archive_image(vault_root: Path, cfg: dict, op: dict) -> dict:
             write_bytes_atomic(str(note_path), snap)
             journal.log_vault_write("restore_note", note_rel, "thumbnail→embed")
         except (OSError, journal.ScopeError) as exc:
-            # The original is already back; surface a warning but don't fail hard.
-            warnings.append(f"note not restored ({type(exc).__name__})")
+            # CRITICAL — do NOT fall through to the thumbnail deletion. The
+            # pre-flight chose restore_note=True because the note still embeds the
+            # *thumbnail*; the snapshot write that would re-point it at the original
+            # just failed, so the note STILL embeds the thumbnail. Deleting that
+            # thumbnail in step 3 would orphan a live embed (the exact corruption
+            # this "atomic-or-nothing" reverter exists to prevent). Abort here with
+            # the thumbnail + archive copy left in place and the op still "applied"
+            # so the user can retry: step 1 (move original back) is idempotent — the
+            # restored original is detected and skipped on the next attempt — so the
+            # only side effect left behind is a now-unreferenced original copy, which
+            # is harmless and self-heals on retry.
+            return {"ok": False, "status": "failed",
+                    "message": (f"could not restore the note from its snapshot "
+                                f"({type(exc).__name__}); thumbnail left in place to avoid a "
+                                "broken embed — resolve the snapshot issue and retry the restore.")}
 
-    # 3) drop the thumbnail (best-effort). Safe: by here the note embeds the
-    #    original again (restored / already-original / deleted), never the thumb.
+    # 3) drop the thumbnail (best-effort). SAFE ONLY HERE: every path that reaches
+    #    this point has the note embedding the ORIGINAL again — restore_note
+    #    succeeded (its failure path returns above), or restore_note was False
+    #    because the note is already pre-archive / was deleted. So the thumbnail can
+    #    never still be a live embed at this point.
     if thumb_rel:
         try:
             tp = vault_root / thumb_rel
             journal.assert_under(tp, vault_root)
             if tp.exists():
                 os.unlink(tp)
+                # m4: audit the in-vault thumbnail removal (write was logged; so
+                # is the delete now) so a vault change stays attributable.
+                journal.log_vault_write("delete_thumb", thumb_rel, "archive restore")
         except (OSError, journal.ScopeError):
             warnings.append("thumbnail not removed")
 

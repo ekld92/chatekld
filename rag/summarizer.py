@@ -26,11 +26,10 @@ from core.providers import get_provider
 from core.providers.base import local_request_timeout
 from core.config import load_config
 from core.constants import PAPER_LOCAL_STALL_TIMEOUT_S
-from core.llm.factory import get_llm_provider, is_online
+from core.llm.factory import is_online
 from core.llm.policy import parse_policy_from_config
 from core.llm.prompt import build_summary_user_message
-from core.llm.redact import redact
-from core.llm.types import LLMError, LLMRequest
+from core.llm.types import LLMRequest
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +154,16 @@ def summarise_stream(
     # backend trips after PAPER_LOCAL_STALL_TIMEOUT_S of no tokens.
     stall_timeout = local_request_timeout() or PAPER_LOCAL_STALL_TIMEOUT_S
 
+    # Prompt Hub capture (local bypass): the local single-paper path sends the
+    # system prompt via ``provider.stream_chat``, NOT through core.llm.factory,
+    # so the factory capture seam never sees it — record it directly here.
+    from core import prompt_capture
+
+    prompt_capture.record(
+        "paper_summary", sys_p, provider=provider_name, model=model,
+        query=user_template,
+    )
+
     stream = provider.stream_chat(
         model=model,
         prompt=prompt,
@@ -206,7 +215,6 @@ def _stream_online(
     # shape is the template later reused by
     # ``rag/engine.py::_OnlineStreamingResponse`` and the RAG-free
     # ``core/llm/chat.py`` Plain Chat helper.
-    from core.config import resolve_chat_model
     cfg = load_config()
     timeout_s = float(cfg.get("online_timeout_s", 60) or 60)
     effective_max_tokens = max_tokens or int(cfg.get("online_max_tokens", 4096) or 4096)
@@ -220,6 +228,8 @@ def _stream_online(
         top_p=top_p,
         max_tokens=effective_max_tokens,
         timeout_s=timeout_s,
+        # Prompt Hub tag — the online summary shares the factory capture seam.
+        workflow="paper_summary",
     )
 
     def _emit(msg: str) -> None:
@@ -229,39 +239,15 @@ def _stream_online(
             except Exception:
                 logger.debug("info_cb failed", exc_info=True)
 
-    primary = get_llm_provider(provider_name, cfg=cfg)
-    yielded_any = False
-    try:
-        stream = primary.stream(request)
-        for token in stream.response_gen:
-            yielded_any = True
-            yield token
-        return
-    except LLMError as err:
-        # Only fall back *before* the first token reaches the client.  Once
-        # ≥1 token has streamed, re-streaming through the fallback would
-        # duplicate the answer, so re-raise and let the route surface a
-        # structured error after the partial output.
-        if yielded_any:
-            raise
-        if not policy.should_fall_back(err) or policy.fallback is None:
-            raise
-        _emit(f"primary provider {provider_name} failed ({err.category.value}); falling back to {policy.fallback}")
-        logger.warning(
-            "online summary fallback %s -> %s: %s",
-            provider_name,
-            policy.fallback,
-            redact(err.message),
-        )
+    def on_fallback(cat: str, fallback: str) -> None:
+        _emit(f"primary provider {provider_name} failed ({cat}); falling back to {fallback}")
 
-    fallback = get_llm_provider(policy.fallback, cfg=cfg)
-    fallback_request = LLMRequest(
-        model=resolve_chat_model(cfg, policy.fallback),
-        system_prompt=system_prompt,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=effective_max_tokens,
-        timeout_s=timeout_s,
+    from core.llm.factory import stream_with_fallback
+    yield from stream_with_fallback(
+        provider_name=provider_name,
+        request=request,
+        policy=policy,
+        cfg=cfg,
+        on_fallback=on_fallback,
+        log_context="online summary fallback"
     )
-    yield from fallback.stream(fallback_request).response_gen

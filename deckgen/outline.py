@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .prompts import OUTLINE_SYSTEM_PROMPT, build_outline_message
 
@@ -18,6 +18,9 @@ from .prompts import OUTLINE_SYSTEM_PROMPT, build_outline_message
 # request_outline so that parse_outline — and the test-suite — can use this module
 # without the HTTP dependency installed. Type hints below are strings thanks to
 # ``from __future__ import annotations``.
+if TYPE_CHECKING:  # type-only — never imported at runtime, so the core stays requests-free
+    from .client import ChatEKLDClient
+    from .result import ChatResult
 
 
 @dataclass
@@ -44,6 +47,41 @@ _NUM_RE = re.compile(r"^(\s*)\d+[.)]\s+(.+?)\s*$")                      # "1. Ti
 _DASH_RE = re.compile(r"^(\s*)[-*+]\s+(.+?)\s*$")                       # "- bullet"
 
 
+def _looks_like_outline(text: str) -> bool:
+    """True if *text* contains explicit outline structure.
+
+    Gates the instructions-as-outline fallback in :func:`request_outline`: we
+    only treat the lecturer's free-text instructions as an outline when they
+    actually typed one — an ATX heading, a "Section N:" line, a top-level
+    numbered item, or a ``-``/``*``/``+`` bullet. Plain prose returns ``False``
+    so the flat-list branch of :func:`_parse_heading_list` cannot turn each
+    sentence line into a bogus section.
+    """
+    for ln in text.splitlines():
+        if not ln.strip():
+            continue
+        if _ATX_RE.match(ln) or _SECTION_WORD_RE.match(ln) or _DASH_RE.match(ln):
+            return True
+        m = _NUM_RE.match(ln)
+        if m and len(m.group(1)) == 0:  # top-level numbered item (not an indented point)
+            return True
+    return False
+
+
+def _emit_info(on_event, text: str) -> None:
+    """Push one SSE-shaped ``{"info": …}`` event, defensively.
+
+    The deck route forwards these dicts straight onto its SSE queue and the CLI
+    prints them; a listener exception must never abort outline generation.
+    """
+    if on_event is None:
+        return
+    try:
+        on_event({"info": text})
+    except Exception:
+        pass
+
+
 def request_outline(
     client: ChatEKLDClient,
     *,
@@ -56,11 +94,29 @@ def request_outline(
     temperature: Optional[float],
     max_sections: int = 8,
     on_event=None,
+    max_attempts: int = 1,
+    retry_backoff_s: float = 0.0,
+    should_cancel=None,
 ) -> tuple[list, "ChatResult"]:
-    """Ask the agent for an outline; return (sections, raw ChatResult)."""
+    """Ask the agent for an outline; return (sections, raw ChatResult).
+
+    *max_attempts* / *retry_backoff_s* / *should_cancel* drive the cancel-aware
+    per-turn retry (see :func:`deckgen.retry.chat_with_retry`); the defaults
+    (``max_attempts=1``) keep the original single-shot behaviour. A transient
+    provider failure is retried before the no-outline salvage / ``OutlineError``
+    path below ever fires.
+    """
+    from .retry import chat_with_retry
+
     message = build_outline_message(topic, instructions, max_sections)
-    result = client.chat(
+    result = chat_with_retry(
+        client,
         message,
+        max_attempts=max_attempts,
+        retry_backoff_s=retry_backoff_s,
+        should_cancel=should_cancel,
+        label="outline",
+        on_event=on_event,
         system_prompt=OUTLINE_SYSTEM_PROMPT,
         provider=provider,
         model=model,
@@ -68,12 +124,31 @@ def request_outline(
         agent=True,
         max_iters=max_iters,
         temperature=temperature,
-        on_event=on_event,
     )
-    if result.error:
-        raise OutlineError(f"Outline request failed: {result.error}")
-    sections = parse_outline(result.text)
+    # Cap to the requested section budget: the prompt ASKS for ≤ max_sections
+    # but a chatty model can return more, and an uncapped outline silently
+    # multiplied generation time/cost (the instructions-fallback below was
+    # already capped — this makes the primary path match it).
+    sections = [] if result.error else parse_outline(result.text)[:max_sections]
     if not sections:
+        # Salvage: the lecturer's free-text instructions frequently already hold a
+        # numbered/heading/bulleted outline. When the model returns nothing usable
+        # — a small local model looping on tool calls until the iteration cap is
+        # the common case — fall back to parsing those instructions, turning a
+        # discarded run into a deck built from the structure the user typed.
+        # Gated on _looks_like_outline so prose instructions are not split
+        # line-by-line into bogus sections.
+        if _looks_like_outline(instructions):
+            fallback = parse_outline(instructions)[:max_sections]
+            if fallback:
+                _emit_info(
+                    on_event,
+                    "Model returned no usable outline; built it from your "
+                    f"instructions instead ({len(fallback)} section(s)).",
+                )
+                return fallback, result
+        if result.error:
+            raise OutlineError(f"Outline request failed: {result.error}")
         raise OutlineError(
             "Could not parse a lecture outline from the model output. Re-run with "
             "--verbose to inspect the raw response, or try a more capable model."

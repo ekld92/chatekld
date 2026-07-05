@@ -142,12 +142,20 @@ def parse_anthropic_tool_use(raw: Any) -> Optional[ToolCall]:
     return ToolCall(id=call_id, name=name, arguments=inp, raw_arguments=raw_args)
 
 
-def parse_gemini_function_call(raw: Any) -> Optional[ToolCall]:
+def parse_gemini_function_call(
+    raw: Any, *, thought_signature: str = "",
+) -> Optional[ToolCall]:
     """Parse a ``functionCall`` payload from a Gemini response part.
 
     Gemini does not return an ID with each call; the adapter
     synthesises a stable-enough one so the agent loop can route
     ``ToolResult.tool_call_id`` back through the response side.
+
+    ``thought_signature`` is the part-level ``thoughtSignature`` (the
+    signature lives on the *part*, not inside ``functionCall``, so the
+    adapter passes it in). Gemini 3.x requires it echoed back on the
+    corresponding part in the next request; see
+    :func:`build_gemini_contents`.
     """
     if not isinstance(raw, dict):
         return None
@@ -162,7 +170,10 @@ def parse_gemini_function_call(raw: Any) -> Optional[ToolCall]:
         raw_args = json.dumps(args)
     except (TypeError, ValueError):
         raw_args = ""
-    return ToolCall(id=call_id, name=name, arguments=args, raw_arguments=raw_args)
+    return ToolCall(
+        id=call_id, name=name, arguments=args, raw_arguments=raw_args,
+        thought_signature=thought_signature or "",
+    )
 
 
 def build_openai_messages(request: LLMRequest) -> list[dict[str, Any]]:
@@ -266,13 +277,19 @@ def build_gemini_contents(request: LLMRequest) -> list[dict[str, Any]]:
         contents.append({"role": gemini_role, "parts": [{"text": content}]})
     for turn in request.tool_history:
         if turn.calls:
-            contents.append({
-                "role": "model",
-                "parts": [
-                    {"functionCall": {"name": c.name, "args": c.arguments or {}}}
-                    for c in turn.calls
-                ],
-            })
+            call_parts: list[dict[str, Any]] = []
+            for c in turn.calls:
+                part: dict[str, Any] = {
+                    "functionCall": {"name": c.name, "args": c.arguments or {}}
+                }
+                # Gemini 3.x REQUIRES the thoughtSignature captured from the
+                # model's functionCall part to be echoed back verbatim on that
+                # part — omitting it 400s the second tool turn. Older Gemini
+                # models never set it, so this stays absent for them.
+                if c.thought_signature:
+                    part["thoughtSignature"] = c.thought_signature
+                call_parts.append(part)
+            contents.append({"role": "model", "parts": call_parts})
         if turn.results:
             parts: list[dict[str, Any]] = []
             for r in turn.results:

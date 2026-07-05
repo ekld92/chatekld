@@ -12,11 +12,25 @@ How to use it for a before/after comparison
 
        RUN_LIVE_EVAL=1 \
        EVAL_PROVIDER=ollama EVAL_MODEL=llama3.2 EVAL_EMBED=nomic-embed-text \
-       ~/venvs/papermind2026/bin/python -m tests.eval.run_eval
+       ~/venvs/chatekld2026/bin/python -m tests.eval.run_eval
 
 2. Note the pass rate, `git stash` (or checkout the pre-change commit), run it
    again, and compare. The signal is the *delta*, not the absolute number —
    this is a tripwire for grounding/citation regressions, not a semantic grader.
+
+Track 5.6 batched-embedding validation
+---------------------------------------
+Hermetic parity (test_vault_regressions.py::TestEmbedBatchParity) proves the batch
+path stores identical docstore/hashes/vectors for a FAKE embedder, but can't see a
+real provider returning slightly different numerics for a batched vs single embed.
+To check that on a real backend, run this eval twice and compare the pass rate:
+
+    RUN_LIVE_EVAL=1 EVAL_EMBED_BATCH=1  EVAL_MODEL=llama3.2:3b ... python -m tests.eval.run_eval
+    RUN_LIVE_EVAL=1 EVAL_EMBED_BATCH=16 EVAL_MODEL=llama3.2:3b ... python -m tests.eval.run_eval
+
+Equal pass rates ⇒ batching is numerically safe on that backend (`EVAL_EMBED_BATCH`
+pins `vault_embed_batch_size`; unset ⇒ the app default of 16; ≤1 ⇒ the legacy
+per-chunk path).
 
 It writes only to a throwaway ``CHATEKLD_BASE_DIR`` (a temp dir when unset), so
 it never touches your real ChatEKLD app data, index, or config.
@@ -119,6 +133,12 @@ def main() -> int:
     provider = os.environ.get("EVAL_PROVIDER", "ollama")
     model = os.environ.get("EVAL_MODEL", "llama3.2")
     embed = os.environ.get("EVAL_EMBED", "nomic-embed-text")
+    # Track 5.6 validation knob: pin the indexer's embed batch size so a batched
+    # (default 16) vs legacy per-chunk (1) run can be compared. Hermetic parity can't
+    # see provider-side batch-vs-single embedding numerics, so running this eval at
+    # EVAL_EMBED_BATCH=16 and =1 and comparing the pass rate is the way to confirm
+    # batching doesn't move retrieval quality on a real backend. Unset ⇒ app default.
+    embed_batch = os.environ.get("EVAL_EMBED_BATCH", "").strip()
 
     # Import only after the base dir is fixed.
     from core import constants
@@ -135,6 +155,11 @@ def main() -> int:
         "vault_reranker_enabled": False,
         "vault_prewarm_enabled": False,
     }
+    if embed_batch:
+        try:
+            cfg["vault_embed_batch_size"] = int(embed_batch)
+        except ValueError:
+            print(f"Ignoring non-integer EVAL_EMBED_BATCH={embed_batch!r}")
     Path(constants.CONFIG_FILE).write_text(json.dumps(cfg), encoding="utf-8")
 
     # Use a FRESH manager instance, not rag.vault.obsidian_manager (the app
@@ -143,6 +168,13 @@ def main() -> int:
     # script is single-threaded, so it adds no concurrency against the manager's
     # internal locks either.
     manager = ObsidianVaultManager()
+    # A fresh manager has _vault_path=None; index_vault reads self._vault_path
+    # directly (and bails with "Vault path not set" otherwise), so point it at the
+    # fixture vault in-memory. restore_vault_path sets the path WITHOUT re-saving
+    # config (an in-memory setter only), so the cfg we just wrote is preserved —
+    # this is the run_eval "wiring tweak local to main()" the module docstring
+    # anticipated (the live path had never been executed before).
+    manager.restore_vault_path(str(_FIXTURES))
     print(f"Indexing fixture vault at {_FIXTURES} (provider={provider}, embed={embed}) ...")
     manager.index_vault(model, embed, provider_name=provider)
 

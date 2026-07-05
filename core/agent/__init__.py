@@ -4,8 +4,8 @@ Opt-in alternative to the single-shot RAG path in ``rag.vault.stream_chat``.
 When the user toggles agent mode the route hands the request to
 :func:`core.agent.loop.run_agent_loop`, which orchestrates
 a multi-turn conversation: the LLM emits structured tool calls, the loop
-dispatches them against the registered tools (``vault.search`` /
-``vault.read_note`` / ``vault.list_materials``), and the model integrates
+dispatches them against the registered tools (``vault_search`` /
+``vault_read_note`` / ``vault_list_materials``), and the model integrates
 the observations until it produces a final answer or the loop budget runs
 out.
 

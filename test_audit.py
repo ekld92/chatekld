@@ -32,7 +32,6 @@ to clean them up.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tempfile
 import unittest
@@ -76,13 +75,16 @@ class TestSettingsAdapter(unittest.TestCase):
         cfg_path = str(self.tmp / "config.json")
         p1 = mock.patch("core.constants.CONFIG_FILE", cfg_path)
         p2 = mock.patch("core.config.CONFIG_FILE", cfg_path)
-        p1.start(); self.addCleanup(p1.stop)
-        p2.start(); self.addCleanup(p2.stop)
+        p1.start()
+        self.addCleanup(p1.stop)
+        p2.start()
+        self.addCleanup(p2.stop)
         # Also patch BASE_DIR so the mapping.json default (BASE_DIR/audit/...)
         # lands inside the tmpdir rather than the real app data dir.
         base = str(self.tmp)
         p3 = mock.patch("core.constants.BASE_DIR", base)
-        p3.start(); self.addCleanup(p3.stop)
+        p3.start()
+        self.addCleanup(p3.stop)
 
         (self.tmp / "config.json").write_text(
             json.dumps({
@@ -100,7 +102,7 @@ class TestSettingsAdapter(unittest.TestCase):
         )
 
     def test_subpaths_are_configurable(self):
-        from audit.config import load_settings  # noqa: WPS433
+        from audit.config import load_settings
 
         s = load_settings()
         self.assertEqual(s.vault_root, self.vault.resolve())
@@ -122,7 +124,7 @@ class TestSettingsAdapter(unittest.TestCase):
             json.dumps({"obsidian_vault_path": str(self.vault)}),
             encoding="utf-8",
         )
-        from audit.config import (  # noqa: WPS433
+        from audit.config import (
             DEFAULT_ATTACHMENTS_SUBDIR,
             DEFAULT_BIBLIO_ARTICLES_SUBDIR,
             DEFAULT_MASTER_BIB_PATH,
@@ -141,7 +143,7 @@ class TestSettingsAdapter(unittest.TestCase):
             json.dumps({"obsidian_vault_path": ""}),
             encoding="utf-8",
         )
-        from audit.config import AuditConfigError, load_settings  # noqa: WPS433
+        from audit.config import AuditConfigError, load_settings
 
         with self.assertRaises(AuditConfigError):
             load_settings()
@@ -151,7 +153,7 @@ class TestSettingsAdapter(unittest.TestCase):
             json.dumps({"obsidian_vault_path": "/nonexistent/path/xyz"}),
             encoding="utf-8",
         )
-        from audit.config import AuditConfigError, load_settings  # noqa: WPS433
+        from audit.config import AuditConfigError, load_settings
 
         with self.assertRaises(AuditConfigError):
             load_settings()
@@ -167,7 +169,7 @@ class TestSettingsAdapter(unittest.TestCase):
             }),
             encoding="utf-8",
         )
-        from audit.config import load_settings  # noqa: WPS433
+        from audit.config import load_settings
 
         s = load_settings()
         self.assertEqual(s.biblio_skip_prefix, "")
@@ -180,7 +182,7 @@ class TestSettingsAdapter(unittest.TestCase):
             }),
             encoding="utf-8",
         )
-        from audit.config import DEFAULT_ANNOTATIONS_READ_THRESHOLD, load_settings  # noqa: WPS433
+        from audit.config import DEFAULT_ANNOTATIONS_READ_THRESHOLD, load_settings
 
         s = load_settings()
         self.assertEqual(s.annotations_read_threshold, DEFAULT_ANNOTATIONS_READ_THRESHOLD)
@@ -222,7 +224,7 @@ class TestAuditManagerStateMachine(unittest.TestCase):
         # Reset the audit_manager singleton between tests.  The module
         # itself stays cached; we only zero out per-test state so we
         # don't leak inventories or thread state across tests.
-        from audit.manager import audit_manager  # noqa: WPS433
+        from audit.manager import audit_manager
         with audit_manager._state_lock:
             audit_manager._state = "idle"
             audit_manager._inventory = None
@@ -355,8 +357,8 @@ class TestFlaskAppBootDoesNotScan(unittest.TestCase):
     """
 
     def test_create_app_leaves_audit_idle(self):
-        from app import create_app  # noqa: WPS433
-        from audit.manager import audit_manager  # noqa: WPS433
+        from app import create_app
+        from audit.manager import audit_manager
 
         with mock.patch.object(
             audit_manager, "start_scan", wraps=audit_manager.start_scan
@@ -372,10 +374,15 @@ def _build_audit_only_app():
 
     Avoids importing services.vision / rag.vault / etc. so test_audit
     cannot affect the shared singletons that smoke_test relies on.
+
+    Item 4.1: register the app-level origin guard so the CSRF-header tests
+    continue to exercise the real gate.
     """
-    from api.routes.audit import audit_bp  # noqa: WPS433
+    from api.routes.audit import audit_bp
+    from api.security import register_origin_guard
 
     app = flask.Flask(__name__)
+    register_origin_guard(app)
     app.register_blueprint(audit_bp)
     return app
 
@@ -622,7 +629,7 @@ class TestUnmappedAnnotationPrecompute(unittest.TestCase):
     def _patch_reader(self, counts: dict[str, int], seen: list[Path]):
         """Patch read_annotations to a deterministic, disk-free stub that
         records which paths it was asked to read."""
-        from audit.core import pdf_annotations  # noqa: WPS433
+        from audit.core import pdf_annotations
 
         def fake(path):
             seen.append(path)
@@ -631,8 +638,8 @@ class TestUnmappedAnnotationPrecompute(unittest.TestCase):
         return mock.patch.object(pdf_annotations, "read_annotations", fake)
 
     def test_build_inventory_precomputes_unmapped_annotations(self):
-        from audit.config import load_settings  # noqa: WPS433
-        from audit.engine import inventory as eng_inventory  # noqa: WPS433
+        from audit.config import load_settings
+        from audit.engine import inventory as eng_inventory
 
         settings = load_settings()
         seen: list[Path] = []
@@ -654,8 +661,8 @@ class TestUnmappedAnnotationPrecompute(unittest.TestCase):
         )
 
     def test_count_annotations_false_leaves_cache_empty(self):
-        from audit.config import load_settings  # noqa: WPS433
-        from audit.engine import inventory as eng_inventory  # noqa: WPS433
+        from audit.config import load_settings
+        from audit.engine import inventory as eng_inventory
 
         settings = load_settings()
         seen: list[Path] = []
@@ -675,8 +682,8 @@ class TestUnzoterodReportsUseCache(unittest.TestCase):
     def test_reports_serve_from_cache_without_disk_reads(self):
         from types import SimpleNamespace
 
-        from audit.core.pdf_annotations import AnnotationsResult  # noqa: WPS433
-        from audit.engine.reports import (  # noqa: WPS433
+        from audit.core.pdf_annotations import AnnotationsResult
+        from audit.engine.reports import (
             read_unzoterod as r_read,
             unread_unzoterod as r_unread,
         )
@@ -713,8 +720,8 @@ class TestReadAnnotationsParallel(unittest.TestCase):
     and honours cooperative cancel without hanging."""
 
     def test_reads_all_paths(self):
-        from audit.core import pdf_annotations  # noqa: WPS433
-        from audit.engine.inventory import _read_annotations_parallel  # noqa: WPS433
+        from audit.core import pdf_annotations
+        from audit.engine.inventory import _read_annotations_parallel
 
         paths = [Path(f"/x/{i}.pdf") for i in range(20)]
 
@@ -727,13 +734,13 @@ class TestReadAnnotationsParallel(unittest.TestCase):
         self.assertEqual(out[paths[7]].count, 7)
 
     def test_empty_input(self):
-        from audit.engine.inventory import _read_annotations_parallel  # noqa: WPS433
+        from audit.engine.inventory import _read_annotations_parallel
 
         self.assertEqual(_read_annotations_parallel([]), {})
 
     def test_cancel_returns_without_hanging(self):
-        from audit.core import pdf_annotations  # noqa: WPS433
-        from audit.engine.inventory import _read_annotations_parallel  # noqa: WPS433
+        from audit.core import pdf_annotations
+        from audit.engine.inventory import _read_annotations_parallel
 
         paths = [Path(f"/x/{i}.pdf") for i in range(50)]
 

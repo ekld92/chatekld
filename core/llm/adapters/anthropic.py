@@ -7,14 +7,17 @@ honours the same env vars (``ANTHROPIC_API_KEY``, ``ANTHROPIC_BASE_URL``).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import re
+import threading
 import time
 from typing import Iterator, Optional
 
 from core.llm.base import LLMProvider, StreamingResponse, looks_like_quota
-from core.llm.retry import retry_with_backoff
+from core.llm.retry import parse_retry_after_s, retry_with_backoff
 from core.llm.tool_schema import (
     build_anthropic_messages,
     jsonschema_to_anthropic_tool,
@@ -32,13 +35,34 @@ from core.llm.usage import usage_tracker
 
 logger = logging.getLogger(__name__)
 
-# Active models only (per platform.claude.com, 2026-05).  The Claude 3.x
-# entries were removed because those models are retired and now 404:
-# 3.5 Sonnet (2025-10), 3 Opus (2026-01), 3.5 Haiku (2026-02).
+# Cached shared ``httpx.Client`` per (base_url, timeout). Previously every
+# generate()/stream() opened a ``with httpx.Client(...)`` and closed it on exit,
+# so each online round-trip built and tore down a fresh connection pool + TLS
+# session — N handshakes per agent turn / per deck section to the same host. A
+# long-lived shared client keeps connections alive across calls. httpx.Client is
+# thread-safe for concurrent requests, so one client serves all callers.
+#
+# Unlike the OpenAI cache, the API key is NOT part of the key: Anthropic auth is
+# a per-request header (``_headers()`` re-reads the env key every call), so a
+# rotated key applies on the next request through the SAME pooled client — no
+# stale-auth risk and no need to fingerprint the key here. The listing call
+# (_fetch_live_models) keeps its own short-lived client (different, shorter
+# timeout, rare + TTL-cached) and is intentionally left uncached.
+_client_cache: dict = {}
+_client_cache_lock = threading.Lock()
+
+# Active models only (per platform.claude.com; newest generations added
+# 2026-07-04, Track 5.5 — the curated list is authoritative for the default
+# selection and must carry a PRICING_TABLE entry, pinned by
+# test_all_curated_models_are_priced).  The Claude 3.x entries were removed
+# because those models are retired and now 404: 3.5 Sonnet (2025-10),
+# 3 Opus (2026-01), 3.5 Haiku (2026-02).
 CURATED_MODELS: list[str] = [
+    "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
+    "claude-sonnet-5",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
     "claude-opus-4-5",
@@ -48,12 +72,85 @@ CURATED_MODELS: list[str] = [
 _API_VERSION = "2023-06-01"
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
 
+# Model families on which Anthropic REMOVED the sampling params — sending
+# temperature/top_p/top_k 400s the whole call ("`temperature` is deprecated
+# for this model", field-reported on claude-fable-5 2026-07; verified vs
+# platform.claude.com: removed on Fable 5 / Mythos 5 / Opus 4.7+ / Sonnet 5,
+# still accepted ≤1.0 on Opus 4.6 / Sonnet 4.6 and older). Prefix-matched so
+# dated snapshots ("claude-opus-4-8-2026…") are covered; a *future* family
+# that also drops them is healed reactively by the strip-and-retry pass in
+# generate()/stream() rather than requiring a code change here.
+_SAMPLING_REMOVED_MODEL_PREFIXES = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+)
+
+# Params the reactive heal pass may strip from a payload, at most once each
+# per call. top_k is listed for completeness (this adapter never sends it
+# today) so the heal loop keeps working if it is ever added.
+_STRIPPABLE_SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
+
+
+def _sampling_params_removed(model: str) -> bool:
+    """True when *model* belongs to a family that rejects sampling params."""
+    return (model or "").lower().startswith(_SAMPLING_REMOVED_MODEL_PREFIXES)
+
+
+def _strip_rejected_sampling_param(payload: dict, message: str, healed: set) -> str:
+    """Reactive self-heal for a sampling-param 400: mutate *payload*, retry.
+
+    When a 400 message names a sampling param the payload actually carries
+    (word-boundary match — Anthropic backtick-quotes the name), drop it and
+    return a short description so the caller retries the SAME request once
+    per param (bounded by the *healed* set; "" means not healable → raise).
+    Dropping the param trades exact sampling for a successful call — strictly
+    better than the terminal 400 the user otherwise sees, and it absorbs the
+    next family's parameter drift without an adapter update.
+    """
+    for candidate in _STRIPPABLE_SAMPLING_PARAMS:
+        if candidate in healed or candidate not in payload:
+            continue
+        if re.search(rf"\b{candidate}\b", message or ""):
+            healed.add(candidate)
+            payload.pop(candidate, None)
+            return f"dropped unsupported {candidate}"
+    return ""
+
 _STOP_REASON_MAP: dict[str, FinishReason] = {
     "end_turn": FinishReason.STOP,
     "stop_sequence": FinishReason.STOP,
     "max_tokens": FinishReason.LENGTH,
     "tool_use": FinishReason.TOOL_USE,
 }
+
+
+def _usage_from_anthropic_block(usage_block: dict) -> LLMUsage:
+    """Normalise an Anthropic ``usage`` block into the app's LLMUsage shape.
+
+    SEMANTICS GUARD (Track 5.5): Anthropic's ``input_tokens`` EXCLUDES the
+    cache-read and cache-write tokens (total prompt = input + cache_read +
+    cache_creation), whereas OpenAI's ``prompt_tokens`` INCLUDES its cached
+    subset — and ``estimate_cost_usd`` (plus the /api/usage totals) are built
+    on the inclusive shape. Recording the raw Anthropic numbers would both
+    under-report prompt size and make the cost formula subtract cache reads
+    from a count that never contained them. So the adapter re-adds the cache
+    figures here: ``input_tokens`` becomes the TOTAL prompt size,
+    ``cached_input_tokens`` the read subset, ``cache_creation_input_tokens``
+    the write subset (billed at 1.25× by the pricing layer). Pinned by
+    TestAnthropicPromptCaching.
+    """
+    api_input = int(usage_block.get("input_tokens", 0) or 0)
+    cache_read = int(usage_block.get("cache_read_input_tokens", 0) or 0)
+    cache_creation = int(usage_block.get("cache_creation_input_tokens", 0) or 0)
+    return LLMUsage(
+        input_tokens=api_input + cache_read + cache_creation,
+        output_tokens=int(usage_block.get("output_tokens", 0) or 0),
+        cached_input_tokens=cache_read,
+        cache_creation_input_tokens=cache_creation,
+    )
 
 
 class AnthropicProvider(LLMProvider):
@@ -138,6 +235,24 @@ class AnthropicProvider(LLMProvider):
             ) from exc
         return httpx
 
+    def _client(self):
+        """Return a cached, long-lived ``httpx.Client`` for (base_url, timeout).
+
+        Reused across generate()/stream() so connections stay keep-alive instead
+        of a fresh pool + TLS handshake per call (see the module cache note). The
+        client is never closed (process-lifetime, like the local-provider caches);
+        auth is applied per request via ``_headers()``, so the client is
+        key-agnostic and a rotated key takes effect on the next request.
+        """
+        httpx = self._httpx()
+        key = (self._base_url(), self.timeout_s)
+        with _client_cache_lock:
+            client = _client_cache.get(key)
+            if client is None:
+                client = httpx.Client(timeout=self.timeout_s)
+                _client_cache[key] = client
+            return client
+
     def supports_embeddings(self) -> bool:
         """Online providers are chat-only; embeddings resolve to a local
         provider."""
@@ -215,28 +330,55 @@ class AnthropicProvider(LLMProvider):
             "stream": stream,
         }
         if request.system_prompt:
-            payload["system"] = request.system_prompt
-        if request.temperature is not None:
-            # Anthropic caps temperature at 1.0 (verified vs platform.claude.com,
-            # 2026-06), whereas OpenAI/Gemini allow up to 2.0 and the app's
-            # vault-chat range is 0-2. Clamp so a temperature in (1.0, 2.0] does
-            # not 400 against Anthropic specifically.
-            payload["temperature"] = min(float(request.temperature), 1.0)
-        if request.top_p is not None:
-            payload["top_p"] = request.top_p
+            # Prompt caching (Track 5.5, 2026-07-04): the system prompt goes as
+            # a block array with a cache_control breakpoint instead of a bare
+            # string. Anthropic caching is a PREFIX match over tools → system →
+            # messages, so this single breakpoint caches the tool definitions
+            # AND the system prompt together — exactly the stable prefix that
+            # repeats across agent-loop iterations, deck per-section turns, and
+            # same-settings vault chats. Cache reads bill at ~0.1× the input
+            # rate, writes at ~1.25× (5-min TTL); below the model's minimum
+            # cacheable prefix the marker is silently ignored (no write, no
+            # premium), so marking is safe for short prompts too. The volatile
+            # parts (retrieved context, the user question, tool results) ride
+            # in `messages`, after the breakpoint. Wire shape per
+            # platform.claude.com prompt-caching docs (anthropic-version
+            # 2023-06-01 accepts both the string and block-array forms).
+            payload["system"] = [{
+                "type": "text",
+                "text": request.system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }]
+        # Newest families (Fable 5 / Mythos 5 / Opus 4.7+ / Sonnet 5) REMOVED
+        # the sampling params — sending them 400s every call, which took down
+        # deck generate/augment and vault chat against those models entirely
+        # (the app's callers always set a temperature from config). Older
+        # models keep them, clamped: Anthropic caps temperature at 1.0
+        # (verified vs platform.claude.com, 2026-06) whereas OpenAI/Gemini
+        # allow 2.0 and the app's vault-chat range is 0-2.
+        if not _sampling_params_removed(request.model):
+            if request.temperature is not None:
+                payload["temperature"] = min(float(request.temperature), 1.0)
+            if request.top_p is not None:
+                payload["top_p"] = request.top_p
         if request.stop:
             payload["stop_sequences"] = request.stop
-        if request.tools and request.tool_choice != "none":
-            # Anthropic's tool_choice union has no ``none`` variant — to
-            # honour the cross-provider semantic that ``"none"`` disables
-            # tool use, omit the tools payload entirely so the model
-            # cannot emit tool_use blocks even by default.
+        if request.tools:
+            # Tools are included even for tool_choice="none": once the
+            # history contains tool_use/tool_result blocks (the agent loop's
+            # forced final turn arrives exactly then), Anthropic REQUIRES the
+            # tools param and 400s without it. ``{"type": "none"}`` is the
+            # supported way to forbid new calls (verified vs
+            # platform.claude.com 2026-07 — the old "omit tools entirely"
+            # workaround predates the none variant and breaks that case).
             payload["tools"] = [jsonschema_to_anthropic_tool(t) for t in request.tools]
             choice = request.tool_choice
             if choice in (None, "auto"):
                 payload["tool_choice"] = {"type": "auto"}
             elif choice in ("required", "any"):
                 payload["tool_choice"] = {"type": "any"}
+            elif choice == "none":
+                payload["tool_choice"] = {"type": "none"}
             else:
                 payload["tool_choice"] = {"type": "tool", "name": choice}
         return payload
@@ -253,27 +395,45 @@ class AnthropicProvider(LLMProvider):
         httpx = self._httpx()
         start = time.monotonic()
 
+        payload = self._build_payload(request, stream=False)
+        healed: set = set()
+
         def _do_call() -> LLMResponse:
-            try:
-                with httpx.Client(timeout=self.timeout_s) as client:
+            while True:
+                try:
+                    # Cached shared client (keep-alive) instead of a per-call pool.
+                    client = self._client()
                     resp = client.post(
                         f"{self._base_url()}/v1/messages",
                         headers=self._headers(),
-                        json=self._build_payload(request, stream=False),
+                        json=payload,
                     )
-            except httpx.TimeoutException as exc:
-                raise LLMError(
-                    category=ErrorCategory.TIMEOUT, message=str(exc),
-                    provider=self.name, model=request.model, retryable=True,
-                )
-            except httpx.HTTPError as exc:
-                raise LLMError(
-                    category=ErrorCategory.NETWORK, message=str(exc),
-                    provider=self.name, model=request.model, retryable=True,
-                )
-
-            if resp.status_code >= 400:
-                raise _http_error_to_llm_error(resp, self.name, request.model)
+                except httpx.TimeoutException as exc:
+                    raise LLMError(
+                        category=ErrorCategory.TIMEOUT, message=str(exc),
+                        provider=self.name, model=request.model, retryable=True,
+                    )
+                except httpx.HTTPError as exc:
+                    raise LLMError(
+                        category=ErrorCategory.NETWORK, message=str(exc),
+                        provider=self.name, model=request.model, retryable=True,
+                    )
+                if resp.status_code < 400:
+                    break
+                err = _http_error_to_llm_error(resp, self.name, request.model)
+                # Reactive param heal: a 400 naming a sampling param the
+                # payload carries (a family drift _sampling_params_removed
+                # doesn't know yet) gets that param stripped and ONE
+                # immediate retry — not a transient, so no backoff.
+                if err.category is ErrorCategory.INVALID_REQUEST:
+                    fix = _strip_rejected_sampling_param(payload, err.message, healed)
+                    if fix:
+                        logger.info(
+                            "anthropic param heal for %s: %s (retrying once)",
+                            request.model, fix,
+                        )
+                        continue
+                raise err
             try:
                 body = resp.json()
             except ValueError as exc:
@@ -295,11 +455,7 @@ class AnthropicProvider(LLMProvider):
                     if tc is not None:
                         tool_calls.append(tc)
             usage_block = body.get("usage", {}) or {}
-            usage = LLMUsage(
-                input_tokens=int(usage_block.get("input_tokens", 0) or 0),
-                output_tokens=int(usage_block.get("output_tokens", 0) or 0),
-                cached_input_tokens=int(usage_block.get("cache_read_input_tokens", 0) or 0),
-            )
+            usage = _usage_from_anthropic_block(usage_block)
             finish = _STOP_REASON_MAP.get(body.get("stop_reason") or "", FinishReason.STOP)
             latency_ms = int((time.monotonic() - start) * 1000)
             response = LLMResponse(
@@ -321,7 +477,19 @@ class AnthropicProvider(LLMProvider):
             )
             return response
 
-        return retry_with_backoff(_do_call, max_attempts=self.max_retries)
+        # Deadline-aware retry (improvement plan 1.3): the agent loop sets
+        # request.timeout_s to its REMAINING wall-clock budget each iteration;
+        # deriving the retry deadline from it keeps backoff sleeps from
+        # blocking past the turn deadline. None (non-agent callers) preserves
+        # the unbounded-by-deadline behaviour.
+        deadline = (
+            start + float(request.timeout_s)
+            if request.timeout_s and request.timeout_s > 0 else None
+        )
+        return retry_with_backoff(
+            _do_call, max_attempts=self.max_retries,
+            deadline_monotonic_s=deadline,
+        )
 
     def stream(self, request: LLMRequest) -> StreamingResponse:
         """Streaming completion over Anthropic's typed SSE event stream.
@@ -340,63 +508,93 @@ class AnthropicProvider(LLMProvider):
         final = LLMResponse(provider=self.name, model=request.model)
         buf: list[str] = []
 
+        payload = self._build_payload(request, stream=True)
+        healed: set = set()
+
         def _iter() -> Iterator[str]:
+            # Raw per-event counters in Anthropic's own (exclusive) semantics;
+            # normalised into the inclusive LLMUsage shape in the finally via
+            # _usage_from_anthropic_block.
             usage_in = 0
             usage_out = 0
             cached_in = 0
+            creation_in = 0
             finish_reason = FinishReason.STOP
             stream_error: LLMError | None = None
             try:
-                with httpx.Client(timeout=self.timeout_s) as client:
-                    with client.stream(
-                        "POST",
-                        f"{self._base_url()}/v1/messages",
-                        headers=self._headers(),
-                        json=self._build_payload(request, stream=True),
-                    ) as resp:
-                        if resp.status_code >= 400:
-                            try:
-                                body_text = resp.read().decode("utf-8", errors="replace")
-                            except Exception:
-                                body_text = ""
-                            raise _http_error_to_llm_error(
-                                resp, self.name, request.model, body_text=body_text,
-                            )
-                        event_name = ""
-                        for line in resp.iter_lines():
-                            if not line:
-                                continue
-                            if line.startswith("event:"):
-                                event_name = line.split(":", 1)[1].strip()
-                                continue
-                            if not line.startswith("data:"):
-                                continue
-                            raw = line.split(":", 1)[1].strip()
-                            if not raw or raw == "[DONE]":
-                                continue
-                            try:
-                                data = json.loads(raw)
-                            except json.JSONDecodeError:
-                                continue
-                            ev_type = data.get("type") or event_name
-                            if ev_type == "content_block_delta":
-                                delta = data.get("delta") or {}
-                                if delta.get("type") == "text_delta":
-                                    text = delta.get("text") or ""
-                                    if text:
-                                        buf.append(text)
-                                        yield text
-                            elif ev_type == "message_start":
-                                msg_usage = (data.get("message") or {}).get("usage") or {}
-                                usage_in = int(msg_usage.get("input_tokens", 0) or 0)
-                                cached_in = int(msg_usage.get("cache_read_input_tokens", 0) or 0)
-                            elif ev_type == "message_delta":
-                                delta_usage = data.get("usage") or {}
-                                if delta_usage:
-                                    usage_out = int(delta_usage.get("output_tokens", 0) or usage_out)
-                                stop_reason = (data.get("delta") or {}).get("stop_reason")
-                                if stop_reason:
-                                    finish_reason = _STOP_REASON_MAP.get(stop_reason, FinishReason.STOP)
+                # nullcontext wraps the CACHED client so the streaming block's
+                # structure/indentation is unchanged, but the shared client is NOT
+                # closed on exit (only the inner client.stream(...) response is) —
+                # keep-alive survives for the next call.
+                with contextlib.nullcontext(self._client()) as client:
+                    while True:  # re-entered only by the pre-token param heal below
+                        with client.stream(
+                            "POST",
+                            f"{self._base_url()}/v1/messages",
+                            headers=self._headers(),
+                            json=payload,
+                        ) as resp:
+                            if resp.status_code >= 400:
+                                try:
+                                    body_text = resp.read().decode("utf-8", errors="replace")
+                                except Exception:
+                                    body_text = ""
+                                err = _http_error_to_llm_error(
+                                    resp, self.name, request.model, body_text=body_text,
+                                )
+                                # Reactive param heal, streaming flavour: a
+                                # parameter-shape 400 always arrives BEFORE any
+                                # token (it is the response status), so retrying
+                                # the whole stream here can never replay
+                                # already-yielded text.
+                                if err.category is ErrorCategory.INVALID_REQUEST:
+                                    fix = _strip_rejected_sampling_param(
+                                        payload, err.message, healed,
+                                    )
+                                    if fix:
+                                        logger.info(
+                                            "anthropic param heal for %s: %s (retrying once)",
+                                            request.model, fix,
+                                        )
+                                        continue
+                                raise err
+                            event_name = ""
+                            for line in resp.iter_lines():
+                                if not line:
+                                    continue
+                                if line.startswith("event:"):
+                                    event_name = line.split(":", 1)[1].strip()
+                                    continue
+                                if not line.startswith("data:"):
+                                    continue
+                                raw = line.split(":", 1)[1].strip()
+                                if not raw or raw == "[DONE]":
+                                    continue
+                                try:
+                                    data = json.loads(raw)
+                                except json.JSONDecodeError:
+                                    continue
+                                ev_type = data.get("type") or event_name
+                                if ev_type == "content_block_delta":
+                                    delta = data.get("delta") or {}
+                                    if delta.get("type") == "text_delta":
+                                        text = delta.get("text") or ""
+                                        if text:
+                                            buf.append(text)
+                                            yield text
+                                elif ev_type == "message_start":
+                                    msg_usage = (data.get("message") or {}).get("usage") or {}
+                                    usage_in = int(msg_usage.get("input_tokens", 0) or 0)
+                                    cached_in = int(msg_usage.get("cache_read_input_tokens", 0) or 0)
+                                    creation_in = int(msg_usage.get("cache_creation_input_tokens", 0) or 0)
+                                elif ev_type == "message_delta":
+                                    delta_usage = data.get("usage") or {}
+                                    if delta_usage:
+                                        usage_out = int(delta_usage.get("output_tokens", 0) or usage_out)
+                                    stop_reason = (data.get("delta") or {}).get("stop_reason")
+                                    if stop_reason:
+                                        finish_reason = _STOP_REASON_MAP.get(stop_reason, FinishReason.STOP)
+                        break  # normal completion — the while exists only for the heal retry
             except LLMError as exc:
                 stream_error = exc
                 raise
@@ -416,11 +614,12 @@ class AnthropicProvider(LLMProvider):
                 final.text = "".join(buf)
                 final.finish_reason = FinishReason.ERROR if stream_error else finish_reason
                 final.latency_ms = int((time.monotonic() - start) * 1000)
-                final.usage = LLMUsage(
-                    input_tokens=usage_in,
-                    output_tokens=usage_out,
-                    cached_input_tokens=cached_in,
-                )
+                final.usage = _usage_from_anthropic_block({
+                    "input_tokens": usage_in,
+                    "output_tokens": usage_out,
+                    "cache_read_input_tokens": cached_in,
+                    "cache_creation_input_tokens": creation_in,
+                })
                 final.error = stream_error
                 usage_tracker.record(
                     provider=self.name,
@@ -484,6 +683,12 @@ def _http_error_to_llm_error(
     # it surfaces immediately instead of being retried as a bad request.
     if category in (ErrorCategory.RATE_LIMIT, ErrorCategory.INVALID_REQUEST) and looks_like_quota(message):
         category = ErrorCategory.QUOTA
+    # 429s carry the provider's own wait (Retry-After header / "try again in
+    # Xs" body phrase) — captured so the retry layers can floor their backoff
+    # on it instead of guaranteeing a second 429 with a shorter sleep.
+    retry_after = None
+    if category == ErrorCategory.RATE_LIMIT:
+        retry_after = parse_retry_after_s(message, getattr(resp, "headers", None))
     return LLMError(
         category=category,
         message=message,
@@ -495,4 +700,5 @@ def _http_error_to_llm_error(
             ErrorCategory.RATE_LIMIT,
             ErrorCategory.SERVER_ERROR,
         },
+        retry_after_s=retry_after,
     )

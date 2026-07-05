@@ -19,8 +19,8 @@
 # even though local generation is free.
 from __future__ import annotations
 
+import json
 import logging
-import math
 import time
 import uuid
 from typing import Iterator, Optional
@@ -45,8 +45,48 @@ from core.llm.usage import estimate_tokens, usage_tracker
 logger = logging.getLogger(__name__)
 
 
+# Transport exception TYPES that mean "the local backend was unreachable / timed
+# out" — i.e. exactly the transient shapes a fallback to an online provider can
+# recover. Built once, import-guarded so a missing optional dep never breaks the
+# module. We classify by `isinstance`, NOT by scanning the exception message:
+# substring-matching `str(exc)` for words like "connection"/"timeout" misclassed
+# a backend-returned error (e.g. an HTTP 400 whose body merely mentions those
+# words) as retryable, which could trigger an unwanted failover to a paid online
+# provider even though the local backend was up.
+#
+# Timeout is checked BEFORE network because the SDK timeout classes subclass the
+# connection ones (openai.APITimeoutError ⊂ APIConnectionError; httpx's
+# *Timeout ⊂ TimeoutException) and we want the more specific TIMEOUT category.
+_TIMEOUT_EXC_TYPES: tuple[type, ...] = (TimeoutError,)
+_NETWORK_EXC_TYPES: tuple[type, ...] = (ConnectionError,)  # builtin (OSError sub)
+try:  # httpx underlies both the ollama client and the OpenAI SDK transport
+    import httpx as _httpx
+    _TIMEOUT_EXC_TYPES += (_httpx.TimeoutException,)
+    _NETWORK_EXC_TYPES += (_httpx.NetworkError, _httpx.ProtocolError)
+except Exception:  # noqa: BLE001 — httpx absent ⇒ just rely on the builtins
+    pass
+try:  # LM Studio path uses the OpenAI SDK
+    import openai as _openai
+    _TIMEOUT_EXC_TYPES += (_openai.APITimeoutError,)
+    _NETWORK_EXC_TYPES += (_openai.APIConnectionError,)
+except Exception:  # noqa: BLE001 — openai absent ⇒ builtins/httpx still cover it
+    pass
+
+# Exact class-NAME fallback for the rare case a transport error reaches us as a
+# re-raised/wrapped instance whose concrete class isn't one we captured above
+# (e.g. a different httpx import). Exact-match only — never a substring scan — so
+# it cannot reintroduce the over-broad message matching it replaces.
+_TIMEOUT_EXC_NAMES = frozenset({"timeout", "timeoutexception", "connecttimeout",
+                                "readtimeout", "writetimeout", "pooltimeout",
+                                "apitimeouterror"})
+_NETWORK_EXC_NAMES = frozenset({"connectionerror", "connectionrefusederror",
+                                "connectionreseterror", "connecterror",
+                                "networkerror", "remoteprotocolerror",
+                                "apiconnectionerror"})
+
+
 def _classify_local_error(
-    exc: BaseException, *, provider: str, model: str = "",
+    exc: Exception, *, provider: str, model: str = "",
 ) -> LLMError:
     """Map a local-backend transport exception to the right ``ErrorCategory``.
 
@@ -54,22 +94,20 @@ def _classify_local_error(
     in the default ``fallback_on`` set), so a connection-refused from a stopped
     Ollama / LM Studio would surface as a hard error instead of failing over to
     a configured online ``fallback_provider`` — unlike the online adapters,
-    which map the same class of failure to ``NETWORK``. Detect connection /
-    timeout shapes here (covers ollama's ``httpx.ConnectError`` / ``ConnectTimeout``
-    and LM Studio's ``openai.APIConnectionError`` / ``APITimeoutError``) so
-    local-down is fallback-eligible too; anything else degrades to
-    ``coerce_error``'s ``UNKNOWN``.
+    which map the same class of failure to ``NETWORK``. We detect the
+    connection / timeout shapes by exception TYPE (``isinstance`` against the
+    captured SDK/builtin transport classes, plus an exact class-name fallback)
+    so local-down is fallback-eligible too; anything else — including an error a
+    *running* backend returns whose message happens to contain "connection" /
+    "timeout" — degrades to ``coerce_error``'s ``UNKNOWN`` (no spurious
+    failover).
     """
     if isinstance(exc, LLMError):
         return exc
-    blob = f"{type(exc).__name__.lower()} {str(exc).lower()}"
-    if "timeout" in blob or "timed out" in blob:
+    name = type(exc).__name__.lower()
+    if isinstance(exc, _TIMEOUT_EXC_TYPES) or name in _TIMEOUT_EXC_NAMES:
         category = ErrorCategory.TIMEOUT
-    elif any(sig in blob for sig in (
-        "connect", "refused", "connection", "max retries",
-        "unreachable", "reset by peer", "broken pipe",
-        "failed to establish", "name or service not known",
-    )):
+    elif isinstance(exc, _NETWORK_EXC_TYPES) or name in _NETWORK_EXC_NAMES:
         category = ErrorCategory.NETWORK
     else:
         return coerce_error(exc, provider=provider, model=model)
@@ -101,16 +139,17 @@ def _effective_local_timeout(request: LLMRequest) -> Optional[float]:
         candidates.append(base)
     if not candidates:
         return None
-    # Quantize UP to whole seconds. The agent feeds a continuously-varying float
-    # here (the shrinking remaining-deadline), and OllamaProvider._client caches
-    # one ollama.Client + httpx pool per distinct (host, timeout). Without this
-    # rounding, every call near the deadline — and EVERY call whenever
-    # agent_wall_clock_s <= online_timeout_s (e.g. the documented wall_clock=30
-    # config) — mints a new cached client that never evicts, an unbounded fd /
-    # memory leak. ceil (never floor) keeps the bound no shorter than intended;
-    # integer buckets cap the cache at <= max(online_timeout_s, wall_clock)
-    # entries per host (in practice a handful, since a turn spans a few seconds).
-    return float(math.ceil(min(candidates)))
+    # Quantize to whole seconds. The agent feeds a continuously-varying float here
+    # (the shrinking remaining-deadline), and the downstream client caches
+    # (OllamaProvider._client / lms.get_lmstudio_client) keep one client + httpx
+    # pool per distinct (host, timeout). Without rounding, every near-deadline call
+    # would mint a fresh cached client that never evicts (an unbounded fd/memory
+    # leak); integer buckets cap the cache at a handful of entries per host. Use
+    # ``round`` (with a 1 s floor) to MATCH those downstream caches' own rounding
+    # exactly — ``ceil`` produced a per-call timeout up to ~1 s LONGER than the
+    # remaining wall-clock budget it was derived from, defeating the very deadline
+    # the agent set; the route's wall-clock backstop covers the residual sub-second.
+    return float(max(1, round(min(candidates))))
 
 
 class LocalLLMProvider(LLMProvider):
@@ -208,6 +247,14 @@ class LocalLLMProvider(LLMProvider):
         """
         messages = build_openai_messages(request)
         tools_payload = [jsonschema_to_openai_tool(t) for t in request.tools]
+        if request.tool_choice == "none" and self.name == "ollama":
+            # Ollama's chat API has no tool_choice — omitting the tools is the
+            # only way to forbid new calls (the agent loop's forced final turn
+            # relies on this). Safe with tool history present: role:"tool"
+            # messages are first-class in ollama and don't require the tools
+            # param. LM Studio speaks the OpenAI dialect and honours
+            # tool_choice natively, so it keeps its tools below.
+            tools_payload = []
         start = time.monotonic()
         if self.name == "ollama":
             try:
@@ -254,7 +301,6 @@ class LocalLLMProvider(LLMProvider):
         synthesised — Ollama omits them), and falls back to
         :func:`estimate_tokens` when the backend returns no usage counts.
         """
-        import ollama
         provider = self._provider()
         resolved = provider.resolve_model(request.model) if hasattr(provider, "resolve_model") else request.model
         options: dict = {}
@@ -270,7 +316,7 @@ class LocalLLMProvider(LLMProvider):
 
         call_kwargs: dict = {
             "model": resolved,
-            "messages": messages,
+            "messages": _ollama_messages(messages),
             "tools": tools_payload,
             "stream": False,
         }
@@ -326,7 +372,7 @@ class LocalLLMProvider(LLMProvider):
         :func:`_effective_local_timeout` like the Ollama branch, then parses the
         OpenAI-native ``tool_calls`` and estimates usage when missing.
         """
-        import openai
+        from core.providers.lms import get_lmstudio_client
         provider = self._provider()
         base_url = getattr(provider, "base_url", None)
         if not base_url:
@@ -338,12 +384,10 @@ class LocalLLMProvider(LLMProvider):
             )
         # Bound this (non-streaming) tool call by the tightest of (per-request
         # deadline, configured local_request_timeout_s); None leaves the OpenAI
-        # SDK default. Mirrors the Ollama tool branch above.
+        # SDK default. Mirrors the Ollama tool branch above. The shared cached
+        # factory avoids leaking a fresh httpx pool per agent tool call.
         timeout = _effective_local_timeout(request)
-        client_init: dict = {"base_url": base_url, "api_key": "lm-studio"}
-        if timeout is not None:
-            client_init["timeout"] = timeout
-        client = openai.OpenAI(**client_init)
+        client = get_lmstudio_client(base_url, timeout)
         call_kwargs: dict = {
             "model": request.model,
             "messages": messages,
@@ -547,6 +591,55 @@ class LocalLLMProvider(LLMProvider):
         else:
             prompt = ""
         return prompt, request.system_prompt or ""
+
+
+def _ollama_messages(messages: list[dict]) -> list[dict]:
+    """Adapt OpenAI-shape ``messages`` for the ollama client's request models.
+
+    ``build_openai_messages`` serialises assistant ``tool_calls`` with
+    ``function.arguments`` as a JSON *string* — correct for OpenAI / LM
+    Studio, but the ollama client validates outgoing messages against its
+    own pydantic ``Message`` model whose ``ToolCall.Function.arguments``
+    is typed ``Mapping[str, Any]``. Passing the string shape made EVERY
+    multi-turn agent conversation on Ollama fail at iteration 2 with
+    "Input should be a valid dictionary". Parse the strings back to dicts
+    here (ollama branch only). While at it, populate ollama's native
+    ``tool_name`` on ``role:"tool"`` results (ollama has no
+    ``tool_call_id``; extra keys are ignored by its model, but the name
+    helps the model associate results with calls).
+    """
+    id_to_name: dict[str, str] = {}
+    out: list[dict] = []
+    for msg in messages:
+        m = dict(msg)
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            new_calls = []
+            for tc in m["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                tc2 = dict(tc)
+                fn = dict(tc2.get("function") or {})
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        parsed = json.loads(args) if args else {}
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = {}
+                    fn["arguments"] = parsed if isinstance(parsed, dict) else {}
+                elif not isinstance(args, dict):
+                    fn["arguments"] = {}
+                tc2["function"] = fn
+                call_id = tc2.get("id")
+                if isinstance(call_id, str):
+                    id_to_name[call_id] = str(fn.get("name") or "")
+                new_calls.append(tc2)
+            m["tool_calls"] = new_calls
+        elif m.get("role") == "tool":
+            name = id_to_name.get(str(m.get("tool_call_id") or ""))
+            if name:
+                m["tool_name"] = name
+        out.append(m)
+    return out
 
 
 def _ollama_attr(obj, key: str):

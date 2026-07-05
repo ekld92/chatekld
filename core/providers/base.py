@@ -1,5 +1,47 @@
+import os
 from abc import ABC, abstractmethod
 from typing import Any, Optional
+
+from core.constants import LM_STUDIO_HOST, OLLAMA_HOST
+
+
+def _resolve_local_host(config_key: str, env_var: str, default: str) -> str:
+    """Resolve a local-backend base URL: config key → env var → constant.
+
+    Read per call (not cached, lazy config import) so a Settings change applies
+    on the next request without a restart — exactly like ``local_request_timeout``.
+    A scheme-less value (``host:port``, the shape Ollama's own ``OLLAMA_HOST``
+    accepts) is prefixed with ``http://`` so every consumer — the bare
+    ``ollama.Client`` AND the ``f"{host}/v1"`` LM Studio base URL — gets a
+    well-formed URL; any trailing slash is stripped for the same reason.
+
+    This is the single source of truth that closes the split-brain where the
+    health/list probe honoured ``OLLAMA_HOST`` but generation/embedding silently
+    used the hardcoded constant.
+    """
+    val = ""
+    try:
+        from core.config import load_config
+        val = str(load_config().get(config_key, "") or "").strip()
+    except Exception:
+        val = ""
+    if not val:
+        val = os.environ.get(env_var, "").strip()
+    if not val:
+        return default
+    if "://" not in val:
+        val = "http://" + val
+    return val.rstrip("/")
+
+
+def resolve_ollama_host() -> str:
+    """Base URL for Ollama: ``ollama_host`` config → ``OLLAMA_HOST`` env → constant."""
+    return _resolve_local_host("ollama_host", "OLLAMA_HOST", OLLAMA_HOST)
+
+
+def resolve_lm_studio_host() -> str:
+    """Base URL for LM Studio: ``lm_studio_host`` config → ``LM_STUDIO_HOST`` env → constant."""
+    return _resolve_local_host("lm_studio_host", "LM_STUDIO_HOST", LM_STUDIO_HOST)
 
 
 def local_request_timeout() -> Optional[float]:

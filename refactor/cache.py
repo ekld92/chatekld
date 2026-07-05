@@ -21,6 +21,7 @@ the vault.
 from __future__ import annotations
 
 import hashlib
+import threading
 from pathlib import Path
 
 from core.constants import OBSIDIAN_CACHE_DIR
@@ -46,6 +47,50 @@ _SF_DATALESS = 0x40000000
 # ``<sha256>.txt``). Restricted set so a mode string can never escape the
 # filename it builds. ``classify`` stores a single canonical label string.
 _ALLOWED_MODES = frozenset({"table", "redescribe", "classify"})
+
+# --- image-digest memo (Track 5.1, 2026-07-04) ------------------------------
+# DEFECT: ``digest_for`` read + sha256-hashed the FULL image bytes on every
+# call, and the per-image OCR-inclusion panel debounce-re-analyzes a note
+# (``plan.analyze_one`` → ``digest_for`` per embedded image) on EVERY checkbox
+# toggle — so a user flipping a few checkboxes on an image-heavy note re-read
+# tens of MB from disk per click for bytes that had not changed.
+# FIX: memoize ``(path, size, mtime_ns) → sha256`` and consult it after the
+# dataless/size-cap checks (which already stat fresh, never from the memo).
+# SAFE W.R.T. STATE: the key embeds the fresh stat's ``(size, mtime_ns)``, so
+# any content change mints a new key and re-hashes — a hit can only serve the
+# digest of the exact bytes currently on disk (APFS mtime is ns-resolution; a
+# same-size same-mtime_ns content swap is not achievable by normal editing).
+# Entries are evicted LRU at ``_DIGEST_MEMO_MAX`` and the whole memo is dropped
+# by ``resolver.invalidate_index_cache`` (archive/restore move files; vault
+# switch) purely to bound memory — correctness never depends on invalidation.
+# INVARIANT (pinned by test_refactor.py::test_digest_memo_*): a memo hit
+# returns the same digest a fresh read would, and a changed file (different
+# size or mtime_ns) is always re-hashed.
+_DIGEST_MEMO_MAX = 4096
+_digest_memo_lock = threading.Lock()
+_digest_memo: dict[tuple[str, int, int], str] = {}
+
+
+def _digest_memo_get(key: tuple[str, int, int]) -> str | None:
+    with _digest_memo_lock:
+        digest = _digest_memo.pop(key, None)
+        if digest is not None:
+            _digest_memo[key] = digest  # re-insert = mark most-recently-used
+        return digest
+
+
+def _digest_memo_put(key: tuple[str, int, int], digest: str) -> None:
+    with _digest_memo_lock:
+        _digest_memo.pop(key, None)
+        _digest_memo[key] = digest
+        while len(_digest_memo) > _DIGEST_MEMO_MAX:
+            _digest_memo.pop(next(iter(_digest_memo)))
+
+
+def clear_digest_memo() -> None:
+    """Drop every memoized digest (memory bound only — see memo notes above)."""
+    with _digest_memo_lock:
+        _digest_memo.clear()
 
 
 def digest_for(rel_path: str, vault_root: Path, *, materialize: bool = False) -> dict:
@@ -77,6 +122,13 @@ def digest_for(rel_path: str, vault_root: Path, *, materialize: bool = False) ->
         # The indexer never described over-cap images, so there is nothing to
         # reuse; flag rather than read a potentially huge file.
         return {"digest": "", "size": size, "status": STATUS_TOO_BIG}
+    # Memo lookup sits AFTER the dataless/size-cap gates so those decisions are
+    # always made on the fresh stat, never on a remembered one. The key's
+    # (size, mtime_ns) self-validates the entry against the current bytes.
+    memo_key = (str(p), size, st.st_mtime_ns)
+    memoized = _digest_memo_get(memo_key)
+    if memoized is not None:
+        return {"digest": memoized, "size": size, "status": STATUS_OK}
     try:
         data = p.read_bytes()
     except OSError:
@@ -84,7 +136,9 @@ def digest_for(rel_path: str, vault_root: Path, *, materialize: bool = False) ->
     # The cache key is the sha256 of the raw image bytes — byte-identical to how
     # the indexer keys ``<sha256>.txt`` (rag/vault.py), which is what makes the
     # description reuse work without re-running vision.
-    return {"digest": hashlib.sha256(data).hexdigest(), "size": size, "status": STATUS_OK}
+    digest = hashlib.sha256(data).hexdigest()
+    _digest_memo_put(memo_key, digest)
+    return {"digest": digest, "size": size, "status": STATUS_OK}
 
 
 def read_description(digest: str, vault_root: Path) -> str:

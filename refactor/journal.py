@@ -37,6 +37,13 @@ from rag.vault import obsidian_manager
 _MANIFEST_VERSION = 1
 _MANIFEST_NAME = "manifest.json"
 
+# Cap on the number of ops the manifest retains. Without a bound the manifest JSON
+# (rewritten whole on every change) and the per-op note snapshots under
+# ``notes/*.bak`` grow without limit over the app's lifetime. 200 keeps a deep undo
+# history (the restore UI lists the most recent ops) while bounding both the JSON
+# size and the snapshot disk footprint. See :func:`prune`.
+_MAX_OPS = 200
+
 
 class ScopeError(Exception):
     """A write/move target escaped its allowed root (scope / vault / archive)."""
@@ -127,6 +134,74 @@ def save(vault_root: Path, cfg: dict, manifest: dict) -> None:
     )
 
 
+def prune(vault_root: Path, cfg: dict, manifest: dict) -> int:
+    """Bound the manifest and reclaim snapshot disk. Returns the op count dropped.
+
+    Caller holds the op lock (single writer) and persists the manifest afterwards.
+    Two phases:
+
+    1. **Spent ops** — an op whose ``state`` is ``reverted`` or ``failed`` no longer
+       needs its note snapshot (the undo is done, or the write never happened), so
+       its ``.bak`` is deleted and the op dropped. A reverted ``archive_image`` op
+       already had its archive copy + thumbnail reclaimed by the reverter, so it is
+       safe to drop too.
+    2. **Cap** — if still over ``_MAX_OPS``, drop the OLDEST note-write ops
+       (``apply_note`` / ``normalize_note`` / ``llm_note``) and delete their
+       snapshots, accepting the loss of *their* undo (the vault note itself is
+       intact and was audit-logged at write time). An **applied** ``archive_image``
+       op is never evicted here: it holds the only restore mapping for a file
+       physically moved out of the vault, so dropping it would strand the archived
+       original. The cap is therefore best-effort if many applied archive ops
+       accumulate (rare — archiving is one image at a time).
+
+    Only snapshots belonging to ops this function drops are deleted — there is no
+    blind directory sweep, so a ``.bak`` orphaned by a crash mid-batch (its op never
+    committed to the manifest) survives for manual recovery.
+    """
+    arch = archive_dir(vault_root, cfg)
+
+    def _del_snapshot(op: dict) -> None:
+        for key in ("snapshot_rel", "note_snapshot_rel"):
+            rel = op.get(key)
+            if not rel:
+                continue
+            try:
+                p = arch / rel
+                assert_under(p, arch)   # defence-in-depth: stay under the archive dir
+                Path(p).unlink(missing_ok=True)
+            except (OSError, ScopeError):
+                pass
+
+    ops = manifest.get("ops", [])
+    dropped = 0
+
+    # Phase 1 — drop spent ops (reverted / failed) and reclaim their snapshots.
+    kept: list[dict] = []
+    for op in ops:
+        if op.get("state") in ("reverted", "failed"):
+            _del_snapshot(op)
+            dropped += 1
+        else:
+            kept.append(op)
+
+    # Phase 2 — enforce the cap, oldest-first (``kept`` is in append/chronological
+    # order), but never evict an applied archive_image op (restore-critical).
+    if len(kept) > _MAX_OPS:
+        over = len(kept) - _MAX_OPS
+        survivors: list[dict] = []
+        for op in kept:
+            if over > 0 and op.get("kind") in ("apply_note", "normalize_note", "llm_note"):
+                _del_snapshot(op)
+                dropped += 1
+                over -= 1
+                continue
+            survivors.append(op)
+        kept = survivors
+
+    manifest["ops"] = kept
+    return dropped
+
+
 def new_op_id(manifest: dict) -> str:
     """A unique, ordered op id (ms timestamp + position in the ops list)."""
     return f"{int(time.time() * 1000)}-{len(manifest.get('ops', []))}"
@@ -186,7 +261,11 @@ def revert_op(vault_root: Path, cfg: dict, op: dict) -> dict:
     if op.get("state") == "reverted":
         return {"ok": True, "status": "already_reverted", "message": "Already reverted."}
     kind = op.get("kind")
-    if kind == "apply_note":
+    if kind in ("apply_note", "normalize_note", "llm_note"):
+        # All three write a whole note and snapshot the prior bytes; restore is
+        # the same snapshot-based revert (the op carries identical note_rel /
+        # hash_before / hash_after / snapshot_rel fields). ``llm_note`` covers the
+        # applyable LLM rewrite + PDF-summary writers (refactor.llm_apply).
         from refactor.apply import revert_apply_note
         return revert_apply_note(vault_root, cfg, op)
     if kind == "archive_image":
@@ -197,7 +276,7 @@ def revert_op(vault_root: Path, cfg: dict, op: dict) -> dict:
 
 __all__ = [
     "ScopeError", "archive_dir", "manifest_path", "assert_under", "thumb_dir",
-    "load", "save", "new_op_id", "now_iso", "find_op",
+    "load", "save", "prune", "new_op_id", "now_iso", "find_op",
     "write_note_snapshot", "read_snapshot", "revert_op",
     "log_vault_write",
 ]

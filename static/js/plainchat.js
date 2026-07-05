@@ -7,8 +7,8 @@
  * global loaded via a vendored <script> tag, referenced the same way vault.js
  * does — never imported.
  */
-import { secureFetch, readSSE } from './api.js';
-import { sanitiseHtml, copyToClipboard, showTaskError, clearTaskError } from './ui.js';
+import { secureFetch, consumeSSE } from './api.js';
+import { sanitiseHtml, copyToClipboard, enhanceCodeBlocks, showTaskError, clearTaskError, makeAnswerRenderer, announceStatus } from './ui.js';
 
 let history = [];          // {role: 'user'|'assistant', content: string}[]
 let _isQuerying = false;
@@ -61,15 +61,6 @@ function _attachCopyButton(messageEl, getText, ariaLabel) {
     return btn;
 }
 
-function _renderAnswer(botMsg, fullAnswer) {
-    // marked is vendored locally; a load failure must never cost the user the
-    // answer — fall back to plain text rather than throwing mid-stream.
-    if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
-        botMsg.innerHTML = sanitiseHtml(marked.parse(fullAnswer));
-    } else {
-        botMsg.textContent = fullAnswer;
-    }
-}
 
 // Surface a recoverable error in the shared boundary. `retry`, when given,
 // becomes a "Retry" button; a "Dismiss" button always clears it.
@@ -91,23 +82,32 @@ function _showError(message, retry) {
  * error the un-answered user turn is rolled back so a retry re-sends it exactly
  * once; an empty-but-clean stream shows a muted placeholder that is NOT recorded.
  */
-export async function chatPlain() {
+export async function chatPlain(retryText) {
     if (_isQuerying) return;
     const input = document.getElementById('plainchat-input');
-    const text = input ? input.value.trim() : '';
+    // Item 3.5: a Retry passes the failed message DIRECTLY (string guard —
+    // DOM handlers call this with an Event) so it never overwrites a fresh
+    // draft the user typed after the failure.
+    const fromRetry = typeof retryText === 'string' && retryText.trim() !== '';
+    const text = fromRetry ? retryText.trim() : (input ? input.value.trim() : '');
     if (!text) return;
+    // Resolve the transcript container BEFORE locking the UI. It is appended to
+    // unconditionally below (outside the try/finally), so a missing element here
+    // would throw with `_isQuerying`/Send-disabled already set and no finally to
+    // clear them — permanently wedging the panel. Bail cleanly instead.
+    const chat = document.getElementById('plainchat-history');
+    if (!chat) return;
 
     _isQuerying = true;
     _setSending(true);
     clearTaskError(document.getElementById('plainchat-error-boundary'));
-    const chat = document.getElementById('plainchat-history');
 
     const userMsg = document.createElement('div');
     userMsg.className = 'message message-user';
     userMsg.textContent = text;
     chat.appendChild(userMsg);
     _attachCopyButton(userMsg, () => text, 'Copy message');
-    if (input) input.value = '';
+    if (input && !fromRetry) input.value = '';   // a retry leaves the draft untouched
 
     // Push the user turn before the request so it is part of the sent history;
     // it is rolled back on failure so a retry does not duplicate it.
@@ -118,66 +118,76 @@ export async function chatPlain() {
     botMsg.innerHTML = '<span class="typing-indicator"><span></span></span>';
     chat.appendChild(botMsg);
     chat.scrollTop = chat.scrollHeight;
+    const answerRenderer = makeAnswerRenderer(botMsg);
+    // Bind the scroll update to the renderer
+    const _oldUpdate = answerRenderer.update.bind(answerRenderer);
+    answerRenderer.update = (fullAnswer) => {
+        _oldUpdate(fullAnswer);
+        chat.scrollTop = chat.scrollHeight;
+    };
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), _abortMs());
+
+    // Track 6b: announce the generation lifecycle (streamed tokens are
+    // otherwise silent to AT; errors announce via showTaskError).
+    announceStatus('Generating response…');
 
     let fullAnswer = '';
     try {
         const body = { messages: history.slice(-_MAX_TURNS) };
 
-        const resp = await secureFetch('/api/plainchat', {
+        await consumeSSE('/api/plainchat', {
             method: 'POST',
             signal: controller.signal,
             body: JSON.stringify(body),
-        });
-        if (!resp.ok) {
-            const data = await resp.json().catch(() => ({}));
-            throw new Error(data.error || 'Chat request failed.');
-        }
-
-        for await (const payload of readSSE(resp)) {
-            if (payload.error) {
-                throw new Error(payload.error);
-            } else if (payload.info) {
+        }, {
+            onInfo: (info) => {
                 const note = document.createElement('div');
                 note.className = 'message message-info';
                 note.setAttribute('role', 'status');
-                note.textContent = payload.info;
+                note.textContent = info;
                 chat.insertBefore(note, botMsg);
                 chat.scrollTop = chat.scrollHeight;
-            } else if (payload.token) {
+            },
+            onToken: (token) => {
                 if (fullAnswer === '') botMsg.innerHTML = '';
-                fullAnswer += payload.token;
-                _renderAnswer(botMsg, fullAnswer);
-                chat.scrollTop = chat.scrollHeight;
-            }
-        }
+                fullAnswer += token;
+                answerRenderer.update(fullAnswer);
+            },
+            onError: (errMsg) => { throw new Error(errMsg); }
+        });
+
+        answerRenderer.flush();
 
         if (fullAnswer) {
             history.push({ role: 'assistant', content: fullAnswer });
-            // Attach the copy button only after streaming completes so the
-            // per-token innerHTML re-render does not clobber it. Copies the raw
-            // markdown rather than the rendered HTML.
             _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
+            enhanceCodeBlocks(botMsg);
         } else {
-            // Empty-but-clean stream: the model produced no tokens. Settle the
-            // bubble (replacing the typing indicator) with a muted placeholder
-            // that is deliberately NOT recorded in `history` — so it cannot be
-            // re-sent as a fake assistant turn next request.
             botMsg.textContent = _NO_RESPONSE_MSG;
         }
+        announceStatus('Response ready.');
     } catch (e) {
-        botMsg.remove();
-        // Roll back the un-answered user turn so a retry re-sends it exactly once.
+        if (fullAnswer) {
+            answerRenderer.flush();
+            const note = document.createElement('div');
+            note.className = 'muted';
+            note.lang = 'fr';
+            note.textContent = '⚠ Réponse interrompue — le texte ci-dessus est partiel.';
+            botMsg.appendChild(note);
+            _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
+        } else {
+            answerRenderer.cancel();
+            botMsg.remove();
+        }
         if (history.length && history[history.length - 1].role === 'user') history.pop();
-        const msg = e.name === 'AbortError'
+        const msg = e.message === 'AbortError'
             ? 'Response timed out. The model may be overloaded — please try again.'
             : ('Error: ' + e.message);
         _showError(msg, () => {
-            userMsg.remove();
-            if (input) input.value = text;
-            chatPlain();
+            if (!fullAnswer) userMsg.remove();
+            chatPlain(text);
         });
     } finally {
         clearTimeout(timeout);

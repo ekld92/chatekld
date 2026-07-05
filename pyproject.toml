@@ -1,0 +1,57 @@
+# Tool configuration only — ChatEKLD is an application, not an installable
+# package, so there is deliberately NO [project]/[build-system] table (pip
+# install . should stay meaningless). Runtime deps live in requirements.txt
+# (+ constraints.txt for CI); dev-only tools in requirements-dev.txt.
+#
+# Ruff (improvement plan 2026-07-04, Track 7.1): the default rule set
+# (E4/E7/E9 pycodestyle errors + the full F pyflakes set) — defect-shaped
+# rules only (undefined names, unused imports/variables, redefinitions), no
+# style crusade. The baseline is CLEAN: `ruff check .` passing is a suite
+# gate (CLAUDE.md §Tests), so any new finding is a regression, not noise.
+# Widen the rule set deliberately (Track 7.5 adds mypy/pre-commit), never by
+# drive-by.
+
+[tool.ruff]
+target-version = "py312"
+# The vendored Library Audit tree (audit/) is checked too — it is maintained
+# in-repo and covered by tests/audit/. Only non-Python and generated trees
+# are excluded (node_modules/.venv/etc. are excluded by Ruff's defaults).
+extend-exclude = [
+    "static",   # JS/CSS — Vitest owns this side (tests/js/)
+]
+
+[tool.ruff.lint]
+# Default rules (E4, E7, E9, F) — explicit so an upgraded Ruff changing its
+# defaults cannot silently widen or narrow the gate.
+select = ["E4", "E7", "E9", "F"]
+
+# ---------------------------------------------------------------------------
+# mypy (improvement plan Track 7.5) — PERMISSIVE and ADVISORY, not a suite gate.
+#
+# Why advisory: a permissive pass over this large, deliberately-untyped codebase
+# surfaces ~60 findings, and the defect-shaped ones are almost all FALSE POSITIVES
+# from untyped third-party libs (PIL `Image.LANCZOS`, lancedb `**kwargs`, waitress)
+# or benign dynamic patterns — not real bugs. Gating on zero would mean a pile of
+# noise-suppressing `# type: ignore`s, which is the opposite of "permissive" and
+# adds no safety. So `ruff check .` stays the enforced static gate (CLAUDE.md
+# §Tests); mypy is a standalone advisory tool (`mypy` with no args uses the `files`
+# below) — deliberately NOT a pre-commit hook. Ratchet toward a gate as modules gain
+# real annotations — do it deliberately, never by drive-by (same discipline as the
+# Ruff rule set).
+[tool.mypy]
+python_version = "3.12"
+# The app is NOT a package and several top-level dirs (api/core/rag/services) have
+# no __init__.py, so the two `config.py` files collide as bare module `config`
+# without namespace-package resolution anchored at the repo root.
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "."
+ignore_missing_imports = true      # torch/llama_index/flask/PIL/waitress ship no stubs
+follow_imports = "silent"
+# Don't demand annotations: this pass targets defect-shaped errors (undefined names,
+# bad attribute access, import errors) in already-annotated code — complementing
+# Ruff's F rules — not a typing crusade over untyped function bodies.
+check_untyped_defs = false
+# `mypy` (no args) checks the app source; tests + generated/vendored-JS trees excluded.
+files = ["app.py", "launch.py", "api", "core", "rag", "services", "deckgen", "refactor", "audit"]
+exclude = '(^|/)(build|dist|node_modules|\.venv|static|deckgen/tests)/'

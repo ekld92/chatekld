@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -109,6 +110,62 @@ _NEWDOCCOMMAND_RE = re.compile(
 )
 _DEF_RE = re.compile(r"\\def\s*\\([A-Za-z@]+)")
 
+# A ``% @deckgen`` annotation: the vault-side way to describe a custom macro to
+# the model WITHOUT touching app code (so a new macro is documented by editing the
+# .sty in the suite, portably). Two forms, both matched by _ANNOT_RE's payload:
+#   explicit :  % @deckgen \citefoot: cite a bibliography key …
+#   positional: % @deckgen: cite a bibliography key …   (describes the NEXT macro)
+_ANNOT_RE = re.compile(r"%+\s*@deckgen\b[ \t]*(.*)$")
+_ANNOT_EXPLICIT_RE = re.compile(r"\\?([A-Za-z@]+)\s*:\s*(.+)$")
+# Any macro-definition line, name-capturing — used to attach a pending positional
+# annotation to the macro it precedes. Kept in sync with the def regexes above.
+_DEF_NAME_RE = re.compile(
+    r"\\(?:newcommand|providecommand|renewcommand|DeclareRobustCommand|def"
+    r"|NewDocumentCommand|DeclareDocumentCommand|ProvideDocumentCommand)\*?\s*"
+    r"\{?\\([A-Za-z@]+)"
+)
+
+
+def _scan_annotations(raw: str) -> dict:
+    """Parse ``% @deckgen`` descriptions out of a *raw* (un-stripped) source.
+
+    Returns ``name -> description``. The explicit form (``% @deckgen \\name: …``)
+    binds directly; the positional form (``% @deckgen: …``) attaches to the next
+    macro definition, tolerating blank or comment lines in between but dropped by
+    any intervening code line so it can't bleed onto an unrelated macro. Scanned
+    on the raw text because :func:`scan_macros` strips comments before the
+    definition regexes run — the annotations would otherwise be gone.
+    """
+    ann: dict = {}
+    pending: Optional[str] = None
+    for line in raw.splitlines():
+        m = _ANNOT_RE.search(line)
+        if m:
+            payload = m.group(1).strip()
+            if payload.startswith(":"):                      # positional "% @deckgen: desc"
+                desc = payload[1:].strip()
+                if desc:
+                    pending = desc
+                continue
+            em = _ANNOT_EXPLICIT_RE.match(payload)           # explicit "% @deckgen \name: desc"
+            if em:
+                ann.setdefault(em.group(1), em.group(2).strip())
+                continue
+            if payload:                                      # bare "% @deckgen desc" → positional
+                pending = payload
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("%"):
+            continue                                         # blanks / plain comments keep pending
+        dm = _DEF_NAME_RE.search(line)
+        if dm:
+            if pending:
+                ann.setdefault(dm.group(1), pending)
+            pending = None
+        else:
+            pending = None                                   # unrelated code line drops it
+    return ann
+
 
 def _balanced_brace_group(text: str, start: int) -> str:
     """Return the contents of the ``{...}`` group beginning at *start*.
@@ -186,14 +243,17 @@ class TemplateParts:
     """The fully-analyzed template: the three reusable spans plus derived metadata.
 
     ``preamble`` / ``opening`` / ``closing`` are the verbatim shell slices (see
-    :func:`split_template`); ``base_dir`` is the template's directory (used to
-    resolve sibling ``.sty``/``.bib`` files); ``macros`` and ``bib_index`` are the
-    scanned house macros and bibliography that feed the per-section prompts.
+    :func:`split_template`); ``base_dir`` is the template's directory and
+    ``suite_root`` is the ancestor holding ``common/`` (both used to resolve
+    sibling ``.sty``/``.bib`` files the kpathsea way — see :func:`_search_dirs`);
+    ``macros`` and ``bib_index`` are the scanned house macros and bibliography
+    that feed the per-section prompts.
     """
     preamble: str
     opening: str
     closing: str
     base_dir: str = ""
+    suite_root: str = ""
     macros: list = field(default_factory=list)            # list[MacroInfo]
     bib_index: dict = field(default_factory=dict)         # key -> (author, year, title)
 
@@ -290,18 +350,43 @@ def _find_closing_start(masked_body: str) -> int:
 # Local-file resolution (.sty referenced by the preamble)
 # ---------------------------------------------------------------------------
 
-def _is_local_ref(arg: str) -> bool:
-    """True when a \\usepackage / \\input arg names a *relative* local file.
+def _search_dirs(base_dir: str, suite_root: str = "") -> list:
+    """The kpathsea-style search path deckgen resolves bare references against.
 
-    Absolute paths are rejected: the house style only ever references siblings
-    via ``../common/...``, and an absolute ``\\usepackage{/etc/...}`` (which
-    ``os.path.join`` would honour verbatim) is never legitimate — so we never
-    follow one when scanning for macros/bib.
+    Mirrors the suite's own ``TEXINPUTS``/``BIBINPUTS`` (set relatively by
+    ``.latexmkrc`` / ``common/latex-build.mk`` to ``.:$(SUITE_ROOT)`` and
+    ``.:$(SUITE_ROOT)/common``): the template's own directory first, then the
+    suite root, then ``<suite_root>/common``. This is what lets a **bare** name
+    like ``\\usepackage{cress-style}`` or ``\\addbibresource{_master.bib}`` — the
+    correct house convention, since kpathsea finds them at compile time — resolve
+    for macro/bib scanning, instead of being mistaken for a CTAN package and
+    ignored. It is a *search path*, not a per-package hardcode: a new ``.sty``
+    dropped into ``common/`` (or a new ``.bib``) is found automatically, and the
+    whole thing is relative, so it works unchanged on any machine that keeps the
+    suite layout.
     """
-    arg = arg.strip()
-    if not arg or arg.startswith(("/", "\\")):
-        return False
-    return ("/" in arg) or arg.endswith((".sty", ".tex")) or arg.startswith(".")
+    dirs: list = []
+    common = os.path.join(suite_root, "common") if suite_root else ""
+    for d in (base_dir, suite_root, common):
+        if d and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def _resolve_in_dirs(dirs: list, arg: str, default_ext: str) -> Optional[str]:
+    """Resolve *arg* against the first *dirs* entry that holds a matching file.
+
+    Tries each directory via :func:`_resolve_local` (which rejects absolute paths
+    and honours ``default_ext``) and returns the first hit, or ``None``. Because
+    it only ever returns a file that *exists* in the search path, a real CTAN
+    package name (``amsmath``, ``helvet``) resolves to nothing and is silently
+    skipped — exactly what we want when scanning ``\\usepackage`` lines.
+    """
+    for d in dirs:
+        resolved = _resolve_local(d, arg, default_ext)
+        if resolved:
+            return resolved
+    return None
 
 
 def _resolve_local(base_dir: str, arg: str, default_ext: str) -> Optional[str]:
@@ -340,20 +425,113 @@ def _read_capped(path: str, cap: int) -> str:
         return ""
 
 
-def _referenced_sty_sources(preamble: str, base_dir: str) -> list:
-    """Return the text of each local .sty/.tex the preamble pulls in (one hop)."""
+# --- stat-signature parse caches (Track 5.2, 2026-07-04) --------------------
+# DEFECT: every deck operation (load-template, generate, augment preview/apply,
+# compile-fix) re-runs ``load_template_parts``, which re-read the suite
+# ``_master.bib`` (up to the 32 MB ``_MAX_BIB_BYTES`` cap) and re-parsed it into
+# the key index, plus re-read every referenced local ``.sty`` — pure repeat I/O
+# and regex work for files that change ~never within a session. On a large
+# suite bib this was the dominant per-request cost of the deck routes.
+# FIX: two small signature-keyed LRU caches, mirroring the thesaurus-cache
+# pattern (``rag/vault.py::_get_thesaurus``): key = (path, size, mtime_ns), so
+# an edit to the file (or a different file at the same path) is a natural miss
+# and the entry self-invalidates. No explicit invalidation hook is needed —
+# correctness never depends on eviction.
+# SAFE W.R.T. STATE: cached values are treated as immutable by every consumer —
+# ``resolve_bib`` merges the cached per-file dict into a FRESH dict via
+# ``update`` (never mutates it), and the cached ``.sty`` text is only ever
+# scanned. Bounds: ≤ _BIB_CACHE_MAX parsed bib dicts + ≤ _STY_CACHE_MAX capped
+# ``.sty`` texts (2 MB cap each). Stdlib-only (threading), preserving this
+# module's app-independence.
+# INVARIANT (pinned by deckgen/tests/test_template.py::test_bib_and_sty_caches):
+# a cache hit yields byte-identical scan results to a fresh read, and an edited
+# file is always re-read on the next call.
+_BIB_CACHE_MAX = 4
+_STY_CACHE_MAX = 8
+_parse_cache_lock = threading.Lock()
+_bib_parse_cache: dict[tuple, dict] = {}
+_sty_text_cache: dict[tuple, str] = {}
+
+
+def _file_signature(path: str) -> Optional[tuple]:
+    """(path, size, mtime_ns) identity of *path*'s current bytes; None if unstattable."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (path, st.st_size, st.st_mtime_ns)
+
+
+def _cache_get(cache: dict, key: tuple):
+    with _parse_cache_lock:
+        val = cache.pop(key, None)
+        if val is not None:
+            cache[key] = val  # re-insert = most-recently-used
+        return val
+
+
+def _cache_put(cache: dict, key: tuple, val, max_entries: int) -> None:
+    with _parse_cache_lock:
+        cache.pop(key, None)
+        cache[key] = val
+        while len(cache) > max_entries:
+            cache.pop(next(iter(cache)))
+
+
+def _read_sty_cached(path: str) -> str:
+    """``_read_capped(path, _MAX_STY_BYTES)`` served from the signature cache."""
+    sig = _file_signature(path)
+    if sig is None:
+        return ""
+    cached = _cache_get(_sty_text_cache, sig)
+    if cached is not None:
+        return cached
+    text = _read_capped(path, _MAX_STY_BYTES)
+    _cache_put(_sty_text_cache, sig, text, _STY_CACHE_MAX)
+    return text
+
+
+def _parse_bib_file_cached(path: str) -> dict:
+    """Parsed ``key -> (author, year, title)`` for one ``.bib`` file, cached.
+
+    The returned dict is shared across calls — callers must treat it as
+    read-only (``resolve_bib`` only ``update``s it into a fresh merge dict).
+    """
+    sig = _file_signature(path)
+    if sig is None:
+        return {}
+    cached = _cache_get(_bib_parse_cache, sig)
+    if cached is not None:
+        return cached
+    index: dict = {}
+    text = _read_capped(path, _MAX_BIB_BYTES)
+    if text:
+        _parse_bib_into(text, index)
+    _cache_put(_bib_parse_cache, sig, index, _BIB_CACHE_MAX)
+    return index
+
+
+def _referenced_sty_sources(preamble: str, base_dir: str, suite_root: str = "") -> list:
+    """Return the text of each local .sty/.tex the preamble pulls in (one hop).
+
+    Every ``\\usepackage`` / ``\\input`` arg is *attempted* against the suite
+    search path (:func:`_search_dirs`) and followed only when it resolves to a
+    real file — so a bare house name like ``cress-style`` (found at
+    ``<suite_root>/common/cress-style.sty``) is scanned for its ``\\citefoot`` /
+    ``\\commonlogo`` macros, while a CTAN package (``amsmath``) resolves to nothing
+    and is skipped. No name is hardcoded and no per-package list is kept.
+    """
     sources = []
     seen = set()
     active = strip_comments(preamble)
+    dirs = _search_dirs(base_dir, suite_root)
     for rx, ext in ((_USEPACKAGE_RE, ".sty"), (_INPUT_RE, ".tex")):
         for m in rx.finditer(active):
             for arg in m.group(1).split(","):
-                if not _is_local_ref(arg):
-                    continue
-                resolved = _resolve_local(base_dir, arg, ext)
+                resolved = _resolve_in_dirs(dirs, arg, ext)
                 if resolved and resolved not in seen:
                     seen.add(resolved)
-                    sources.append(_read_capped(resolved, _MAX_STY_BYTES))
+                    sources.append(_read_sty_cached(resolved))
     return sources
 
 
@@ -361,12 +539,26 @@ def _referenced_sty_sources(preamble: str, base_dir: str) -> list:
 # Macro scanning
 # ---------------------------------------------------------------------------
 
-def scan_macros(preamble: str, base_dir: str = "") -> list:
+def scan_macros(preamble: str, base_dir: str = "", suite_root: str = "") -> list:
     """Find document-defined macros in *preamble* + its local ``.sty`` files.
 
-    Returns a de-duplicated list of :class:`MacroInfo`, known house macros first.
+    Returns a de-duplicated list of :class:`MacroInfo`, described macros first
+    (those carrying a ``% @deckgen`` annotation or a built-in house description).
+    A macro's friendly description comes from its vault-side ``% @deckgen``
+    annotation when present, else the built-in :data:`_KNOWN_MACROS` fallback —
+    so documenting a new macro for the model is a suite edit, not an app change.
+    Discovery itself is generic: any ``\\newcommand`` / ``\\def`` /
+    ``\\NewDocumentCommand`` is picked up whether or not it is described.
     """
     found: dict[str, MacroInfo] = {}
+
+    # Descriptions are parsed from the RAW sources (comments intact) before the
+    # per-source comment strip below removes them.
+    raw_sources = [preamble] + _referenced_sty_sources(preamble, base_dir, suite_root)
+    annotations: dict = {}
+    for raw in raw_sources:
+        for name, desc in _scan_annotations(raw).items():
+            annotations.setdefault(name, desc)
 
     def _add(name: str, arity: int, optional_first: bool) -> None:
         # ``@`` macros are LaTeX-internal (need \makeatletter) — never user-callable.
@@ -376,11 +568,10 @@ def scan_macros(preamble: str, base_dir: str = "") -> list:
             name=name,
             arity=arity,
             optional_first=optional_first,
-            description=_KNOWN_MACROS.get(name, ""),
+            description=annotations.get(name) or _KNOWN_MACROS.get(name, ""),
         )
 
-    sources = [preamble] + _referenced_sty_sources(preamble, base_dir)
-    for src in sources:
+    for src in raw_sources:
         src = strip_comments(src)
         for m in _NEWCOMMAND_RE.finditer(src):
             name = m.group(1)
@@ -406,9 +597,11 @@ def scan_macros(preamble: str, base_dir: str = "") -> list:
         for m in _DEF_RE.finditer(src):
             _add(m.group(1), 0, False)
 
+    def described(mi):
+        return mi.name in annotations or mi.name in _KNOWN_MACROS
     ordered = (
-        [mi for mi in found.values() if mi.name in _KNOWN_MACROS]
-        + [mi for mi in found.values() if mi.name not in _KNOWN_MACROS]
+        [mi for mi in found.values() if described(mi)]
+        + [mi for mi in found.values() if not described(mi)]
     )
     return ordered[:_MAX_MACROS]
 
@@ -437,17 +630,26 @@ _BIB_ENTRY_RE = re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,", re.IGNORECASE)
 _BIB_NONENTRY = frozenset({"comment", "string", "preamble", "set"})
 
 
-def resolve_bib(preamble: str, base_dir: str = "") -> dict:
-    """Parse the bibliography referenced by *preamble* into ``key -> (author, year, title)``."""
+def resolve_bib(preamble: str, base_dir: str = "", suite_root: str = "") -> dict:
+    """Parse the bibliography referenced by *preamble* into ``key -> (author, year, title)``.
+
+    Resolves ``\\addbibresource{...}`` against the suite search path
+    (:func:`_search_dirs`), so a bare ``_master.bib`` at the suite root is found
+    even though the template lives in a sibling ``template/`` folder — matching
+    how the suite's ``BIBINPUTS`` finds it at compile time. Absolute paths are
+    still rejected (see :func:`_resolve_local`).
+    """
     index: dict[str, tuple] = {}
+    dirs = _search_dirs(base_dir, suite_root)
     for m in _ADDBIB_RE.finditer(strip_comments(preamble)):
         for arg in m.group(1).split(","):
-            path = _resolve_local(base_dir, arg, ".bib")
+            path = _resolve_in_dirs(dirs, arg, ".bib")
             if not path:
                 continue
-            text = _read_capped(path, _MAX_BIB_BYTES)
-            if text:
-                _parse_bib_into(text, index)
+            # Merge the (shared, read-only) cached per-file parse into this
+            # call's fresh dict — later files win on duplicate keys, exactly
+            # as the previous in-place _parse_bib_into ordering did.
+            index.update(_parse_bib_file_cached(path))
     return index
 
 
@@ -577,14 +779,23 @@ def find_suite_root(template_path: str) -> Optional[str]:
 
 
 def load_template_parts(tex: str, template_path: str = "") -> TemplateParts:
-    """One-shot: split *tex* and derive macros + bib relative to *template_path*."""
+    """One-shot: split *tex* and derive macros + bib relative to *template_path*.
+
+    ``suite_root`` (the ancestor holding ``common/``) is discovered with
+    :func:`find_suite_root` and threaded into the macro/bib scan, so bare house
+    references (``\\usepackage{cress-style}``, ``\\addbibresource{_master.bib}``)
+    resolve the same way the suite's ``TEXINPUTS``/``BIBINPUTS`` resolve them at
+    compile time — no per-package hardcoding, and portable across machines.
+    """
     base_dir = os.path.dirname(os.path.abspath(template_path)) if template_path else ""
+    suite_root = (find_suite_root(template_path) or "") if template_path else ""
     preamble, opening, closing = split_template(tex)
     return TemplateParts(
         preamble=preamble,
         opening=opening,
         closing=closing,
         base_dir=base_dir,
-        macros=scan_macros(preamble, base_dir),
-        bib_index=resolve_bib(preamble, base_dir),
+        suite_root=suite_root,
+        macros=scan_macros(preamble, base_dir, suite_root),
+        bib_index=resolve_bib(preamble, base_dir, suite_root),
     )

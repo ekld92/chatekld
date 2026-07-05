@@ -5,6 +5,10 @@ PyMuPDF>=1.25.2,<2.0
 ollama>=0.4,<1.0
 pywebview>=5.3,<6.0
 Pillow>=11.1,<12.0
+# HEIF/HEIC decoder for PIL — lets the vision path describe .heic images (the
+# default macOS screenshot/photo format). Optional at runtime (vision.py guards
+# the import), but declared so a fresh install supports HEIC out of the box.
+pillow-heif>=0.18,<1.0
 
 # LlamaIndex (RAG)
 # Pinned to compatible versions to prevent pip resolver from backtracking through
@@ -35,8 +39,9 @@ python-dotenv>=1.0,<2.0
 # core line below. BM25 is still import-guarded in rag/engine.py so vault chat
 # falls back to dense-only retrieval if the optional package is unavailable.
 # llama-index-postprocessor-sbert-rerank wraps sentence-transformers' CrossEncoder
-# via its "model_name_or_path" constructor keyword, which requires
-# sentence-transformers >=4.0.0.
+# via its "model_name_or_path" constructor keyword (still present at 5.x). Pinned
+# to a SINGLE major (5.x, the validated line) rather than the old 4.0-5.x span so
+# a fresh install months apart cannot silently resolve a different major.
 llama-index-retrievers-bm25>=0.7.0,<0.8
 # bm25s is the backend behind llama-index-retrievers-bm25, which itself only
 # requires ">=0.2.7.post1" (unbounded above).  The BM25 sidecar persisted under
@@ -45,7 +50,15 @@ llama-index-retrievers-bm25>=0.7.0,<0.8
 # verified against; bump deliberately alongside the round-trip test.
 bm25s>=0.3.9,<0.4
 llama-index-postprocessor-sbert-rerank>=0.5.0,<0.6
-sentence-transformers>=4.0.0,<6.0
+sentence-transformers>=5.0.0,<6.0
+# torch and transformers are pulled in transitively by sentence-transformers /
+# the reranker, but declared explicitly with UPPER bounds so a fresh install
+# cannot resolve a newer, unvalidated major (torch was previously unbounded
+# above). The next-major caps (<3 / <6) are the reproducibility guard; for an
+# exact lock use constraints.txt (pip freeze of the validated venv) — the
+# installer applies it via `pip install -r requirements.txt -c constraints.txt`.
+torch>=2.2,<3.0
+transformers>=5.0,<6.0
 
 # Binary vector store (Batch 4 — replaces the JSON SimpleVectorStore on disk).
 # The 0.4.1+ integration line is the first that supports the LlamaIndex 0.14.x
@@ -58,6 +71,14 @@ sentence-transformers>=4.0.0,<6.0
 # integration 0.5.0, ijson 3.5.0, pyarrow 24.0.0 against core 0.14.22.
 lancedb>=0.21.1,<1.0
 llama-index-vector-stores-lancedb>=0.4.1,<0.6
+# pandas is a HARD import-time dependency of the lancedb integration: its
+# base.py does `from pandas import DataFrame` at module load, so a venv that
+# resolves the integration without pandas raises ImportError on
+# `from llama_index.vector_stores.lancedb import LanceDBVectorStore` — which the
+# import guard in rag/lancedb_store.py swallows into `lancedb_available() = False`.
+# Declared explicitly so a `--no-deps`-style rebuild cannot silently drop it and
+# blind the app to an existing lancedb index. Exact lock in constraints.txt (2.3.3).
+pandas>=2.0,<3.0
 ijson>=3.3.0,<4.0
 
 # Tokenizer — required by LlamaIndex text splitter (was pre-cached by install script only)
@@ -86,19 +107,24 @@ setuptools>=70.0,<81
 # MarkItDown: Microsoft's Markdown conversion library, used as a text-extraction
 # tier in pdf_extractor.py (pdfminer.six backend for .pdf). The app indexes only
 # .md and .pdf — .docx is excluded by design (core/constants.py::VAULT_BINARY_EXTS)
-# — so MarkItDown's other converters (.docx/.pptx/.xlsx) are not exercised here.
-# [all] installs every optional converter; absent = pdf_extractor.py degrades to
-# its OCR-only path. Privacy note: the app never passes cloud API keys. Vision
-# callbacks are routed through the locally configured OCR/vision provider.
-markitdown[all]>=0.1.0,<2.0
+# — so MarkItDown's other converters (.docx/.pptx/.xlsx) are never exercised.
+# We therefore install ONLY the [pdf] extra (pdfminer.six), not [all]: that drops
+# the office/zip/audio converters' deps (python-docx/pptx, openpyxl, …) which were
+# pure bundle bloat. NOTE: magika + onnxruntime are MarkItDown *base* deps (core
+# file-type sniffing), so they stay regardless of extras — the trim removed the
+# office converters, not onnxruntime. Absent entirely = pdf_extractor.py degrades
+# to its OCR-only path. Privacy note:
+# the app never passes cloud API keys; vision callbacks route through the locally
+# configured OCR/vision provider.
+markitdown[pdf]>=0.1.0,<2.0
 
 # Library Audit subsystem (audit/ — vendored from kb_harmonizer).
 # pikepdf is used only for read-only PDF annotation counting (no /Annots
 # decoding, just header walk).  ruamel.yaml parses Obsidian frontmatter
 # while preserving quoting.  bibtexparser handles Better BibTeX exports.
-# beautifulsoup4 strips HTML out of Zotero child-note bodies; it is
-# already pulled in transitively by markitdown but pinned here so an
-# upstream change does not silently break the audit.
+# beautifulsoup4 strips HTML out of Zotero child-note bodies; it is pinned
+# here as a first-class dependency (markitdown[pdf] no longer pulls it in,
+# unlike the former [all]) so the audit never silently breaks.
 pikepdf>=8.15,<10.0
 ruamel.yaml>=0.18,<0.19
 bibtexparser>=1.4,<2.0

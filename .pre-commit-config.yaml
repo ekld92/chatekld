@@ -1,0 +1,48 @@
+# Track 7.5: local commit-time guardrails. Install once with `pre-commit install`
+# (needs the dev deps: `pip install -r requirements-dev.txt`). These run on the
+# files you stage, so they keep NEW work clean without rewriting the whole tree.
+#
+#   * ruff        — mirrors the enforced CI static gate (run from the venv's pinned
+#                   ruff so pre-commit and CI never disagree on a version).
+#   * gitleaks    — blocks committing an API key / secret (the app reads keys from
+#                   env / BASE_DIR/.env, never config — this stops an accidental
+#                   hard-coded key from ever landing in git).
+#   * hygiene     — trailing whitespace / final newline / merge-conflict / YAML /
+#                   accidental large-file or case-collision guards.
+#
+# mypy is deliberately NOT a hook here (the plan is "pre-commit (ruff, gitleaks)"):
+# it is a PERMISSIVE, ADVISORY standalone tool (config in pyproject [tool.mypy]).
+# Run it on demand from the venv: `mypy` (checks the app source; ~60 findings today,
+# mostly false positives from untyped third-party libs — informational, not a gate).
+minimum_pre_commit_version: "4.0.0"
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        # Markdown uses trailing double-space as a hard line break; the repo's docs
+        # rely on it, so don't strip whitespace there.
+        exclude: '\.md$'
+      - id: end-of-file-fixer
+        exclude: '\.md$'
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-case-conflict
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  # Enforced static gate, same rule set as CI (`ruff check .`). Self-contained repo
+  # hook (its own isolated env) so it runs from any commit context — an IDE commit or
+  # a shell without the venv activated — not only an activated venv. Pinned to the
+  # SAME version as requirements-dev.txt's ruff (0.12.x) so pre-commit and CI agree.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.12
+    hooks:
+      - id: ruff
+        name: ruff check

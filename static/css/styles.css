@@ -1,41 +1,166 @@
 :root {
-    /* ── Surfaces ── */
+    /* ── Geometry (theme-independent) ── */
+    --radius:    8px;
+    --radius-sm: 7px;
+
+    /* ── Motion (theme-independent) ── */
+    --ease:          cubic-bezier(0.22, 0, 0.08, 1);
+    --dur-fast:      0.11s;
+    --dur:           0.18s;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Theming. Color tokens live under [data-theme]; an inline <head> bootstrap
+   (templates/index.html) resolves System/Light/Dark and stamps a concrete
+   data-theme on <html> BEFORE first paint, so there is no flash-of-dark on a
+   light load. `:root` is grouped with the dark block so a no-JS / pre-script
+   render still gets a usable (dark) palette. Light comes last so, at equal
+   specificity, [data-theme="light"] wins when set. Every surface/overlay/tint
+   in the sheet flows from these tokens — adding a new theme = a new block, not
+   a literal sweep. ────────────────────────────────────────────────────────── */
+:root,
+[data-theme="dark"] {
+    /* Surfaces */
     --bg-app:      #101114;
     --bg-sidebar:  #18191d;
     --bg-card:     #202126;
     --bg-elevated: #2a2b31;
+    --card-bg:     #17181c;   /* opaque card / input-bar / upload-overlay */
+    --input-bg:    #25262b;
+    --header-bg:   rgba(14,14,16,0.88);
+    --tab-active-bg: #33343a;
 
-    /* ── Accent / Danger ── */
-    --accent:        #6f63ff;
-    --accent-hover:  #8278ff;
+    /* Surface overlays (hover / subtle fills) — alpha-on-light in light mode */
+    --surface-subtle:       rgba(255,255,255,0.03);
+    --surface-hover:        rgba(255,255,255,0.05);
+    --surface-hover-strong: rgba(255,255,255,0.08);
+    --scrollbar-thumb:       rgba(255,255,255,0.11);
+    --scrollbar-thumb-hover: rgba(255,255,255,0.20);
+    --overlay-scrim:         rgba(0,0,0,0.55);
+
+    /* Accent (Track 6a, 2026-07-04 — values validated by the contrast lint,
+       tests/js/contrastTokens.test.js). #6f63ff put white button text at
+       4.28:1 (< AA 4.5); #675aff clears it while keeping >=3:1 as a border/
+       outline on every dark surface. --accent-hover is the TEXT-grade accent
+       (links/badges on dark + tinted fills — #8278ff sat at 3.62:1 on the
+       glow tint); the button hover BACKGROUND is the separate
+       --accent-hover-bg, because one value cannot be both light enough to
+       read as text on dark and dark enough to carry white text. */
+    --accent:        #675aff;
+    --accent-hover:  #a29aff;
+    --accent-hover-bg: #5b4de8;
     --accent-glow:   rgba(111,99,255,0.22);
+    --on-accent:     #fff;
+    --user-msg-from: #675aff;
+    --user-msg-to:   #6b53e8;
+    --accent-soft-bg: rgba(124,99,255,0.12);
+    --accent-soft-fg: #a29aff;
+
+    /* Status — semantic bg/border/fg trios (invert per theme) */
     --danger:        #ff453a;
     --danger-hover:  #ff6961;
+    --danger-bg:     rgba(255,69,58,0.08);
+    --danger-border: rgba(255,69,58,0.45);
+    --warn-bg:       rgba(255,204,0,0.10);
+    --warn-border:   rgba(255,204,0,0.45);
+    --warn-fg:       #ffd866;
+    --ok-fg:         #4ade80;   /* diff-add green */
 
-    /* ── Typography ── */
+    /* Item 4.9: CSS variables for provider badges and status dots to replace inline JS hex codes.
+       Defect: Inline hex values in JS bypass the css theme engine and fail contrast guidelines (e.g. 1.9:1 in light mode).
+       Safety: CSS variables resolve correctly based on data-theme attribute. No markup or logic mutations are needed.
+       Invariant: All badges and status dot colors are fully themed and accessible (>= 4.5:1 text, >= 3:1 UI components). */
+    --provider-ollama:      #30d158;
+    --provider-lm-studio:   #0a84ff;
+    --provider-openai:      #10a37f;
+    --provider-anthropic:   #ff9f0a;
+    --provider-google:      #4589ff;
+    --status-ok:            #30d158;
+    --status-warn:          #ffd60a;
+    --status-error:         #ff453a;
+
+    /* Typography */
     --text-primary:   #eeeef3;
     --text-secondary: #aeaeb2;
-    /* Bumped from #6b6b70 to clear WCAG AA (~4.5:1) on the sidebar/card
-       surfaces where tertiary text (labels, hints, meta) is used. */
     --text-tertiary:  #8a8a91;
 
-    /* ── Borders ── */
+    /* Borders */
     --border:        rgba(255,255,255,0.10);
     --border-strong: rgba(255,255,255,0.16);
 
-    /* ── Geometry ── */
-    --radius:    8px;
-    --radius-sm: 7px;
-
-    /* ── Shadows ── */
+    /* Shadows */
     --shadow-sm: 0 1px 4px rgba(0,0,0,0.35);
     --shadow:    0 4px 16px rgba(0,0,0,0.50);
     --shadow-lg: 0 16px 48px rgba(0,0,0,0.65);
 
-    /* ── Motion ── */
-    --ease:          cubic-bezier(0.22, 0, 0.08, 1);
-    --dur-fast:      0.11s;
-    --dur:           0.18s;
+    color-scheme: dark;
+}
+
+[data-theme="light"] {
+    /* Surfaces */
+    --bg-app:      #f4f4f7;
+    --bg-sidebar:  #ececef;
+    --bg-card:     #ffffff;
+    --bg-elevated: #e6e6ea;
+    --card-bg:     #ffffff;
+    --input-bg:    #ffffff;
+    --header-bg:   rgba(248,248,250,0.85);
+    --tab-active-bg: #ffffff;
+
+    --surface-subtle:       rgba(0,0,0,0.025);
+    --surface-hover:        rgba(0,0,0,0.05);
+    --surface-hover-strong: rgba(0,0,0,0.08);
+    --scrollbar-thumb:       rgba(0,0,0,0.20);
+    --scrollbar-thumb-hover: rgba(0,0,0,0.32);
+    --overlay-scrim:         rgba(0,0,0,0.32);
+
+    /* Accent darkened so white-on-accent AND accent-as-text both clear AA.
+       Light hover already darkens, so text-grade and bg-grade coincide. */
+    --accent:        #5446d6;
+    --accent-hover:  #4536c4;
+    --accent-hover-bg: #4536c4;
+    --accent-glow:   rgba(84,70,214,0.16);
+    --on-accent:     #fff;
+    --user-msg-from: #5e51e0;
+    --user-msg-to:   #5446d6;
+    --accent-soft-bg: rgba(84,70,214,0.10);
+    --accent-soft-fg: #4536c4;
+
+    --danger:        #d70015;
+    --danger-hover:  #b00010;
+    --danger-bg:     rgba(215,0,21,0.08);
+    --danger-border: rgba(215,0,21,0.32);
+    --warn-bg:       rgba(255,180,0,0.16);
+    --warn-border:   rgba(180,130,0,0.50);
+    --warn-fg:       #7a5e00;
+    --ok-fg:         #1a7f37;
+
+    /* Item 4.9: CSS variables for provider badges and status dots in light mode.
+       Ensures >= 4.5:1 text contrast on light background (e.g. #ececef and #ffffff). */
+    /* Track 6a: ollama/openai measured 4.31/4.37:1 on the light sidebar
+       (#ececef) — under AA 4.5 for the badge TEXT that uses these tokens;
+       anthropic sat exactly at 4.50 (no margin). Darkened to >=5:1. */
+    --provider-ollama:      #136a2c;
+    --provider-lm-studio:   #0056b3;
+    --provider-openai:      #0b6350;
+    --provider-anthropic:   #925200;
+    --provider-google:      #005fda;
+    --status-ok:            #136a2c;
+    --status-warn:          #9a6e00;
+    --status-error:         #d70015;
+
+    --text-primary:   #1c1c1e;
+    --text-secondary: #54545a;
+    --text-tertiary:  #6a6a72;
+
+    --border:        rgba(0,0,0,0.12);
+    --border-strong: rgba(0,0,0,0.20);
+
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.10);
+    --shadow:    0 4px 16px rgba(0,0,0,0.14);
+    --shadow-lg: 0 16px 48px rgba(0,0,0,0.22);
+
+    color-scheme: light;
 }
 
 * { box-sizing: border-box; }
@@ -82,7 +207,7 @@ body {
     border-radius: var(--radius-sm);
     background: var(--accent);
     color: #fff;
-    font-size: 13px;
+    font-size: 0.8125rem;
     font-weight: 600;
     text-decoration: none;
     box-shadow: var(--shadow);
@@ -124,7 +249,7 @@ body {
 }
 
 .brand h1 {
-    font-size: 17px;
+    font-size: 1.0625rem;
     font-weight: 700;
     margin: 0;
     letter-spacing: 0;
@@ -136,7 +261,7 @@ body {
 }
 
 .sidebar-label {
-    font-size: 10px;
+    font-size: 0.75rem;
     font-weight: 700;
     color: var(--text-tertiary);
     text-transform: uppercase;
@@ -156,7 +281,7 @@ body {
 label {
     display: block;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 0.75rem;
     font-weight: 500;
     line-height: 1.2;
 }
@@ -166,9 +291,9 @@ select, input[type="text"], input[type="number"], input[type="password"], textar
     padding: 9px 12px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
-    background: #25262b;
+    background: var(--input-bg);
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: 0.8125rem;
     outline: none;
     transition: border-color var(--dur-fast) var(--ease),
                 box-shadow var(--dur-fast) var(--ease);
@@ -194,7 +319,7 @@ input[type="number"]:not(:focus):hover, textarea:not(:focus):hover {
 .slider-label {
     display: flex;
     justify-content: space-between;
-    font-size: 11px;
+    font-size: 0.75rem;
     color: var(--text-secondary);
     margin-bottom: 4px;
 }
@@ -210,7 +335,7 @@ input[type="range"] {
     justify-content: center;
     padding: 9px 16px;
     border-radius: var(--radius-sm);
-    font-size: 13px;
+    font-size: 0.8125rem;
     font-weight: 500;
     letter-spacing: -0.1px;
     cursor: pointer;
@@ -258,18 +383,20 @@ input[type="range"] {
 }
 
 .btn-primary:hover:not(:disabled) {
-    background: var(--accent-hover);
+    /* 6a: --accent-hover is text-grade (too light under white text in dark
+       mode); the hover surface is the bg-grade token. */
+    background: var(--accent-hover-bg);
     box-shadow: 0 3px 10px rgba(124,99,255,0.40), inset 0 1px 0 rgba(255,255,255,0.14);
 }
 
 .btn-outline {
-    background: rgba(255,255,255,0.04);
+    background: var(--surface-hover);
     border: 1px solid var(--border);
     color: var(--text-primary);
 }
 
 .btn-outline:hover:not(:disabled) {
-    background: rgba(255,255,255,0.08);
+    background: var(--surface-hover-strong);
     border-color: var(--border-strong);
 }
 
@@ -288,7 +415,7 @@ input[type="range"] {
 
 .btn-sm {
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: 0.75rem;
     min-height: 28px;
 }
 
@@ -301,9 +428,9 @@ input[type="range"] {
     padding: 7px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: rgba(255,255,255,0.03);
+    background: var(--surface-subtle);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 0.75rem;
     font-weight: 600;
     margin: 2px 0 10px;
 }
@@ -318,10 +445,20 @@ input[type="range"] {
     flex: 0 0 auto;
 }
 
+/* Track 6a: runtime-status dots carried their state in COLOR ONLY (app.js set
+   an inline background) — invisible to color-blind users. The state now rides
+   a data attribute and each state gets a distinct SHAPE as well as its token
+   color: ok = circle, degraded = diamond, error = square. app.js sets
+   data-state and never writes inline styles here (an inline background would
+   override these rules). aria-labels carry the state for screen readers. */
+.dot[data-state="ok"] { background: var(--status-ok); }
+.dot[data-state="degraded"] { background: var(--status-warn); border-radius: 1px; transform: rotate(45deg) scale(0.9); }
+.dot[data-state="error"] { background: var(--status-error); border-radius: 1px; }
+
 .status-card {
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: rgba(255,255,255,0.03);
+    background: var(--surface-subtle);
     overflow: hidden;
 }
 
@@ -332,7 +469,7 @@ input[type="range"] {
     min-height: 34px;
     padding: 8px 10px;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 
 .sidebar-spacer {
@@ -343,26 +480,71 @@ input[type="range"] {
 .warning-banner {
     margin-top: 10px;
     padding: 10px 12px;
-    border: 1px solid rgba(255, 204, 0, 0.45);
+    border: 1px solid var(--warn-border);
     border-radius: var(--radius-sm);
-    background: rgba(255, 204, 0, 0.10);
-    color: #ffd866;
-    font-size: 12px;
+    background: var(--warn-bg);
+    color: var(--warn-fg);
+    font-size: 0.75rem;
     line-height: 1.4;
 }
 
 .model-note {
     color: var(--text-tertiary);
-    font-size: 11px;
+    font-size: 0.75rem;
     line-height: 1.45;
     margin-top: -4px;
 }
 
 .modal-copy {
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: 0.8125rem;
     line-height: 1.5;
     margin: 0 0 16px;
+}
+
+/* Sidebar appearance switch — a 3-way segmented radiogroup (System/Light/Dark),
+   styled like the header .tabs. Roving tabindex + arrow keys wired in ui.js. */
+.theme-switch {
+    display: flex;
+    gap: 2px;
+    background: var(--surface-hover);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 3px;
+    margin-bottom: 10px;
+}
+
+.theme-option {
+    flex: 1;
+    padding: 6px 4px;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 0.75rem;
+    font-weight: 500;
+    border-radius: 6px;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    transition: background-color var(--dur-fast) var(--ease),
+                color var(--dur-fast) var(--ease);
+}
+
+.theme-option:hover:not(.active) {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+}
+
+.theme-option.active {
+    background: var(--tab-active-bg);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-sm);
+}
+
+.theme-option:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 /* --- Main Content --- */
@@ -374,12 +556,12 @@ input[type="range"] {
 }
 
 .header {
-    height: 56px;
+    min-height: 56px;   /* 6d: floor, not fixed — zoomed text must not clip */
     display: flex;
     align-items: center;
     padding: 0 26px;
     gap: 10px;
-    background: rgba(14,14,16,0.88);
+    background: var(--header-bg);
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
     border-bottom: 1px solid var(--border);
@@ -389,16 +571,19 @@ input[type="range"] {
 .tabs {
     display: flex;
     gap: 2px;
-    background: rgba(255,255,255,0.05);
+    background: var(--surface-hover);
     padding: 3px;
     border-radius: 8px;
     border: 1px solid rgba(255,255,255,0.06);
+    /* 6d: scaled-up tab labels must scroll into reach, never vanish. */
+    overflow-x: auto;
+    max-width: 100%;
 }
 
 .tab {
     padding: 7px 18px;
     border-radius: 6px;
-    font-size: 13px;
+    font-size: 0.8125rem;
     font-weight: 500;
     cursor: pointer;
     color: var(--text-secondary);
@@ -416,11 +601,11 @@ input[type="range"] {
 
 .tab:hover:not(.active) {
     color: var(--text-primary);
-    background: rgba(255,255,255,0.05);
+    background: var(--surface-hover);
 }
 
 .tab.active {
-    background: #33343a;
+    background: var(--tab-active-bg);
     color: var(--text-primary);
     border-color: rgba(255,255,255,0.08);
     box-shadow: 0 1px 5px rgba(0,0,0,0.45), 0 0 0 0.5px rgba(255,255,255,0.06);
@@ -456,7 +641,7 @@ input[type="range"] {
 }
 
 .card {
-    background: #17181c;
+    background: var(--card-bg);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
@@ -474,22 +659,38 @@ input[type="range"] {
     display: flex;
     flex-direction: column;
     gap: 16px;
-    font-size: 14px;
+    font-size: 0.875rem;
     line-height: 1.65;
     letter-spacing: 0.01em;
 }
 
 .card > .header {
-    height: 62px;
+    min-height: 62px;   /* 6d: floor, not fixed */
     flex: 0 0 auto;
-    background: #17181c;
+    background: var(--card-bg);
     border-bottom: 1px solid var(--border);
 }
 
-.card > .header > span {
-    font-size: 15px;
+/* Track 6c: card titles are real <h2>s now (heading navigation); the reset
+   keeps them byte-identical to the styled spans they replaced. */
+.card > .header > span,
+.card > .header > h2.card-title {
+    font-size: 0.9375rem;
     font-weight: 700;
+    margin: 0;
 }
+
+h3.panel-subtitle {
+    font-size: inherit;
+    font-weight: inherit;
+    margin: 0;
+}
+
+h3.sidebar-label { margin: 0; }
+
+/* Fieldset used purely for checkbox-group semantics — no visual chrome. */
+fieldset.checkbox-fieldset { border: none; padding: 0; margin: 0; min-width: 0; }
+fieldset.checkbox-fieldset > legend { padding: 0; }
 
 .actions {
     display: flex;
@@ -505,9 +706,9 @@ input[type="range"] {
     min-height: 42px;
     padding: 8px 16px;
     border-bottom: 1px solid var(--border);
-    background: rgba(255,255,255,0.03);
+    background: var(--surface-subtle);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 
 #vault-path-display {
@@ -523,7 +724,7 @@ input[type="range"] {
     min-height: 0;
     padding: 0 16px;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 
 .prewarm-banner {
@@ -533,7 +734,7 @@ input[type="range"] {
     background: rgba(125, 110, 240, 0.12);
     border: 1px solid rgba(125, 110, 240, 0.35);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 0.75rem;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -542,8 +743,8 @@ input[type="range"] {
 .prewarm-banner[hidden] { display: none; }
 
 .prewarm-banner.prewarm-error {
-    background: rgba(220, 80, 80, 0.12);
-    border-color: rgba(220, 80, 80, 0.4);
+    background: var(--danger-bg);
+    border-color: var(--danger-border);
 }
 
 .prewarm-banner .prewarm-spinner {
@@ -567,7 +768,7 @@ input[type="range"] {
 
 .message-user {
     align-self: flex-end;
-    background: linear-gradient(160deg, var(--accent), #6b53e8);
+    background: linear-gradient(160deg, var(--user-msg-from), var(--user-msg-to));
     color: #fff;
     border-bottom-right-radius: 3px;
     box-shadow: 0 2px 8px rgba(124,99,255,0.30);
@@ -588,7 +789,7 @@ input[type="range"] {
     align-self: stretch;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 0.75rem;
     font-style: italic;
     padding: 4px 12px;
     border: none;
@@ -601,12 +802,31 @@ input[type="range"] {
     align-self: stretch;
     margin: 4px 0;
     padding: 6px 10px;
-    background: rgba(255,255,255,0.02);
+    background: var(--surface-subtle);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    font-size: 12px;
+    font-size: 0.75rem;
     color: var(--text-secondary);
 }
+
+.retrieval-trace {
+    align-self: stretch;
+    margin: 4px 0;
+    padding: 6px 10px;
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.retrieval-trace summary {
+    cursor: pointer;
+    font-weight: 600;
+    user-select: none;
+    list-style: revert;
+}
+
 
 .agent-trace summary {
     cursor: pointer;
@@ -614,6 +834,89 @@ input[type="range"] {
     user-select: none;
     list-style: revert;
 }
+
+/* --- Prompt Hub (read-only system-prompt transparency panel) ---
+   Deliberately reuses the same surface/text tokens the agent + retrieval
+   collapsibles use (text on --surface-subtle, primary text on --bg-app) so the
+   panel inherits their already-contrast-linted pairs — no new token pair to add
+   to tests/js/contrastTokens.test.js. */
+.prompts-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 12px 24px 24px;
+    /* The app shell is height:100vh/overflow:hidden and .card clips its
+       overflow, so the LIST must be the scroll container (same pattern as
+       .chat-history): flex:1 fills the card's remaining height, min-height:0
+       lets the flex child shrink below its content so overflow engages, and
+       overflow-y:auto scrolls the rows — otherwise expanding a few prompts
+       pushes the bottom rows past the clipped card with no way to reach them. */
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+}
+.prompt-row {
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+    color: var(--text-secondary);
+}
+.prompt-row-summary {
+    cursor: pointer;
+    user-select: none;
+    list-style: revert;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.prompt-row-label {
+    font-weight: 700;
+    color: var(--text-primary);
+}
+/* Badges are bordered text in the secondary colour — no filled backgrounds, so
+   they add no new foreground/background contrast pair to lint. */
+.prompt-badge {
+    font-size: 0.75rem;
+    padding: 1px 6px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+.prompt-badge-model { font-family: var(--font-mono, monospace); }
+.prompt-badge-empty { font-style: italic; }
+.prompt-row-body { margin-top: 8px; }
+.prompt-row-desc { margin: 0 0 6px; }
+.prompt-row-meta,
+.prompt-row-note {
+    margin: 4px 0;
+    font-size: 0.75rem;
+}
+.prompt-row-note { font-style: italic; }
+.prompt-row-placeholder {
+    margin: 4px 0;
+    font-style: italic;
+    color: var(--text-tertiary);
+}
+.prompt-row-text {
+    margin: 8px 0;
+    padding: 10px;
+    background: var(--bg-app);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: var(--font-mono, monospace);
+    font-size: 0.75rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    /* Long prompts scroll inside their own box — the page body never scrolls
+       horizontally (root CLAUDE.md responsive rule). */
+    max-height: 420px;
+    overflow: auto;
+}
+.prompt-copy-btn { margin-top: 4px; }
 
 .agent-iteration {
     margin-top: 8px;
@@ -638,7 +941,7 @@ input[type="range"] {
 
 .agent-tool-call code {
     font-family: var(--font-mono, monospace);
-    background: rgba(124,99,255,0.10);
+    background: var(--accent-soft-bg);
     padding: 1px 6px;
     border-radius: 3px;
     word-break: break-all;
@@ -647,7 +950,7 @@ input[type="range"] {
 .agent-tool-result {
     margin: 4px 0 8px;
     padding: 6px 8px;
-    background: rgba(255,255,255,0.03);
+    background: var(--surface-subtle);
     border-radius: 3px;
 }
 
@@ -656,7 +959,7 @@ input[type="range"] {
     white-space: pre-wrap;
     word-break: break-word;
     font-family: var(--font-mono, monospace);
-    font-size: 11px;
+    font-size: 0.75rem;
     max-height: 200px;
     overflow-y: auto;
 }
@@ -667,15 +970,15 @@ input[type="range"] {
     color: var(--text-primary);
     border-radius: 3px;
     padding: 0 6px;
-    font-size: 10px;
+    font-size: 0.75rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     margin-bottom: 4px;
 }
 
 .agent-tool-result-error .agent-tool-result-tag {
-    background: rgba(220, 80, 80, 0.18);
-    color: #f6a8a8;
+    background: var(--danger-bg);
+    color: var(--danger-hover);
 }
 
 .checkbox-row {
@@ -688,31 +991,93 @@ input[type="range"] {
 
 .control-hint {
     display: block;
-    font-size: 11px;
+    font-size: 0.75rem;
     color: var(--text-secondary);
     margin-top: 4px;
     line-height: 1.4;
+}
+
+/* Click-to-insert example prompts (ui.js::renderExampleChips). */
+.example-chips-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+}
+.example-chips-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-right: 2px;
+}
+.example-chip {
+    font-size: 0.75rem;
+    line-height: 1.3;
+    padding: 3px 9px;
+    min-height: 24px;   /* 6d: 24px minimum target */
+    max-width: 100%;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.example-chip:hover {
+    color: var(--text-primary);
+    border-color: var(--accent);
+}
+
+/* In-app application-log viewer (the "Application log" settings section). */
+.log-viewer-output {
+    max-height: 340px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    margin: 0;
+    padding: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+}
+.log-viewer-actions {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
 }
 
 .copy-btn {
     position: absolute;
     top: 4px;
     right: 4px;
-    background: rgba(40,40,44,0.9);
+    min-height: 24px;   /* 6d: 24px minimum target */
+    background: var(--bg-elevated);
     color: var(--text-secondary);
     border: 1px solid var(--border);
     border-radius: 4px;
     padding: 2px 6px;
-    font-size: 10px;
+    font-size: 0.75rem;
     cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.2s;
+    /* 6a: the old resting opacity:0.5 put the 10px "Copy" TEXT at ~2.7:1
+       effective (opacity composites the whole button toward the page bg) and
+       no opacity keeps AA in light mode. De-emphasis now comes from the muted
+       --text-secondary color at FULL opacity (>=6:1 both themes); hover/focus
+       promote to primary text instead of fading in. */
+    transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
 
 .message-bot:hover .copy-btn,
 .message-user:hover .copy-btn,
 .copy-btn:focus-visible {
-    opacity: 1;
+    color: var(--text-primary);
+    border-color: var(--border-strong);
 }
 
 .copy-btn:focus-visible {
@@ -721,14 +1086,51 @@ input[type="range"] {
 }
 
 .message-user .copy-btn {
-    background: rgba(255, 255, 255, 0.25);
-    color: white;
+    /* 6a: a white-tint fill under white text was ~3.1:1; a dark scrim over
+       the accent bubble keeps the white label >=4.5:1 on both gradient stops. */
+    background: rgba(0, 0, 0, 0.28);
+    color: #fff;
     border-color: rgba(255, 255, 255, 0.4);
+}
+
+.message-user .copy-btn:hover,
+.message-user .copy-btn:focus-visible {
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.7);
+}
+
+/* Per-code-block copy button injected into rendered-markdown <pre> by
+   ui.js::enhanceCodeBlocks (chat answers + the single-paper summary). */
+pre.has-code-copy { position: relative; }
+
+.code-copy-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    min-height: 24px;   /* 6d: 24px minimum target */
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    cursor: pointer;
+    /* 6a: same treatment as .copy-btn — muted color at full opacity. */
+    transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+
+pre.has-code-copy:hover .code-copy-btn,
+.code-copy-btn:focus-visible { color: var(--text-primary); border-color: var(--border-strong); }
+
+.code-copy-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
 }
 
 .input-bar {
     padding: 16px;
-    background: #17181c;
+    background: var(--card-bg);
     border-top: 1px solid var(--border);
     display: flex;
     gap: 12px;
@@ -763,7 +1165,7 @@ input[type="range"] {
     border-radius: var(--radius-sm);
     padding: 10px;
     margin: 4px 0 14px;
-    background: rgba(255,255,255,0.025);
+    background: var(--surface-subtle);
 }
 
 /* Obsidian card only: cap the expanded settings panel and let it scroll
@@ -779,9 +1181,34 @@ input[type="range"] {
 .advanced-controls summary {
     color: var(--text-secondary);
     cursor: pointer;
-    font-size: 12px;
+    font-size: 0.75rem;
     font-weight: 600;
     user-select: none;
+}
+
+/* Settings modal: each labelled group is now a collapsible section so the long
+   control list is navigable instead of one scroll wall. Summary is styled like
+   the old `.sidebar-label` heading it replaced. */
+.settings-section {
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
+}
+
+.settings-section > summary {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    cursor: pointer;
+    user-select: none;
+    padding: 12px 0 4px;
+    list-style: revert;
+}
+
+.settings-section[open] > summary {
+    color: var(--text-secondary);
+    margin-bottom: 8px;
 }
 
 .control-grid {
@@ -793,7 +1220,7 @@ input[type="range"] {
 
 .materials-panel {
     border-bottom: 1px solid var(--border);
-    background: rgba(255,255,255,0.02);
+    background: var(--surface-subtle);
 }
 
 .materials-panel-header {
@@ -804,7 +1231,7 @@ input[type="range"] {
     justify-content: space-between;
     gap: 12px;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 0.75rem;
     font-weight: 600;
 }
 
@@ -823,8 +1250,8 @@ input[type="range"] {
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 10px;
     padding: 8px 0;
-    border-top: 1px solid rgba(255,255,255,0.06);
-    font-size: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 0.75rem;
 }
 
 .material-source {
@@ -842,7 +1269,7 @@ input[type="range"] {
 
 .materials-empty {
     color: var(--text-tertiary);
-    font-size: 12px;
+    font-size: 0.75rem;
     padding: 8px 0;
 }
 
@@ -852,9 +1279,9 @@ input[type="range"] {
     display: flex;
     align-items: center;
     justify-content: center;
-    border: 1px dashed rgba(255,255,255,0.18);
+    border: 1px dashed var(--border-strong);
     border-radius: var(--radius);
-    background: #17181c;
+    background: var(--card-bg);
     cursor: pointer;
     transition: border-color var(--dur-fast) var(--ease),
                 background-color var(--dur-fast) var(--ease);
@@ -863,7 +1290,7 @@ input[type="range"] {
 #upload-overlay:hover,
 #upload-overlay.dragover {
     border-color: rgba(130,120,255,0.72);
-    background: #1b1c22;
+    background: var(--bg-elevated);
 }
 
 #upload-overlay.dragover {
@@ -883,7 +1310,7 @@ input[type="range"] {
     justify-content: center;
     gap: 14px;
     color: var(--text-secondary);
-    font-size: 15px;
+    font-size: 0.9375rem;
     font-weight: 600;
 }
 
@@ -897,7 +1324,7 @@ input[type="range"] {
     border-radius: 8px;
     background: rgba(111,99,255,0.10);
     color: var(--accent-hover);
-    font-size: 13px;
+    font-size: 0.8125rem;
     font-weight: 800;
     letter-spacing: 0.08em;
 }
@@ -909,7 +1336,7 @@ input[type="range"] {
 .field-error {
     display: none;
     margin-top: 6px;
-    font-size: 11px;
+    font-size: 0.75rem;
     color: var(--danger);
     line-height: 1.35;
 }
@@ -927,8 +1354,8 @@ input[type="range"] {
     display: none;
     margin: 8px 16px;
     padding: 10px 12px;
-    border: 1px solid rgba(255, 69, 58, 0.45);
-    background: rgba(255, 69, 58, 0.08);
+    border: 1px solid var(--danger-border);
+    background: var(--danger-bg);
     border-radius: 8px;
 }
 
@@ -937,14 +1364,14 @@ input[type="range"] {
 }
 
 .task-error-title {
-    font-size: 12px;
+    font-size: 0.75rem;
     font-weight: 600;
-    color: #ffb4ae;
+    color: var(--danger-hover);
     margin-bottom: 6px;
 }
 
 .task-error-msg {
-    font-size: 12px;
+    font-size: 0.75rem;
     color: var(--text-primary);
     line-height: 1.45;
 }
@@ -964,27 +1391,27 @@ input[type="range"] {
 }
 
 .stat-pill {
-    background: rgba(124,99,255,0.12);
+    background: var(--accent-soft-bg);
     color: var(--accent-hover);
     border-radius: 20px;
     padding: 3px 10px;
-    font-size: 11px;
+    font-size: 0.75rem;
     font-weight: 500;
 }
 
 .stat-pill.warn {
-    background: rgba(255, 149, 0, 0.15);
-    color: #e5a000;
+    background: var(--warn-bg);
+    color: var(--warn-fg);
 }
 
 .doc-type-badge {
     display: inline-block;
-    background: rgba(123, 97, 255, 0.08);
-    border: 1px solid rgba(123, 97, 255, 0.25);
-    color: var(--accent);
+    background: var(--accent-soft-bg);
+    border: 1px solid var(--accent-glow);
+    color: var(--accent-soft-fg); /* 6a: accent-as-text on a tinted fill */
     border-radius: 20px;
     padding: 3px 10px;
-    font-size: 11px;
+    font-size: 0.75rem;
     font-weight: 500;
     margin-left: 8px;
     vertical-align: middle;
@@ -1009,7 +1436,7 @@ input[type="range"] {
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(0,0,0,0.55);
+    background: var(--overlay-scrim);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
     z-index: 1000;
@@ -1024,7 +1451,7 @@ input[type="range"] {
 .modal {
     background: var(--bg-card);
     border-radius: 14px;
-    border: 1px solid rgba(255,255,255,0.10);
+    border: 1px solid var(--border);
     padding: 28px;
     width: 480px;
     max-width: 95vw;
@@ -1036,7 +1463,7 @@ input[type="range"] {
 
 .modal h2 {
     margin: 0 0 20px;
-    font-size: 17px;
+    font-size: 1.0625rem;
     font-weight: 700;
     letter-spacing: -0.4px;
 }
@@ -1055,7 +1482,7 @@ input[type="range"] {
     background: transparent;
     border: none;
     color: var(--text-secondary);
-    font-size: 18px;
+    font-size: 1.125rem;
     line-height: 1;
     cursor: pointer;
     padding: 4px 6px;
@@ -1065,7 +1492,7 @@ input[type="range"] {
 
 .modal-close-btn:hover {
     color: var(--text-primary);
-    background: rgba(255,255,255,0.09);
+    background: var(--surface-hover-strong);
 }
 
 .rt-item {
@@ -1079,7 +1506,7 @@ input[type="range"] {
 }
 
 .rt-item-name {
-    font-size: 13px;
+    font-size: 0.8125rem;
     font-weight: 500;
 }
 
@@ -1092,9 +1519,9 @@ input[type="range"] {
     display: none;
     margin: 0 -16px;
     padding: 8px 16px;
-    background: rgba(123,97,255,0.10);
+    background: var(--accent-soft-bg);
     border-top: 1px solid var(--border);
-    font-size: 11px;
+    font-size: 0.75rem;
     color: var(--text-secondary);
 }
 
@@ -1157,14 +1584,40 @@ input[type="range"] {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* Indeterminate indexing activity bar (see #vault-index-progress). */
+.index-progress {
+    height: 4px;
+    margin: 0 16px 6px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.index-progress[hidden] { display: none; }
+.index-progress-bar {
+    height: 100%;
+    width: 35%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+    animation: index-indeterminate 1.3s ease-in-out infinite;
+}
+@keyframes index-indeterminate {
+    0%   { margin-left: -35%; }
+    100% { margin-left: 100%; }
+}
+/* Reduced motion: the moving bar would freeze off-screen under the global
+   animation kill, so show a static full-width fill as the "busy" signal. */
+@media (prefers-reduced-motion: reduce) {
+    .index-progress-bar { width: 100%; margin-left: 0; }
+}
+
 /* ── Thin native-feeling scrollbars ── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-    background: rgba(255,255,255,0.11);
+    background: var(--scrollbar-thumb);
     border-radius: 3px;
 }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.20); }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 ::-webkit-scrollbar-corner { background: transparent; }
 
 /* --- Library Audit tab --- */
@@ -1184,12 +1637,12 @@ input[type="range"] {
     padding: 8px 10px;
 }
 .audit-summary-value {
-    font-size: 18px;
+    font-size: 1.125rem;
     font-weight: 600;
     color: var(--text-primary);
 }
 .audit-summary-label {
-    font-size: 11px;
+    font-size: 0.75rem;
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -1197,11 +1650,11 @@ input[type="range"] {
 .audit-summary-warning {
     margin-top: 8px;
     padding: 8px 10px;
-    background: rgba(255, 69, 58, 0.08);
+    background: var(--danger-bg);
     color: var(--danger-hover);
-    border: 1px solid rgba(255, 69, 58, 0.30);
+    border: 1px solid var(--danger-border);
     border-radius: var(--radius-sm);
-    font-size: 13px;
+    font-size: 0.8125rem;
 }
 .audit-report-tabs {
     display: flex;
@@ -1217,7 +1670,7 @@ input[type="range"] {
     padding: 6px 10px;
     border-radius: var(--radius-sm) var(--radius-sm) 0 0;
     cursor: pointer;
-    font-size: 13px;
+    font-size: 0.8125rem;
 }
 .audit-report-tab.active {
     background: var(--bg-elevated);
@@ -1228,7 +1681,7 @@ input[type="range"] {
 .audit-report-meta {
     padding: 8px 16px;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 .audit-report-body {
     overflow-x: auto;
@@ -1237,7 +1690,7 @@ input[type="range"] {
 .audit-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 13px;
+    font-size: 0.8125rem;
 }
 .audit-table th,
 .audit-table td {
@@ -1262,10 +1715,13 @@ input[type="range"] {
 .audit-link-btn {
     background: transparent;
     border: none;
-    color: var(--accent);
+    min-height: 24px;   /* 6d: was padding 0 2px — a sliver of a target */
+    /* 6a: --accent as TEXT on the dark card was 3.75:1; the soft-fg token is
+       the text-grade accent (>=4.5 on every surface it sits on, both themes). */
+    color: var(--accent-soft-fg);
     cursor: pointer;
     padding: 0 2px;
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 .audit-link-btn:hover {
     color: var(--accent-hover);
@@ -1273,7 +1729,7 @@ input[type="range"] {
 }
 .audit-error-tag {
     color: var(--danger);
-    font-size: 11px;
+    font-size: 0.75rem;
     margin-left: 4px;
 }
 
@@ -1306,7 +1762,7 @@ input[type="range"] {
 }
 .control-row .control-group { margin-bottom: 0; }
 
-.muted { color: var(--text-tertiary); font-size: 12px; }
+.muted { color: var(--text-tertiary); font-size: 0.75rem; }
 
 /* Deck Generator is one long single-column form. Unlike chat (.chat-history) it
    had no scroll region of its own, so inside the overflow:hidden .card its lower
@@ -1315,7 +1771,11 @@ input[type="range"] {
    the header (with Generate), the description and the status banner stay pinned
    above it. min-height:0 lets the flex child shrink so it scrolls rather than
    overflowing the card. */
-#deck-tab .deck-body {
+/* Note Refactor reuses the .deck-body class but lives under #refactor-tab, so it
+   needs the same scroll region — without it the analyzer's preview + image rows
+   clip off the bottom of the overflow:hidden card with no scrollbar. */
+#deck-tab .deck-body,
+#refactor-tab .deck-body {
     flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
@@ -1326,7 +1786,7 @@ input[type="range"] {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12px;
+    font-size: 0.75rem;
     color: var(--text-secondary);
 }
 .deck-template-hint code,
@@ -1335,15 +1795,23 @@ input[type="range"] {
     background: var(--bg-elevated);
     border-radius: 4px;
     padding: 1px 5px;
-    font-size: 11px;
+    font-size: 0.75rem;
 }
 
 .deck-tex-output {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
+    font-size: 0.75rem;
     line-height: 1.45;
     white-space: pre;
     resize: vertical;
+}
+
+.deck-tex-block { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.deck-tex-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
 }
 
 .deck-activity {
@@ -1355,7 +1823,7 @@ input[type="range"] {
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 .deck-activity:empty { display: none; }
 .deck-activity-line { color: var(--text-secondary); padding: 1px 0; }
@@ -1369,8 +1837,8 @@ input[type="range"] {
     border: 1px solid var(--danger);
     border-radius: var(--radius-sm);
     padding: 8px 12px;
-    background: rgba(255,69,58,0.08);
-    font-size: 12px;
+    background: var(--danger-bg);
+    font-size: 0.75rem;
     color: var(--text-secondary);
 }
 .deck-warnings ul { margin: 6px 0 0; padding-left: 18px; }
@@ -1385,34 +1853,36 @@ input[type="range"] {
     border-radius: var(--radius-sm);
     padding: 6px 10px;
     margin: 6px 0;
-    font-size: 13px;
+    font-size: 0.8125rem;
 }
 .refactor-discrepancy ul { margin: 4px 0 0; padding-left: 18px; }
-.refactor-discrepancy li { color: var(--text-secondary); font-size: 12px; }
+.refactor-discrepancy li { color: var(--text-secondary); font-size: 0.75rem; }
 
-.refactor-note-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.refactor-note-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; }
 
 .refactor-badge {
-    font-size: 10px;
+    font-size: 0.75rem;
     text-transform: uppercase;
     letter-spacing: 0.4px;
     padding: 1px 6px;
     border-radius: 10px;
     background: var(--bg-elevated);
-    color: var(--text-tertiary);
+    /* 6a: tertiary was 4.12:1 on the elevated fill — under AA for this
+       10px uppercase label; secondary clears 6:1 in both themes. */
+    color: var(--text-secondary);
 }
 .refactor-badge.badge-changed { background: var(--accent-glow); color: var(--accent-hover); }
-.refactor-badge.badge-table { background: rgba(255,159,10,0.18); color: #ffb340; }
+.refactor-badge.badge-table { background: var(--warn-bg); color: var(--warn-fg); }
 .refactor-badge.badge-status { background: var(--bg-elevated); color: var(--text-secondary); }
 
-.refactor-hygiene { color: var(--danger-hover); font-size: 12px; margin: 4px 0; }
+.refactor-hygiene { color: var(--danger-hover); font-size: 0.75rem; margin: 4px 0; }
 
 .refactor-image {
     border-top: 1px solid var(--border);
     padding: 8px 0;
 }
 .refactor-image-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
-.refactor-image-head code { font-size: 11px; }
+.refactor-image-head code { font-size: 0.75rem; }
 .refactor-image-body { display: flex; gap: 12px; align-items: flex-start; }
 .refactor-thumb {
     max-width: 280px;
@@ -1422,14 +1892,40 @@ input[type="range"] {
     background: var(--bg-app);
 }
 .refactor-image-side { flex: 1; min-width: 0; }
-.refactor-desc { font-size: 13px; color: var(--text-secondary); white-space: pre-wrap; }
+.refactor-desc { font-size: 0.8125rem; color: var(--text-secondary); white-space: pre-wrap; }
 .refactor-desc:empty { display: none; }
-.refactor-image-actions { display: flex; gap: 6px; margin: 8px 0 4px; }
+.refactor-image-actions { display: flex; gap: 6px; margin: 8px 0 4px; flex-wrap: wrap; }
 .refactor-extract-out:empty { display: none; }
+/* Per-note formatting-fix opt-in. */
+.refactor-norm-approve { margin: 8px 0; font-size: 0.8125rem; }
+/* Per-image OCR-inclusion panel (request d): a collapsible overview of every
+   attached image with an include checkbox, above the preview. */
+.refactor-incl-panel { margin: 10px 0; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
+.refactor-incl-panel > summary { cursor: pointer; font-weight: 600; font-size: 0.8125rem; }
+.refactor-incl-status { margin-left: 8px; font-size: 0.75rem; }
+.refactor-incl-list { max-height: 260px; overflow-y: auto; margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.refactor-incl-row { display: flex; align-items: flex-start; gap: 8px; padding: 5px 6px; border-radius: 5px; cursor: pointer; }
+.refactor-incl-row:hover { background: var(--bg-elevated); }
+.refactor-incl-excluded { opacity: 0.5; }
+.refactor-incl-cb { margin-top: 3px; flex: 0 0 auto; }
+.refactor-incl-thumb { width: 40px; height: 40px; object-fit: cover; border-radius: 3px; flex: 0 0 auto; background: var(--bg-elevated); }
+.refactor-incl-text { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.refactor-incl-top { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.refactor-incl-top code { word-break: break-all; }
+.refactor-incl-snippet { font-size: 0.75rem; white-space: normal; }
+/* On-demand LLM actions panel (requests b/c/e) with section-scope selector (f). */
+.refactor-llm-panel { margin: 12px 0; padding-top: 8px; border-top: 1px solid var(--border); }
+.refactor-llm-scope { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0; font-size: 0.8125rem; }
+.refactor-section-select { max-width: 320px; }
+.refactor-llm-out { margin-top: 8px; }
+.refactor-llm-out:empty { display: none; }
+/* Free-prompt edit (single-shot instruction → applyable proposal). */
+.refactor-custom { margin: 8px 0; }
+.refactor-custom-instruction { width: 100%; min-height: 48px; resize: vertical; box-sizing: border-box; font: inherit; }
 .refactor-extract-text {
     white-space: pre-wrap;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
+    font-size: 0.75rem;
     background: var(--bg-app);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -1437,14 +1933,14 @@ input[type="range"] {
     margin: 4px 0;
     overflow-x: auto;
 }
-.refactor-extract-warn { color: #ffb340; font-size: 12px; margin: 4px 0; }
-.refactor-extract-error { color: var(--danger); font-size: 12px; margin: 4px 0; }
+.refactor-extract-warn { color: var(--warn-fg); font-size: 0.75rem; margin: 4px 0; }
+.refactor-extract-error { color: var(--danger); font-size: 0.75rem; margin: 4px 0; }
 
 .refactor-diff {
     white-space: pre;
     overflow-x: auto;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
+    font-size: 0.75rem;
     line-height: 1.45;
     background: var(--bg-app);
     border: 1px solid var(--border);
@@ -1452,10 +1948,21 @@ input[type="range"] {
     padding: 8px 10px;
     margin-top: 6px;
 }
-.refactor-diff .diff-add { color: #4ade80; }
+.refactor-diff .diff-add { color: var(--ok-fg); }
 .refactor-diff .diff-del { color: var(--danger-hover); }
 .refactor-diff .diff-hunk { color: var(--accent-hover); }
 .refactor-diff .diff-ctx { color: var(--text-tertiary); }
+
+/* Track 6e: shared inline confirmation strip (ui.js::confirmInline). */
+.inline-confirm-strip {
+    margin-top: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--danger-border);
+    border-radius: var(--radius-sm);
+    background: var(--danger-bg);
+}
+.inline-confirm-msg { font-size: 0.8125rem; margin-bottom: 8px; }
+.inline-confirm-actions { display: flex; gap: 8px; }
 
 /* --- Note Refactor hub: master-detail layout (Phase 1.5) --- */
 .refactor-layout { display: flex; gap: 12px; margin-top: 10px; align-items: flex-start; }
@@ -1474,7 +1981,7 @@ input[type="range"] {
 .refactor-note-list:empty::before {
     content: "No notes yet.";
     color: var(--text-tertiary);
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 .refactor-note-entry {
     cursor: pointer;
@@ -1485,7 +1992,13 @@ input[type="range"] {
     gap: 3px;
 }
 .refactor-note-entry:hover { background: var(--bg-elevated); }
-.refactor-note-entry.selected { background: var(--accent-glow); }
+/* Selection signalled by an accent left-border + weight, not tint alone (the
+   accent-glow fill is easy to miss, especially in light mode). */
+.refactor-note-entry.selected {
+    background: var(--accent-glow);
+    box-shadow: inset 3px 0 0 var(--accent);
+}
+.refactor-note-entry.selected .refactor-note-path { color: var(--text-primary); font-weight: 600; }
 .refactor-note-entry .refactor-note-path { word-break: break-all; }
 .refactor-entry-badges { display: flex; gap: 4px; flex-wrap: wrap; }
 
@@ -1497,21 +2010,32 @@ input[type="range"] {
     background: var(--bg-card);
     padding: 10px 12px;
 }
-.refactor-detail-placeholder { font-size: 13px; padding: 12px 4px; }
+.refactor-detail-placeholder { font-size: 0.8125rem; padding: 12px 4px; }
 .refactor-detail-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
-.refactor-view-toggle { display: flex; gap: 6px; margin-bottom: 8px; }
+.refactor-view-toggle { display: flex; gap: 6px; margin: 8px 0; }
+
+.refactor-review { margin: 8px 0; }
+.refactor-review-out:empty { display: none; }
+.refactor-review-out {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.8125rem;
+}
+.refactor-review-body { margin-top: 6px; }
 
 .refactor-md-cols { display: flex; gap: 12px; align-items: flex-start; }
 .refactor-md-col { flex: 1; min-width: 0; }
 .refactor-md-col-label {
-    font-size: 11px;
+    font-size: 0.75rem;
     text-transform: uppercase;
     letter-spacing: 0.4px;
     color: var(--text-tertiary);
     margin-bottom: 4px;
 }
 .refactor-md-preview {
-    font-size: 13px;
+    font-size: 0.8125rem;
     color: var(--text-secondary);
     background: var(--bg-app);
     border: 1px solid var(--border);
@@ -1535,29 +2059,55 @@ input[type="range"] {
 /* Classification + ignore states */
 .refactor-badge.badge-muted { background: var(--bg-elevated); color: var(--text-tertiary); }
 .refactor-badge.badge-classify { background: var(--bg-elevated); color: var(--text-secondary); }
-.refactor-badge.badge-handwritten { background: rgba(255,159,10,0.18); color: #ffb340; }
+.refactor-badge.badge-handwritten { background: var(--warn-bg); color: var(--warn-fg); }
 .refactor-image-ignored { opacity: 0.5; }
-.refactor-classify-result { font-size: 13px; color: var(--text-secondary); margin: 4px 0; }
+.refactor-classify-result { font-size: 0.8125rem; color: var(--text-secondary); margin: 4px 0; }
 
 /* Phase 2 — vault-write controls (apply / archive / restore). */
 .refactor-approve-cb { margin-right: 6px; cursor: pointer; }
-.refactor-archive-btn { border-color: rgba(255,159,10,0.5); }
+.refactor-archive-btn { border-color: var(--warn-border); }
 .refactor-archive-confirm {
-    font-size: 13px; color: var(--text-secondary);
-    background: rgba(255,159,10,0.08); border: 1px solid rgba(255,159,10,0.25);
+    font-size: 0.8125rem; color: var(--text-secondary);
+    background: var(--warn-bg); border: 1px solid var(--warn-border);
     border-radius: 6px; padding: 8px; margin: 6px 0;
 }
-.refactor-archived-note { font-size: 12px; margin-top: 6px; }
+.refactor-archived-note { font-size: 0.75rem; margin-top: 6px; }
 .refactor-confirm-list {
     max-height: 240px; overflow-y: auto; margin: 8px 0; padding-left: 18px;
-    font-size: 13px; color: var(--text-secondary);
+    font-size: 0.8125rem; color: var(--text-secondary);
 }
 .refactor-confirm-list li { margin: 2px 0; word-break: break-all; }
 .refactor-restore-list { max-height: 50vh; overflow-y: auto; margin: 8px 0; }
 .refactor-restore-op {
     display: grid; grid-template-columns: 1fr auto; align-items: center;
     gap: 4px 12px; padding: 8px 0; border-bottom: 1px solid var(--border);
-    font-size: 13px;
+    font-size: 0.8125rem;
 }
-.refactor-restore-op .muted { grid-column: 1; font-size: 12px; }
+.refactor-restore-op .muted { grid-column: 1; font-size: 0.75rem; }
 .refactor-restore-op button { grid-row: 1 / span 2; grid-column: 2; }
+
+/* --- Light-touch responsiveness (macOS window resize) -----------------------
+   The app targets a wide desktop window; these breakpoints stop the fixed-width
+   chrome (sidebar, config panes) and the 6-tab header from clipping when the
+   window is dragged narrow — without an off-canvas drawer rework. */
+
+/* The tab header scrolls horizontally rather than clipping or wrapping to two
+   rows; the thin scrollbar is hidden (the tabs themselves remain reachable by
+   click and by the existing arrow-key roving navigation). */
+.tabs { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { height: 0; }
+
+@media (max-width: 1024px) {
+    .sidebar { width: 240px; padding: 18px 14px; }
+    .pane-config { width: 260px; padding: 20px; }
+    #document-tab.active { grid-template-columns: 260px minmax(0, 1fr); }
+    .refactor-note-list { flex-basis: 220px; }
+}
+
+@media (max-width: 820px) {
+    .sidebar { width: 210px; }
+    .header { padding: 0 14px; }
+    .pane-view { padding: 16px; }
+    .pane-config { width: 230px; padding: 16px; }
+    #document-tab.active { grid-template-columns: 230px minmax(0, 1fr); }
+}

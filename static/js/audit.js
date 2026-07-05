@@ -12,7 +12,7 @@
 // interpolate server data into innerHTML, so every cell is run through the _esc /
 // _attr HTML-escape helpers — there is no createElement path here.
 import { secureFetch, logError } from './api.js';
-import { setStatusA11y, closeModal, taskBegin, taskEnd } from './ui.js';
+import { setStatusA11y, closeModal, taskBegin, taskEnd, makeLatestGate } from './ui.js';
 
 const _STATUS_POLL_MS = 1500;
 let _statusPollTimer = null;
@@ -186,14 +186,22 @@ function _stopStatusPolling() {
     }
 }
 
+// Item 3.3: the 1.5 s poll had no staleness discipline — a slow status
+// response could render its banner (and even fire _loadReport) AFTER a newer
+// poll already painted fresher state. Latest-wins per poll tick.
+const _statusPollGate = makeLatestGate();
+
 async function _pollStatus() {
+    const isCurrent = _statusPollGate.enter();
     let status;
     try {
         status = await _getStatus();
     } catch (e) {
+        if (!isCurrent()) return;
         _showError(String(e));
         return;
     }
+    if (!isCurrent()) return;
     _renderStatusBanner(status);
     if (status.state !== 'scanning') {
         _stopStatusPolling();
@@ -255,10 +263,20 @@ export async function selectAuditReport(name) {
         t.setAttribute('aria-selected', selected ? 'true' : 'false');
         t.setAttribute('tabindex', selected ? '0' : '-1');
     });
+    // Track 6c: keep the tabpanel's accessible name in sync with the active
+    // tab (the static markup names the initial Inventory tab only).
+    const panel = document.getElementById('audit-report-body');
+    if (panel) panel.setAttribute('aria-labelledby', 'audit-rtab-' + name);
     await _loadReport(name);
 }
 
+// Item 3.3: rapid report-tab switches raced — the SLOWER response rendered
+// last, leaving report A's table under report B's selected tab. Latest-wins:
+// a superseded load abandons before touching the DOM.
+const _reportLoadGate = makeLatestGate();
+
 async function _loadReport(name) {
+    const isCurrent = _reportLoadGate.enter();
     const meta = document.getElementById('audit-report-meta');
     const body = document.getElementById('audit-report-body');
     const tabs = document.getElementById('audit-report-tabs');
@@ -269,6 +287,7 @@ async function _loadReport(name) {
         if (name === 'inventory') {
             const r = await secureFetch('/api/audit/inventory');
             const d = await r.json();
+            if (!isCurrent()) return;
             if (!r.ok) {
                 _hideReport();
                 _showError(d.error || 'Inventory unavailable');
@@ -289,6 +308,7 @@ async function _loadReport(name) {
         } else {
             const r = await secureFetch(`/api/audit/reports/${encodeURIComponent(name)}`);
             const d = await r.json();
+            if (!isCurrent()) return;
             if (!r.ok) {
                 _hideReport();
                 _showError(d.error || 'Report unavailable');
@@ -309,6 +329,7 @@ async function _loadReport(name) {
         }
         _wireRowActions();
     } catch (e) {
+        if (!isCurrent()) return;
         body.textContent = '';
         _showError(String(e));
     }
@@ -349,8 +370,8 @@ function _summaryHtml(s) {
 function _inventoryTable(records) {
     const head = `
         <thead><tr>
-            <th>Citation key</th><th>Year</th><th>Author</th><th>Title</th>
-            <th>Bib</th><th>Zot</th><th>Note</th><th>PDFs</th><th>Annot</th><th>Match</th>
+            <th scope="col">Citation key</th><th scope="col">Year</th><th scope="col">Author</th><th scope="col">Title</th>
+            <th scope="col">Bib</th><th scope="col">Zot</th><th scope="col">Note</th><th scope="col">PDFs</th><th scope="col">Annot</th><th scope="col">Match</th>
         </tr></thead>`;
     const rows = records.map(r => `
         <tr>
@@ -361,7 +382,7 @@ function _inventoryTable(records) {
             <td>${r.has_bib_entry ? '✓' : ''}</td>
             <td>${r.has_zotero_item ? '✓' : ''}</td>
             <td>${r.has_obsidian_note ? '✓' : ''}</td>
-            <td>${r.pdf_count}${_pdfActions(r)}</td>
+            <td>${_esc(r.pdf_count)}${_pdfActions(r)}</td>
             <td>${r.annotations_count_max >= 0 ? r.annotations_count_max : '—'}</td>
             <td>${_esc((r.match_sources || []).join(','))}</td>
         </tr>`).join('');
@@ -377,8 +398,8 @@ function _pdfActions(r) {
 
 function _renderReport(name, d) {
     if (name === 'note_tag_drift') {
-        const meta = `${d.rows.length} citation keys with Zotero note tags that the Obsidian YAML is missing.`;
-        const head = '<thead><tr><th>Key</th><th>Author</th><th>Title</th><th>Zotero note tags</th><th>Obs YAML tags</th><th>Missing in Obs</th></tr></thead>';
+        const meta = `${_esc(d.rows.length)} citation keys with Zotero note tags that the Obsidian YAML is missing.`;
+        const head = '<thead><tr><th scope="col">Key</th><th scope="col">Author</th><th scope="col">Title</th><th scope="col">Zotero note tags</th><th scope="col">Obs YAML tags</th><th scope="col">Missing in Obs</th></tr></thead>';
         const rows = d.rows.map(r => `
             <tr>
                 <td>${_esc(r.citation_key)}</td>
@@ -391,16 +412,16 @@ function _renderReport(name, d) {
         return [meta, `<table class="audit-table">${head}<tbody>${rows}</tbody></table>`];
     }
     if (name === 'unread_unzoterod') {
-        const meta = `${d.rows.length} unmapped PDFs with fewer than ${d.threshold} annotations · ${d.ambiguous_count} ambiguous PDFs excluded.`;
+        const meta = `${_esc(d.rows.length)} unmapped PDFs with fewer than ${_esc(d.threshold)} annotations · ${_esc(d.ambiguous_count)} ambiguous PDFs excluded.`;
         return [meta, _pdfReportTable(d.rows)];
     }
     if (name === 'read_unzoterod') {
-        const meta = `${d.rows.length} unmapped PDFs ranked by annotation count (suggested read cutoff: ${d.suggested_read_cutoff}).`;
+        const meta = `${_esc(d.rows.length)} unmapped PDFs ranked by annotation count (suggested read cutoff: ${_esc(d.suggested_read_cutoff)}).`;
         return [meta, _pdfReportTable(d.rows)];
     }
     if (name === 'zotero_unread') {
-        const meta = `${d.rows.length} bib entries with a Zotero parent but no child note · ${d.skipped_no_zotero_match} skipped (no Zotero title match).`;
-        const head = '<thead><tr><th>Year</th><th>Key</th><th>Author</th><th>Title</th></tr></thead>';
+        const meta = `${_esc(d.rows.length)} bib entries with a Zotero parent but no child note · ${_esc(d.skipped_no_zotero_match)} skipped (no Zotero title match).`;
+        const head = '<thead><tr><th scope="col">Year</th><th scope="col">Key</th><th scope="col">Author</th><th scope="col">Title</th></tr></thead>';
         const rows = d.rows.map(r => `
             <tr>
                 <td>${_esc(r.year || '')}</td>
@@ -411,8 +432,8 @@ function _renderReport(name, d) {
         return [meta, `<table class="audit-table">${head}<tbody>${rows}</tbody></table>`];
     }
     if (name === 'zotero_no_pdf') {
-        const meta = `${d.rows.length} bib entries with no resolved PDF.`;
-        const head = '<thead><tr><th>Year</th><th>Key</th><th>Author</th><th>Title</th><th>Zotero match</th></tr></thead>';
+        const meta = `${_esc(d.rows.length)} bib entries with no resolved PDF.`;
+        const head = '<thead><tr><th scope="col">Year</th><th scope="col">Key</th><th scope="col">Author</th><th scope="col">Title</th><th scope="col">Zotero match</th></tr></thead>';
         const rows = d.rows.map(r => `
             <tr>
                 <td>${_esc(r.year || '')}</td>
@@ -424,8 +445,8 @@ function _renderReport(name, d) {
         return [meta, `<table class="audit-table">${head}<tbody>${rows}</tbody></table>`];
     }
     if (name === 'duplicates') {
-        const meta = `${d.rows.length} duplicate sets · ${_fmtBytes(d.total_wasted_bytes)} wasted.`;
-        const head = '<thead><tr><th>Hash</th><th>Size</th><th>Wasted</th><th>Files</th></tr></thead>';
+        const meta = `${_esc(d.rows.length)} duplicate sets · ${_fmtBytes(d.total_wasted_bytes)} wasted.`;
+        const head = '<thead><tr><th scope="col">Hash</th><th scope="col">Size</th><th scope="col">Wasted</th><th scope="col">Files</th></tr></thead>';
         const rows = d.rows.map(r => `
             <tr>
                 <td><code>${_esc(r.content_hash.slice(0, 12))}</code></td>
@@ -439,7 +460,7 @@ function _renderReport(name, d) {
 }
 
 function _pdfReportTable(rows) {
-    const head = '<thead><tr><th>Annot</th><th>Path</th><th></th></tr></thead>';
+    const head = '<thead><tr><th scope="col">Annot</th><th scope="col">Path</th><th scope="col"></th></tr></thead>';
     const body = rows.map(r => `
         <tr>
             <td>${r.annotations}${r.error ? ` <span class="audit-error-tag">(${_esc(r.error)})</span>` : ''}</td>
@@ -491,11 +512,14 @@ function _fmtBytes(n) {
 }
 
 function _esc(s) {
+    // Item 3.8 (carried 07-02 4.3): single quotes escaped too — an attribute
+    // interpolation inside single-quoted HTML could otherwise break out.
     return String(s == null ? '' : s)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 function _attr(s) {

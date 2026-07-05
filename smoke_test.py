@@ -476,6 +476,32 @@ class ChatEKLDSmokeTest(unittest.TestCase):
         # 10 of the last 110 must be throttled — the cap is 100 per window.
         self.assertGreaterEqual(throttled_count, 10)
 
+    def test_27b_log_tail_reads_and_redacts(self):
+        """GET /api/log/tail tails the log, redacts keys, and is local-origin gated."""
+        from core.constants import LOG_FILE
+        # Seed the canonical log file (LOG_FILE honours CHATEKLD_BASE_DIR, which
+        # conftest pins to a temp dir, so this never touches the real log).
+        with open(LOG_FILE, "w", encoding="utf-8") as fh:
+            for i in range(30):
+                fh.write(f"line {i}\n")
+            fh.write("oops leaked sk-ant-api03-ABCDEF1234567890SECRETKEY here\n")
+
+        resp = self.client.get("/api/log/tail?lines=5", headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertTrue(data["exists"])
+        self.assertEqual(data["lines"], 5)
+        # The API key must never reach the UI.
+        self.assertNotIn("sk-ant-api03-ABCDEF", data["text"])
+        self.assertIn("line 29", data["text"])
+
+        # Garbage ``lines`` param falls back to the default (does not 500).
+        self.assertEqual(
+            self.client.get("/api/log/tail?lines=xyz", headers=self.headers).status_code, 200)
+
+        # Local-origin gate: the X-Requested-With header is mandatory.
+        self.assertEqual(self.client.get("/api/log/tail").status_code, 403)
+
     def test_28_delete_upload(self):
         """DELETE /api/upload/<id> removes the stored row."""
         import sqlite3 as _sqlite3
@@ -553,8 +579,13 @@ class ChatEKLDSmokeTest(unittest.TestCase):
         """POST /api/reset with wipe_feedback=true and wipe_config=true deletes
         the corresponding files when they exist.
         """
-        import tempfile, unittest.mock as mock
-        from app import FEEDBACK_FILE, CONFIG_FILE
+        import tempfile
+        import unittest.mock as mock
+        # Importability canary, not a real use: CLAUDE.md documents that
+        # FEEDBACK_FILE / CONFIG_FILE stay importable from `app` because this
+        # test patches them at app.FEEDBACK_FILE / app.CONFIG_FILE below. The
+        # import failing IS the regression this line exists to catch.
+        from app import FEEDBACK_FILE, CONFIG_FILE  # noqa: F401
 
         # Create temporary stand-ins so we do not touch real user files.
         with (
@@ -592,6 +623,62 @@ class ChatEKLDSmokeTest(unittest.TestCase):
             for path in (fake_feedback, fake_config):
                 if os.path.exists(path):
                     os.unlink(path)
+
+    # ------------------------------------------------------------------
+    # Item 4.1 — app-level origin guard (before_request hook)
+    # ------------------------------------------------------------------
+
+    def test_all_routes_gated(self):
+        """Every ``/api/*`` route returns 403 without the CSRF header.
+
+        Item 4.1: the origin guard is now a single ``before_request`` hook
+        (``api.security.register_origin_guard``) instead of 67 inline checks.
+        This test introspects ``app.url_map`` and confirms that every ``/api/``
+        rule is rejected when the required ``X-Requested-With: ChatEKLD``
+        header is absent — so a new blueprint cannot silently forget the gate.
+
+        Defect and failure scenario: a new /api/* route registered without an
+        origin check would be remotely accessible from any webpage with a
+        matching Origin (CSRF attack via a malicious page opened alongside
+        the app).
+
+        Why the change is safe: the before_request hook runs before any
+        handler code; the response shape (``{"error": "Forbidden"}``, 403)
+        is byte-identical to the old inline pattern; no migration needed.
+
+        Invariant: request.path.startswith("/api/") AND NOT origin_is_local()
+        → HTTP 403 with ``{"error": "Forbidden"}``.
+        """
+        # Use a fresh test client WITHOUT the CSRF header.
+        client = app.test_client()
+        seen = set()
+        for rule in app.url_map.iter_rules():
+            if not rule.rule.startswith("/api/"):
+                continue
+            # Normalise to just the path (skip HEAD which Flask auto-adds).
+            for method in (rule.methods - {"OPTIONS", "HEAD"}):
+                key = (rule.rule, method)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if method == "GET":
+                    resp = client.get(rule.rule)
+                elif method == "POST":
+                    resp = client.post(rule.rule)
+                elif method == "DELETE":
+                    resp = client.delete(rule.rule)
+                else:
+                    continue
+                self.assertEqual(
+                    resp.status_code, 403,
+                    f"{method} {rule.rule} returned {resp.status_code}, "
+                    f"expected 403 without X-Requested-With header",
+                )
+
+    def test_origin_guard_allows_with_csrf_header(self):
+        """``GET /api/status`` succeeds with the correct CSRF header."""
+        resp = self.client.get("/api/status", headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
 
 
 class ExtractAllPagesTest(unittest.TestCase):
@@ -774,6 +861,119 @@ class ConfigCacheTest(unittest.TestCase):
         second = load_config()
         self.assertNotEqual(second.get("llm"), "caller-side-mutation")
         self.assertNotIn("caller-side-mutation", second.get("vault_exclude_dirs", []))
+
+    def test_load_config_readonly_reflects_values_and_blocks_mutation(self):
+        # W7b: the read-only view returns the same values as load_config, does no
+        # deepcopy, and blocks top-level mutation so it can't poison the cache.
+        from core.config import load_config, load_config_readonly, save_config
+        save_config({"llm": "ro-test-model"})
+        ro = load_config_readonly()
+        self.assertEqual(ro.get("llm"), "ro-test-model")
+        with self.assertRaises(TypeError):      # MappingProxyType is read-only
+            ro["llm"] = "should-fail"
+        # A subsequent save is reflected (the cache is replaced, not mutated).
+        save_config({"llm": "ro-test-model-2"})
+        self.assertEqual(load_config_readonly().get("llm"), "ro-test-model-2")
+        # The read-only view never leaks a mutation into what load_config returns.
+        self.assertEqual(load_config().get("llm"), "ro-test-model-2")
+
+
+class TestConfigVersionMigration(unittest.TestCase):
+    """Track 5.7 pinning: config_version stamping + the migration chain.
+
+    Invariant: after any load, the persisted file is at CONFIG_VERSION and
+    contains only KNOWN_KEYS; a client can never set config_version; a
+    future-versioned file (downgraded app) is never migrated backwards.
+    """
+
+    def setUp(self):
+        import tempfile as _tempfile
+        from unittest import mock
+        self._tmpdir = _tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.config_path = os.path.join(self._tmpdir.name, "config.json")
+        patcher = mock.patch("core.config.CONFIG_FILE", self.config_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_raw(self, data: dict) -> None:
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def _read_raw(self) -> dict:
+        with open(self.config_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_every_persisted_key_is_known(self):
+        # KNOWN_KEYS must cover every key any code path persists — the 0->1
+        # prune migration deletes unknown keys, and the POST /api/config
+        # whitelist drops them. obsidian_vault_path was the historical gap:
+        # persisted by rag/vault.py + the config route but absent from
+        # _DEFAULTS, so the whitelist silently un-persisted a vault path set
+        # via the route, and the migration would have wiped it from existing
+        # configs. Add new persisted keys to _DEFAULTS, never around it.
+        from core.config import KNOWN_KEYS
+
+        # Forward guard for the un-persist FAMILY (2026-07-05 audit m1): the
+        # old test only checked two hardcoded keys, so a NEW Settings knob given
+        # a validator but no _DEFAULTS entry would silently un-persist with a
+        # green suite (the exact 4.10 class). EVERY key the Settings route
+        # validates + persists must be in KNOWN_KEYS — otherwise POST
+        # /api/config validates it and then the same request's whitelist drops
+        # it. This now fails HERE instead of shipping.
+        from api.routes.config import _CONFIG_VALIDATORS
+        undefaulted = sorted(set(_CONFIG_VALIDATORS) - set(KNOWN_KEYS))
+        self.assertEqual(
+            undefaulted, [],
+            "Settings validators persist keys absent from core.config._DEFAULTS "
+            f"(they will be silently un-persisted): {undefaulted}",
+        )
+
+        # Route-persisted keys that live outside the validator map.
+        self.assertIn("obsidian_vault_path", KNOWN_KEYS)
+        self.assertIn("config_version", KNOWN_KEYS)
+
+    def test_unversioned_file_is_migrated_pruned_and_stamped(self):
+        from core.config import CONFIG_VERSION, load_config
+        # A pre-version config: one real user key + one key retired long ago.
+        self._write_raw({"llm": "user-model", "some_retired_knob_2024": 5})
+        cfg = load_config()
+        self.assertEqual(cfg.get("llm"), "user-model")
+        self.assertNotIn("some_retired_knob_2024", cfg)
+        on_disk = self._read_raw()
+        self.assertEqual(on_disk.get("config_version"), CONFIG_VERSION)
+        self.assertNotIn("some_retired_knob_2024", on_disk)  # pruned, persisted
+        self.assertEqual(on_disk.get("llm"), "user-model")   # user value kept
+
+    def test_current_version_file_is_not_rewritten(self):
+        from core.config import CONFIG_VERSION, load_config
+        self._write_raw({"config_version": CONFIG_VERSION, "llm": "m"})
+        before = os.stat(self.config_path).st_mtime_ns
+        load_config()
+        self.assertEqual(os.stat(self.config_path).st_mtime_ns, before)
+
+    def test_future_version_is_left_alone(self):
+        from core.config import CONFIG_VERSION, load_config
+        self._write_raw({"config_version": CONFIG_VERSION + 7, "llm": "m"})
+        before = os.stat(self.config_path).st_mtime_ns
+        cfg = load_config()
+        # Never migrated backwards, never rewritten; the newer stamp survives
+        # into the merged view (an older app must not clobber a newer schema).
+        self.assertEqual(os.stat(self.config_path).st_mtime_ns, before)
+        self.assertEqual(cfg.get("config_version"), CONFIG_VERSION + 7)
+
+    def test_save_config_restamps_version_and_survives_old_file(self):
+        from core.config import CONFIG_VERSION, load_config, save_config
+        # Old, unversioned file + a save that tries to forge the version:
+        # exercises the migrate-inside-save reentrancy (RLock) AND the
+        # server-owned stamp in one flow.
+        self._write_raw({"llm": "old-model", "zombie_key": 1})
+        save_config({"llm": "new-model", "config_version": 0})
+        on_disk = self._read_raw()
+        self.assertEqual(on_disk.get("config_version"), CONFIG_VERSION)
+        self.assertEqual(on_disk.get("llm"), "new-model")
+        self.assertNotIn("zombie_key", on_disk)
+        self.assertEqual(load_config().get("llm"), "new-model")
 
 
 class SaveFeedbackNoStallTest(unittest.TestCase):

@@ -4,8 +4,9 @@ Phase 1 ships the deterministic foundation the design (§9) calls for: extract
 ``(subject, dose, line)`` per note, group by normalized subject, and flag a
 subject mentioned in ≥2 notes whose dose values span a wide ratio — a likely
 transcription slip or genuine inconsistency. **Advisory only, never auto-edits**,
-and high-false-positive by nature (subject detection is heuristic). The richer
-LLM atomic-claim extractor is deferred to Phase 3.
+and high-false-positive by nature (subject detection is heuristic). A richer
+LLM atomic-claim extractor was considered in the design but not built; this
+deterministic check is the shipped implementation.
 """
 from __future__ import annotations
 

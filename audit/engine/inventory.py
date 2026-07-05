@@ -293,6 +293,17 @@ def build_inventory(
         except Exception as e:
             zotero_error = f"{type(e).__name__}: {e}"
             zot_items = []
+    else:
+        # No DB at the configured (often default ~/Zotero) path. Surface an
+        # actionable note so the empty Zotero reports are explained — a second
+        # user without Zotero, or with it installed elsewhere, otherwise sees
+        # blank reports with no reason. zotero_error flows to the status feed
+        # (manager.py) and the inventory payload (serialize.py).
+        zotero_error = (
+            f"Zotero database not found at {settings.zotero_sqlite}. If you use "
+            f"Zotero, set its path in Library Audit settings; otherwise the "
+            f"Zotero reports stay empty (this is not an error)."
+        )
     zot_by_title = _index_zotero_by_title(zot_items)
     matched_zot_titles: set[str] = set()
 

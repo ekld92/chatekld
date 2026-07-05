@@ -89,8 +89,10 @@ class TestGLMOCRManagerLock(unittest.TestCase):
 
             t1 = threading.Thread(target=writer)
             t2 = threading.Thread(target=reader)
-            t1.start(); t2.start()
-            t1.join(); t2.join()
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
 
         self.assertEqual(errors, [], f"Concurrency errors: {errors}")
         # All results must be bool, never None
@@ -161,8 +163,10 @@ class TestGLMOCRManagerLock(unittest.TestCase):
 
             t1 = threading.Thread(target=writer)
             t2 = threading.Thread(target=checker)
-            t1.start(); t2.start()
-            t1.join(); t2.join()
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
 
         self.assertEqual(inconsistencies, [], f"Inconsistent state observed: {inconsistencies}")
 
@@ -215,8 +219,10 @@ class TestApiUploadTOCTOU(unittest.TestCase):
 
         t1 = threading.Thread(target=do_upload)
         t2 = threading.Thread(target=do_config_change)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
         # Non-PDF must always be rejected as 400, never a 500 crash.
         self.assertEqual(results.get("upload_status"), 400,
@@ -511,16 +517,16 @@ class TestVisionCallBounds(unittest.TestCase):
         # Unset / non-positive / unparseable -> hard default.
         for value in ({}, {"vision_timeout_s": 0}, {"vision_timeout_s": -3},
                       {"vision_timeout_s": "x"}, {"vision_timeout_s": None}):
-            with patch("core.config.load_config", return_value=value):
+            with patch("core.config.load_config_readonly", return_value=value):
                 self.assertEqual(_cfg_bounded_int("vision_timeout_s", 120, 5, 600), 120)
         # In-range value is returned verbatim.
-        with patch("core.config.load_config", return_value={"vision_timeout_s": 45}):
+        with patch("core.config.load_config_readonly", return_value={"vision_timeout_s": 45}):
             self.assertEqual(_cfg_bounded_int("vision_timeout_s", 120, 5, 600), 45)
         # Positive but out-of-range -> CLAMPED (defends a hand-edited config.json
         # that bypassed the POST /api/config validator).
-        with patch("core.config.load_config", return_value={"vision_timeout_s": 99999}):
+        with patch("core.config.load_config_readonly", return_value={"vision_timeout_s": 99999}):
             self.assertEqual(_cfg_bounded_int("vision_timeout_s", 120, 5, 600), 600)
-        with patch("core.config.load_config", return_value={"vision_timeout_s": 1}):
+        with patch("core.config.load_config_readonly", return_value={"vision_timeout_s": 1}):
             self.assertEqual(_cfg_bounded_int("vision_timeout_s", 120, 5, 600), 5)
 
     def test_fit_downscales_oversized_noops_small_survives_junk(self):
@@ -547,7 +553,7 @@ class TestVisionCallBounds(unittest.TestCase):
             return "desc"
 
         mgr = VisionManager(model="m", provider="lm_studio")
-        with patch("core.config.load_config", return_value={}), \
+        with patch("core.config.load_config_readonly", return_value={}), \
              patch("services.vision._chat_lm_studio_image", side_effect=fake):
             out = mgr.describe_image(self._big_png_b64())
 
@@ -566,7 +572,7 @@ class TestVisionCallBounds(unittest.TestCase):
             return "page text"
 
         mgr = GLMOCRManager(model="ocr", provider="lm_studio")
-        with patch("core.config.load_config",
+        with patch("core.config.load_config_readonly",
                    return_value={"vision_timeout_s": 90, "ocr_max_tokens": 2048}), \
              patch("services.vision._chat_lm_studio_image", side_effect=fake):
             out = mgr.extract_page_text("data")
@@ -606,6 +612,209 @@ class TestVisionCallBounds(unittest.TestCase):
         self.assertEqual(captured["client_kw"]["max_retries"], 0)
         self.assertNotIn("timeout", captured["client_kw"])
         self.assertNotIn("max_tokens", captured["create_kw"])
+
+
+class TestOpLockEpochToken(unittest.TestCase):
+    """Pinning tests for the per-operation op-lock epoch token (improvement
+    plan 2026-07-04, item 1.5).
+
+    The defect: ``ObsidianVaultManager.try_acquire_lock`` cached the epoch in a
+    shared ``self._lock_epoch`` attribute that ``release_lock``/``heartbeat``
+    read at CALL time — so any new acquisition overwrote the token a
+    still-running previous holder would later release with (cancel an index
+    run, start a refactor Apply, and the indexer's ``finally`` released the
+    refactor's lock mid-batch). The invariant pinned here: **a holder can only
+    release/extend the acquisition whose epoch it captured at acquire time** —
+    a stale holder's release/heartbeat is a no-op against a newer acquisition.
+    """
+
+    def setUp(self):
+        # A fresh manager (never the singleton) — these tests only exercise the
+        # op-lock facade, no vault path / index state involved.
+        from rag.vault import ObsidianVaultManager
+        self.manager = ObsidianVaultManager()
+
+    def test_acquire_returns_truthy_epoch_and_refusal_returns_none(self):
+        epoch = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(epoch)                    # truthy — `if not` guards keep working
+        self.assertIsInstance(epoch, int)
+        self.assertIsNone(self.manager.try_acquire_lock(ttl=30))  # held ⇒ None
+        self.manager.release_lock(epoch)
+        self.assertTrue(self.manager.try_acquire_lock(ttl=30))    # released ⇒ re-acquirable
+
+    def test_stale_holder_cannot_release_newer_acquisition(self):
+        # The exact failure scenario from the plan: worker A acquires, is
+        # cancelled (force_release), worker B acquires; A's late finally-release
+        # must NOT free B's lock.
+        epoch_a = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(epoch_a)
+        self.assertTrue(self.manager.force_release())     # cancel path
+        epoch_b = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(epoch_b)
+        self.assertNotEqual(epoch_a, epoch_b)
+
+        self.manager.release_lock(epoch_a)                # zombie A's finally
+        # B still holds the lock: a third acquire must be refused.
+        self.assertIsNone(self.manager.try_acquire_lock(ttl=30))
+
+        self.manager.release_lock(epoch_b)                # real holder releases
+        self.assertTrue(self.manager.try_acquire_lock(ttl=30))
+
+    def test_try_acquire_epoch_captures_token_atomically(self):
+        # m2 (2026-07-05): the acquire and the epoch read are ONE critical
+        # section (try_acquire_epoch), so try_acquire_lock hands back the
+        # caller's OWN acquisition — never a token read in a second critical
+        # section that a concurrent force_release + re-acquire could have
+        # advanced. Pin the primitive contract the manager relies on.
+        from core.utils import RagOperationLock
+        lock = RagOperationLock()
+        e1 = lock.try_acquire_epoch(60)
+        self.assertIsNotNone(e1)
+        self.assertEqual(e1, lock.epoch)                # returned == this acquisition
+        self.assertIsNone(lock.try_acquire_epoch(60))   # held ⇒ refused
+        lock.release(e1)
+        e2 = lock.try_acquire_epoch(60)
+        self.assertGreater(e2, e1)                       # fresh acquisition ⇒ fresh token
+        # The bool convenience wrapper is the SAME acquire, so it must agree.
+        self.assertFalse(lock.try_acquire(60))           # e2 still held
+        lock.release(e2)
+        self.assertTrue(lock.try_acquire(60))
+
+    def test_stale_holder_cannot_extend_newer_acquisition(self):
+        epoch_a = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(self.manager.force_release())
+        epoch_b = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(epoch_b)
+        # A zombie heartbeat with the stale epoch must not refresh B's TTL —
+        # RagOperationLock.heartbeat returns False on an epoch mismatch; assert
+        # through the manager facade by checking the underlying refusal.
+        self.assertFalse(self.manager._op_lock.heartbeat(epoch_a))
+        self.assertTrue(self.manager._op_lock.heartbeat(epoch_b))
+        self.manager.release_lock(epoch_b)
+
+    def test_release_with_falsy_epoch_is_never_unconditional(self):
+        # RagOperationLock.release(0) is an unconditional release; the manager
+        # facade must never let a caller reach it with a falsy token (that is
+        # force_release's job, and only recovery paths call that).
+        epoch = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(epoch)
+        self.manager.release_lock(0)                       # must be a no-op
+        self.manager.release_lock(None)                    # must be a no-op
+        self.assertIsNone(self.manager.try_acquire_lock(ttl=30))  # still held
+        self.manager.release_lock(epoch)
+
+    def test_index_vault_heartbeat_with_default_epoch_is_inert(self):
+        # index_vault(op_epoch=0) — e.g. a direct test invocation holding no
+        # lock — must not extend or disturb a live foreign acquisition: the
+        # inert-token contract that keeps heartbeats safe when no lock is held.
+        epoch = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(epoch)
+        self.assertFalse(self.manager._op_lock.heartbeat(0))
+        self.manager.release_lock(epoch)
+
+
+
+
+class TestPutDoneResilient(unittest.TestCase):
+    """Item 2.5 (improvement plan 2026-07-04): a finished SSE worker's _DONE
+    sentinel must reach a live consumer whatever the queue depth — the old
+    one-shot 5 s put dropped it on a persistently-full queue, making the
+    consumer report "Generation timed out" on a COMPLETED answer."""
+
+    def test_sentinel_delivered_once_consumer_drains(self):
+        import queue
+        import threading
+        import time
+        from core.utils import put_done_resilient
+
+        q: queue.Queue = queue.Queue(maxsize=1)
+        q.put("blocker")                      # queue full
+        cancel = threading.Event()
+        DONE = object()
+
+        def slow_consumer():
+            time.sleep(1.5)                    # past the old put's first window
+            q.get()                            # frees the slot
+
+        t = threading.Thread(target=slow_consumer, daemon=True)
+        t.start()
+        delivered = put_done_resilient(q, DONE, cancel)
+        t.join(timeout=5)
+        self.assertTrue(delivered)
+        self.assertIs(q.get_nowait(), DONE)
+
+    def test_dead_consumer_does_not_trap_the_worker(self):
+        import queue
+        import threading
+        import time
+        from core.utils import put_done_resilient
+
+        q: queue.Queue = queue.Queue(maxsize=1)
+        q.put("blocker")                       # full forever — nobody drains
+        cancel = threading.Event()
+        cancel.set()                           # consumer already gone
+        start = time.monotonic()
+        delivered = put_done_resilient(q, object(), cancel)
+        self.assertFalse(delivered)
+        self.assertLess(time.monotonic() - start, 3.0)   # bounded exit
+
+
+
+
+class TestClientCacheBound(unittest.TestCase):
+    """Item 2.6: the (host, timeout)-keyed local-client caches are bounded
+    LRUs — the agent loop's per-iteration remaining-budget timeouts used to
+    mint an unbounded set of cached httpx pools (the in-code "handful of
+    entries" claim was wrong)."""
+
+    def test_ollama_client_cache_never_exceeds_cap(self):
+        import core.providers.ollama as om
+        with om._client_cache_lock:
+            saved = dict(om._client_cache)
+            om._client_cache.clear()
+        try:
+            with patch.object(om.ollama, "Client", side_effect=lambda **kw: object()):
+                for t in range(1, 40):          # 39 distinct integer timeouts
+                    om._ollama_client("http://localhost:11434", float(t))
+            with om._client_cache_lock:
+                self.assertLessEqual(len(om._client_cache), om._CLIENT_CACHE_MAX)
+                # Most-recent keys survive (LRU, not random) — the hot key wins.
+                self.assertIn(("http://localhost:11434", 39.0), om._client_cache)
+        finally:
+            with om._client_cache_lock:
+                om._client_cache.clear()
+                om._client_cache.update(saved)
+
+    def test_lms_client_cache_never_exceeds_cap(self):
+        import core.providers.lms as lms
+        with lms._client_cache_lock:
+            saved = dict(lms._client_cache)
+            lms._client_cache.clear()
+        try:
+            with patch("openai.OpenAI", side_effect=lambda **kw: object()):
+                for t in range(1, 40):
+                    lms.get_lmstudio_client("http://localhost:1234/v1", timeout=float(t))
+            with lms._client_cache_lock:
+                self.assertLessEqual(len(lms._client_cache), lms._CLIENT_CACHE_MAX)
+        finally:
+            with lms._client_cache_lock:
+                lms._client_cache.clear()
+                lms._client_cache.update(saved)
+
+
+class TestAgentTimeoutQuantisation(unittest.TestCase):
+    """Item 2.6: every per-call timeout the agent loop emits is drawn from the
+    coarse bucket ladder, so the client caches see at most len(buckets) keys
+    per host instead of one per remaining-second."""
+
+    def test_quantise_covers_ladder_and_never_cuts_short(self):
+        from core.agent.loop import _TIMEOUT_BUCKETS, _quantise_timeout
+        for remaining in (0.5, 1.0, 14.9, 15.0, 16.0, 59.0, 250.0, 299.9,
+                          301.0, 1799.0, 5000.0):
+            q = _quantise_timeout(max(1.0, remaining))
+            self.assertIn(q, _TIMEOUT_BUCKETS)
+            if remaining <= _TIMEOUT_BUCKETS[-1]:
+                self.assertGreaterEqual(q, min(remaining, _TIMEOUT_BUCKETS[-1]))
 
 
 if __name__ == "__main__":

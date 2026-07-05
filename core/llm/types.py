@@ -76,12 +76,19 @@ class ToolCall:
     the Gemini adapter (Gemini ties responses back by name, not id).
     ``arguments`` is the parsed JSON object; ``raw_arguments`` keeps the
     original JSON string for debugging and provider round-tripping.
+    ``thought_signature`` is Gemini-only: Gemini 3.x attaches an opaque
+    ``thoughtSignature`` to each ``functionCall`` part and REQUIRES it to
+    be echoed back verbatim on that part in the follow-up request —
+    omitting it 400s the second tool turn ("Function call is missing a
+    thought_signature"). Captured by the Google adapter, re-emitted by
+    ``build_gemini_contents``, ignored by every other provider.
     """
 
     id: str
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
     raw_arguments: str = ""
+    thought_signature: str = ""
 
 
 @dataclass(frozen=True)
@@ -138,6 +145,13 @@ class LLMRequest:
     timeout_s: Optional[float] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    # Prompt Hub tag (transparency only, never sent to the provider): the
+    # workflow id (see ``core.prompt_capture.WORKFLOWS``) whose system prompt
+    # this request carries. The shared send seams in ``core.llm.factory`` read
+    # it to record the effective prompt for the read-only ``/api/prompts``
+    # panel. Empty on requests from paths that capture directly (or not at all).
+    workflow: str = ""
+
     tools: list[ToolSchema] = field(default_factory=list)
     tool_choice: Optional[str] = None
     tool_history: list[ToolTurn] = field(default_factory=list)
@@ -149,7 +163,16 @@ class LLMUsage:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    # Prompt-cache figures (Track 5.5). Semantics are normalised at the
+    # adapter: ``input_tokens`` is always the TOTAL prompt size and
+    # ``cached_input_tokens`` the cache-served subset of it (OpenAI reports
+    # this shape natively; the Anthropic adapter re-adds its cache_read /
+    # cache_creation counts, which the API excludes from input_tokens).
+    # ``cache_creation_input_tokens`` is the Anthropic cache-WRITE count --
+    # billed at 1.25x the input rate (5-min TTL) by estimate_cost_usd; 0
+    # everywhere else.
     cached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
     estimated_cost_usd: float = 0.0
 
     @property
@@ -194,6 +217,14 @@ class LLMError(Exception):
     model: str = ""
     status_code: Optional[int] = None
     retryable: bool = False
+    # Provider-suggested wait before retrying (seconds), from a 429's
+    # ``Retry-After`` header or the "Please try again in Xs" body message.
+    # A TPM-shaped rate limit tells the caller exactly how long the window
+    # needs to drain; a generic exponential backoff that sleeps LESS than
+    # this is guaranteed to burn the retry on another 429, so the retry
+    # layers treat it as a floor (see ``core/llm/retry.py``). ``None`` =
+    # no hint available (non-429 errors, or a provider that omits it).
+    retry_after_s: Optional[float] = None
 
     def __post_init__(self) -> None:
         super().__init__(self.message)

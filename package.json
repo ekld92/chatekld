@@ -1,0 +1,13 @@
+{
+  "name": "chatekld-js-tests",
+  "private": true,
+  "type": "module",
+  "description": "JS unit-test harness only (Vitest + jsdom). The app itself ships no npm build step: runtime third-party JS stays vendored under static/js/vendor/ (see CLAUDE.md — never load runtime JS from a CDN or node_modules).",
+  "scripts": {
+    "test:js": "vitest run"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0",
+    "vitest": "^3.2.4"
+  }
+}

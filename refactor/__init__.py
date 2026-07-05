@@ -14,6 +14,16 @@ confirmed: ``apply`` (callout-only batch note writer), ``archive`` (per-image
 move-out + thumbnail), and ``journal`` (the restore manifest + scope-lock +
 ``log_vault_write`` audit core). Every vault write is atomic, scope-locked,
 audit-logged, and reversible. Design + phasing: ``docs/project_note_refactor.md``.
-Imports flow refactor → {rag.vault, services.vision, core.utils}; the package
-never reaches into the indexer's internals beyond the documented reuse points.
+
+Advisory analyzer helpers layered on top of the read-only plan: ``text``
+(``strip_ocr_preamble`` — the per-image "strip the description preamble" opt-in),
+``flags`` (sticky per-image flag sidecar driving that strip + the handwritten
+"keep anyway" override), ``hints.likely_handwritten`` (zero-vision handwritten
+auto-hide), ``hygiene.structure_notes`` (deterministic "you didn't skip a line"
+checks), and ``review`` (the **opt-in, per-note LLM prose review** — the only
+chat-LLM caller, never run by the read-only plan).
+
+Imports flow refactor → {rag.vault, services.vision, core.utils, core.llm}; the
+package never reaches into the indexer's or the adapters' internals beyond the
+documented reuse points.
 """

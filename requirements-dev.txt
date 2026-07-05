@@ -1,0 +1,26 @@
+# Development-only tools — NOT needed to run the app (see requirements.txt).
+# Install into the project venv: pip install -r requirements-dev.txt
+#
+# Pinned to a verified minor line like the runtime pins: ruff's rule behaviour
+# shifts between minors, and `ruff check .` is a suite gate (CLAUDE.md §Tests),
+# so an unpinned upgrade could turn the clean baseline red on a fresh clone.
+ruff>=0.12,<0.13
+
+# The test runner. Previously these lived ONLY in constraints.txt, which pins
+# versions of packages being installed but never installs anything itself — so
+# CI (which installs requirements-dev.txt, then runs `python -m pytest`) failed
+# at the test step with "No module named pytest" on every run, meaning the
+# hermetic gate had never actually executed the suite. Listing them here is what
+# makes the gate real. Exact versions come from constraints.txt via the `-c`
+# flag in the CI install step.
+pytest>=9.0,<10.0
+pytest-asyncio>=1.3,<1.4
+
+# Track 7.5 tooling. mypy is ADVISORY (permissive config in pyproject.toml — not a
+# suite gate, and NOT a pre-commit hook; run it standalone with `mypy`). pre-commit
+# runs the local commit hooks (`ruff check`, gitleaks secret scan, whitespace/EOF
+# hygiene). Minor-line pins like the other dev tools: mypy's inference and
+# pre-commit's hook behaviour shift between minors, and a silent upgrade could turn a
+# clean local run noisy on a fresh checkout. Neither is needed to RUN the app.
+mypy>=1.14,<1.15
+pre-commit>=4.0,<5.0

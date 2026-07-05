@@ -23,13 +23,13 @@ Indexing is guarded separately by the manager's ``RagOperationLock`` (TTL 3600 s
 thread. ``_resolve_chat_params`` resolves every live retrieval/generation knob
 body→config→default so a Settings change applies on the next Send with no reload.
 """
-import queue
 import threading
 import time
 import os
-import json
 from pathlib import Path
-from flask import Blueprint, jsonify, request, Response
+from flask import Blueprint, jsonify, request
+from api.security import sanitise_error_msg
+from api.sse import run_sse_worker
 from core.config import load_config
 from core.constants import (
     DEFAULT_EMBED,
@@ -40,7 +40,6 @@ from core.constants import (
     SSE_STALL_MARGIN_S as _STALL_MARGIN_S,
     SSE_SINGLE_SHOT_FLOOR_S as _SINGLE_SHOT_FLOOR_S,
 )
-from api.security import origin_is_local, sanitise_error_msg
 from api.validators import (
     MISSING,
     coerce_bool,
@@ -249,7 +248,7 @@ def _resolve_chat_params(data: dict, cfg: dict) -> dict:
     # Wikilink graph expansion (query-time, no reindex): live per-Send toggle
     # so flipping it in the UI takes effect on the next message. The caps live
     # in config only (read by the engine), so they are not body overrides. The
-    # agent's active vault.search is intentionally not threaded this knob —
+    # agent's active vault_search is intentionally not threaded this knob —
     # parity with mmr_enabled / query_expansion, which are also single-shot
     # only; it still applies to the agent's RAG fallback via stream_chat.
     wikilink_expansion = _resolve(
@@ -258,6 +257,29 @@ def _resolve_chat_params(data: dict, cfg: dict) -> dict:
     )
     if wikilink_expansion is not MISSING:
         out["wikilink_expansion"] = wikilink_expansion
+
+    # Thesaurus query expansion (query-time, no reindex): live per-Send toggle
+    # like wikilink. max_variants is config-only (read by the engine). Not
+    # threaded to the agent's active vault_search — parity with wikilink /
+    # mmr / query_expansion (single-shot only; still applies to the agent's RAG
+    # fallback via stream_chat).
+    thesaurus_expansion = _resolve(
+        "thesaurus_expansion", "vault_thesaurus_expansion",
+        coerce_bool,
+    )
+    if thesaurus_expansion is not MISSING:
+        out["thesaurus_expansion"] = thesaurus_expansion
+
+    # System-prompt primer (query-time, no reindex): live per-Send toggle. The
+    # glossary budget (vault_primer_max_chars) is config-only (read by the
+    # engine). Like expansion, it applies to single-shot RAG and the agent's
+    # RAG fallback via stream_chat, not the agent's active vault_search.
+    primer_enabled = _resolve(
+        "primer_enabled", "vault_primer_enabled",
+        coerce_bool,
+    )
+    if primer_enabled is not MISSING:
+        out["primer_enabled"] = primer_enabled
 
     custom_sys = _resolve(
         "system_prompt", "vault_chat_system_prompt",
@@ -295,15 +317,11 @@ vault_bp = Blueprint('vault', __name__)
 @vault_bp.route("/api/obsidian/status")
 def api_obsidian_status():
     """Poll indexing state, progress messages, and warnings (local-origin only)."""
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     return jsonify(obsidian_manager.get_status_payload())
 
 @vault_bp.route("/api/obsidian/materials")
 def api_obsidian_materials():
     """List the files recorded in the current vault index manifest."""
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     return jsonify(obsidian_manager.get_indexed_materials())
 
 @vault_bp.route("/api/obsidian/index", methods=["POST"])
@@ -317,8 +335,6 @@ def api_obsidian_index():
     timeout), THEN ``try_acquire_lock`` (503 if still held), and only then spawn the
     daemon indexer thread — which releases the lock in its own ``finally``.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     from core.config import resolve_chat_model
     data = request.get_json(silent=True) or {}
     cfg = load_config()
@@ -334,13 +350,23 @@ def api_obsidian_index():
     # reset path's guard).  A normal cancel's thread exits in well under a second.
     if not obsidian_manager.wait_for_indexing(timeout=30.0):
         return jsonify({"error": "A previous indexing run is still finishing; please retry shortly."}), 503
-    if not obsidian_manager.try_acquire_lock(ttl=3600):
+    # Per-operation epoch token (improvement plan 2026-07-04, item 1.5): the
+    # token this acquisition returned lives on THIS closure's stack and is the
+    # only epoch this run may heartbeat/release with. Previously the epoch sat
+    # on the shared manager singleton, so a cancel + new acquisition (e.g. a
+    # refactor Apply) overwrote it and this finally released the NEW holder's
+    # lock mid-operation. Invariant: run_index can only release the
+    # acquisition it was admitted under; a stale release is a no-op.
+    op_epoch = obsidian_manager.try_acquire_lock(ttl=3600)
+    if not op_epoch:
         return jsonify({"error": "An indexing operation is already in progress"}), 503
     def run_index():
         try:
-            obsidian_manager.index_vault(llm, embed, provider_name=provider)
+            obsidian_manager.index_vault(
+                llm, embed, provider_name=provider, op_epoch=op_epoch
+            )
         finally:
-            obsidian_manager.release_lock()
+            obsidian_manager.release_lock(op_epoch)
     t = threading.Thread(target=run_index, daemon=True)
     obsidian_manager.register_index_thread(t)
     t.start()
@@ -357,8 +383,6 @@ def api_obsidian_chat():
     stall timeout is floored at ``_SINGLE_SHOT_FLOOR_S`` so lowering that cap can
     never starve a slow single-shot first token (the two share this one consumer).
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
     if not data or "message" not in data:
         return jsonify({"error": "Missing message"}), 400
@@ -384,38 +408,23 @@ def api_obsidian_chat():
     # exact user cap; only this backstop is floored.
     consumer_timeout_s = max(wall_clock_s, _SINGLE_SHOT_FLOOR_S) + _STALL_MARGIN_S
 
-    def generate():
-        """The SSE consumer: drain the worker's queue into ``data:`` frames + [DONE]."""
-        cancel = threading.Event()
-        # Bounded queue → back-pressure: a fast producer cannot grow memory without
-        # bound if the client drains slowly.
-        event_q: queue.Queue = queue.Queue(maxsize=512)
-        _DONE = object()  # unique sentinel marking the worker has finished
-
+    def _vault_worker(put, cancel):
+        found_any = False
+        errored = False
         def _put(item):
-            # Block until enqueued, but re-check ``cancel`` every 1 s so a
-            # disconnected/timed-out consumer (queue full, nobody draining) cannot
-            # wedge the worker here forever — it bails and reaches its finally/_DONE.
-            placed = False
-            while not placed and not cancel.is_set():
-                try:
-                    event_q.put(item, timeout=1)
-                    placed = True
-                except queue.Full:
-                    continue
-
+            nonlocal found_any, errored
+            if isinstance(item, dict):
+                if item.get("token"):
+                    found_any = True
+                if item.get("error"):
+                    errored = True
+            put(item)
+            
         def _stage(text: str) -> None:
-            # stage_cb: surface a retrieval/fallback stage label as an {info} frame.
             if text:
                 _put({"info": text})
 
         def _run_chat():
-            """Single-shot RAG worker: pump retrieval+generation tokens onto the queue.
-
-            Runs off the request thread so the consumer can apply the stall timeout
-            independently. Always enqueues ``_DONE`` in ``finally`` so the consumer's
-            blocking ``get`` returns promptly instead of waiting the full timeout.
-            """
             try:
                 response = obsidian_manager.stream_chat(
                     message,
@@ -425,10 +434,24 @@ def api_obsidian_chat():
                     stage_cb=_stage,
                     **chat_params,
                 )
+                chunks = []
+                if hasattr(response, "source_nodes") and response.source_nodes:
+                    from rag.engine import SimpleQueryEngine
+                    chunks = SimpleQueryEngine._nodes_to_chunks(response.source_nodes)
+                elif hasattr(response, "used_chunks") and response.used_chunks:
+                    chunks = response.used_chunks
+
+                if chunks:
+                    retrieval_data = []
+                    for c in chunks:
+                        retrieval_data.append({
+                            "source": c.source,
+                            "score": c.score,
+                            "is_image": c.metadata.get("is_image", False),
+                        })
+                    _put({"retrieval": retrieval_data})
+
                 if hasattr(response, 'response_gen'):
-                    # Surface a stage event between retrieval and the first
-                    # token so a slow/hanging LLM load (Ollama cold model swap,
-                    # LM Studio JIT load) is visible to the user.
                     _stage("Waiting for model response…")
                     for tok in response.response_gen:
                         if cancel.is_set():
@@ -443,42 +466,23 @@ def api_obsidian_chat():
             except Exception as exc:
                 if not cancel.is_set():
                     _put({"error": sanitise_error_msg(exc)})
-            finally:
-                try:
-                    event_q.put(_DONE, timeout=5)
-                except queue.Full:
-                    pass
 
         def _run_agent():
-            """ReAct-agent worker: run the tool loop, forwarding its events to the queue.
-
-            Translates each :class:`AgentEvent` to the queue-item dict shape via
-            ``_agent_event_to_queue_item`` (so the consumer pattern-matches one set of
-            keys), bounds the loop with ``deadline`` (= the user wall-clock cap), wires
-            a clean single-shot RAG fallback against the ORIGINAL message, and shares
-            the ``cancel`` Event so a consumer timeout stops the loop. Emits a usage
-            footer ``{info}`` only when the model actually ran. ``_DONE`` in finally.
-            """
             try:
+                deadline = time.monotonic() + wall_clock_s
                 ctx = VaultToolContext(
                     llm_name=llm,
                     embed_name=embed,
                     provider_name=provider,
                     similarity_cutoff=chat_params.get("similarity_cutoff", 0.25),
-                    # Fallbacks match the documented engine defaults (both
-                    # True) — they only apply if the persisted vault_* key is
-                    # missing or fails coercion, since _resolve_chat_params
-                    # otherwise always supplies a value from body or config.
                     hybrid_enabled=chat_params.get("hybrid_enabled", True),
                     reranker_enabled=chat_params.get("reranker_enabled", True),
                     reranker_model=chat_params.get("reranker_model", ""),
+                    deadline_monotonic_s=deadline,
                 )
                 tools = ToolRegistry(build_vault_tools(obsidian_manager, ctx))
-                deadline = time.monotonic() + wall_clock_s
 
                 def _rag_fallback():
-                    # Clean re-run against the original user message —
-                    # accumulated agent trace is NOT mixed in.
                     fallback_params = {
                         k: v for k, v in chat_params.items()
                         if k not in ("agent_enabled", "agent_max_iterations")
@@ -507,9 +511,6 @@ def api_obsidian_chat():
                     provider_name=provider,
                     model=llm,
                     user_system_prompt=chat_params.get("custom_system_prompt", ""),
-                    # Forward the resolved per-request temperature so agent mode
-                    # honours the same knob as single-shot RAG (None ⇒ the loop
-                    # falls back to the persisted vault_chat_temperature).
                     temperature=chat_params.get("temperature"),
                     tools=tools,
                     cfg=cfg,
@@ -520,99 +521,38 @@ def api_obsidian_chat():
                     capability_state=_agent_capability_state,
                     cancel_event=cancel,
                 )
-                # Footer info event with the per-turn usage totals so
-                # the user can see how much the turn cost. Only emit
-                # when we actually invoked the model — a zero-iteration
-                # turn (e.g. deadline-past edge case) has nothing to say.
                 if not cancel.is_set() and budget.iteration_count > 0:
                     _put({"info": _format_agent_usage(budget)})
             except Exception as exc:
                 if not cancel.is_set():
                     _put({"error": sanitise_error_msg(exc)})
-            finally:
-                try:
-                    event_q.put(_DONE, timeout=5)
-                except queue.Full:
-                    pass
 
         try:
-            # Surface a leading info event when indexing is in flight so the
-            # user understands why retrieval may miss recently-added content.
-            index_state = obsidian_manager.get_status()
-            if index_state in ("running", "scanning", "embedding", "paused", "paused_scan", "paused_partial"):
-                partial_note = (
-                    "Indexing is still in progress — answers may miss "
-                    "content from files not yet indexed."
-                )
-                yield f"data: {json.dumps({'info': partial_note})}\n\n"
-
-            worker = _run_agent if agent_enabled else _run_chat
-            threading.Thread(target=worker, daemon=True).start()
-            found_any = False
-            timed_out = False
-            errored = False
-            while True:
-                try:
-                    item = event_q.get(timeout=consumer_timeout_s)
-                except queue.Empty:
-                    timed_out = True
-                    cancel.set()
-                    yield f"data: {json.dumps({'error': 'Generation timed out — the model may be overloaded. Please try again.'})}\n\n"
-                    break
-                if item is _DONE:
-                    break
-                if isinstance(item, dict) and item.get("error"):
-                    errored = True
-                    cancel.set()
-                    yield f"data: {json.dumps({'error': item['error']})}\n\n"
-                    break
-                if isinstance(item, dict) and item.get("info"):
-                    yield f"data: {json.dumps({'info': item['info']})}\n\n"
-                    continue
-                if isinstance(item, dict) and "iteration" in item:
-                    yield f"data: {json.dumps({'iteration': item['iteration']})}\n\n"
-                    continue
-                if isinstance(item, dict) and "thought" in item:
-                    yield f"data: {json.dumps({'thought': item['thought']})}\n\n"
-                    continue
-                if isinstance(item, dict) and "tool_call" in item:
-                    yield f"data: {json.dumps({'tool_call': item['tool_call']})}\n\n"
-                    continue
-                if isinstance(item, dict) and "tool_result" in item:
-                    yield f"data: {json.dumps({'tool_result': item['tool_result']})}\n\n"
-                    continue
-                if isinstance(item, dict) and item.get("token"):
-                    found_any = True
-                    yield f"data: {json.dumps({'token': item['token']})}\n\n"
-
-            if not found_any and not timed_out and not errored:
-                # Agent mode can legitimately finish with only info events
-                # (iteration cap reached, fallback emitted, etc.); in that
-                # case the bot bubble would stay stuck on its typing
-                # indicator because nothing ever cleared it. Emit a
-                # placeholder token so the bubble settles into a final
-                # visible state — the user-facing info events above
-                # carry the explanation.
-                placeholder = (
-                    _NO_AGENT_ANSWER_MSG if agent_enabled else _NO_CONTENT_MSG
-                )
-                yield f"data: {json.dumps({'token': placeholder})}\n\n"
-            yield "data: [DONE]\n\n"
-        except GeneratorExit:
-            # Client disconnected mid-stream.  Yielding here would raise
-            # ``RuntimeError: generator ignored GeneratorExit`` from Werkzeug's
-            # close() path, so just signal the worker and propagate.
-            cancel.set()
+            if agent_enabled:
+                _run_agent()
+            else:
+                _run_chat()
+        except Exception:
+            errored = True
             raise
-        except Exception as e:
-            yield f"data: {json.dumps({'error': sanitise_error_msg(e)})}\n\n"
-            yield "data: [DONE]\n\n"
         finally:
-            # Non-yielding cleanup only.  The [DONE] sentinel is emitted on
-            # the normal and error paths above; on GeneratorExit there is no
-            # downstream consumer to send it to.
-            cancel.set()
-    return Response(generate(), mimetype="text/event-stream")
+            if not found_any and not errored and not cancel.is_set():
+                placeholder = _NO_AGENT_ANSWER_MSG if agent_enabled else _NO_CONTENT_MSG
+                _put({"token": placeholder})
+
+    preflight_msgs = []
+    index_state = obsidian_manager.get_status()
+    if index_state in ("running", "scanning", "embedding", "paused", "paused_scan", "paused_partial"):
+        preflight_msgs.append(
+            "Indexing is still in progress — answers may miss "
+            "content from files not yet indexed."
+        )
+
+    return run_sse_worker(
+        _vault_worker,
+        consumer_timeout_s=consumer_timeout_s,
+        preflight_msgs=preflight_msgs,
+    )
 
 @vault_bp.route("/api/native-pick-folder", methods=["POST"])
 def api_native_pick_folder():
@@ -622,8 +562,6 @@ def api_native_pick_folder():
     a *sub*-folder of the configured vault (the vault root itself is rejected),
     returning the vault-relative path for the caller to use as a scope.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     import webview
     if not webview.windows:
         return jsonify({"error": "No active window"}), 503
@@ -648,15 +586,11 @@ def api_native_pick_folder():
 @vault_bp.route("/api/obsidian/pause", methods=["POST"])
 def api_obsidian_pause():
     """Request a resumable pause of the in-flight indexing run."""
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     ok = obsidian_manager.pause_indexing()
     return jsonify({"ok": ok})
 
 @vault_bp.route("/api/obsidian/cancel", methods=["POST"])
 def api_obsidian_cancel():
     """Cancel indexing and force-release the op-lock; report whether it was held."""
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     was_held = obsidian_manager.cancel_indexing()
     return jsonify({"ok": True, "was_held": was_held})

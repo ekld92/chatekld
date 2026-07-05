@@ -18,11 +18,9 @@ from __future__ import annotations
 import logging
 from typing import Generator, Optional
 
-from core.config import load_config, resolve_chat_model
-from core.llm.factory import get_llm_provider
+from core.config import load_config
 from core.llm.policy import parse_policy_from_config
-from core.llm.redact import redact
-from core.llm.types import LLMError, LLMRequest
+from core.llm.types import LLMRequest
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +35,7 @@ def stream_chat_messages(
     max_tokens: Optional[int] = None,
     cfg: Optional[dict] = None,
     info_cb=None,
+    workflow: str = "plain_chat",
 ) -> Generator[str, None, None]:
     """Stream tokens for a plain (RAG-free) multi-turn chat.
 
@@ -72,6 +71,10 @@ def stream_chat_messages(
         temperature=temperature,
         max_tokens=effective_max_tokens,
         timeout_s=timeout_s,
+        # Prompt Hub tag. Defaults to "plain_chat"; the deck-review, deck
+        # compile-fix, and refactor callers pass their own workflow id so the
+        # Hub attributes each shared-helper call to the right panel row.
+        workflow=workflow,
     )
 
     def _emit(msg: str) -> None:
@@ -81,37 +84,18 @@ def stream_chat_messages(
             except Exception:
                 logger.debug("info_cb failed", exc_info=True)
 
-    primary = get_llm_provider(provider_name, cfg=cfg)
-    yielded_any = False
-    try:
-        for token in primary.stream(request).response_gen:
-            yielded_any = True
-            yield token
-        return
-    except LLMError as err:
-        # Only fall back *before* the first token (see docstring).
-        if yielded_any:
-            raise
-        if not policy.should_fall_back(err) or policy.fallback is None:
-            raise
+    def on_fallback(cat: str, fallback: str) -> None:
         _emit(
-            f"primary provider {provider_name} failed ({err.category.value}); "
-            f"falling back to {policy.fallback}"
-        )
-        logger.warning(
-            "plain-chat fallback %s -> %s: %s",
-            provider_name,
-            policy.fallback,
-            redact(err.message),
+            f"primary provider {provider_name} failed ({cat}); "
+            f"falling back to {fallback}"
         )
 
-    fallback = get_llm_provider(policy.fallback, cfg=cfg)
-    fallback_request = LLMRequest(
-        model=resolve_chat_model(cfg, policy.fallback),
-        system_prompt=system_prompt,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=effective_max_tokens,
-        timeout_s=timeout_s,
+    from core.llm.factory import stream_with_fallback
+    yield from stream_with_fallback(
+        provider_name=provider_name,
+        request=request,
+        policy=policy,
+        cfg=cfg,
+        on_fallback=on_fallback,
+        log_context="plain-chat fallback"
     )
-    yield from fallback.stream(fallback_request).response_gen

@@ -1,13 +1,68 @@
 import functools
 import json
 import logging
+import threading
+from collections import OrderedDict
 import tiktoken
 import urllib.request
 from typing import Any, Optional
-from core.providers.base import Provider, local_request_timeout
-from core.constants import LM_STUDIO_HOST
+from core.providers.base import Provider, local_request_timeout, resolve_lm_studio_host
 
 logger = logging.getLogger(__name__)
+
+# Cached ``openai.OpenAI`` clients for LM Studio, keyed by (base_url, timeout).
+# A fresh client per call leaked its httpx connection pool (the client is never
+# closed and only reclaimed on GC); under steady load — single-paper summarise,
+# vault chat, agent tool calls — those pools accumulated. The OpenAI client is
+# thread-safe to share (like httpx), so we cache one per key, exactly as
+# ``core/providers/ollama.py`` caches its httpx client. See ``get_lmstudio_client``.
+# Item 2.6: small LRU, mirroring core/providers/ollama.py — the agent loop's
+# per-iteration remaining-budget timeouts would otherwise mint an unbounded
+# set of (base_url, timeout) keys, each pinning an idle httpx pool. Evicted
+# clients are NOT closed here (a concurrent call may still stream on them);
+# dropping the reference lets GC close them after the in-flight call ends.
+_CLIENT_CACHE_MAX = 8
+_client_cache: OrderedDict = OrderedDict()
+_client_cache_lock = threading.Lock()
+
+
+def get_lmstudio_client(base_url: str, timeout):
+    """Return a cached ``openai.OpenAI`` client for *(base_url, timeout)*.
+
+    Replaces the per-call client construction that leaked a connection pool on
+    every LM Studio request. *timeout* is part of the key because the OpenAI SDK
+    fixes it at construction. It is normalised the same way the Ollama cache
+    normalises its timeout: a non-positive value becomes ``None`` (leave the SDK
+    default — never ``0``, which the SDK reads as "time out immediately"), and a
+    positive value is rounded to whole seconds so the agent path feeding a slightly
+    different remaining-deadline float on every call cannot mint unbounded clients.
+
+    ``max_retries=0`` is forced: the OpenAI SDK otherwise retries a timed-out or
+    failed call up to 2 more times *internally* (each up to the full per-call
+    ``timeout``), so a single wedged LM Studio call could block ~3×timeout — long
+    enough to blow past the SSE consumer's stall window and surface a spurious
+    whole-stream timeout (the deck-generation random-failure mode). With retries
+    off, one call is bounded by exactly one ``timeout``; recovery is owned at the
+    application level (the deckgen per-section retry, the agent loop's deadline),
+    where it is cancel-aware and visible to the user.
+    """
+    import openai
+    if timeout is not None:
+        timeout = max(1, int(round(timeout))) if timeout > 0 else None
+    key = (base_url, timeout)
+    with _client_cache_lock:
+        client = _client_cache.get(key)
+        if client is None:
+            client_kwargs = {"base_url": base_url, "api_key": "lm-studio", "max_retries": 0}
+            if timeout is not None:
+                client_kwargs["timeout"] = timeout
+            client = openai.OpenAI(**client_kwargs)
+            _client_cache[key] = client
+            while len(_client_cache) > _CLIENT_CACHE_MAX:
+                _client_cache.popitem(last=False)   # evict LRU; GC closes it
+        else:
+            _client_cache.move_to_end(key)
+        return client
 
 
 @functools.lru_cache(maxsize=1)
@@ -66,9 +121,13 @@ class LMStudioProvider(Provider):
     own one-shot ``openai.OpenAI`` client.
     """
 
-    def __init__(self, host: str = LM_STUDIO_HOST):
-        self.host = host
-        self.base_url = f"{host}/v1"
+    def __init__(self, host: Optional[str] = None):
+        # Resolve at CONSTRUCTION time (not as a default-arg value). Each
+        # get_provider() call mints a fresh provider, so the host re-resolves
+        # from config/env per request — no restart needed. host=config
+        # (lm_studio_host) → env(LM_STUDIO_HOST) → constant.
+        self.host = host if host is not None else resolve_lm_studio_host()
+        self.base_url = f"{self.host}/v1"
 
     def check_running(self) -> tuple[bool, str]:
         """Reachability probe: a short-timeout GET of ``/v1/models``."""
@@ -125,16 +184,23 @@ class LMStudioProvider(Provider):
         object.__setattr__(llm, "_lmstudio_context_window", context_window)
         return llm
 
-    def get_embedding(self, model_name: str, **kwargs) -> Any:
+    def get_embedding(self, model_name: str, *, request_timeout_s: Optional[float] = None, **kwargs) -> Any:
         """Return a LlamaIndex ``OpenAIEmbedding`` pointed at LM Studio.
 
         Passes the LM Studio model ID via ``model_name`` (not ``model``) to
         bypass the SDK's ``OpenAIEmbeddingModelType`` enum validation, which
         would reject arbitrary local IDs.
+
+        ``request_timeout_s`` (improvement plan 2026-07-04, item 2.1): the
+        QUERY-path bound — see ``OllamaProvider.get_embedding``. ``max_retries=0``
+        rides with it so one wedged call is bounded by exactly one timeout, not
+        the SDK's default 2 internal retries (the get_lmstudio_client rule).
+        The INDEXING path omits it and keeps the SDK defaults, on purpose.
         """
         if not _LLAMAINDEX_OPENAI_AVAILABLE:
             raise ImportError("llama-index-embeddings-openai is required for LM Studio support.")
-        
+        if request_timeout_s is not None and request_timeout_s > 0:
+            kwargs = {**kwargs, "timeout": float(request_timeout_s), "max_retries": 0}
         return _LlamaOpenAIEmbedding(
             # LM Studio exposes arbitrary local model IDs. Passing them via
             # ``model`` triggers OpenAIEmbeddingModelType enum validation.
@@ -146,28 +212,27 @@ class LMStudioProvider(Provider):
 
     def stream_chat(self, model: str, prompt: str, system_prompt: Optional[str] = None,
                     request_timeout: Optional[float] = None, **kwargs) -> Any:
-        """Stream a chat completion through a one-shot OpenAI client.
+        """Stream a chat completion through the cached OpenAI client.
 
-        Builds a fresh ``openai.OpenAI`` per call (LM Studio is not on the
-        ollama-style shared-client cache) and applies ``local_request_timeout_s``
-        as the per-read gap — i.e. a max-time-between-tokens stall guard, not a
-        total-call deadline — when set. Returns the raw streaming iterator.
+        Uses the shared ``get_lmstudio_client`` cache (keyed by base_url+timeout,
+        so consecutive calls reuse one connection pool) and applies
+        ``local_request_timeout_s`` as the per-read gap — i.e. a
+        max-time-between-tokens stall guard, not a total-call deadline — when set.
+        Returns the raw streaming iterator.
 
         ``request_timeout`` (when not None) overrides the configured value for
         this call — the single-paper route passes a non-zero floor so a wedged
         backend can't hang its guard-less synchronous SSE stream.
         """
         try:
-            import openai
             # Bound this streaming call with the explicit request_timeout when
             # given, else the configured local timeout when set (>0); otherwise
             # 0 leaves the OpenAI SDK default. For a stream this is the per-read
-            # gap, i.e. a max-time-between-tokens stall guard.
+            # gap, i.e. a max-time-between-tokens stall guard. The cached factory
+            # (get_lmstudio_client) imports openai, so a missing SDK still raises
+            # ImportError here and is reported below.
             timeout = request_timeout if request_timeout is not None else local_request_timeout()
-            client_kwargs = {"base_url": self.base_url, "api_key": "lm-studio"}
-            if timeout is not None:
-                client_kwargs["timeout"] = timeout
-            client = openai.OpenAI(**client_kwargs)
+            client = get_lmstudio_client(self.base_url, timeout)
             messages = []
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})

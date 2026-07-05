@@ -32,9 +32,20 @@ import io
 import logging
 import threading
 import time
-import ollama
 
 from PIL import Image
+
+# Register the HEIF/HEIC opener so PIL can decode .heic — the standard macOS
+# screenshot/photo format. Without it, a referenced .heic is undecodable and is
+# forwarded raw to a local vision model that cannot read it (empty description →
+# silently skipped). Import-guarded: a missing pillow-heif just leaves HEIC
+# unsupported (the prior behaviour), it never blocks startup.
+try:
+    import pillow_heif  # type: ignore
+    pillow_heif.register_heif_opener()
+    _HEIF_SUPPORTED = True
+except Exception:  # pragma: no cover - optional dependency
+    _HEIF_SUPPORTED = False
 
 from core.providers import get_provider
 from core.constants import (
@@ -43,12 +54,37 @@ from core.constants import (
     DEFAULT_VISION_TIMEOUT_S,
     DEFAULT_VISION_MAX_TOKENS,
     DEFAULT_OCR_MAX_TOKENS,
-    VISION_MAX_RETRIES,
+    DEFAULT_VISION_FAILURE_COOLDOWN_S,
     VISION_IMAGE_MAX_SIDE,
-    OLLAMA_HOST,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _failure_cooldown_s() -> float:
+    """Per-call read of ``vision_failure_cooldown_s`` (improvement plan 1.5).
+
+    The fast-fail window after a failed vision/OCR call. Unlike the other
+    vision bounds this one legitimately supports **0 = disabled** (retry every
+    image immediately), so it does not go through :func:`_cfg_bounded_int`
+    (whose ``<= 0 ⇒ default`` contract would erase the disable). Missing /
+    garbage / negative ⇒ the hard default; values above 600 clamp.
+
+    Item 4.6: uses ``load_config_readonly`` — a no-deepcopy
+    ``MappingProxyType`` read — instead of ``load_config`` because this is a
+    read-only ``.get()`` on a hot path (called 3× per image × thousands of
+    images per indexing run; the old ``load_config`` deep-copied the entire
+    config dict every call).
+    """
+    try:
+        from core.config import load_config_readonly
+        v = int(load_config_readonly().get(
+            "vision_failure_cooldown_s", DEFAULT_VISION_FAILURE_COOLDOWN_S))
+    except Exception:
+        return float(DEFAULT_VISION_FAILURE_COOLDOWN_S)
+    if v < 0:
+        return float(DEFAULT_VISION_FAILURE_COOLDOWN_S)
+    return float(min(v, 600))
 
 
 def _cfg_bounded_int(key: str, default: int, lo: int, hi: int) -> int:
@@ -69,10 +105,13 @@ def _cfg_bounded_int(key: str, default: int, lo: int, hi: int) -> int:
     bypassed the route — a value of e.g. ``1`` (a stray ``true`` also gives
     ``int(True) == 1``) cannot turn into a 1-second timeout that fails every
     call. The ``lo``/``hi`` mirror ``api/routes/config.py::_CONFIG_VALIDATORS``.
+
+    Item 4.6: uses ``load_config_readonly`` (no-deepcopy ``MappingProxyType``)
+    because this is a read-only ``.get()`` on the vision/OCR hot path.
     """
     try:
-        from core.config import load_config
-        v = int(load_config().get(key, default))
+        from core.config import load_config_readonly
+        v = int(load_config_readonly().get(key, default))
     except Exception:
         return default
     if v <= 0:
@@ -105,19 +144,17 @@ class VisionManager:
     * an **availability cache** (``_is_available`` + ``_availability_checked_at``,
       TTL ``_AVAILABILITY_TTL_S``) — an informational hint surfaced to the UI; it
       never gates :meth:`describe_image`.
-    * a **negative-result cooldown** (``_call_failure_at``,
-      ``_CALL_FAILURE_COOLDOWN_S``) — after a failed call, subsequent calls
+    * a **negative-result cooldown** (``_call_failure_at``; window from the
+      ``vision_failure_cooldown_s`` config key via :func:`_failure_cooldown_s`,
+      default 30 s, 0 disables) — after a failed call, subsequent calls
       fast-fail to "" for the cooldown window so a vault full of images cannot
-      hammer a model that is not loaded.
+      hammer a model that is not loaded. Cleared by set_model / set_provider
+      so a UI change retries immediately.
 
     All of this state is guarded by ``self._lock``; the slow vision call runs
     *outside* the lock (see the module docstring).
     """
     _AVAILABILITY_TTL_S: float = 60.0
-    # Short cool-down after a failed call: avoids hammering the provider with
-    # per-image traffic when the configured model is not actually loaded.
-    # Cleared by set_model / set_provider so a UI change retries immediately.
-    _CALL_FAILURE_COOLDOWN_S: float = 30.0
 
     def __init__(self, model: str = DEFAULT_VISION_MODEL, provider: str = "ollama"):
         self.model = model
@@ -129,6 +166,12 @@ class VisionManager:
 
     def check_availability(self) -> bool:
         """Best-effort informational probe; never gates a call."""
+        # Item 4.10: Fix lock discipline by performing the network call outside the lock.
+        # Defect/Scenario: Calling provider.get_models() while holding self._lock blocks any other
+        # thread calling describe_image() or set_model(), wedging workers if the model backend is slow or hangs.
+        # Safety: Snapshots the configurations under the lock, calls get_models() outside, and re-acquires
+        # the lock to cache the result only if the configuration hasn't changed in the window.
+        # Invariant: self._lock is never held during external network I/O.
         with self._lock:
             now = time.monotonic()
             if (
@@ -137,14 +180,22 @@ class VisionManager:
                 and (now - self._availability_checked_at) < self._AVAILABILITY_TTL_S
             ):
                 return self._is_available
-            try:
-                provider = get_provider(self.provider)
-                models, _ = provider.get_models()
-                self._is_available = _model_matches(self.model, models)
-            except Exception:
-                self._is_available = False
-            self._availability_checked_at = time.monotonic()
-            return self._is_available
+            provider_name = self.provider
+            model_name = self.model
+
+        try:
+            provider = get_provider(provider_name)
+            models, _ = provider.get_models()
+            is_available = _model_matches(model_name, models)
+        except Exception:
+            is_available = False
+
+        with self._lock:
+            if self.provider == provider_name and self.model == model_name:
+                self._is_available = is_available
+                self._availability_checked_at = time.monotonic()
+                return is_available
+            return self._is_available if self._is_available is not None else False
 
     def describe_image(self, base64_data: str) -> str:
         """Return a search-oriented description of *base64_data*, or "" on failure.
@@ -161,7 +212,7 @@ class VisionManager:
             failure_at = self._call_failure_at
         # Cooldown is checked AFTER snapshotting and OUTSIDE the lock: a recent
         # failure short-circuits to "" without touching the provider.
-        if failure_at is not None and (time.monotonic() - failure_at) < self._CALL_FAILURE_COOLDOWN_S:
+        if failure_at is not None and (time.monotonic() - failure_at) < _failure_cooldown_s():
             return ""
 
         try:
@@ -194,6 +245,16 @@ class VisionManager:
             # since a truncated description is still useful for retrieval.
             timeout = _cfg_bounded_int("vision_timeout_s", DEFAULT_VISION_TIMEOUT_S, 5, 600)
             max_tokens = _cfg_bounded_int("vision_max_tokens", DEFAULT_VISION_MAX_TOKENS, 64, 8192)
+            # Prompt Hub capture: the vision instruction is sent as a USER-role
+            # message to the vision model (there is no system field on this
+            # path), so it is recorded under the "vision_describe" row which the
+            # Hub labels as a user-instruction, not a system prompt.
+            from core import prompt_capture
+
+            prompt_capture.record(
+                "vision_describe", prompt,
+                provider=current_provider, model=current_model,
+            )
             if current_provider == "lm_studio":
                 result = _chat_lm_studio_image(
                     current_model, prompt, payload,
@@ -253,10 +314,10 @@ class GLMOCRManager:
     """
     _OCR_CACHE_MAX_SIZE: int = 256
     _AVAILABILITY_TTL_S: float = 60.0  # mirrors VisionManager; prevents stale cache after Ollama restarts
-    # Same negative-result cooldown as VisionManager.  Stops a 1000-page
-    # scanned PDF from making 1000 failed round-trips when the configured
-    # OCR model is not loaded on the provider.
-    _CALL_FAILURE_COOLDOWN_S: float = 30.0
+    # Same negative-result cooldown as VisionManager (window from the
+    # vision_failure_cooldown_s config key via _failure_cooldown_s(); default
+    # 30 s, 0 disables). Stops a 1000-page scanned PDF from making 1000 failed
+    # round-trips when the configured OCR model is not loaded on the provider.
 
     def __init__(self, model: str = DEFAULT_OCR_MODEL, provider: str = "ollama"):
         self.model = model
@@ -271,6 +332,12 @@ class GLMOCRManager:
     def check_availability(self) -> bool:
         """Best-effort informational probe; never gates a call or rewrites the
         configured model."""
+        # Item 4.10: Fix lock discipline by performing the network call outside the lock.
+        # Defect/Scenario: Calling provider.get_models() while holding self._lock blocks any other
+        # thread calling extract_page_text() or set_model(), wedging workers if the model backend is slow or hangs.
+        # Safety: Snapshots the configurations under the lock, calls get_models() outside, and re-acquires
+        # the lock to cache the result only if the configuration hasn't changed in the window.
+        # Invariant: self._lock is never held during external network I/O.
         with self._lock:
             now = time.monotonic()
             if (
@@ -279,14 +346,22 @@ class GLMOCRManager:
                 and (now - self._availability_checked_at) < self._AVAILABILITY_TTL_S
             ):
                 return self._is_available
-            try:
-                provider = get_provider(self.provider)
-                models, _ = provider.get_models()
-                self._is_available = _model_matches(self.model, models)
-            except Exception:
-                self._is_available = False
-            self._availability_checked_at = time.monotonic()
-            return self._is_available
+            provider_name = self.provider
+            model_name = self.model
+
+        try:
+            provider = get_provider(provider_name)
+            models, _ = provider.get_models()
+            is_available = _model_matches(model_name, models)
+        except Exception:
+            is_available = False
+
+        with self._lock:
+            if self.provider == provider_name and self.model == model_name:
+                self._is_available = is_available
+                self._availability_checked_at = time.monotonic()
+                return is_available
+            return self._is_available if self._is_available is not None else False
 
     def set_model(self, model: str) -> None:
         """Switch the configured model and invalidate both caches immediately.
@@ -337,12 +412,26 @@ class GLMOCRManager:
         # page is always served — an unrelated failure must never withhold text
         # we already have.
         # OCR output can differ by provider/model, so cache keys include both.
-        img_hash = hashlib.sha256(f"{current_provider}:{current_model}:{base64_png}".encode()).hexdigest()
+        # Hash the components incrementally instead of building an
+        # f"{provider}:{model}:{base64_png}" string first: base64_png for a
+        # rendered page is multi-MB, so the f-string concatenation allocated a
+        # second multi-MB string (then .encode() a third) on every call — pure
+        # transient churn over a 1000-page scan. update() feeds each part directly.
+        # This is the IN-MEMORY OCR result cache only (per process); the digest
+        # value is never persisted, so changing how it's computed cannot affect
+        # any on-disk cache — it just means a cold in-memory cache on first use.
+        _h = hashlib.sha256()
+        _h.update(current_provider.encode())
+        _h.update(b":")
+        _h.update(current_model.encode())
+        _h.update(b":")
+        _h.update(base64_png.encode())
+        img_hash = _h.hexdigest()
         with self._cache_lock:
             if img_hash in self._cache:
                 return self._cache[img_hash]
 
-        if failure_at is not None and (time.monotonic() - failure_at) < self._CALL_FAILURE_COOLDOWN_S:
+        if failure_at is not None and (time.monotonic() - failure_at) < _failure_cooldown_s():
             return ""
 
         prompt = "Extract all text from this scanned document page. Return only the extracted text, preserving reading order and paragraph breaks. Ignore page numbers."
@@ -355,6 +444,14 @@ class GLMOCRManager:
         # /api/config validator.
         timeout = _cfg_bounded_int("vision_timeout_s", DEFAULT_VISION_TIMEOUT_S, 5, 600)
         max_tokens = _cfg_bounded_int("ocr_max_tokens", DEFAULT_OCR_MAX_TOKENS, 64, 8192)
+        # Prompt Hub capture: the OCR instruction is a USER-role message to the
+        # OCR model (no system field), recorded under "ocr_extract".
+        from core import prompt_capture
+
+        prompt_capture.record(
+            "ocr_extract", prompt,
+            provider=current_provider, model=current_model,
+        )
         result = ""
         for attempt in range(2):
             image_payload = base64_png if attempt == 0 else _downscale_base64_png(base64_png, 0.8)
@@ -407,38 +504,50 @@ def _is_context_overflow_error(exc: Exception) -> bool:
         or ("context" in message and "exceed" in message)
     )
 
-def _fit_base64_image_to_max_side(base64_data: str, max_side: int) -> str:
-    """Return a downscaled (PNG, 14px-aligned) re-encode of *base64_data* when
-    its longest side exceeds *max_side*, else the input unchanged.
+# Formats local vision models decode directly. A decodable-but-model-unfriendly
+# format (HEIC/HEIF/TIFF/BMP) is re-encoded to PNG even when under the size cap,
+# so the model receives bytes it can actually read — the whole point of decoding
+# HEIC via pillow-heif. Anything PIL cannot open at all (SVG, .img) still falls
+# through to the original bytes (and is skipped downstream).
+_MODEL_SAFE_IMAGE_FORMATS = frozenset({"PNG", "JPEG", "JPG", "WEBP", "GIF"})
 
-    Best-effort: on any failure — already small enough, undecodable image
-    (HEIC without pillow-heif, the ``.img`` extension, or non-image test input)
-    — the ORIGINAL base64 is returned so the vision call still proceeds.  The
-    image-description cache (``rag.vault``) keys on the original bytes, so this
-    transform is invisible to caching.
+
+def _fit_base64_image_to_max_side(base64_data: str, max_side: int) -> str:
+    """Return a model-friendly PNG re-encode of *base64_data* when needed, else input.
+
+    Re-encodes to PNG (14px-aligned) when the longest side exceeds *max_side*
+    OR the source format is not one a local vision model reads directly
+    (HEIC/HEIF/TIFF/BMP). A within-budget PNG/JPEG/WebP/GIF passes through
+    untouched (no needless re-encode).
+
+    Best-effort: on any failure — non-image input, or a format PIL cannot open at
+    all (SVG, the ``.img`` extension) — the ORIGINAL base64 is returned so the
+    vision call still proceeds. The image-description cache (``rag.vault``) keys
+    on the original bytes, so this transform is invisible to caching.
     """
     try:
-        # Open once just to read the header dimensions — PIL is lazy, so
+        # Open once just to read the header dimensions + format — PIL is lazy, so
         # .size does NOT decompress the pixel data (cheap even for a 20 MB
-        # image).  The actual resize re-decodes inside _downscale_base64_png;
-        # the double-decode is negligible on the low-volume vision path and
-        # keeps this a thin size-gate over the existing downscaler.
+        # image).  The actual resize re-decodes inside _downscale_base64_png.
         raw = base64.b64decode(base64_data)
         with Image.open(io.BytesIO(raw)) as image:
             longest = max(image.size)
-        # Already within budget: return the ORIGINAL bytes untouched — no
-        # needless re-encode (a small JPEG stays a small JPEG).
-        if longest <= max_side:
+            fmt = (image.format or "").upper()
+        # Already within budget AND a format the model reads: return the ORIGINAL
+        # bytes untouched (a small JPEG stays a small JPEG).
+        if longest <= max_side and fmt in _MODEL_SAFE_IMAGE_FORMATS:
             return base64_data
-        # Scale so the longest side lands at max_side. _downscale_base64_png
-        # rounds UP to the nearest 14 px, so this stays <= max_side only because
-        # max_side is a multiple of 14 (see VISION_IMAGE_MAX_SIDE). ``or
-        # base64_data`` falls back to the original if the downscale itself fails
-        # (it returns "" on error).
-        return _downscale_base64_png(base64_data, max_side / float(longest)) or base64_data
+        # Otherwise re-encode to PNG. Scale down so the longest side lands at
+        # max_side (clamped to 1.0 so an under-budget but unfriendly format — e.g.
+        # a small HEIC — is converted at its own size, never upscaled).
+        # _downscale_base64_png rounds UP to the nearest 14 px, so the result
+        # stays <= max_side only because max_side is a multiple of 14
+        # (VISION_IMAGE_MAX_SIDE). ``or base64_data`` falls back on encode failure.
+        scale = min(1.0, max_side / float(longest)) if longest > 0 else 1.0
+        return _downscale_base64_png(base64_data, scale) or base64_data
     except Exception:
-        # Undecodable (HEIC without pillow-heif, the ".img" extension) or
-        # non-image input: send the original so the vision call still proceeds.
+        # Undecodable (SVG, the ".img" extension) or non-image input: send the
+        # original so the vision call still proceeds (it is skipped if empty).
         return base64_data
 
 def _downscale_base64_png(base64_png: str, scale: float) -> str:
@@ -485,8 +594,9 @@ def _chat_ollama_image(
     # ollama.chat so a stuck call is bounded; ``timeout=None`` leaves the SDK
     # default, handled inside _ollama_client.  num_predict caps generation.
     from core.providers.ollama import _ollama_client
+    from core.providers.base import resolve_ollama_host
 
-    client = _ollama_client(OLLAMA_HOST, timeout)
+    client = _ollama_client(resolve_ollama_host(), timeout)
     # options=None when max_tokens is unset/falsy ⇒ NO num_predict cap (the
     # model's own default applies). In production the managers always pass a
     # positive cap; only a direct/test call can reach the uncapped path.
@@ -520,18 +630,19 @@ def _chat_lm_studio_image(
     forwarded only when set (never ``timeout=None``, which the SDK reads as "no
     timeout"). ``temperature=0`` for deterministic transcription.
     """
-    import openai
-    from core.constants import LM_STUDIO_HOST
+    from core.providers.base import resolve_lm_studio_host
+    from core.providers.lms import get_lmstudio_client
 
-    # max_retries=0: the OpenAI SDK otherwise retries a timed-out request twice,
-    # turning one stuck image into 3x the wall-clock wait. Never forward
-    # timeout=None explicitly (the SDK can read that as "no timeout").
-    client_kwargs = {"max_retries": VISION_MAX_RETRIES}
-    if timeout is not None:
-        client_kwargs["timeout"] = timeout
-    client = openai.OpenAI(
-        base_url=f"{LM_STUDIO_HOST}/v1", api_key="lm-studio", **client_kwargs
-    )
+    # Reuse the SHARED, cached LM Studio client (keyed by base_url+timeout) instead
+    # of constructing a fresh openai.OpenAI per image — a per-call client leaked a
+    # connection pool on every page of a scanned PDF (the chat path was fixed the
+    # same way). get_lmstudio_client already forces max_retries=0 (so one stuck
+    # image is bounded by exactly one timeout, not 3x — matching VISION_MAX_RETRIES)
+    # and normalises the timeout (non-positive ⇒ SDK default, never "0 = time out
+    # immediately"; a positive value is rounded to whole seconds), so it never
+    # forwards timeout=None. Passing timeout through unchanged preserves the
+    # vision_timeout_s bound.
+    client = get_lmstudio_client(f"{resolve_lm_studio_host()}/v1", timeout)
     create_kwargs = {"temperature": 0.0}
     if max_tokens is not None:
         create_kwargs["max_tokens"] = max_tokens

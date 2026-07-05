@@ -42,7 +42,15 @@ def get_db_connection():
     """
     conn = sqlite3.connect(DB_PATH, timeout=10)
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        # WAL is a PERSISTENT database property — set once in init_db(), not
+        # re-issued per connection (the old per-connection PRAGMA was a
+        # redundant write-lock acquisition on every open). busy_timeout and
+        # synchronous are per-connection settings, so they DO belong here:
+        # busy_timeout makes a concurrent writer wait instead of failing
+        # immediately with SQLITE_BUSY, and NORMAL is the recommended
+        # durability level under WAL (fsync at checkpoint, not every commit).
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         yield conn
         conn.commit()
     except Exception:

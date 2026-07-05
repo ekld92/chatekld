@@ -15,13 +15,15 @@ This blueprint backs the Single Paper workflow and its supporting routes:
 - ``POST /api/feedback`` / ``GET /api/feedback/history`` — store/read feedback,
   recursively capping every string field to bound disk writes.
 
-Every route is gated by :func:`api.security.origin_is_local`, and SSE routes use
+All routes are gated by the app-level before_request origin guard
+(api.security.register_origin_guard). SSE routes use
 the shared ``{info}`` / ``{token}`` / ``{error}`` + ``[DONE]`` contract.
 """
 import logging
-import json
 import os
-from flask import Blueprint, request, jsonify, Response
+import re
+import unicodedata
+from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
 
 from core.constants import (
@@ -29,6 +31,8 @@ from core.constants import (
     PROMPT_PRESETS,
     SYSTEM_PROMPT_LIMIT,
     TARGET_AUDIENCE_OPTIONS,
+    SSE_SINGLE_SHOT_FLOOR_S,
+    SSE_STALL_MARGIN_S,
 )
 from core.database import get_db_connection, DB_LOCK
 from core.config import load_config, load_report_types
@@ -36,17 +40,42 @@ from core.utils import (
     cap, parse_temperature, parse_num_ctx, parse_num_predict,
     parse_top_p, parse_repeat_penalty, write_text_atomic
 )
-from api.security import origin_is_local, sanitise_error_msg
+from api.security import sanitise_error_msg
 from api.validators import (
     coerce_enum,
     coerce_int_in_range,
     coerce_non_empty_string,
     coerce_regex,
 )
+from api.sse import run_sse_worker
 from rag.summarizer import summarise_stream
 
 paper_bp = Blueprint('paper', __name__)
 logger = logging.getLogger(__name__)
+
+# Windows-reserved filename characters, replaced with "_" in export names.
+_RESERVED_FILENAME_CHARS_RE = re.compile(r'[<>:"|?*]')
+
+
+def _safe_export_basename(raw: str, max_len: int = 128) -> str:
+    """Filesystem-safe export basename that PRESERVES accented / CJK letters.
+
+    werkzeug's ``secure_filename`` strips every non-ASCII byte, so a French
+    ("résumé") or CJK title collapses to ASCII or the generic "summary" — and
+    because the export is written with ``os.replace`` a second collapsing title
+    silently overwrites the first. This keeps Unicode letters and only removes
+    what is actually unsafe in a path component: separators, NUL, control chars,
+    and the Windows-reserved set. NFC-normalised, length-capped, with a
+    ``"summary"`` fallback so the basename is never empty.
+    """
+    s = unicodedata.normalize("NFC", str(raw))
+    s = s.replace("/", "_").replace("\\", "_").replace("\x00", "")
+    s = "".join(ch for ch in s if ord(ch) >= 32)        # drop control chars
+    s = _RESERVED_FILENAME_CHARS_RE.sub("_", s)          # Windows-reserved
+    s = re.sub(r"\s+", " ", s).strip().strip(".")        # collapse ws, no edge dots
+    s = s[:max_len].strip()
+    return s or "summary"
+
 
 def _extract_summarise_params(data: dict) -> dict:
     """Resolve generation params: request body wins, else the persisted
@@ -136,11 +165,12 @@ def api_summarise():
     are emitted as ``{token}`` frames, stage messages as ``{info}``, any failure
     as a sanitised ``{error}``, ending with ``[DONE]``.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
 
     data = request.get_json(silent=True)
-    if not data:
+    if not isinstance(data, dict):
+        # isinstance (not `if not data`): a truthy non-dict body (JSON array /
+        # scalar) would pass `if not data` and then AttributeError on data.get(),
+        # surfacing as a 500 instead of this clean 400.
         return jsonify({"error": "Invalid or missing JSON body"}), 400
 
     model = coerce_non_empty_string(data.get("model"), max_len=128)
@@ -176,17 +206,18 @@ def api_summarise():
     audience_modifier = TARGET_AUDIENCE_OPTIONS.get(str(data.get("audience", "")), "")
 
     from core.llm.factory import ALL_PROVIDER_NAMES
-    req_provider = data.get("provider", "").strip().lower()
+    # str(...) first: a non-string `provider` (JSON number/array) would
+    # AttributeError on .strip() → 500; coerce so an invalid type just falls
+    # through to the configured default. Mirrors the `format` handling below.
+    req_provider = str(data.get("provider", "")).strip().lower()
     summarise_provider = (
         req_provider if req_provider in ALL_PROVIDER_NAMES
         else load_config().get("provider", "ollama")
     )
 
-    def generate():
-        info_queue: list[str] = []
-
+    def _paper_worker(put, cancel):
         def _info_cb(msg: str) -> None:
-            info_queue.append(msg)
+            put({"info": msg})
 
         try:
             for token in summarise_stream(
@@ -196,9 +227,6 @@ def api_summarise():
                 user_template=preset.get("user_template"),
                 doc_type=doc_type,
                 audience_modifier=audience_modifier,
-                # Cap language like focus_question so a malicious body cannot
-                # push an unbounded string into the prompt; fall back to the
-                # default for empty / non-string values.
                 language=cap(data.get("language", "English"), limit=100) or "English",
                 focus_question=cap(data.get("focus_question", ""), limit=2_000),
                 temperature=params["temperature"],
@@ -209,15 +237,18 @@ def api_summarise():
                 provider_name=summarise_provider,
                 info_cb=_info_cb,
             ):
-                while info_queue:
-                    msg = info_queue.pop(0)
-                    yield f"data: {json.dumps({'info': msg})}\n\n"
-                yield f"data: {json.dumps({'token': token})}\n\n"
+                if cancel.is_set():
+                    break
+                if token:
+                    put({"token": token})
         except Exception as e:
-            yield f"data: {json.dumps({'error': sanitise_error_msg(e)})}\n\n"
-        yield "data: [DONE]\n\n"
+            if not cancel.is_set():
+                put({"error": sanitise_error_msg(e)})
 
-    return Response(generate(), mimetype="text/event-stream")
+    return run_sse_worker(
+        _paper_worker,
+        consumer_timeout_s=SSE_SINGLE_SHOT_FLOOR_S + SSE_STALL_MARGIN_S,
+    )
 
 @paper_bp.route("/api/upload", methods=["POST"])
 def api_upload():
@@ -230,8 +261,6 @@ def api_upload():
     ``{upload_id, filename}``; a ``ValueError`` (bad/empty PDF) is a 400 and any
     other failure a 500, both sanitised.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
@@ -266,8 +295,6 @@ def api_delete_upload(upload_id: str):
     (1-128 of ``[A-Za-z0-9._-]``) before it reaches the parameterised DELETE,
     as defence in depth. Idempotent: deleting an absent id still returns ok.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     if coerce_regex(upload_id, r"[A-Za-z0-9._-]{1,128}") is None:
         return jsonify({"error": "Invalid upload id"}), 400
     with DB_LOCK:
@@ -287,19 +314,22 @@ def api_export_summary():
     rename) so a crash/disk-full mid-write cannot leave a truncated file the
     user only notices after deleting the original chat. Returns the output path.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
-    if not data:
+    if not isinstance(data, dict):
         return jsonify({"error": "Invalid request body"}), 400
-    
+
     raw_format = str(data.get("format", "txt")).lower()
     export_format = coerce_enum(raw_format, ("txt", "md"))
     if export_format is None:
         return jsonify({"error": "Unsupported export format"}), 400
 
-    raw_name = data.get("filename", "summary").replace(".pdf", "")
-    safe_name = secure_filename(raw_name) or "summary"
+    # str(...) first so a non-string `filename` (JSON number/array) cannot
+    # AttributeError on .replace() → 500. Then a Unicode-aware sanitiser instead
+    # of secure_filename, which strips ALL non-ASCII and would collapse a French
+    # ('résumé') or CJK title to the generic 'summary' (silently overwriting a
+    # prior export). See _safe_export_basename.
+    raw_name = str(data.get("filename", "summary")).replace(".pdf", "")
+    safe_name = _safe_export_basename(raw_name)
     content = cap(data.get("content", ""), limit=500_000)
     if export_format == "md":
         title = safe_name.replace("_", " ").strip() or "Summary"
@@ -340,8 +370,6 @@ def api_feedback():
     10k-char cap per string leaf before ``save_feedback`` appends it, so a
     crafted body cannot write an unbounded amount to the feedback log.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Invalid or missing JSON body"}), 400
@@ -362,8 +390,6 @@ def api_feedback_history():
     ``?limit=`` (clamped 1-500, default 50) and ``?offset=`` (clamped, default 0)
     page the full record list; ``total`` reports the unpaginated count.
     """
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
     from core.feedback import load_feedback
     limit = coerce_int_in_range(request.args.get("limit", 50), 1, 500) or 50
     offset = coerce_int_in_range(request.args.get("offset", 0), 0, 1_000_000_000) or 0

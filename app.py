@@ -13,14 +13,16 @@ so a patch on this module takes effect there without an import-time binding.
 import os
 import sys
 import logging
+import logging.handlers
 from flask import Flask, render_template
 
 from core.config import load_config
 # CONFIG_FILE and FEEDBACK_FILE are re-imported here intentionally: smoke_test
 # patches them at `app.CONFIG_FILE` / `app.FEEDBACK_FILE` via mock.patch.
-from core.constants import BASE_DIR, CONFIG_FILE, FEEDBACK_FILE  # noqa: F401
+from core.constants import BASE_DIR, CONFIG_FILE, FEEDBACK_FILE, LOG_FILE  # noqa: F401
 from core.database import init_db
-from core.llm.usage import configure_default_usage_tracker
+from core.llm.usage import configure_default_usage_tracker, log_unpriced_curated_models
+from api.security import register_origin_guard
 from services.vision import vision_manager, glm_ocr_manager
 from rag.vault import obsidian_manager
 
@@ -35,6 +37,7 @@ from api.routes.audit import audit_bp
 from api.routes.deck import deck_bp
 from api.routes.refactor import refactor_bp
 from api.routes.plainchat import plainchat_bp
+from api.routes.prompts import prompts_bp
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +69,33 @@ def create_app():
     else:
         app = Flask(__name__)
 
+    # Global request-body ceiling (improvement plan 0.4). Set ABOVE the 500 MB
+    # PDF upload cap so the streamed /api/upload path (which enforces its own
+    # hard byte cap while spooling to disk) is unaffected; everything else —
+    # JSON bodies included — now has a backstop instead of being unbounded.
+    # Werkzeug raises RequestEntityTooLarge (413) past this.
+    app.config["MAX_CONTENT_LENGTH"] = 550 * 1024 * 1024
+
+    @app.errorhandler(413)
+    def _too_large(_e):
+        # JSON (not the default HTML page) so the fetch()-based UI surfaces a
+        # readable message.
+        from flask import jsonify
+        return jsonify({"error": "Request body too large."}), 413
+
+    # Item 4.1 — single before_request hook replaces the 67 inline
+    # origin_is_local() checks that lived in every route handler.
+    # New blueprints are protected automatically; the hook is the single
+    # location to patch in tests (api.security.origin_is_local).
+    register_origin_guard(app)
+
     # --- Initialization ---
     init_db()
     configure_default_usage_tracker(BASE_DIR)
+    # Track 5.5 startup advisory: name any curated model whose usage would
+    # silently cost out at $0 (missing PRICING_TABLE entry). Warning only —
+    # never blocks boot.
+    log_unpriced_curated_models()
 
     cfg = load_config()
     
@@ -98,6 +125,7 @@ def create_app():
     app.register_blueprint(deck_bp)
     app.register_blueprint(refactor_bp)
     app.register_blueprint(plainchat_bp)
+    app.register_blueprint(prompts_bp)
 
     # --- Main Index Route ---
     @app.route("/")
@@ -114,7 +142,9 @@ if __name__ == "__main__":
         level=logging.INFO,
         format=log_format,
         handlers=[
-            logging.FileHandler("chatekld.log"),
+            # Rotate so the dev log can't grow unbounded (mirrors launch.py).
+            logging.handlers.RotatingFileHandler(
+                LOG_FILE, maxBytes=10_000_000, backupCount=3),
             logging.StreamHandler(sys.stdout)
         ]
     )

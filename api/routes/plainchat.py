@@ -11,15 +11,13 @@ mirrors ``api/routes/vault.py``'s ``/api/obsidian/chat`` handler, stripped
 of every agent / iteration / tool branch: only ``{info}`` / ``{token}`` /
 ``{error}`` frames plus the ``[DONE]`` sentinel.
 """
-import json
-import queue
-import threading
 
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, jsonify, request
 
-from api.security import origin_is_local, sanitise_error_msg
+from api.security import sanitise_error_msg
 from api.validators import coerce_float_in_range, coerce_string_max_len
 from core.config import load_config, resolve_chat_model
+from api.sse import run_sse_worker
 from core.constants import (
     SYSTEM_PROMPT_LIMIT,
     # Shared SSE stall-guard timing. Plain chat has no agent wall-clock — the
@@ -105,8 +103,6 @@ def _validate_messages(raw) -> list[dict] | None:
 
 @plainchat_bp.route("/api/plainchat", methods=["POST"])
 def api_plainchat():
-    if not origin_is_local():
-        return jsonify({"error": "Forbidden"}), 403
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
@@ -144,110 +140,29 @@ def api_plainchat():
     # interrupt a blocking read from outside the call).
     consumer_timeout_s = SSE_SINGLE_SHOT_FLOOR_S + SSE_STALL_MARGIN_S
 
-    def generate():
-        cancel = threading.Event()
-        # Bounded queue (back-pressure): a fast producer cannot grow memory
-        # without bound if the client consumes slowly.
-        event_q: queue.Queue = queue.Queue(maxsize=512)
-        _DONE = object()  # unique sentinel marking the worker has finished
-
-        def _put(item):
-            # Block until the item is enqueued, BUT re-check ``cancel`` every 1 s
-            # so a disconnected/timed-out client (consumer no longer draining,
-            # queue full) cannot wedge the worker thread here forever — it bails
-            # out and lets the worker reach its finally/_DONE.
-            placed = False
-            while not placed and not cancel.is_set():
-                try:
-                    event_q.put(item, timeout=1)
-                    placed = True
-                except queue.Full:
-                    continue
-
+    def _plainchat_worker(put, cancel):
         def _stage(text: str) -> None:
-            # info_cb for stream_chat_messages — surfaces the fallback notice as
-            # an {info} SSE frame.
             if text:
-                _put({"info": text})
-
-        def _run_chat():
-            # Worker thread: pump tokens from the (RAG-free) chat helper into the
-            # queue. Runs off the request thread so the consumer/generator can
-            # apply the stall timeout independently.
-            try:
-                for tok in stream_chat_messages(
-                    messages=messages,
-                    system_prompt=system_prompt,
-                    provider_name=provider,
-                    model=model,
-                    temperature=temperature,
-                    cfg=cfg,
-                    info_cb=_stage,
-                ):
-                    # Stop pumping the moment the consumer gave up (timeout /
-                    # client disconnect) — avoids spending work on a dead stream.
-                    if cancel.is_set():
-                        break
-                    if tok:
-                        _put({"token": tok})
-            except Exception as exc:
-                # Surface a structured, key-redacted error frame — unless the
-                # consumer already cancelled (then nobody is listening).
-                if not cancel.is_set():
-                    _put({"error": sanitise_error_msg(exc)})
-            finally:
-                # Always signal completion so the consumer's blocking get()
-                # returns promptly instead of waiting out the full timeout.
-                try:
-                    event_q.put(_DONE, timeout=5)
-                except queue.Full:
-                    pass
+                put({"info": text})
 
         try:
-            threading.Thread(target=_run_chat, daemon=True).start()
-            while True:
-                try:
-                    item = event_q.get(timeout=consumer_timeout_s)
-                except queue.Empty:
-                    # No event at all within the stall window: the worker is
-                    # silent (hung backend). Free the client with a clean error
-                    # and signal the worker to stop pumping.
-                    cancel.set()
-                    yield f"data: {json.dumps({'error': 'Generation timed out — the model may be overloaded. Please try again.'})}\n\n"
+            for tok in stream_chat_messages(
+                messages=messages,
+                system_prompt=system_prompt,
+                provider_name=provider,
+                model=model,
+                temperature=temperature,
+                cfg=cfg,
+                info_cb=_stage,
+            ):
+                if cancel.is_set():
                     break
-                if item is _DONE:
-                    break
-                # Branch dispatch — only {info} / {token} / {error} exist (no
-                # agent/iteration/tool frames in plain chat). An {error} is
-                # terminal; cancel the worker and stop.
-                if isinstance(item, dict) and item.get("error"):
-                    cancel.set()
-                    yield f"data: {json.dumps({'error': item['error']})}\n\n"
-                    break
-                if isinstance(item, dict) and item.get("info"):
-                    yield f"data: {json.dumps({'info': item['info']})}\n\n"
-                    continue
-                if isinstance(item, dict) and item.get("token"):
-                    yield f"data: {json.dumps({'token': item['token']})}\n\n"
-
-            # Intentionally NO synthesized "no response" token here: the client
-            # records every {token} into its conversation history, so a synthetic
-            # placeholder would be re-sent to the model as a real assistant turn.
-            # On an empty-but-clean stream we simply end with [DONE]; the frontend
-            # detects the empty answer and renders a muted, non-recorded bubble.
-            yield "data: [DONE]\n\n"
-        except GeneratorExit:
-            # Client disconnected mid-stream — signal the worker and propagate
-            # (yielding here would raise from Werkzeug's close() path).
-            cancel.set()
-            raise
-        except Exception as e:
-            yield f"data: {json.dumps({'error': sanitise_error_msg(e)})}\n\n"
-            yield "data: [DONE]\n\n"
-        finally:
-            # Non-yielding cleanup only. The [DONE] sentinel is emitted on the
-            # normal/error paths above; on GeneratorExit there is no consumer to
-            # send it to.
-            cancel.set()
-
-    return Response(generate(), mimetype="text/event-stream")
+                if tok:
+                    put({"token": tok})
+        except Exception as exc:
+            if not cancel.is_set():
+                put({"error": sanitise_error_msg(exc)})
+    return run_sse_worker(
+        _plainchat_worker,
+        consumer_timeout_s=consumer_timeout_s,
+    )

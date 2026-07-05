@@ -24,6 +24,7 @@ import threading
 import time
 import socket
 import logging
+import logging.handlers
 import traceback
 import multiprocessing
 
@@ -33,14 +34,17 @@ if getattr(sys, 'frozen', False):
 # Logs live alongside config/index under the platform app-data directory so
 # `python launch.py` (dev) and a frozen build share one log location and a
 # Finder-cleanup of the repo never wipes prior diagnostics.
-from core.constants import BASE_DIR as _BASE_DIR  # noqa: E402
-log_file = os.path.join(_BASE_DIR, "chatekld.log")
+from core.constants import BASE_DIR as _BASE_DIR, LOG_FILE as log_file  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_file),
+        # Rotate so the log can't grow unbounded over months of use (it shares the
+        # volume with the local LLM weights). 10 MB x 3 backups; the in-app log
+        # viewer (/api/log/tail) only ever reads the last ~1 MB.
+        logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=10_000_000, backupCount=3),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -67,6 +71,26 @@ def _pin_tiktoken_cache() -> None:
         os.environ.setdefault("TIKTOKEN_CACHE_DIR", TIKTOKEN_CACHE_DIR)
     except Exception:
         logger.debug("Could not pin TIKTOKEN_CACHE_DIR.", exc_info=True)
+
+
+def _pin_nltk_data() -> None:
+    """Point NLTK at a durable data dir under BASE_DIR (the installer pre-seeds it).
+
+    LlamaIndex's SentenceSplitter eagerly loads NLTK punkt + stopwords; without
+    the data it reaches out to huggingface/nltk over the network, which breaks an
+    OFFLINE first index on a fresh machine. The installer pre-downloads the data
+    into ``core.constants.NLTK_DATA_DIR``; exporting it here (``setdefault`` so a
+    user override wins) makes the app find it without a network call.
+
+    MUST run before the first SentenceSplitter import (pulled by ``from app import
+    app`` below). Mirrors ``_pin_tiktoken_cache``.
+    """
+    try:
+        from core.constants import NLTK_DATA_DIR
+        os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+        os.environ.setdefault("NLTK_DATA", NLTK_DATA_DIR)
+    except Exception:
+        logger.debug("Could not pin NLTK_DATA.", exc_info=True)
 
 
 def _load_env_files() -> None:
@@ -154,12 +178,123 @@ def _maybe_enable_hf_offline() -> None:
         logger.debug("HF offline-mode probe failed; leaving online.", exc_info=True)
 
 
-# Order matters: pin the tiktoken cache env var before any tiktoken import,
-# load .env so it can supply keys / HF_HOME, then probe the HF cache (which
+def _configured_reranker_model() -> str:
+    """Reranker model to seed: the configured value if set, else the shipped default.
+
+    Reads ``config.json`` directly (like ``_maybe_enable_hf_offline`` above) rather
+    than importing ``core.config``, so seed mode keeps a minimal import surface and
+    does not drag in the Flask app chain. The default string mirrors the installer
+    and ``_maybe_enable_hf_offline``.
+    """
+    default = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    try:
+        import json as _json
+        from core.constants import CONFIG_FILE as _CONFIG_FILE
+        if os.path.exists(_CONFIG_FILE):
+            with open(_CONFIG_FILE) as _f:
+                val = str(_json.load(_f).get("vault_reranker_model", default) or "").strip()
+                return val or default
+    except Exception:
+        logger.debug("seed: reranker-model config read failed; using default.", exc_info=True)
+    return default
+
+
+def seed_models() -> int:
+    """Headless ``--seed-models`` mode: download the offline model caches, then exit.
+
+    The tiktoken BPE vocab, NLTK punkt/stopwords, and the ~67 MB HF cross-encoder
+    reranker live OUTSIDE the .app bundle (under BASE_DIR and ~/.cache/huggingface).
+    A fresh Mac that received only the app has none of them, so its first OFFLINE
+    vault index FAILS (the SentenceSplitter needs tiktoken + NLTK) and its first
+    chat stalls on a reranker download. This function is the per-machine seed a
+    recipient runs once (via the DMG's ``seed_models.command``): it downloads all
+    three into the exact locations the app reads, reusing the SAME bundled packages
+    (tiktoken / nltk / sentence-transformers) the app uses at runtime — so it can
+    never drift from what the app expects. Requires network. Returns a process exit
+    code (0 = every step succeeded; non-zero if any download failed, so the caller /
+    .command can tell the user to re-run while online).
+
+    Runs BEFORE the heavy ``import webview; from app import app`` block below, so
+    seeding needs neither the native webview framework nor the Flask app. The
+    tiktoken + NLTK cache dirs were already pinned by ``_pin_tiktoken_cache`` /
+    ``_pin_nltk_data`` above (they export TIKTOKEN_CACHE_DIR / NLTK_DATA), so the
+    downloads land where the app reads them.
+    """
+    # Seeding downloads by definition — a set HF_HUB_OFFLINE=1 (from
+    # _maybe_enable_hf_offline when a PRIOR seed already cached the model, or a
+    # user override) would block the reranker fetch, so force online for this run.
+    if os.environ.pop("HF_HUB_OFFLINE", None):
+        logger.info("seed: cleared HF_HUB_OFFLINE for the download pass.")
+
+    ok = True
+
+    # 1. tiktoken BPE (cl100k_base + o200k_base) -> TIKTOKEN_CACHE_DIR (pinned above).
+    try:
+        import tiktoken
+        tiktoken.get_encoding("cl100k_base")
+        tiktoken.get_encoding("o200k_base")
+        logger.info("seed: tiktoken encodings cached -> %s",
+                    os.environ.get("TIKTOKEN_CACHE_DIR", "<default>"))
+    except Exception:
+        ok = False
+        logger.exception("seed: tiktoken caching failed.")
+
+    # 2. NLTK punkt_tab + stopwords -> NLTK_DATA (pinned above).
+    try:
+        import nltk
+        nltk_dir = os.environ.get("NLTK_DATA") or None
+        nltk.download("punkt_tab", download_dir=nltk_dir)
+        nltk.download("stopwords", download_dir=nltk_dir)
+        logger.info("seed: NLTK data cached -> %s", nltk_dir or "<default>")
+    except Exception:
+        ok = False
+        logger.exception("seed: NLTK download failed.")
+
+    # 3. HF cross-encoder reranker -> ~/.cache/huggingface (or HF_HOME). Mirrors the
+    #    installer's pre-download (SentenceTransformerRerank, with a direct
+    #    CrossEncoder fallback for llama-index/sentence-transformers API drift) so
+    #    the first vault chat doesn't stall on the fetch.
+    try:
+        model = _configured_reranker_model()
+        try:
+            from llama_index.postprocessor.sbert_rerank import SentenceTransformerRerank
+            SentenceTransformerRerank(model=model, top_n=1)
+        except Exception as _e:
+            from sentence_transformers.cross_encoder import CrossEncoder
+            CrossEncoder(model_name_or_path=model)
+            logger.info("seed: reranker wrapper init failed (%s); used CrossEncoder fallback.", _e)
+        logger.info("seed: reranker cached -> %s", model)
+    except Exception:
+        ok = False
+        logger.exception("seed: reranker download failed.")
+
+    # Terminal-visible summary (logger also mirrors to stdout for the .command window).
+    print("")
+    print("ChatEKLD offline model seed: " + (
+        "DONE — the app can now index and chat fully offline."
+        if ok else
+        "FINISHED WITH ERRORS — see chatekld.log and re-run while online."
+    ))
+    return 0 if ok else 1
+
+
+# Order matters: pin the tiktoken + NLTK caches before any import that reads
+# them, load .env so it can supply keys / HF_HOME, then probe the HF cache (which
 # reads HF_HOME) — all before ``from app import app`` pulls the heavy chain.
 _pin_tiktoken_cache()
+_pin_nltk_data()
 _load_env_files()
 _maybe_enable_hf_offline()
+
+# Headless offline-seed mode. `--seed-models` downloads the three model caches that
+# live OUTSIDE the bundle and exits WITHOUT starting Flask or opening a window — the
+# per-machine seed a fresh-Mac recipient runs once (via the DMG's seed_models.command)
+# so the first offline index/chat work. Handled HERE, before the heavy
+# ``import webview; from app import app`` block, so seeding needs neither the native
+# webview framework nor the Flask app. Membership test (not a flag parser) so Finder's
+# legacy ``-psn_...`` argv entry can never match it.
+if "--seed-models" in sys.argv:
+    raise SystemExit(seed_models())
 
 try:
     import webview
@@ -168,6 +303,7 @@ try:
         start_ollama_server,
         start_lm_studio_server,
         shutdown_ollama,
+        add_provider_warning,
     )
     from core.config import load_config
 except Exception as e:
@@ -378,6 +514,16 @@ def main():
                 ok, err = start_ollama_server()
                 if not ok:
                     logger.warning("Ollama start issue: %s", err)
+                    # A4 first-run UX: surface the ACTIONABLE failure message (e.g.
+                    # "Ollama executable not found. Install it (`brew install ollama`
+                    # or the Ollama.app) …") to the UI's provider-warnings banner
+                    # (/api/status → #runtime-warning). Previously it was only logged,
+                    # so a fresh Mac with no runner installed got no in-app guidance —
+                    # just a terse "not running" from the health probe. The LM Studio
+                    # path already self-reports via add_provider_warning; this brings
+                    # the Ollama path to parity. add_provider_warning de-dupes.
+                    if err:
+                        add_provider_warning(err)
 
             # Daemon=False so we can join it during shutdown and ensure
             # start_ollama_server() has stored its process handle before

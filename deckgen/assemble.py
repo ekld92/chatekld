@@ -8,6 +8,7 @@ run a light structural sanity check (no compiler — emit-only by design).
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -20,6 +21,8 @@ _PREAMBLE_TEMPLATE = r"""\documentclass{beamer}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
 
 \title{@@TITLE@@}
 \author{@@AUTHOR@@}
@@ -64,8 +67,73 @@ _SECTION_RE = re.compile(r"\\section\b")
 # *compile* time. The model's output is grounded in untrusted vault notes, so a
 # prompt-injection (or accident) could emit one of these; we never strip them
 # (that could corrupt legitimate content) but we WARN so the user reviews the
-# file and compiles without shell-escape. See validate().
-_DANGEROUS_MACRO_RE = re.compile(r"\\(?:write18|immediate|openin|input|include|read)\b")
+# file and compiles without shell-escape. The list is intentionally broad —
+# shell-escape / file write (write, incl. `\write18`/`\write16`; openout;
+# immediate), file read (input/include/openin/read), and the LuaTeX escape
+# hatches (directlua/luaexec) plus the catch-all \special — because it is
+# advisory-only here and, in review.screen_repair, only ever blocks a repair
+# that INTRODUCES one not in the original (a legitimate template using e.g.
+# \special is never falsely refused; it just earns an advisory warning).
+#
+# The terminator is ``\d*(?![a-zA-Z])`` (NOT ``\b``): a TeX control word ends at
+# the first non-letter, so this matches stream-numbered forms like ``\write18`` /
+# ``\openout15`` (where ``\b`` fails — it counts the trailing digit as a word
+# char) and CAPTURES the digits so the warning names the exact macro
+# (``\write18`` = shell-escape, not just ``\write``); the ``(?![a-zA-Z])`` still
+# excludes a longer letter-suffixed macro such as the safe, common
+# ``\includegraphics`` (``\include`` followed by the letter ``g``). See
+# validate() and review.screen_repair().
+_DANGEROUS_MACRO_RE = re.compile(
+    r"\\(?:write|immediate|openin|openout|input|include|read"
+    r"|special|directlua|luaexec|@@?input)\d*(?![a-zA-Z])"
+)
+
+# A ``\csname … \endcsname`` construction. LaTeX builds a control sequence from the
+# literal text between the two macros at expansion time, so ``\csname write18\endcsname``
+# IS ``\write18`` — a shell-escape the plain ``\macro`` regex above never matches
+# (there is no backslash before ``write18``). We reconstruct the built name and run
+# it through the same dangerous-word test. ``re.DOTALL`` so a multi-line build is
+# still caught.
+_CSNAME_RE = re.compile(r"\\csname\s*(.*?)\\endcsname", re.DOTALL)
+
+# The dangerous control-word stems, as bare names (no leading backslash), for the
+# reconstructed-``\csname`` test. Kept in sync with the alternation above.
+_DANGEROUS_WORDS = (
+    "write", "immediate", "openin", "openout", "input", "include", "read",
+    "special", "directlua", "luaexec", "@@input", "@input",
+)
+
+
+def find_dangerous_macros(tex: str) -> set[str]:
+    """Return the set of dangerous compile-time macros found in *tex*.
+
+    THE single detector shared by :func:`validate` and
+    :func:`deckgen.review.screen_repair` so the advisory warning and the repair
+    safety-gate can never disagree. Catches both the direct ``\\write18`` form AND
+    the ``\\csname write18\\endcsname`` / ``\\@@input`` obfuscations a prompt-injected
+    vault note could use to smuggle a shell-escape past a naive ``\\macro`` scan.
+    Comments are stripped first (a commented-out ``\\input`` is inert).
+
+    KNOWN RESIDUAL LIMITS (documented honestly, not over-claimed): a determined
+    attacker can still defeat a regex-only screen via catcode tricks or char-by-char
+    construction (``\\string`` / ``\\lowercase{…}`` / ``\\expandafter`` chains that
+    assemble the name from fragments). This screen RAISES THE BAR; it is not a
+    sandbox. The real safety net is the emit-only design plus the standing advice to
+    compile WITHOUT shell-escape (``pdflatex -no-shell-escape``).
+    """
+    scan = _strip_latex_comments(tex or "")
+    found: set[str] = set(_DANGEROUS_MACRO_RE.findall(scan))
+    for inner in _CSNAME_RE.findall(scan):
+        bare = "".join(inner.split()).lstrip("\\")   # builder ignores whitespace; drop a written-in backslash
+        for word in _DANGEROUS_WORDS:
+            # Match the word optionally followed by a stream number (write18) but
+            # not a longer letter-suffixed macro (includegraphics) — same semantics
+            # as the ``\d*(?![a-zA-Z])`` terminator on the direct-form regex.
+            if bare == word or (bare.startswith(word)
+                                and bare[len(word):].lstrip("0123456789") == ""):
+                found.add(f"\\csname {bare}\\endcsname")
+                break
+    return found
 
 # Citation commands whose argument is a (comma-separated list of) bib key(s).
 # Used by the hallucinated-key guard in validate() and is biblatex/natbib-aware.
@@ -73,6 +141,10 @@ _CITE_MACRO_RE = re.compile(
     r"\\(?:cite|citefoot|textcite|parencite|autocite|smartcite|footcite"
     r"|citeauthor|citeyear|citep|citet|citealp|citealt|citenum)\*?"
     r"(?:\[[^\]]*\])*\s*\{([^}]*)\}"
+)
+
+_GRAPHICS_RE = re.compile(
+    r"\\includegraphics\*?(?:\[[^\]]*\])*\s*\{([^}]*)\}"
 )
 
 # Characters to escape when injecting CLI-supplied metadata into LaTeX macros.
@@ -212,6 +284,62 @@ def extract_cite_keys(tex: str) -> list[str]:
     return keys
 
 
+def extract_graphics_keys(tex: str) -> list[str]:
+    """Return every graphics path referenced by an \\includegraphics command in *tex*."""
+    keys: list[str] = []
+    for m in _GRAPHICS_RE.finditer(tex):
+        k = m.group(1).strip()
+        if k:
+            keys.append(k)
+    return keys
+
+
+def comment_out_missing_graphics(tex: str, resolved_basenames: set[str]) -> str:
+    """Comment out every ``\\includegraphics`` whose basename is unresolved.
+
+    *resolved_basenames* is the caller's verdict (vault-copied figures plus
+    anything the caller chose to keep — e.g. files already present next to
+    the deck); filesystem knowledge deliberately stays with the caller so
+    this module remains pure.
+
+    Line-safe: a ``%`` comments out the REST of its line, so a command that
+    shares a line with other content is moved onto its own commented line and
+    the surrounding pieces are preserved on adjacent lines (a single newline
+    is just a space to LaTeX, inside braces too, so meaning is unchanged).
+    The naive whole-match ``% <cmd>`` replacement this fixes swallowed
+    whatever followed the command on the line — a closing brace, an
+    ``\\end{...}`` — breaking the very decks it was meant to protect. A
+    command whose optional args span multiple lines is left untouched (kept),
+    the safe default for a rewrite that only ever *removes* content.
+    """
+    def _unresolved(line: str) -> list:
+        return [
+            m for m in _GRAPHICS_RE.finditer(line)
+            if os.path.basename(m.group(1).strip()) not in resolved_basenames
+        ]
+
+    out_lines: list[str] = []
+    for line in tex.split("\n"):
+        matches = _unresolved(line)
+        if not matches:
+            out_lines.append(line)
+            continue
+        pieces: list[str] = []
+        cursor = 0
+        for m in matches:
+            pre = line[cursor:m.start()]
+            if pre.strip():
+                pieces.append(pre)
+            basename = os.path.basename(m.group(1).strip())
+            pieces.append(f"% {m.group(0)} % Figure not found: {basename}")
+            cursor = m.end()
+        post = line[cursor:]
+        if post.strip():
+            pieces.append(post)
+        out_lines.append("\n".join(pieces))
+    return "\n".join(out_lines)
+
+
 def assemble(sections: list[SectionOutput], meta: DeckMeta) -> str:
     """Wrap sanitized section bodies in the Beamer preamble template."""
     sections_block = _sections_block(sections)
@@ -254,6 +382,7 @@ def validate(
     *,
     generated_tex: Optional[str] = None,
     known_bib_keys: Optional[set] = None,
+    copied_figures: Optional[set] = None,
 ) -> list[str]:
     """Best-effort structural checks. Returns a list of human-readable warnings.
 
@@ -269,6 +398,7 @@ def validate(
     no-template path). *known_bib_keys*, when given, enables a guard that warns
     about ``\\citefoot{key}`` / ``\\cite{key}`` keys absent from the bibliography
     (an invented citation to review before compiling).
+    *copied_figures*, when given, validates that every graphics target exists.
     """
     warnings: list[str] = []
     # Strip comments before counting/scanning so a commented-out \end{frame},
@@ -299,7 +429,7 @@ def validate(
     if n_begin == 0:
         warnings.append("No frames found — the generated deck has no slides.")
 
-    danger = sorted(set(_DANGEROUS_MACRO_RE.findall(untrusted)))
+    danger = sorted(find_dangerous_macros(tex if generated_tex is None else generated_tex))
     if danger:
         warnings.append(
             "Potentially unsafe LaTeX found in generated content: "
@@ -318,6 +448,23 @@ def validate(
                 f"{', '.join(unknown)}. The model may have invented these — "
                 "remove the \\citefoot/\\cite or add the entry to your .bib "
                 "before compiling (an undefined key compiles to '[?]')."
+            )
+
+    if copied_figures is not None:
+        # Commented-out figures were already stripped with the other comments
+        # above, so only figures that SURVIVED resolution un-resolved warn
+        # here (e.g. a multi-line command the line-safe pass left untouched).
+        graphics_keys = extract_graphics_keys(untrusted)
+        unknown_figs = sorted({
+            os.path.basename(k) for k in graphics_keys if os.path.basename(k) not in copied_figures
+        })
+        for fig in unknown_figs:
+            warnings.append(
+                f"Figure not found: {fig}. The model may have invented this target or it could not be resolved in the vault."
+            )
+        if graphics_keys and not re.search(r"\\usepackage(?:\[[^\]]*\])*\s*\{graphicx\}", scan_tex):
+            warnings.append(
+                "The LaTeX preamble does not load 'graphicx' — graphics targets may fail to compile. Add \\usepackage{graphicx} to your template."
             )
 
     return warnings

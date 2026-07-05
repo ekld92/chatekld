@@ -1,0 +1,91 @@
+# Track 7.2 (improvement plan 2026-07-04): the hermetic gate the repo already
+# defines, run on every push/PR instead of only on the maintainer's machine.
+# The 2026-07-04 Track 4 Batch 2 incident (a batch committed with `import app`
+# broken — the suite had never run) is exactly the failure class this catches.
+#
+# Scope decisions:
+# * ubuntu-latest + Python 3.12 + constraints.txt = the validated combination.
+# * requirements.txt is filtered of the macOS-only lines (pywebview, pyobjc-*,
+#   pyinstaller) — none are imported at module scope, so the suite is complete
+#   without them; torch/sentence-transformers install fine on Linux and ARE
+#   exercised (the reranker device knob tests), so they stay.
+# * The pytest set = the documented suite command PLUS the targets it omits
+#   (test_launch.py, test_thesaurus.py, deckgen/tests/) — the union every
+#   track batch has been gating on.
+# * Suite is hermetic via the root conftest.py (CHATEKLD_BASE_DIR → tempdir);
+#   no app data, no network, no API keys are touched. Live provider smokes
+#   live in live-smoke.yml (manual/scheduled, key-gated), not here.
+# * One job for now; split fast/mock vs full-stack if a measured run exceeds
+#   ~15 min (the torch install dominates — pip caching absorbs it after the
+#   first run per requirements/constraints change).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            constraints.txt
+            requirements-dev.txt
+
+      - name: Filter macOS-only requirements
+        run: |
+          grep -vE '^(pywebview|pyobjc|pyinstaller)' requirements.txt > requirements-ci.txt
+          diff <(grep -cE '^(pywebview|pyobjc|pyinstaller)' requirements.txt) <(echo 7) \
+            || { echo '::error::macOS-only line count changed — update the filter AND this check'; exit 1; }
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt -c constraints.txt
+          # -c constraints.txt here too: the dev tools (pytest/pytest-asyncio/
+          # ruff) resolve to the exact validated versions, and a dev dep can't
+          # silently upgrade a constrained runtime package.
+          pip install -r requirements-dev.txt -c constraints.txt
+
+      - name: py_compile sweep
+        run: >
+          python -m py_compile app.py api/routes/*.py api/*.py core/*.py
+          core/providers/*.py core/llm/*.py core/llm/adapters/*.py
+          core/agent/*.py rag/*.py services/*.py audit/*.py audit/core/*.py
+          audit/engine/*.py audit/engine/reports/*.py deckgen/*.py refactor/*.py
+
+      - name: Ruff (clean baseline is a suite gate)
+        run: ruff check .
+
+      - name: Python test suite
+        run: >
+          python -m pytest smoke_test.py test_concurrency.py
+          test_vault_regressions.py test_llm.py test_validators.py
+          test_agent.py test_audit.py test_deck.py test_refactor.py
+          test_plainchat.py test_prompts.py test_compile.py test_health.py
+          test_lancedb_migration.py test_launch.py test_thesaurus.py
+          tests/audit/ tests/eval/test_scoring.py deckgen/tests/ -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: JS test suite
+        run: |
+          npm ci
+          npm run test:js

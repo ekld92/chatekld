@@ -4,6 +4,24 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ChatEKLD</title>
+    <!-- Theme bootstrap. Resolves the persisted System/Light/Dark preference and
+         stamps a concrete data-theme on <html> BEFORE the stylesheet paints, so a
+         Light user never sees a flash-of-dark on load. Mirrors ui.js::applyTheme;
+         kept inline + tiny because a module import would run too late. -->
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem('chatekld-theme') || 'system';
+          var resolved = pref;
+          if (pref !== 'light' && pref !== 'dark') {
+            resolved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+          }
+          document.documentElement.setAttribute('data-theme', resolved);
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/daphne.png') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
     <!-- Vendored (marked v15.0.12, MIT). Served locally so chat rendering
@@ -15,6 +33,9 @@
          here so screen readers hear errors that are otherwise only shown
          as inline text. -->
     <div id="sr-error-announcer" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></div>
+    <!-- Polite counterpart for non-error confirmations (e.g. ui.js::announceStatus
+         on a successful clipboard copy) so AT users get feedback too. -->
+    <div id="sr-status-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
     <a href="#main-content" class="skip-link">Skip to main content</a>
 
     <!-- Sidebar -->
@@ -25,7 +46,7 @@
         </div>
 
         <div class="sidebar-section">
-            <span class="sidebar-label">Model Settings</span>
+            <h3 class="sidebar-label">Model Settings</h3>
             <div class="control-group">
                 <label for="provider-select">Provider</label>
                 <select id="provider-select" onchange="onProviderChange()">
@@ -65,18 +86,31 @@
         </div>
 
         <div class="sidebar-section">
-            <span class="sidebar-label">System Status</span>
+            <h3 class="sidebar-label">System Status</h3>
             <div class="status-card">
                 <div class="status-row">
                     <span>Provider</span>
                     <span id="rs-provider-dot" class="dot" role="img" aria-label="Status unknown"></span>
+                </div>
+                <div class="status-row">
+                    <span>Vector Store</span>
+                    <span id="rs-vector-dot" class="dot" role="img" aria-label="Status unknown"></span>
+                </div>
+                <div class="status-row">
+                    <span>Local Models</span>
+                    <span id="rs-local-dot" class="dot" role="img" aria-label="Status unknown"></span>
                 </div>
             </div>
             <div id="runtime-warning" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
         </div>
 
         <div class="sidebar-spacer"></div>
-        <button class="btn btn-outline" onclick="openModal('settings-modal')">&#9881; LLM Settings</button>
+        <div class="theme-switch" role="radiogroup" aria-label="Appearance">
+            <button type="button" class="theme-option" data-theme-option="system" role="radio" aria-checked="true" onclick="setTheme('system')">System</button>
+            <button type="button" class="theme-option" data-theme-option="light" role="radio" aria-checked="false" tabindex="-1" onclick="setTheme('light')">Light</button>
+            <button type="button" class="theme-option" data-theme-option="dark" role="radio" aria-checked="false" tabindex="-1" onclick="setTheme('dark')">Dark</button>
+        </div>
+        <button class="btn btn-outline" onclick="openModal('settings-modal')"><span aria-hidden="true">&#9881;</span> LLM Settings</button>
         <button class="btn btn-outline" onclick="openModal('howto-modal')">How to Use</button>
         <button class="btn btn-danger" onclick="openModal('reset-modal')">Reset App Data</button>
 
@@ -96,6 +130,7 @@
                 <button id="tab-deck" class="tab" role="tab" aria-selected="false" aria-controls="deck-tab" tabindex="-1" onclick="showTab('deck')">Deck Generator</button>
                 <button id="tab-refactor" class="tab" role="tab" aria-selected="false" aria-controls="refactor-tab" tabindex="-1" onclick="showTab('refactor')">Note Refactor</button>
                 <button id="tab-chat" class="tab" role="tab" aria-selected="false" aria-controls="chat-tab" tabindex="-1" onclick="showTab('chat')">Plain Chat</button>
+                <button id="tab-prompts" class="tab" role="tab" aria-selected="false" aria-controls="prompts-tab" tabindex="-1" onclick="showTab('prompts')">Prompt Hub</button>
             </div>
         </div>
 
@@ -104,7 +139,7 @@
             <div class="pane-view">
                 <div class="card">
                     <div class="header">
-                        <span>Obsidian Agent</span>
+                        <h2 class="card-title">Obsidian Agent</h2>
                         <div class="actions">
                             <button id="vault-index-btn"  class="btn btn-primary" onclick="indexVault()">Index Vault</button>
                             <button id="vault-pause-btn"  class="btn btn-outline" onclick="pauseVaultIndex()"  style="display:none">Pause</button>
@@ -121,10 +156,10 @@
                     </div>
                     <div class="materials-panel">
                         <div class="materials-panel-header">
-                            <span>Indexed Materials</span>
+                            <h3 class="panel-subtitle">Indexed Materials</h3>
                             <div class="actions">
                                 <button class="btn btn-outline btn-sm" onclick="refreshVaultMaterials()">Refresh</button>
-                                <button id="materials-toggle-btn" class="btn btn-outline btn-sm" onclick="toggleVaultMaterials()">Show</button>
+                                <button id="materials-toggle-btn" class="btn btn-outline btn-sm" aria-expanded="false" aria-controls="materials-list-container" onclick="toggleVaultMaterials()">Show</button>
                             </div>
                         </div>
                         <div id="materials-list-container" class="materials-list collapsed"></div>
@@ -133,13 +168,23 @@
                     <details class="advanced-controls">
                         <summary>System Prompt Override</summary>
                         <div class="control-group">
-                            <textarea id="vault-system-prompt" rows="4" maxlength="4000" placeholder="Optional. Prepended to the selected Answer Mode template; the retrieval safety preamble and context block remain in place."></textarea>
-                            <small class="control-hint">Retrieval &amp; generation knobs (Top K, reranker, agent mode, temperature…) live in <strong>&#9881; LLM Settings</strong> in the sidebar.</small>
+                            <textarea id="vault-system-prompt" aria-label="System prompt override for vault chat" rows="4" maxlength="4000" placeholder="Optional. Prepended to the selected Answer Mode template; the retrieval safety preamble and context block remain in place."></textarea>
+                            <small class="control-hint">Retrieval &amp; generation knobs (Top K, reranker, agent mode, temperature…) live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong> in the sidebar.</small>
                         </div>
                     </details>
                     <div id="obsidian-chat" class="chat-history"></div>
                     <div id="obsidian-status-msg"></div>
-                    <div id="prewarm-banner" class="prewarm-banner" hidden></div>
+                    <!-- Indeterminate activity bar shown while an index run is in
+                         flight. The status payload carries no total/processed
+                         counts, so this is an honest "working" signal paired with
+                         the text status above — not a fabricated percentage. -->
+                    <div id="vault-index-progress" class="index-progress" role="progressbar" aria-label="Indexing in progress" hidden>
+                        <div class="index-progress-bar"></div>
+                    </div>
+                    <!-- Track 6b: static polite region — prewarm stage changes announce to AT.
+                         Declared in markup (not created by JS) because WebKit can miss
+                         live regions minted the same tick they are populated. -->
+                    <div id="prewarm-banner" class="prewarm-banner" role="status" aria-live="polite" hidden></div>
                     <div id="vault-error-boundary" class="task-error-boundary"></div>
                     <div class="input-bar">
                         <input type="text" id="obsidian-input" aria-label="Ask about your vault" placeholder="Ask about your vault..." onkeydown="if(event.key==='Enter') chatWithVault()">
@@ -155,14 +200,15 @@
             <div class="pane-view">
                 <div class="card">
                     <div class="header">
-                        <span>Plain Chat</span>
+                        <h2 class="card-title">Plain Chat</h2>
                         <div class="actions">
                             <button class="btn btn-outline" onclick="plainchatNew()" title="Start a new conversation">New chat</button>
                         </div>
                     </div>
-                    <small class="control-hint">A direct, multi-turn conversation with the configured provider/model &mdash; no vault retrieval. Conversation is ephemeral (lost on reload). System prompt &amp; temperature live in <strong>&#9881; LLM Settings</strong>.</small>
+                    <small class="control-hint">A direct, multi-turn conversation with the configured provider/model &mdash; no vault retrieval. Conversation is ephemeral (lost on reload). System prompt &amp; temperature live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong>.</small>
                     <div id="plainchat-history" class="chat-history"></div>
                     <div id="plainchat-error-boundary" class="task-error-boundary"></div>
+                    <div id="plainchat-examples"></div>
                     <div class="input-bar">
                         <input type="text" id="plainchat-input" aria-label="Chat message" placeholder="Message the model..." onkeydown="if(event.key==='Enter') chatPlain()">
                         <button id="plainchat-send-btn" class="btn btn-primary" onclick="chatPlain()">Send</button>
@@ -174,7 +220,7 @@
         <!-- Document Tab -->
         <div id="document-tab" class="content-area" role="tabpanel" aria-labelledby="tab-document" tabindex="0">
             <div class="pane-config">
-                <span class="sidebar-label">Paper Settings</span>
+                <h3 class="sidebar-label">Paper Settings</h3>
                 <div class="control-group">
                     <label for="preset-select">Summary Style</label>
                     <select id="preset-select">
@@ -215,8 +261,8 @@
                 <details class="advanced-controls">
                     <summary>System Prompt Override</summary>
                     <div class="control-group">
-                        <textarea id="doc-system-prompt" rows="4" placeholder="Leave blank to use the selected document type."></textarea>
-                        <small class="control-hint">Temperature, context, max tokens, Top P and repeat penalty live in <strong>&#9881; LLM Settings</strong> in the sidebar.</small>
+                        <textarea id="doc-system-prompt" aria-label="System prompt override for the paper summary" rows="4" placeholder="Leave blank to use the selected document type."></textarea>
+                        <small class="control-hint">Temperature, context, max tokens, Top P and repeat penalty live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong> in the sidebar.</small>
                     </div>
                 </details>
                 <div class="paper-actions">
@@ -236,6 +282,12 @@
                     <input type="file" id="pdf-upload" accept=".pdf" tabindex="-1" aria-hidden="true" style="display:none;" onchange="uploadPDF()">
                 </div>
                 <div id="summary-view" class="card" style="display:none;">
+                    <div class="header">
+                        <h2 class="card-title">Summary</h2>
+                        <div class="actions">
+                            <button id="summary-copy-btn" class="btn btn-outline btn-sm" onclick="copySummary()" title="Copy the summary to the clipboard">Copy</button>
+                        </div>
+                    </div>
                     <div id="doc-error-boundary" class="task-error-boundary"></div>
                     <div id="document-summary-content" class="summary-content"></div>
                 </div>
@@ -247,7 +299,7 @@
             <div class="pane-view">
                 <div class="card">
                     <div class="header">
-                        <span>Library Audit</span>
+                        <h2 class="card-title">Library Audit</h2>
                         <div class="actions">
                             <button id="audit-run-btn" class="btn btn-primary" onclick="runAuditScan()">Run Scan</button>
                             <button id="audit-cancel-btn" class="btn btn-outline" onclick="cancelAuditScan()" style="display:none">Cancel</button>
@@ -265,16 +317,16 @@
                     </div>
                     <div id="audit-summary" class="audit-summary" style="display:none;"></div>
                     <div id="audit-report-tabs" class="audit-report-tabs" role="tablist" aria-label="Audit reports" style="display:none;">
-                        <button class="audit-report-tab active" role="tab" aria-selected="true" aria-controls="audit-report-body" tabindex="0" data-report="inventory" onclick="selectAuditReport('inventory')">Inventory</button>
-                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="note_tag_drift" onclick="selectAuditReport('note_tag_drift')">Tag Drift</button>
-                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="unread_unzoterod" onclick="selectAuditReport('unread_unzoterod')">Unread PDFs</button>
-                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="zotero_unread" onclick="selectAuditReport('zotero_unread')">Zotero Queue</button>
-                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="read_unzoterod" onclick="selectAuditReport('read_unzoterod')">Read PDFs Missing Zotero</button>
-                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="zotero_no_pdf" onclick="selectAuditReport('zotero_no_pdf')">Bib Entries Without PDFs</button>
-                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" data-report="duplicates" onclick="selectAuditReport('duplicates')">Duplicate PDFs</button>
+                        <button class="audit-report-tab active" role="tab" aria-selected="true" aria-controls="audit-report-body" tabindex="0" id="audit-rtab-inventory" data-report="inventory" onclick="selectAuditReport('inventory')">Inventory</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-note_tag_drift" data-report="note_tag_drift" onclick="selectAuditReport('note_tag_drift')">Tag Drift</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-unread_unzoterod" data-report="unread_unzoterod" onclick="selectAuditReport('unread_unzoterod')">Unread PDFs</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-zotero_unread" data-report="zotero_unread" onclick="selectAuditReport('zotero_unread')">Zotero Queue</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-read_unzoterod" data-report="read_unzoterod" onclick="selectAuditReport('read_unzoterod')">Read PDFs Missing Zotero</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-zotero_no_pdf" data-report="zotero_no_pdf" onclick="selectAuditReport('zotero_no_pdf')">Bib Entries Without PDFs</button>
+                        <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-duplicates" data-report="duplicates" onclick="selectAuditReport('duplicates')">Duplicate PDFs</button>
                     </div>
                     <div id="audit-report-meta" class="audit-report-meta" style="display:none;"></div>
-                    <div id="audit-report-body" class="audit-report-body" role="tabpanel" tabindex="0"></div>
+                    <div id="audit-report-body" class="audit-report-body" role="tabpanel" aria-labelledby="audit-rtab-inventory" tabindex="0"></div>
                 </div>
             </div>
         </div>
@@ -284,7 +336,7 @@
             <div class="pane-view">
                 <div class="card">
                     <div class="header">
-                        <span>Deck Generator</span>
+                        <h2 class="card-title">Deck Generator</h2>
                         <div class="actions">
                             <button id="deck-generate-btn" class="btn btn-primary" onclick="deckGenerate()">Generate Deck</button>
                         </div>
@@ -343,12 +395,73 @@
                         <div class="control-row">
                             <label class="checkbox-row"><input type="checkbox" id="deck-citations" checked> Use <code>\citefoot{key}</code> from the bibliography when it matches</label>
                             <label class="checkbox-row"><input type="checkbox" id="deck-overwrite"> Overwrite if a deck of this name already exists</label>
+                            <label class="checkbox-row"><input type="checkbox" id="deck-review"> Run an LLM <code>.tex</code> integrity review + auto-repair after generating</label>
+                            <label class="checkbox-row"><input type="checkbox" id="deck-force-fresh"> Start fresh (ignore any saved progress from an interrupted run)</label>
                         </div>
 
-                        <small class="control-hint">Max sections, agent iterations and temperature for deck generation live in <strong>&#9881; LLM Settings</strong> in the sidebar.</small>
+                        <small class="control-hint">Max sections, agent iterations and temperature for deck generation live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong> in the sidebar.</small>
 
                         <div id="deck-activity" class="deck-activity" aria-live="polite"></div>
                         <div id="deck-result" class="deck-result"></div>
+                    </div>
+                </div>
+
+                <!-- Augment an existing deck -->
+                <div class="card">
+                    <div class="header">
+                        <h2 class="card-title">Augment an existing deck</h2>
+                        <div class="actions">
+                            <button id="deck-aug-preview-btn" class="btn btn-primary" onclick="deckAugmentPreview()">Preview change</button>
+                        </div>
+                    </div>
+                    <div class="vault-info">
+                        <span>Deepen a section, add a table, or insert a new section into an existing Beamer <code>.tex</code> — grounded in your vault. You preview the change and confirm before anything is written.</span>
+                    </div>
+                    <div id="deck-aug-status" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
+
+                    <div class="deck-body">
+                        <div class="control-group">
+                            <label for="deck-aug-path">Existing deck (.tex)</label>
+                            <div class="input-row">
+                                <input type="text" id="deck-aug-path" placeholder="…/your_suite/cours/topic/topic.tex">
+                                <button class="btn btn-outline" onclick="deckPickAugmentDeck()">Browse…</button>
+                                <button class="btn btn-outline" onclick="deckLoadDeckSections()">Load</button>
+                            </div>
+                            <small class="control-hint">Any complete Beamer deck — one deckgen produced, or hand-written. The deck/preamble outside the edited part is preserved byte-for-byte.</small>
+                            <div id="deck-aug-hint" class="deck-template-hint"></div>
+                        </div>
+
+                        <div class="control-row">
+                            <div class="control-group">
+                                <label for="deck-aug-op">Operation</label>
+                                <select id="deck-aug-op">
+                                    <option value="deepen">Deepen / expand</option>
+                                    <option value="table">Add a table</option>
+                                    <option value="new_section">Add a new section</option>
+                                </select>
+                            </div>
+                            <div class="control-group">
+                                <label for="deck-aug-scope">Scope</label>
+                                <select id="deck-aug-scope" onchange="deckAugScopeChanged()">
+                                    <option value="whole">Whole deck</option>
+                                    <option value="section">One section</option>
+                                </select>
+                            </div>
+                            <div class="control-group">
+                                <label for="deck-aug-section">Section</label>
+                                <select id="deck-aug-section" disabled></select>
+                            </div>
+                        </div>
+
+                        <div class="control-group">
+                            <label for="deck-aug-instruction">What to change (free-form)</label>
+                            <textarea id="deck-aug-instruction" rows="3" maxlength="4000" placeholder="e.g. 'Deepen the treatment section: add second-line options and their evidence' or 'Add a table comparing first- vs second-generation antipsychotics'."></textarea>
+                        </div>
+
+                        <small class="control-hint">Uses the deck's own custom macros + bibliography when present, and the Audience/citation settings above. Agent iterations and temperature come from <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong>.</small>
+
+                        <div id="deck-aug-activity" class="deck-activity" aria-live="polite"></div>
+                        <div id="deck-aug-result" class="deck-result"></div>
                     </div>
                 </div>
             </div>
@@ -359,10 +472,11 @@
             <div class="pane-view">
                 <div class="card">
                     <div class="header">
-                        <span>Note Refactor</span>
+                        <h2 class="card-title">Note Refactor</h2>
                         <div class="actions">
                             <button id="refactor-run-btn" class="btn btn-primary" onclick="refactorRunPlan()">Run Plan</button>
                             <button id="refactor-apply-btn" class="btn btn-outline" onclick="refactorOpenApply()" disabled>Apply approved (0)</button>
+                            <button id="refactor-normalize-btn" class="btn btn-outline" onclick="refactorOpenNormalize()" disabled>Fix formatting (0)</button>
                             <button id="refactor-restore-btn" class="btn btn-outline" onclick="refactorOpenRestore()">Restore…</button>
                         </div>
                     </div>
@@ -380,6 +494,13 @@
                             </div>
                             <small class="control-hint">Only this sub-folder's <code>.md</code> notes are analyzed. Attachments are resolved across the whole vault.</small>
                         </div>
+                        <div class="control-group">
+                            <label class="checkbox-row">
+                                <input type="checkbox" id="refactor-strip-preamble" onchange="refactorToggleStripDefault()">
+                                Strip the OCR-callout preamble for every image
+                            </label>
+                            <small class="control-hint">Drops the “This image is…/Transcribed Text:” lead-in from every inlined callout (keeps the transcription). Saved to settings; re-runs the plan. Additive to the per-image Strip button.</small>
+                        </div>
 
                         <div id="refactor-summary" class="deck-summary" style="display:none;"></div>
                         <div id="refactor-discrepancies" class="refactor-discrepancies"></div>
@@ -390,6 +511,24 @@
                         </div>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <!-- Prompt Hub Tab (read-only system-prompt transparency) -->
+        <div id="prompts-tab" class="content-area" role="tabpanel" aria-labelledby="tab-prompts" tabindex="0">
+            <div class="card">
+                <div class="header">
+                    <h2 class="card-title">Prompt Hub</h2>
+                    <div class="actions">
+                        <button id="prompts-refresh-btn" class="btn btn-outline btn-sm" type="button" onclick="promptsRefresh()">Refresh</button>
+                    </div>
+                </div>
+                <small class="control-hint">
+                    The exact system prompt last sent to the model for each workflow &mdash; local or online.
+                    A row fills in after you run that workflow at least once this session. Read-only; API keys are redacted.
+                </small>
+                <div id="prompts-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+                <div id="prompts-list" class="prompts-list" aria-label="Captured prompts"></div>
             </div>
         </div>
     </main>
@@ -404,12 +543,13 @@
                 sidebar. Changes save automatically and apply to the next run.
             </p>
 
-            <span class="sidebar-label">Global · request limits &amp; fallback</span>
+            <details class="settings-section" open>
+            <summary>Global · request limits &amp; fallback</summary>
             <div class="control-grid">
                 <div class="control-group">
                     <label for="set-online-timeout">Request timeout (seconds)</label>
                     <input type="number" id="set-online-timeout" min="5" max="600" step="5" value="60">
-                    <small class="control-hint">Per-call timeout for online providers. Local models are bound by the agent's wall-clock cap instead.</small>
+                    <small class="control-hint">Per-call timeout for online providers only. Local agent calls are bound by the Agent wall-clock cap below instead.</small>
                 </div>
                 <div class="control-group">
                     <label for="set-online-retries">Max retries</label>
@@ -424,12 +564,22 @@
                 <div class="control-group">
                     <label for="set-agent-wall-clock">Agent wall-clock cap (seconds)</label>
                     <input type="number" id="set-agent-wall-clock" min="30" max="1800" step="30" value="300">
-                    <small class="control-hint">Max time for one vault-chat agent turn / each deck section. The stream stall guard and the chat fetch abort derive from this.</small>
+                    <small class="control-hint">Max time for one whole vault-chat agent turn (all iterations combined) / each deck section; also the per-call bound for local agent calls. The stream stall guard and the chat fetch abort derive from this.</small>
                 </div>
                 <div class="control-group">
                     <label for="set-local-timeout">Local request timeout (seconds)</label>
                     <input type="number" id="set-local-timeout" min="0" max="3600" step="30" value="0">
-                    <small class="control-hint">Per-call HTTP timeout for Ollama / LM Studio. 0 = leave the SDK default (a hung call is then bounded only by the wall-clock cap). For streaming it acts as a max-time-between-tokens guard.</small>
+                    <small class="control-hint">Extra per-call HTTP timeout for Ollama / LM Studio, applied as a minimum — it can only tighten a call, never lengthen it (to give local agent calls more time, raise the Agent wall-clock cap). 0 = no extra bound (SDK default; an agent call is then bounded by the wall-clock cap). For streaming it acts as a max-time-between-tokens guard.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-ollama-host">Ollama host</label>
+                    <input type="text" id="set-ollama-host" placeholder="http://localhost:11434">
+                    <small class="control-hint">Base URL of the Ollama server. Empty = use the <code>OLLAMA_HOST</code> env var, then <code>http://localhost:11434</code>. Set for a remote box or custom port. The status badge and generation use the same host.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-lm-studio-host">LM Studio host</label>
+                    <input type="text" id="set-lm-studio-host" placeholder="http://localhost:1234">
+                    <small class="control-hint">Base URL of the LM Studio server. Empty = <code>http://localhost:1234</code>. Set if you changed LM Studio's server port.</small>
                 </div>
                 <div class="control-group">
                     <label for="set-fallback-provider">Fallback provider</label>
@@ -444,15 +594,17 @@
                     <small class="control-hint">Used only before the first token, only on the transient errors below.</small>
                 </div>
             </div>
-            <div class="control-group">
-                <label>Fall back on</label>
+            <fieldset class="control-group checkbox-fieldset">
+                <legend>Fall back on</legend>
                 <label class="checkbox-row"><input type="checkbox" id="set-fallback-on-timeout"> Timeout</label>
                 <label class="checkbox-row"><input type="checkbox" id="set-fallback-on-network"> Network error</label>
                 <label class="checkbox-row"><input type="checkbox" id="set-fallback-on-rate_limit"> Rate limit</label>
                 <label class="checkbox-row"><input type="checkbox" id="set-fallback-on-server_error"> Server error</label>
-            </div>
+            </fieldset>
 
-            <span class="sidebar-label">Global · OCR &amp; Vision</span>
+            </details>
+            <details class="settings-section">
+            <summary>Global · OCR &amp; Vision</summary>
             <div class="control-grid">
                 <div class="control-group">
                     <label for="ocr-provider-select">OCR Provider</label>
@@ -496,7 +648,9 @@
                 </div>
             </div>
 
-            <span class="sidebar-label">Vault Chat · retrieval &amp; generation</span>
+            </details>
+            <details class="settings-section" open>
+            <summary>Vault Chat · retrieval &amp; generation</summary>
             <div class="control-grid">
                 <div class="control-group">
                     <div class="slider-label"><label for="vault-top-k">Top K</label><span id="vault-top-k-value">6</span></div>
@@ -526,7 +680,7 @@
             </div>
             <div class="control-group">
                 <label class="checkbox-row"><input type="checkbox" id="vault-agent-enabled"> Agent mode (multi-step tool use)</label>
-                <small class="control-hint">When on, the model can call vault.search / vault.read_note / vault.list_materials across iterations.</small>
+                <small class="control-hint">When on, the model can call vault_search / vault_read_note / vault_list_materials across iterations.</small>
                 <div class="slider-label"><label for="vault-agent-max-iter">Max agent iterations</label><span id="vault-agent-max-iter-value">6</span></div>
                 <input type="range" id="vault-agent-max-iter" min="1" max="12" step="1" value="6">
             </div>
@@ -549,6 +703,44 @@
                 <div class="control-group">
                     <label class="checkbox-row"><input type="checkbox" id="vault-wikilink-enabled"> Wikilink expansion</label>
                     <small class="control-hint">Also surface chunks from notes linked to / from your top results, before reranking. No re-index.</small>
+                </div>
+                <div class="control-group">
+                    <label class="checkbox-row"><input type="checkbox" id="vault-thesaurus-enabled"> Thesaurus expansion</label>
+                    <small class="control-hint">Retrieve synonym/abbreviation variants of your query, using the vault's <code>_abreviations.md</code> / <code>_tags.md</code>. Bridges FR/EN shorthand. No re-index.</small>
+                </div>
+                <div class="control-group">
+                    <label class="checkbox-row"><input type="checkbox" id="vault-primer-enabled"> Abbreviation primer</label>
+                    <small class="control-hint">Add a compact glossary to the system prompt so the model can read the vault's shorthand. No re-index.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-thesaurus-abbrev-path">Thesaurus · abbreviations file</label>
+                    <input type="text" id="set-thesaurus-abbrev-path" placeholder="_abreviations.md">
+                    <small class="control-hint">Vault-relative path to the abbreviations glossary (default <code>_abreviations.md</code>). Empty = disable this file. Config-only; no re-index.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-thesaurus-tags-path">Thesaurus · tags file</label>
+                    <input type="text" id="set-thesaurus-tags-path" placeholder="_tags.md">
+                    <small class="control-hint">Vault-relative path to the tags glossary (default <code>_tags.md</code>). Empty = disable this file.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-thesaurus-max-variants">Thesaurus · max query variants</label>
+                    <input type="number" id="set-thesaurus-max-variants" min="1" max="8" step="1" placeholder="3">
+                    <small class="control-hint">Synonym-substituted query variants retrieved per turn (1–8, default 3).</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-primer-max-chars">Primer · max characters</label>
+                    <input type="number" id="set-primer-max-chars" min="500" max="8000" step="100" placeholder="1500">
+                    <small class="control-hint">Glossary-primer byte budget injected into the system prompt (500–8000, default 1500).</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-primer-header">Primer · intro header</label>
+                    <input type="text" id="set-primer-header" placeholder="(built-in default)">
+                    <small class="control-hint">Override the primer's intro sentence. Empty = the built-in (FR/EN clinical) text.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-primer-core-terms">Primer · core terms</label>
+                    <input type="text" id="set-primer-core-terms" placeholder="(built-in default)">
+                    <small class="control-hint">Comma-separated abbreviations that survive truncation when the primer budget is tight. Empty = the built-in list.</small>
                 </div>
                 <div class="control-group">
                     <div class="slider-label"><label for="vault-rerank-pool">Reranker candidate pool</label><span id="vault-rerank-pool-value">50</span></div>
@@ -582,7 +774,9 @@
                 </div>
             </details>
 
-            <span class="sidebar-label">Single Paper · generation</span>
+            </details>
+            <details class="settings-section">
+            <summary>Single Paper · generation</summary>
             <div class="control-grid">
                 <div class="control-group">
                     <label for="doc-ctx">Context (num_ctx)</label>
@@ -606,7 +800,9 @@
                 </div>
             </div>
 
-            <span class="sidebar-label">Deck Generator · generation</span>
+            </details>
+            <details class="settings-section">
+            <summary>Deck Generator · generation</summary>
             <div class="control-grid">
                 <div class="control-group">
                     <label for="deck-max-sections">Max sections</label>
@@ -620,9 +816,30 @@
                     <label for="deck-temp">Temperature</label>
                     <input type="number" id="deck-temp" min="0" max="2" step="0.1" value="0.3">
                 </div>
+                <div class="control-group">
+                    <label for="deck-section-max-tokens">Section length cap (tokens)</label>
+                    <input type="number" id="deck-section-max-tokens" min="256" max="8192" step="64" value="2048">
+                    <small class="control-hint">Output budget per section. Lower = shorter slides, less RAM pressure on a local model (fewer out-of-memory failures), faster turns.</small>
+                </div>
+                <div class="control-group">
+                    <label for="deck-section-attempts">Retries per section</label>
+                    <input type="number" id="deck-section-attempts" min="1" max="5" step="1" value="3">
+                    <small class="control-hint">Total tries per outline/section before it degrades to a placeholder. Covers a transient local-backend failure (memory hiccup, model reload, timeout).</small>
+                </div>
+                <div class="control-group">
+                    <label for="deck-retry-backoff">Retry backoff (s)</label>
+                    <input type="number" id="deck-retry-backoff" min="0" max="30" step="1" value="3">
+                    <small class="control-hint">Linear wait (× attempt) between retries — lets the backend settle / finish reloading.</small>
+                </div>
+            </div>
+            <div class="control-group">
+                <label class="checkbox-row"><input type="checkbox" id="set-deck-review-enabled"> Default the <code>.tex</code> integrity review + auto-repair on</label>
+                <small class="control-hint">Adds one extra LLM call over the assembled deck after generation. The Deck panel's checkbox overrides this per run. Off by default.</small>
             </div>
 
-            <span class="sidebar-label">Plain Chat · generation</span>
+            </details>
+            <details class="settings-section">
+            <summary>Plain Chat · generation</summary>
             <div class="control-grid">
                 <div class="control-group">
                     <div class="slider-label"><label for="set-chat-temp">Temperature</label><span id="set-chat-temp-value">0.3</span></div>
@@ -635,6 +852,70 @@
                 <small class="control-hint">Used as the full system prompt for the Plain Chat panel (no vault grounding). Leave blank for no system prompt.</small>
             </div>
 
+            </details>
+            <details class="settings-section">
+            <summary>Note Refactor · models, LLM edits &amp; archiving</summary>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="set-refactor-extract-model">Image OCR/extract model</label>
+                    <input type="text" id="set-refactor-extract-model" placeholder="leave blank = use the Vision model">
+                    <small class="control-hint">Vision model used by the on-demand image extraction (table / describe / classify) passes. Blank falls back to the global Vision model.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-refactor-review-model">LLM edit / review model</label>
+                    <input type="text" id="set-refactor-review-model" placeholder="leave blank = use the chat model">
+                    <small class="control-hint">Model for the opt-in prose review and the LLM edit actions (Improve formatting, Summarize a PDF, free-prompt, Generate diagram). Blank falls back to the active chat model.</small>
+                </div>
+                <div class="control-group">
+                    <label class="checkbox-row"><input type="checkbox" id="set-refactor-table-double-read"> Double-read tables (no downscale)</label>
+                    <small class="control-hint">Re-reads likely-table images at full resolution for a cleaner transcription. Slower per image.</small>
+                </div>
+            </div>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="set-refactor-review-max-tokens">Review / summary max tokens</label>
+                    <input type="number" id="set-refactor-review-max-tokens" min="64" max="8192" step="64" value="1024">
+                    <small class="control-hint">Caps the prose-review, PDF-summary and Mermaid-chart replies.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-refactor-rewrite-max-tokens">Rewrite max tokens</label>
+                    <input type="number" id="set-refactor-rewrite-max-tokens" min="256" max="16384" step="64" value="4096">
+                    <small class="control-hint">Caps the applyable formatting-rewrite / free-prompt edits (re-emits the whole note or section).</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-refactor-thumb-max-side">Archived-image thumbnail max side (px)</label>
+                    <input type="number" id="set-refactor-thumb-max-side" min="96" max="1024" step="16" value="384">
+                    <small class="control-hint">Longest side of the in-vault thumbnail left behind when an image is archived out.</small>
+                </div>
+            </div>
+            <div class="control-group">
+                <label for="set-refactor-archive-dir">Archive directory (absolute path)</label>
+                <input type="text" id="set-refactor-archive-dir" placeholder="leave blank = default app-data location">
+                <small class="control-hint">Where archived original images are moved. Must resolve <strong>outside</strong> the vault (re-checked at apply time). Blank = a default location under the app-data folder.</small>
+            </div>
+
+            </details>
+            <details class="settings-section" id="log-viewer-section">
+            <summary>Application log</summary>
+            <p class="control-hint">Read-only tail of <code>chatekld.log</code>. API keys are redacted server-side before display. This view never modifies the log.</p>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="log-viewer-lines">Lines to show</label>
+                    <select id="log-viewer-lines">
+                        <option value="100">Last 100</option>
+                        <option value="500" selected>Last 500</option>
+                        <option value="1000">Last 1000</option>
+                        <option value="5000">Last 5000</option>
+                    </select>
+                </div>
+                <div class="control-group log-viewer-actions">
+                    <button type="button" class="btn btn-outline" id="log-viewer-refresh">Refresh</button>
+                    <button type="button" class="btn btn-outline" id="log-viewer-copy">Copy</button>
+                </div>
+            </div>
+            <div id="log-viewer-meta" class="control-hint"></div>
+            <pre id="log-viewer-output" class="log-viewer-output"></pre>
+            </details>
             <div id="settings-status" class="modal-copy"></div>
             <div class="modal-footer">
                 <button class="btn btn-primary" onclick="closeModal('settings-modal')">Done</button>
@@ -695,7 +976,7 @@
     <div id="excl-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="excl-modal-title">
         <div class="modal">
             <h2 id="excl-modal-title">Directory Exclusions</h2>
-            <div id="excl-status" class="modal-copy"></div>
+            <div id="excl-status" class="modal-copy" role="status" aria-live="polite"></div>
             <div id="excl-list"></div>
             <div class="modal-footer">
                 <button class="btn btn-outline" onclick="addExclusion()">Add Folder...</button>
@@ -741,6 +1022,26 @@
         </div>
     </div>
 
+    <!-- Note Refactor: Fix-formatting confirmation Modal (writes to the vault) -->
+    <div id="refactor-normalize-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="refactor-normalize-modal-title">
+        <div class="modal" style="max-width:560px; max-height:80vh; overflow-y:auto;">
+            <h2 id="refactor-normalize-modal-title">Fix formatting in your vault?</h2>
+            <p class="modal-copy">
+                This applies deterministic, reversible formatting fixes (blank
+                lines before headings/lists, blanks around code fences, trailing
+                whitespace, single final newline) to the following note(s). No
+                wording is changed. Each note is written atomically and
+                snapshotted so it can be reverted from <strong>Restore</strong>.
+            </p>
+            <ul id="refactor-normalize-list" class="refactor-confirm-list"></ul>
+            <div id="refactor-normalize-modal-status" class="modal-copy"></div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeModal('refactor-normalize-modal')">Cancel</button>
+                <button id="refactor-normalize-confirm" class="btn btn-primary" onclick="refactorConfirmNormalize()">Write to vault</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Note Refactor: Restore Modal -->
     <div id="refactor-restore-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="refactor-restore-modal-title">
         <div class="modal" style="max-width:640px; max-height:82vh; overflow-y:auto;">
@@ -751,7 +1052,7 @@
                 the vault.
             </p>
             <div id="refactor-restore-list" class="refactor-restore-list"></div>
-            <div id="refactor-restore-status" class="modal-copy"></div>
+            <div id="refactor-restore-status" class="modal-copy" role="status" aria-live="polite"></div>
             <div class="modal-footer">
                 <button class="btn btn-outline" onclick="closeModal('refactor-restore-modal')">Close</button>
                 <button id="refactor-restore-all" class="btn btn-outline" onclick="refactorRevertAll()">Revert all</button>
@@ -782,13 +1083,23 @@
         <div class="modal">
             <h2 id="howto-modal-title">How to Use ChatEKLD</h2>
             <div class="modal-copy">
-                <p><strong>Pick a provider.</strong> Choose Ollama or LM Studio in the sidebar, then select a chat model and an embedding model. OCR and Vision have their own provider and model selectors below.</p>
+                <p><strong>Pick a provider.</strong> Choose a provider in the sidebar — local (Ollama, LM Studio) or online (OpenAI, Anthropic, Google Gemini) — then select a chat model. Online providers are chat-only: embeddings always come from a local provider, so pick an <strong>embedding provider/model</strong> too. API keys for online providers are read from environment variables (<code>OPENAI_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>, <code>GOOGLE_API_KEY</code>) and are never stored. OCR and Vision have their own provider/model selectors in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong> and are local-only.</p>
 
-                <p><strong>Obsidian Agent.</strong> Set your vault folder with “Change…”, then click “Index Vault”. The first index can be long for large vaults; you can Pause (resumable, preserves work) or Cancel (still resumable) at any time. After indexing, ask questions in the input bar — answers are grounded in your notes and PDFs.</p>
+                <p><strong>Obsidian Vault (RAG).</strong> Set your vault folder with “Change…”, then click “Index Vault”. The indexer reads <code>.md</code> and <code>.pdf</code> files plus images referenced from your notes. The first index can be long for large vaults; you can Pause (resumable, preserves work) or Cancel (also resumable) at any time. After indexing, ask questions in the input bar — answers are grounded in your notes and PDFs, with inline source citations. Retrieval and generation knobs (Top K, answer mode, hybrid/reranker, agent mode, temperature, and fine-tuning) live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings → Vault Chat</strong>.</p>
 
-                <p><strong>Single Paper.</strong> Click the upload area to pick a PDF. Choose a summary style, document type, audience, language, and (optionally) a focus question and LLM parameters. Click “Summarise” and then “Export TXT” or “Export MD” to save the result to your Downloads.</p>
+                <p><strong>Agent mode.</strong> An opt-in alternative to single-shot RAG (LLM Settings → Vault Chat). When on, the model works in steps, calling <code>vault_search</code> / <code>vault_read_note</code> / <code>vault_list_materials</code> across iterations before answering. Slower but better for multi-part questions; off by default.</p>
 
-                <p><strong>Tips.</strong> If you change the embedding model after indexing, re-index from scratch — mixing embeddings yields a useless index. PDFs over 5000 pages are skipped; PDFs between 1000 and 5000 pages are extracted in 1000-page chunks. Scanned PDFs use the OCR model as a fallback when no text layer is found.</p>
+                <p><strong>Single Paper.</strong> Click the upload area to pick a PDF. Choose a summary style, document type, audience, language, and (optionally) a focus question — generation parameters (temperature, context, max tokens…) now live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings → Single Paper</strong>. Click “Summarise”, then “Export TXT” or “Export MD” to save the result to your Downloads.</p>
+
+                <p><strong>Plain Chat.</strong> A direct, multi-turn conversation with the configured provider/model — no vault retrieval, no tools. The conversation is ephemeral (lost on reload). Temperature and the system prompt are in <strong><span aria-hidden="true">&#9881;</span> LLM Settings → Plain Chat</strong>.</p>
+
+                <p><strong>Deck Generator.</strong> Turn a topic plus free-form instructions into a LaTeX <strong>Beamer</strong> deck grounded in your indexed vault, in your own template's house style. Load a Beamer template, generate, and the app scaffolds a compile-ready <code>&lt;slug&gt;/&lt;slug&gt;.tex</code> + <code>Makefile</code> — it's <strong>emit-only</strong>, you compile with <code>make</code>. An optional final <code>.tex</code> integrity review can propose a repair you apply yourself.</p>
+
+                <p><strong>Note Refactor.</strong> A scoped, opt-in tool for tidying a sub-folder of your vault. The plan pass is <strong>read-only</strong>: it previews per-note formatting fixes, inlines cached image OCR as callouts, and flags issues — no writes, no vision/LLM calls. Apply / Fix formatting / Archive / LLM edits are the one place the app writes to your vault: each is per-action confirmed, atomic, audit-logged, and reversible via Restore. Models and limits are in <strong><span aria-hidden="true">&#9881;</span> LLM Settings → Note Refactor</strong>.</p>
+
+                <p><strong>Library Audit.</strong> Read-only reconciliation of your Obsidian vault against Zotero, local PDFs, and Finder tags. Strictly manual — nothing runs until you click <strong>Run Scan</strong>. Produces six reports plus a per-citation-key inventory; the only file it ever writes is its own mapping.</p>
+
+                <p><strong>Tips.</strong> If you change the embedding model after indexing, re-index from scratch — mixing embeddings yields a useless index. PDFs are capped at 20 000 pages; anything over 1000 pages is extracted in 1000-page ranges (so the cap bounds time, not memory). Scanned PDFs use the OCR model as a fallback when no text layer is found. All API calls are local-loopback only; uploads and the index live in an owner-only app-data directory.</p>
 
                 <p><strong>Reset.</strong> “Reset App Data” clears uploads and the Obsidian index. You can also delete the saved config and feedback file from the reset flow if needed.</p>
             </div>
@@ -804,8 +1115,10 @@
             <h2 id="reset-modal-title">Reset App Data</h2>
             <p class="modal-copy">This clears uploads and the Obsidian index.</p>
             <div class="modal-footer">
-                <button class="btn btn-danger" onclick="resetAppData()">Reset</button>
+                <!-- Track 6e: Cancel FIRST — openModal focuses the first focusable
+                     element, and it must never be the destructive default. -->
                 <button class="btn btn-outline" onclick="closeModal('reset-modal')">Cancel</button>
+                <button class="btn btn-danger" onclick="resetAppData()">Reset</button>
             </div>
         </div>
     </div>

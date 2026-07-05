@@ -35,7 +35,11 @@ def generate_section(
     macros_block: str = "",
     cite_mode: str = "prose",
     candidate_bib_block: str = "",
+    images_enabled: bool = True,
     on_event=None,
+    max_attempts: int = 1,
+    retry_backoff_s: float = 0.0,
+    should_cancel=None,
 ) -> SectionOutput:
     """Generate and sanitize one section. Errors are surfaced as an info note,
     not raised, so one weak section does not abort the whole deck.
@@ -43,7 +47,14 @@ def generate_section(
     *macros_block* / *cite_mode* / *candidate_bib_block* steer the model toward
     the deck's custom macros and bibliography (template mode); the defaults keep
     the legacy plain-prose behaviour.
+
+    *max_attempts* / *retry_backoff_s* / *should_cancel* drive the cancel-aware
+    per-section retry (see :func:`deckgen.retry.chat_with_retry`); the defaults
+    (``max_attempts=1``) keep the original single-shot behaviour. A section that
+    still fails after every attempt degrades to the placeholder frame below.
     """
+    from .retry import chat_with_retry
+
     message = build_section_message(
         topic=topic,
         instructions=instructions,
@@ -53,10 +64,17 @@ def generate_section(
         points=section.points,
         candidate_bib_block=candidate_bib_block,
     )
-    result = client.chat(
+    result = chat_with_retry(
+        client,
         message,
+        max_attempts=max_attempts,
+        retry_backoff_s=retry_backoff_s,
+        should_cancel=should_cancel,
+        label=f"section {index} ({section.title})",
+        on_event=on_event,
         system_prompt=section_system_prompt(
             audience, macros_block=macros_block, cite_mode=cite_mode,
+            images_enabled=images_enabled,
         ),
         provider=provider,
         model=model,
@@ -64,7 +82,6 @@ def generate_section(
         agent=True,
         max_iters=max_iters,
         temperature=temperature,
-        on_event=on_event,
     )
 
     body = sanitize_section(result.text)

@@ -10,7 +10,6 @@ answer-quality harness under ``tests/eval/`` (which needs a real provider).
 Companion to the 2026-06 prompt audit. When you intentionally change a prompt,
 update the matching assertion here in the same commit.
 """
-import re
 import unittest
 
 
@@ -166,7 +165,7 @@ class TestAgentPreamble(unittest.TestCase):
 
     def test_names_all_three_tools(self):
         p = self._preamble()
-        for tool in ("vault.search", "vault.read_note", "vault.list_materials"):
+        for tool in ("vault_search", "vault_read_note", "vault_list_materials"):
             self.assertIn(tool, p)
 
 
@@ -190,6 +189,23 @@ class TestDeckgenPrompts(unittest.TestCase):
         big_macros = "\n".join(f"\\macro{i}{{...}}" for i in range(2000))
         sp = section_system_prompt("residents", macros_block=big_macros, cite_mode="bib")
         self.assertLessEqual(len(sp), SYSTEM_PROMPT_LIMIT)
+
+
+class TestDeckPromptRendering(unittest.TestCase):
+    """The deck cite/image rules are appended AFTER .format() runs, so any
+    doubled {{...}} escape in them reaches the model verbatim — teaching it
+    broken LaTeX like \\citefoot{{key}}. Pin the rendered output instead of
+    the source literals."""
+
+    def test_no_double_braces_reach_the_model(self):
+        from deckgen.prompts import augment_system_prompt, section_system_prompt
+        for prompt in (
+            section_system_prompt("clinicians", cite_mode="bib"),
+            augment_system_prompt("clinicians", cite_mode="bib"),
+        ):
+            self.assertNotIn("{{", prompt)
+            self.assertNotIn("}}", prompt)
+            self.assertIn("\\citefoot{key}", prompt)
 
 
 if __name__ == "__main__":
