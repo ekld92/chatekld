@@ -1,3 +1,18 @@
+
+A project I vibe-coded through iterative sessions for the last couple months, on my free time.
+
+The idea is to have local (or online) LLMs help me retrieve knowledge from Obsidian .md notes or PDFs or images in my vault, generate first draft of presentations on various topics using indexed informations.
+
+Indexing my vault took a lot of time because I had >6000 PDFs but it was mainly done over night and worth it. Of course online LLMs appear way better than local LLMs I use on my Macbook Pro M4 with 16 GB of RAM, but using offline local LLms is still pretty nice !
+
+Some other functions that are more for my personal use, e.g.,
+- the possibility to see how many PDFs I have in my vault, how many are actually referenced in my Zotero and for how many I have written up a small note. This is nice because it allows me to learn again that for every article that I (try to) read, I download 150 that I think I will read "later".
+- the possibility to augment some of my Obsidian Notes with an LLM pass or to OCR some images added to such obsidian notes and add the content in it
+
+Below is a more detailed and technical presentation, obviously not written by me but by a friendly LLM.
+
+Don't hesitate to reach out if you have suggestions or appreciate the project, I'll try to upload screenshots ASAP.
+
 # ChatEKLD 2026
 
 ChatEKLD is a local Flask and PyWebView application for PDF summarisation, Obsidian vault RAG, library reconciliation, and grounded LaTeX slide generation. It runs offline by default with Ollama or LM Studio, and can optionally route chat through OpenAI, Anthropic, or Google Gemini while keeping the index — and your notes — on-device.
