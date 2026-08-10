@@ -17,6 +17,9 @@ from core.constants import (
     DEFAULT_OPENAI_MODEL,
     DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_GOOGLE_MODEL,
+    DEFAULT_DEEPSEEK_MODEL,
+    DEFAULT_ZAI_MODEL,
+    DEFAULT_OPENROUTER_MODEL,
     DEFAULT_ONLINE_TIMEOUT_S,
     DEFAULT_ONLINE_MAX_RETRIES,
     DEFAULT_ONLINE_MAX_TOKENS,
@@ -40,11 +43,15 @@ _config_write_lock = threading.RLock()
 # load_config() 4-5 times (route layer, engine, vault manager), and 26 call
 # sites across the app re-read and re-parse config.json on every call.  The
 # cache is keyed by (path, st_size, st_mtime_ns) — the same self-correcting
-# pattern as UsageTracker._disk_records — so any rewrite of the file (our
-# own atomic save_config or an external edit) changes the key and forces a
-# re-read; no call site can ever observe a stale config.  The path is part
-# of the key so tests that repoint CHATEKLD_BASE_DIR (and therefore
-# CONFIG_FILE) never share cache entries across locations.
+# pattern as UsageTracker._disk_records.  Our own writes go further: save_config
+# invalidates the cache EAGERLY, so an in-process reader can never observe a
+# stale config regardless of mtime granularity.  For OUT-OF-BAND edits the key
+# is the only signal, so on a filesystem with coarse mtime resolution (SMB/FAT,
+# 1-2 s) two external rewrites of equal byte length within the granularity
+# window could serve the first version until the next size/mtime change
+# (2026-07-20 audit L5 — negligible on APFS's ns resolution, and no in-process
+# path can produce it).  The path is part of the key so tests that repoint
+# CHATEKLD_BASE_DIR (and therefore CONFIG_FILE) never share cache entries.
 _config_cache_lock = threading.Lock()
 _config_cache: Optional[dict] = None
 _config_cache_key: Optional[tuple] = None
@@ -69,13 +76,12 @@ def _invalidate_config_cache() -> None:
 # `_MIGRATIONS[old_version]` step whenever a persisted key is renamed, retyped,
 # or retired — load_config() runs the pending steps once and rewrites the file.
 # Version 0 (implicit) = any config written before the key existed.
-CONFIG_VERSION = 1
+CONFIG_VERSION = 4
 
 _DEFAULTS = {
     # Stamped into every saved config; server-owned (POST /api/config strips
     # it) and self-healing (load_config migrates + re-stamps an older file).
     "config_version": CONFIG_VERSION,
-    "library_root": "",
     "llm": DEFAULT_LLM,
     "embed": DEFAULT_EMBED,
     "ocr_model": DEFAULT_OCR_MODEL,
@@ -199,6 +205,12 @@ _DEFAULTS = {
     "vault_wikilink_neighbor_cap": 10,
     "vault_wikilink_node_cap": 24,
     "vault_wikilink_score_decay": 0.5,
+    # Agent web_search tool (2026-07-22, Batch C): opt-in, ONLINE chat
+    # providers only, requires TAVILY_API_KEY in the environment at call time
+    # (never persisted). The toggle is body-overridable per Send
+    # (web_search_enabled); the result cap is config-only.
+    "vault_web_search_enabled": False,
+    "vault_web_search_max_results": 5,
     # Thesaurus query expansion (query-time, no reindex): retrieve a few
     # synonym-substituted variants of the query — driven by the curated
     # `_abreviations.md` / `_tags.md` files at the vault root — and union
@@ -239,9 +251,18 @@ _DEFAULTS = {
     "openai_model": DEFAULT_OPENAI_MODEL,
     "anthropic_model": DEFAULT_ANTHROPIC_MODEL,
     "google_model": DEFAULT_GOOGLE_MODEL,
+    "deepseek_model": DEFAULT_DEEPSEEK_MODEL,
+    "zai_model": DEFAULT_ZAI_MODEL,
+    "openrouter_model": DEFAULT_OPENROUTER_MODEL,
     "online_timeout_s": DEFAULT_ONLINE_TIMEOUT_S,
     "online_max_retries": DEFAULT_ONLINE_MAX_RETRIES,
     "online_max_tokens": DEFAULT_ONLINE_MAX_TOKENS,
+    # Document-token bound for ONLINE single-paper summaries: past this the
+    # map-reduce path splits the document. A reliability/cost bound, not a
+    # hard model limit — LOWER it when the selected online model's real
+    # context is under ~115k tokens (the bound × the tokenizer safety
+    # margin), or a map part could exceed the provider window. Config-only.
+    "online_doc_window_tokens": 100_000,
     # Wall-clock cap for a single agent turn (vault chat) / per-section
     # turn (deck generation). The SSE stall guard and the frontend fetch
     # abort derive from this so raising it isn't defeated by an outer
@@ -356,6 +377,18 @@ _DEFAULTS = {
     "deck_compile_timeout_s": 180,
     "deck_compile_max_iters": 2,
     "deck_compile_engine": "pdflatex",
+    # --- Doc Generator (article/report) knobs ---
+    # The prose sibling of the deck_* generation knobs (api/routes/docgen.py
+    # falls back to these when the body omits them; ranges mirror the
+    # _*_MIN/_*_MAX constants there). docgen_section_max_tokens defaults higher
+    # than deck's because a prose section is longer than a slide.
+    "docgen_temperature": 0.3,
+    "docgen_max_sections": 8,
+    "docgen_agent_max_iterations": 6,
+    "docgen_section_max_attempts": 3,
+    "docgen_retry_backoff_s": 3,
+    "docgen_section_max_tokens": 4096,
+    "docgen_resume_enabled": True,
     # --- Note Refactor knobs ---
     # Scope sub-folder analyzed by /api/refactor/plan; validated as a
     # vault-relative no-traversal path in api/routes/config.py.
@@ -391,6 +424,55 @@ _DEFAULTS = {
     # writes when it moves a full-res original out.
     "refactor_archive_dir": "",
     "refactor_thumb_max_side": DEFAULT_REFACTOR_THUMB_MAX_SIDE,
+    # Biblio Tagging write knobs. tagging_archive_dir "" ⇒ default
+    # BASE_DIR/tagging/archive/<vault_key>/ (the tagging Restore manifest +
+    # pre-write note snapshots; local disk only). Must resolve OUTSIDE the vault
+    # (re-checked at apply time). Shape-validated abs-or-empty on /api/config.
+    "tagging_archive_dir": "",
+    # Biblio Tagging LLM tag-proposal knobs. tagging_propose_model "" ⇒ the
+    # active chat model (resolve_chat_model); the provider is the active chat
+    # provider. max_tags caps the proposal; min_conf sets the low-confidence
+    # threshold; text_max_chars caps the PDF text fed to the model.
+    "tagging_propose_model": "",
+    # 1536 (not the original 300): on Gemini 2.5+/pro, "thinking" is on by
+    # default and its tokens COUNT AGAINST maxOutputTokens — with a 300 cap the
+    # model spends the whole budget on thoughts and the visible reply truncates
+    # after ~10 tokens (measured live 2026-07-18: gemini-pro-latest returned
+    # 7-12 output tokens per propose call → parse found no JSON → status
+    # "empty"). 1536 leaves thinking headroom PLUS the ≤~100-token JSON answer.
+    # We deliberately do NOT send thinkingConfig instead: budget-0 is rejected
+    # (400) by the pro family and Gemini 3.x uses a different knob entirely
+    # (thinkingLevel), so a hard budget would trade truncation for hard errors
+    # across model families. Headroom is model-agnostic. The 2→3 migration
+    # below resets a persisted 300 (the old materialised default) to this.
+    "tagging_propose_max_tokens": 1536,
+    "tagging_propose_temperature": 0.2,
+    "tagging_max_tags": 4,
+    "tagging_min_conf": 0.35,
+    "tagging_text_max_chars": 6000,
+    # Propose prompt shaping (0 = off ⇒ historical prompt byte-for-byte).
+    # candidate_tags: embed glosses + paper text, show only the top-N vocab
+    # tags in the legend (label-space reduction). fewshot_k: inject the k most
+    # similar already-accepted papers from the tagging journal as
+    # title → accepted-tags examples. Both degrade silently to off when the
+    # embed provider is unavailable.
+    "tagging_candidate_tags": 20,
+    "tagging_fewshot_k": 3,
+    # Zotero local-API base for the tag writer (loopback; no key). The writer
+    # appends /api/<library>/items/<key>. Zotero must have "Allow other
+    # applications on this computer to communicate with Zotero" enabled.
+    "tagging_zotero_api_base": "http://127.0.0.1:23119",
+    # Which Zotero endpoint the tag writer talks to.
+    #   local — the loopback API above. READ-ONLY before Zotero 10: it answers
+    #           GET but returns 501 on PATCH (verified against 9.0.6), so tag
+    #           writes fail until Zotero ships write support.
+    #   web   — https://api.zotero.org with a ZOTERO_API_KEY (env-only, never
+    #           persisted here). Writes work today and sync down to the desktop.
+    #   auto  — web when a key is configured, else local. Default: it picks the
+    #           transport that can actually write, and needs no change once the
+    #           local API gains PATCH.
+    "tagging_zotero_transport": "auto",
+    "tagging_zotero_web_api_base": "https://api.zotero.org",
     # Library Audit (kb_harmonizer) settings. The audit subsystem
     # is fully manual — these keys are read only when the user
     # explicitly clicks "Run Scan" on the Library Audit tab.
@@ -424,8 +506,8 @@ KNOWN_KEYS = frozenset(_DEFAULTS.keys())
 # INVARIANT (pinned by smoke_test.py::TestConfigVersionMigration): after any
 # load, the persisted file is at CONFIG_VERSION and contains only KNOWN_KEYS.
 
-def _migrate_0_to_1(data: dict) -> dict:
-    """0→1: prune keys unknown to this release (see the defect note above).
+def _prune_unknown_keys(data: dict) -> dict:
+    """Drop any key not in KNOWN_KEYS (retired/renamed keys, forged extras).
 
     Safe because every config read goes through ``.get()`` on KNOWN_KEYS —
     an unknown key is dead weight by construction, never load-bearing.
@@ -434,8 +516,58 @@ def _migrate_0_to_1(data: dict) -> dict:
     return {k: v for k, v in data.items() if k in KNOWN_KEYS}
 
 
+# Back-compat alias (the 0→1 step was named this before it was generalised).
+_migrate_0_to_1 = _prune_unknown_keys
+
+def _migrate_2_to_3(data: dict) -> dict:
+    """Reset a persisted ``tagging_propose_max_tokens`` of 300 to the new default.
+
+    300 was the ORIGINAL materialised default; because ``save_config`` writes
+    every default into the file, raising the code default alone can never reach
+    an existing install — the stale 300 shadows it forever (the live bug: Gemini
+    thinking models exhaust 300 tokens on thoughts and Propose returns "empty").
+    Only the exact old default is reset — any other value was user-chosen (or
+    the 640 interim default, still workable) and is preserved. Prunes unknown
+    keys too, keeping the "file contains only KNOWN_KEYS" invariant every step
+    upholds.
+    """
+    data = _prune_unknown_keys(data)
+    if data.get("tagging_propose_max_tokens") == 300:
+        data["tagging_propose_max_tokens"] = _DEFAULTS["tagging_propose_max_tokens"]
+    return data
+
+
+def _migrate_3_to_4(data: dict) -> dict:
+    """Reset a persisted legacy DeepSeek alias to the current default model.
+
+    ``deepseek-chat`` / ``deepseek-reasoner`` retired at the provider's
+    2026-07-24 sunset: the curated list stopped OFFERING them (date-gated at
+    import, removed 2026-07-30 as dead code), but nothing stopped USING a
+    selection persisted before the sunset — every call with it now 404s. The
+    2→3 remedy pattern: reset exactly the known-broken values, read the
+    replacement from ``_DEFAULTS`` (never an inline literal — the 2026-07-18
+    route-fallback lesson), preserve anything else as user-chosen.
+    """
+    data = _prune_unknown_keys(data)
+    if data.get("deepseek_model") in ("deepseek-chat", "deepseek-reasoner"):
+        data["deepseek_model"] = _DEFAULTS["deepseek_model"]
+    return data
+
+
 _MIGRATIONS: dict = {
-    0: _migrate_0_to_1,
+    # 0→1 and 1→2 both prune keys unknown to the CURRENT release. 1→2 (2026-07-13)
+    # retires `library_root` (a config key that was declared but referenced
+    # nowhere) from existing version-1 configs — save_config materialises every
+    # default, so a removed key would otherwise linger forever in a saved file.
+    0: _prune_unknown_keys,
+    1: _prune_unknown_keys,
+    # 2→3 (2026-07-18): un-stick the materialised tagging_propose_max_tokens=300
+    # (see _migrate_2_to_3 — the "default bump never reaches existing installs"
+    # trap; this is the documented remedy pattern for future default changes).
+    2: _migrate_2_to_3,
+    # 3→4 (2026-07-30): reset a persisted retired DeepSeek alias (see
+    # _migrate_3_to_4 — the sunset stopped offering the id, not using it).
+    3: _migrate_3_to_4,
 }
 
 
@@ -518,7 +650,14 @@ def load_config() -> dict:
                 try:
                     with _config_write_lock:
                         _write_config_file(data)
-                    key = _config_file_key()  # re-key: we just rewrote the file
+                        # B6 (2026-07-13): re-key INSIDE the write lock. Stat'ing
+                        # after releasing it let a concurrent save_config write a
+                        # newer file between the release and the stat, so our
+                        # migrated (older) view got cached under the newer file's
+                        # key — a NON-self-healing stale cache. Holding the lock
+                        # (which save_config also takes) makes the file we just
+                        # wrote the current one when we key it.
+                        key = _config_file_key()
                 except OSError:
                     logger.warning("Could not persist migrated config; using in-memory result", exc_info=True)
             defaults.update(data)
@@ -557,11 +696,19 @@ def load_config_readonly() -> "MappingProxyType":
     with _config_cache_lock:
         if _config_cache is not None and _config_cache_key == key:
             return MappingProxyType(_config_cache)
-    load_config()  # populate/refresh the cache (one deepcopy on this cold path)
-    with _config_cache_lock:
-        if _config_cache is not None:
-            return MappingProxyType(_config_cache)
-    return MappingProxyType({})
+    # Cold path: populate the cache, then wrap whatever is cached. A concurrent
+    # save_config can invalidate between the two, so retry rather than fall
+    # through to an EMPTY proxy (2026-07-20 audit; fixed 2026-07-30 — every
+    # reader uses .get(key, default) so the old behaviour degraded one call to
+    # hard defaults, but a reader that iterated or `in`-checked would have seen
+    # zero keys). Bounded: a pathological save storm falls back to a full
+    # deepcopy, which is correct and complete — never an empty mapping.
+    for _ in range(3):
+        merged = load_config()
+        with _config_cache_lock:
+            if _config_cache is not None:
+                return MappingProxyType(_config_cache)
+    return MappingProxyType(merged)
 
 
 def save_config(config: dict):
@@ -579,14 +726,38 @@ def save_config(config: dict):
         current["config_version"] = CONFIG_VERSION
         _write_config_file(current)
 
-_ONLINE_PROVIDER_NAMES = frozenset({"openai", "anthropic", "google"})
+_ONLINE_PROVIDER_NAMES = frozenset(
+    {"openai", "anthropic", "google", "deepseek", "zai", "openrouter"}
+)
 _LOCAL_PROVIDER_NAMES = frozenset({"ollama", "lm_studio"})
 
 _ONLINE_MODEL_KEYS: dict[str, str] = {
     "openai": "openai_model",
     "anthropic": "anthropic_model",
     "google": "google_model",
+    "deepseek": "deepseek_model",
+    "zai": "zai_model",
+    "openrouter": "openrouter_model",
 }
+
+# Hard-coded per-provider default model, used when the provider's model key is
+# missing/blank. Kept beside _ONLINE_MODEL_KEYS so adding a provider is one map
+# edit, not a new branch in resolve_chat_model.
+_ONLINE_DEFAULT_MODELS: dict[str, str] = {
+    "openai": DEFAULT_OPENAI_MODEL,
+    "anthropic": DEFAULT_ANTHROPIC_MODEL,
+    "google": DEFAULT_GOOGLE_MODEL,
+    "deepseek": DEFAULT_DEEPSEEK_MODEL,
+    "zai": DEFAULT_ZAI_MODEL,
+    "openrouter": DEFAULT_OPENROUTER_MODEL,
+}
+
+
+# Public, read-only view of the provider→model-key map for the route layer
+# (api/routes/config.py routes the UI's generic `llm` field through it). The
+# underscore-prefixed dict stays the internal mutation point; importing that
+# private name across modules was a hierarchy smell flagged in review.
+ONLINE_MODEL_KEYS = _ONLINE_MODEL_KEYS
 
 
 def is_online_provider(name: str) -> bool:
@@ -605,17 +776,15 @@ def resolve_chat_model(cfg: dict, provider_name: str) -> str:
     their own model field so switching back and forth does not lose
     the user's selection.
     """
-    key = _ONLINE_MODEL_KEYS.get((provider_name or "").strip().lower())
+    pname = (provider_name or "").strip().lower()
+    key = _ONLINE_MODEL_KEYS.get(pname)
     if key:
         value = cfg.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-        if provider_name == "openai":
-            return DEFAULT_OPENAI_MODEL
-        if provider_name == "anthropic":
-            return DEFAULT_ANTHROPIC_MODEL
-        if provider_name == "google":
-            return DEFAULT_GOOGLE_MODEL
+        default = _ONLINE_DEFAULT_MODELS.get(pname)
+        if default:
+            return default
     return str(cfg.get("llm", DEFAULT_LLM) or DEFAULT_LLM)
 
 

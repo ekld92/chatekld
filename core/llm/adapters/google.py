@@ -16,7 +16,7 @@ import time
 from typing import Iterator, Optional
 
 from core.llm.base import LLMProvider, StreamingResponse, looks_like_quota
-from core.llm.retry import retry_with_backoff
+from core.llm.retry import parse_retry_after_s, retry_with_backoff
 from core.llm.tool_schema import (
     build_gemini_contents,
     jsonschema_to_gemini_tool,
@@ -30,7 +30,7 @@ from core.llm.types import (
     LLMResponse,
     LLMUsage,
 )
-from core.llm.usage import usage_tracker
+from core.llm.usage import CANCELLED_ERROR_CATEGORY, usage_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +343,7 @@ class GoogleProvider(LLMProvider):
             usage_tracker.record(
                 provider=self.name,
                 model=request.model,
+                workflow=request.workflow,
                 usage=usage,
                 latency_ms=latency_ms,
                 stream=False,
@@ -362,6 +363,9 @@ class GoogleProvider(LLMProvider):
         return retry_with_backoff(
             _do_call, max_attempts=self.max_retries,
             deadline_monotonic_s=deadline,
+            # Interruptible backoff (2026-07-22 audit B8): the agent loop puts
+            # its cancel probe in request.metadata; absent for other callers.
+            should_cancel=(request.metadata or {}).get("should_cancel"),
         )
 
     def stream(self, request: LLMRequest) -> StreamingResponse:
@@ -387,6 +391,7 @@ class GoogleProvider(LLMProvider):
             cached_in = 0
             finish_reason = FinishReason.STOP
             stream_error: LLMError | None = None
+            cancelled = False
             try:
                 # nullcontext wraps the CACHED client so the streaming block is
                 # unchanged but the shared client is NOT closed on exit (only the
@@ -427,6 +432,13 @@ class GoogleProvider(LLMProvider):
                                 usage_in = int(usage_meta.get("promptTokenCount", usage_in) or usage_in)
                                 usage_out = int(usage_meta.get("candidatesTokenCount", usage_out) or usage_out)
                                 cached_in = int(usage_meta.get("cachedContentTokenCount", cached_in) or cached_in)
+            except GeneratorExit:
+                # Consumer abandoned the stream (client disconnect) — marked,
+                # not failed. See CANCELLED_ERROR_CATEGORY. Gemini reports
+                # usageMetadata on every chunk, so the counts gathered so far
+                # are the provider's own.
+                cancelled = True
+                raise
             except LLMError as exc:
                 stream_error = exc
                 raise
@@ -455,23 +467,55 @@ class GoogleProvider(LLMProvider):
                 usage_tracker.record(
                     provider=self.name,
                     model=request.model,
+                    workflow=request.workflow,
                     usage=final.usage,
                     latency_ms=final.latency_ms,
                     stream=True,
                     success=stream_error is None,
-                    error_category=stream_error.category.value if stream_error else "",
+                    error_category=(
+                        stream_error.category.value if stream_error
+                        else CANCELLED_ERROR_CATEGORY if cancelled
+                        else ""
+                    ),
                 )
 
         return StreamingResponse(response_gen=_iter(), final=final)
 
 
+def _prompt_block_reason(body: dict) -> str:
+    """The ``promptFeedback.blockReason`` of a fully-blocked prompt, else ``""``.
+
+    Gemini expresses a PROMPT-level safety block differently from a
+    RESPONSE-level one: instead of a candidate carrying
+    ``finishReason: "SAFETY"``, it returns **zero candidates** plus a
+    ``promptFeedback`` block. Read it so the caller can tell "the provider
+    refused this input" from "the model produced nothing" — the agent loop's
+    CONTENT_FILTER branch ends the turn cleanly, while an empty STOP counts
+    toward the malformed-tool-call streak and drags the turn into the RAG
+    fallback + capability nag (2026-07-20 audit; fixed 2026-07-30).
+    """
+    feedback = body.get("promptFeedback")
+    if not isinstance(feedback, dict):
+        return ""
+    reason = feedback.get("blockReason")
+    return reason if isinstance(reason, str) and reason else ""
+
+
 def _extract_text_finish_and_calls(body: dict) -> tuple[str, FinishReason, list]:
     """Walk a Gemini response body's ``candidates[].content.parts`` and pull out
     the concatenated text, parsed ``functionCall`` tool calls, and the mapped
-    finish reason (unknown reasons map to OTHER)."""
+    finish reason (unknown reasons map to OTHER).
+
+    A body with NO candidates but a ``promptFeedback.blockReason`` is a
+    prompt-level refusal and yields CONTENT_FILTER (see
+    :func:`_prompt_block_reason`); a candidate's own ``finishReason`` always
+    wins over it, so the response-level SAFETY path is unchanged.
+    """
     text_parts: list[str] = []
     tool_calls: list = []
     finish = FinishReason.STOP
+    if not (body.get("candidates") or []) and _prompt_block_reason(body):
+        finish = FinishReason.CONTENT_FILTER
     for candidate in body.get("candidates", []) or []:
         if not isinstance(candidate, dict):
             continue
@@ -562,6 +606,15 @@ def _http_error_to_llm_error(
     # "Quota exceeded for quota metric …" 429 stays RATE_LIMIT (retryable).
     if category in (ErrorCategory.RATE_LIMIT, ErrorCategory.INVALID_REQUEST) and looks_like_quota(message):
         category = ErrorCategory.QUOTA
+    # Honour the provider's own wait hint on a 429 (header first, then the
+    # "try again in Xs" body phrase) — `retry_with_backoff` treats it as a
+    # FLOOR over the exponential schedule, because sleeping less than asked is
+    # a guaranteed second 429. Mirrors anthropic.py:760 / openai.py:667; the
+    # Google adapter was the sibling that never captured it (2026-07-20 audit,
+    # fixed 2026-07-30).
+    retry_after = None
+    if category == ErrorCategory.RATE_LIMIT:
+        retry_after = parse_retry_after_s(message, getattr(resp, "headers", None))
     return LLMError(
         category=category,
         message=message,
@@ -573,4 +626,5 @@ def _http_error_to_llm_error(
             ErrorCategory.RATE_LIMIT,
             ErrorCategory.SERVER_ERROR,
         },
+        retry_after_s=retry_after,
     )

@@ -90,7 +90,7 @@ def _normalize_one(vault_root: Path, cfg: dict, rel: str, content_sha256: str,
 
 
 def apply_normalize(vault_root: Path, cfg: dict, approved: list[dict],
-                    heartbeat: Optional[Callable[[], None]] = None) -> list[dict]:
+                    heartbeat: Optional[Callable[[], bool]] = None) -> list[dict]:
     """Apply the deterministic formatting fix to each approved note independently.
 
     *approved* is ``[{rel, content_sha256, normalized_sha256}, ...]`` (already
@@ -98,14 +98,25 @@ def apply_normalize(vault_root: Path, cfg: dict, approved: list[dict],
     Caller holds the obsidian operation lock (single writer).
 
     *heartbeat* (optional) is called once per note so a large batch cannot let
-    the caller's op-lock expire mid-run (see ``apply.apply_notes``).
+    the caller's op-lock expire mid-run (see ``apply.apply_notes``). It returns
+    a bool; ``False`` (lock lapsed and stolen) aborts the batch cleanly with the
+    remaining notes marked skipped — same lost-lock contract as ``apply_notes``
+    (2026-07-20 audit finding 1).
     """
     vault_root = Path(vault_root)
     manifest = journal.load(vault_root, cfg)
     results: list[dict] = []
     for i, item in enumerate(approved, start=1):
-        if heartbeat is not None:
-            heartbeat()
+        if heartbeat is not None and not heartbeat():
+            journal.save(vault_root, cfg, manifest)
+            # [i - 1:] includes the CURRENT item — see apply.py's off-by-one note.
+            for remaining in approved[i - 1:]:
+                results.append({
+                    "rel": remaining.get("rel", ""),
+                    "status": "skipped",
+                    "error": "lock_lost",
+                })
+            return results
         rel = item.get("rel", "")
         results.append(_normalize_one(
             vault_root, cfg, rel,

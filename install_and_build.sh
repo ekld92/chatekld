@@ -49,7 +49,14 @@ if ! command -v brew &>/dev/null; then
 fi
 
 if ! command -v ollama &>/dev/null; then
+    # Non-interactive runs (CI, piped stdin) would die here under `set -e`
+    # when `read` hits EOF — skip the prompt and keep the default (skip).
+    if [ ! -t 0 ]; then
+        warn "Ollama not found (non-interactive shell — skipping the install prompt)."
+        REPLY="n"
+    else
     read -r -p "Ollama not found. Install it via Homebrew? (Optional, required if you don't use LM Studio) [Y/n] " REPLY
+    fi
     if [[ "${REPLY:-Y}" =~ ^[Yy]$ ]]; then
         info "Installing Ollama…"
         brew install ollama
@@ -235,6 +242,12 @@ cd "$SCRIPT_DIR"
 # office/zip/audio converter deps (python-docx/pptx, openpyxl) are absent and never
 # bundled (magika + onnxruntime stay — they are markitdown base deps, not an extra);
 # --collect-all "markitdown" below just gathers the package so it imports when frozen.
+#
+# 2026-07-22: both 2026-07-20 build gaps are CLOSED — `tagging`/`docgen` are
+# in --add-data (they used to survive only via the static-import graph, the
+# exact latent failure mode that bit `refactor/` in 2d9fa53), and the dead
+# `pydantic_settings` collect/hidden-import flags (never installed, never
+# imported; their red ERROR line taught the eye to skim past ERRORs) are gone.
 eval "\"$VENV_DIR/bin/pyinstaller\" \\
     --name \"$APP_NAME\" \\
     --osx-bundle-identifier \"com.chatekld.app\" \\
@@ -250,6 +263,10 @@ eval "\"$VENV_DIR/bin/pyinstaller\" \\
     --add-data \"audit:audit\" \\
     --add-data \"deckgen:deckgen\" \\
     --add-data \"refactor:refactor\" \\
+    --add-data \"tagging:tagging\" \\
+    --add-data \"docgen:docgen\" \\
+    --add-data \"cli:cli\" \\
+    --add-data \"mcp_server:mcp_server\" \\
     --add-data \"README.md:.\" \\
     --collect-all \"ollama\" \\
     --collect-all \"pymupdf\" \\
@@ -259,12 +276,10 @@ eval "\"$VENV_DIR/bin/pyinstaller\" \\
     --collect-all \"tiktoken_ext\" \\
     --collect-all \"pydantic\" \\
     --collect-all \"pydantic_core\" \\
-    --collect-all \"pydantic_settings\" \\
     --collect-all \"anyio\" \\
     --collect-all \"httpcore\" \\
     --collect-all \"httpx\" \\
     --collect-all \"tenacity\" \\
-    --hidden-import \"pydantic_settings\" \\
     --collect-all \"sentence_transformers\" \\
     --collect-all \"transformers\" \\
     --collect-all \"tokenizers\" \\
@@ -281,12 +296,12 @@ eval "\"$VENV_DIR/bin/pyinstaller\" \\
     --collect-all \"ruamel.yaml\" \\
     --collect-all \"bibtexparser\" \\
     --collect-all \"bs4\" \\
-    --exclude-module "torch.utils.tensorboard" \
-    --exclude-module "tkinter" \
-    --exclude-module "pysqlite2" \
-    --exclude-module "MySQLdb" \
-    --exclude-module "psycopg2" \
-    --exclude-module "scipy.special._cdflib" \
+    --exclude-module \"torch.utils.tensorboard\" \\
+    --exclude-module \"tkinter\" \\
+    --exclude-module \"pysqlite2\" \\
+    --exclude-module \"MySQLdb\" \\
+    --exclude-module \"psycopg2\" \\
+    --exclude-module \"scipy.special._cdflib\" \\
     $MYPYC_FLAGS \
     --icon \"AppIcon.icns\" \\
     \"launch.py\""
@@ -332,6 +347,13 @@ if [[ -d "$SCRIPT_DIR/dist/$APP_NAME.app" ]]; then
         cp "$SCRIPT_DIR/packaging/seed_models.command" "$DMG_STAGE/"
         chmod +x "$DMG_STAGE/seed_models.command"
     fi
+    # Optional desktop widgets (Lot 3, 2026-08-06): staged as a folder the
+    # recipient installs by hand (SwiftBar plugin dir / Übersicht widgets dir
+    # — see its README). NOT bundled into the .app.
+    if [[ -d "$SCRIPT_DIR/packaging/widgets" ]]; then
+        cp -R "$SCRIPT_DIR/packaging/widgets" "$DMG_STAGE/widgets"
+        chmod +x "$DMG_STAGE/widgets/chatekld.1d.py" 2>/dev/null || true
+    fi
     # First-run instructions, generated (heredoc) so the exact dated app name and
     # the inner binary path are always correct for THIS build.
     cat > "$DMG_STAGE/READ ME FIRST.txt" <<EOF
@@ -364,10 +386,18 @@ it the first time until you approve it once. It runs 100% locally.
        pull an embedding model (nomic-embed-text) + a chat model, OR
      • use an online provider: create the file
        ~/Library/Application Support/ChatEKLD/.env with a line like
-       OPENAI_API_KEY=sk-...  (also supported: ANTHROPIC_API_KEY, GOOGLE_API_KEY).
+       OPENAI_API_KEY=sk-...  (also supported: ANTHROPIC_API_KEY, GOOGLE_API_KEY,
+       DEEPSEEK_API_KEY, ZAI_API_KEY; ZOTERO_API_KEY enables Zotero tag writes,
+       TAVILY_API_KEY enables the vault agent's web search).
 
 5. LAUNCH
    Open ChatEKLD from Applications.
+
+6. OPTIONAL — DESKTOP WIDGETS
+   The "widgets" folder in this window contains a SwiftBar menu-bar plugin and
+   an Übersicht desktop card showing a paper of the day + suggestions from
+   your library. See widgets/README.md for the two-step install. They read a
+   snapshot the app writes after each library scan — no background scanning.
 
 Everything the app stores lives under ~/Library/Application Support/ChatEKLD/.
 Requires an Apple Silicon (arm64) Mac; Intel is not supported.

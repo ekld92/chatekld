@@ -20,6 +20,7 @@ matching API key in the environment.
 """
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -389,6 +390,315 @@ class TestProviderToolPayloadContract(unittest.TestCase):
         out = _ollama_messages(msgs)
         self.assertEqual(out[0]["tool_calls"][0]["function"]["arguments"], {})
 
+    def test_compat_models_without_tools_mechanism(self):
+        """The MODELS_WITHOUT_TOOLS strip: a listed model loses tools/
+        tool_choice (agent turns degrade to plain answers instead of a hard
+        provider 400); unlisted models keep the full dialect. Pinned via a
+        stub subclass — as of 2026-07-12 both live DeepSeek V4 models support
+        tools (verified vs api-docs.deepseek.com), so the shipping sets are
+        empty and the mechanism itself is what needs a pin."""
+        from core.llm.adapters.openai_compat import DeepSeekProvider, _OpenAICompatProvider
+        from core.llm.types import LLMRequest, ToolSchema
+
+        class _Stub(_OpenAICompatProvider):
+            name = "stub"
+            key_env_vars = ("STUB_KEY",)
+            default_base_url = "https://stub.example"
+            MODELS_WITHOUT_TOOLS = frozenset({"no-tools-model"})
+
+        tools = [ToolSchema(name="vault_search", description="d",
+                            parameters={"type": "object", "properties": {}})]
+        provider = _Stub()
+        req = LLMRequest(model="no-tools-model",
+                         messages=[{"role": "user", "content": "q"}], tools=tools)
+        params = provider._common_params(req)
+        self.assertNotIn("tools", params)
+        self.assertNotIn("tool_choice", params)
+        req = LLMRequest(model="other-model",
+                         messages=[{"role": "user", "content": "q"}], tools=tools)
+        self.assertIn("tools", provider._common_params(req))
+
+        # Live contract: DeepSeek V4 keeps tools (both models support them),
+        # and the custom base_url keeps the legacy max_tokens shape.
+        ds = DeepSeekProvider()
+        req = LLMRequest(model="deepseek-v4-flash", max_tokens=100,
+                         messages=[{"role": "user", "content": "q"}], tools=tools)
+        params = ds._common_params(req)
+        self.assertIn("tools", params)
+        self.assertIn("max_tokens", params)
+        self.assertNotIn("max_completion_tokens", params)
+
+    def test_cached_tokens_reads_deepseek_top_level_shape(self):
+        """Audit #6: DeepSeek reports cache hits TOP-LEVEL as
+        prompt_cache_hit_tokens (not nested under prompt_tokens_details) —
+        missing it billed every cached token at full input rate (~50× over
+        at DeepSeek's ~2% cache-hit pricing). Nested (OpenAI) shape wins
+        when both are present."""
+        from core.llm.adapters.openai import _cached_tokens_from_usage
+
+        deepseek_usage = type("U", (), {
+            "prompt_tokens": 1000, "completion_tokens": 50,
+            "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100,
+        })()
+        self.assertEqual(_cached_tokens_from_usage(deepseek_usage), 900)
+
+        openai_usage = type("U", (), {
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": type("D", (), {"cached_tokens": 700})(),
+        })()
+        self.assertEqual(_cached_tokens_from_usage(openai_usage), 700)
+
+        both = type("U", (), {
+            "prompt_tokens_details": type("D", (), {"cached_tokens": 700})(),
+            "prompt_cache_hit_tokens": 900,
+        })()
+        self.assertEqual(_cached_tokens_from_usage(both), 700)  # nested wins
+        self.assertEqual(_cached_tokens_from_usage(None), 0)
+        self.assertEqual(_cached_tokens_from_usage(type("U", (), {})()), 0)
+
+    def test_heal_drops_tools_on_function_calling_400(self):
+        """Audit #7: with MODELS_WITHOUT_TOOLS shipping empty, the reactive
+        heal is the only degradation path for a model/gateway that rejects
+        tools — a tools 400 must strip tools+tool_choice (plain-answer
+        degradation), not surface as a terminal INVALID_REQUEST on every
+        agent/deck/docgen turn. Both phrasings: the quoted param name and the
+        unquoted 'does not support function calling'."""
+        from core.llm.adapters.openai import OpenAIProvider
+
+        provider = OpenAIProvider()
+        for message in (
+            "Unsupported parameter: 'tools' is not supported with this model.",
+            "This model does not support Function Calling.",
+        ):
+            params = {"model": "m", "tools": [{"type": "function"}], "tool_choice": "auto"}
+            fix = provider._heal_unsupported_param(params, Exception(message), set())
+            self.assertTrue(fix, message)
+            self.assertNotIn("tools", params)
+            self.assertNotIn("tool_choice", params)
+
+        # An unrelated 400 must not strip tools.
+        params = {"model": "m", "tools": [{"type": "function"}], "tool_choice": "auto"}
+        fix = provider._heal_unsupported_param(params, Exception("model not found"), set())
+        self.assertEqual(fix, "")
+        self.assertIn("tools", params)
+
+    def test_deepseek_legacy_aliases_stay_retired(self):
+        """The deepseek-chat/reasoner aliases retired at the provider's
+        2026-07-24 sunset (they 404 at call time); the date-gated curation was
+        removed 2026-07-30 as dead code. The curated list must never offer
+        them again — the 3→4 config migration is what rescues a persisted
+        selection (see smoke_test.py::TestConfigVersionMigration)."""
+        from core.llm.adapters.openai_compat import DEEPSEEK_CURATED_MODELS
+
+        self.assertNotIn("deepseek-chat", DEEPSEEK_CURATED_MODELS)
+        self.assertNotIn("deepseek-reasoner", DEEPSEEK_CURATED_MODELS)
+        self.assertEqual(DEEPSEEK_CURATED_MODELS[:2],
+                         ["deepseek-v4-flash", "deepseek-v4-pro"])
+
+    def test_online_model_keys_are_shape_validated(self):
+        """Audit #25: the per-provider *_model keys (the routing target of the
+        UI's generic `llm` field) must reject control chars / empty / oversize
+        instead of persisting garbage that only fails at call time."""
+        from api.routes.config import _CONFIG_VALIDATORS
+        from core.config import ONLINE_MODEL_KEYS
+
+        # Derived from the registry, not a hardcoded tuple (2026-08-08 review
+        # B1): a future provider's key is covered here automatically.
+        for key in sorted(set(ONLINE_MODEL_KEYS.values())):
+            v = _CONFIG_VALIDATORS[key]
+            self.assertEqual(v("deepseek-v4-flash"), "deepseek-v4-flash", key)
+            # OpenRouter ids are namespaced (vendor/model[:variant]) — the
+            # shape validator must round-trip both forms unchanged.
+            self.assertEqual(v("anthropic/claude-haiku-4.5"),
+                             "anthropic/claude-haiku-4.5", key)
+            self.assertEqual(v("nvidia/nemotron-3-super-120b-a12b:free"),
+                             "nvidia/nemotron-3-super-120b-a12b:free", key)
+            self.assertIsNone(v("bad\nname"), key)
+            self.assertIsNone(v(""), key)          # empty ⇒ drop, prior survives
+            self.assertIsNone(v("x" * 200), key)
+            self.assertIsNone(v(123), key)
+
+    def test_compat_providers_registered_everywhere(self):
+        """The registration contract: each compat provider resolves through
+        the factory, counts as online, and has a per-provider model key +
+        default (the smoke_test test_03b analog for the new providers).
+        Defaults verified vs the providers' model catalogs (DeepSeek/Z.AI
+        2026-07-12, OpenRouter 2026-08-08)."""
+        from core.config import resolve_chat_model, is_online_provider
+        from core.llm.factory import get_llm_provider, is_online
+        for name, default in (
+            ("deepseek", "deepseek-v4-flash"),
+            ("zai", "glm-4.7"),
+            ("openrouter", "anthropic/claude-haiku-4.5"),
+        ):
+            self.assertTrue(is_online(name))
+            self.assertTrue(is_online_provider(name))
+            self.assertEqual(get_llm_provider(name).name, name)
+            self.assertEqual(resolve_chat_model({}, name), default)
+            self.assertEqual(
+                resolve_chat_model({f"{name}_model": "custom-id"}, name), "custom-id")
+
+    def test_online_provider_registries_agree(self):
+        """The server-side registries must name the SAME online-provider set —
+        a provider present in one but not another is exactly the C4-class
+        missed-registration bug (2026-07-13), server-side edition. The route
+        enum is a superset (it also carries the local providers)."""
+        from api.routes.config import _PROVIDER_NAMES
+        from core import config as core_config
+        from core.llm import factory
+
+        online = set(factory.ONLINE_PROVIDER_NAMES)
+        self.assertEqual(online, set(core_config._ONLINE_PROVIDER_NAMES))
+        self.assertEqual(online, set(core_config.ONLINE_MODEL_KEYS))
+        self.assertEqual(online, set(core_config._ONLINE_DEFAULT_MODELS))
+        self.assertTrue(online <= set(_PROVIDER_NAMES))
+        self.assertIn("openrouter", online)
+        # Every online model key must ALSO have a _CONFIG_VALIDATORS row
+        # (2026-08-08 review B1): a key absent from that map passes through
+        # _validate_llm_config_keys unvalidated and persists garbage as-is —
+        # the exact class _coerce_online_model exists to stop.
+        from api.routes.config import _CONFIG_VALIDATORS
+        for key in core_config.ONLINE_MODEL_KEYS.values():
+            self.assertIn(key, _CONFIG_VALIDATORS)
+
+    def test_openrouter_provider_contract(self):
+        """OpenRouter (2026-08-08): env-only key that names OPENROUTER_API_KEY
+        in the no-key AUTH error, the fixed base URL with its env override,
+        and — custom base_url — the legacy max_tokens shape with tools kept
+        (every curated id was verified tools-capable in the live catalog)."""
+        from core.llm.adapters.openai_compat import OpenRouterProvider
+        from core.llm.types import LLMRequest, ToolSchema
+
+        p = OpenRouterProvider()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OPENROUTER_API_KEY", None)
+            with self.assertRaises(Exception) as ctx:
+                p._api_key()
+            self.assertIn("OPENROUTER_API_KEY", str(ctx.exception))
+        self.assertEqual(p._base_url(), "https://openrouter.ai/api/v1")
+        with patch.dict(os.environ,
+                        {"OPENROUTER_BASE_URL": "http://gw.local/v1"}):
+            self.assertEqual(p._base_url(), "http://gw.local/v1")
+
+        tools = [ToolSchema(name="vault_search", description="d",
+                            parameters={"type": "object", "properties": {}})]
+        req = LLMRequest(model="anthropic/claude-haiku-4.5", max_tokens=100,
+                         messages=[{"role": "user", "content": "q"}], tools=tools)
+        params = p._common_params(req)
+        self.assertIn("tools", params)
+        self.assertEqual(params["max_tokens"], 100)
+        self.assertNotIn("max_completion_tokens", params)
+
+    def test_openrouter_tools_routing_503_heals_to_plain_answer(self):
+        """M1, 2026-08-08 review: OpenRouter signals "this model has no
+        tool-capable endpoint" as a 503/404 ROUTING error ("There is no
+        available model provider that meets your routing requirements" /
+        "No endpoints found…"), never a param-named 400 — so the inherited
+        heal could not see it and a live-listed no-tools model in agent/deck
+        mode burned every retry as SERVER_ERROR, then triggered provider
+        fallback. The capability-routing heal must strip tools for ONE retry
+        and degrade to a plain answer, like the tools-400 heal."""
+        from core.llm.adapters.openai_compat import OpenRouterProvider
+        from core.llm.types import LLMRequest, ToolSchema
+
+        p = OpenRouterProvider(api_key="k")
+        tools = [ToolSchema(name="vault_search", description="d",
+                            parameters={"type": "object", "properties": {}})]
+        req = LLMRequest(model="some/no-tools-model", max_tokens=64,
+                         messages=[{"role": "user", "content": "q"}],
+                         tools=tools)
+
+        class _Routing503(Exception):
+            status_code = 503
+
+        seen_params = []
+
+        class _Completions:
+            def create(self, **kwargs):
+                seen_params.append(kwargs)
+                if "tools" in kwargs:
+                    raise _Routing503(
+                        "There is no available model provider that meets "
+                        "your routing requirements")
+                return "ok"
+
+        class _Client:
+            class chat:
+                completions = _Completions()
+
+        result = p._create_with_heal(_Client(), req)
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(seen_params), 2)  # one strip, one retry — bounded
+        self.assertIn("tools", seen_params[0])
+        self.assertNotIn("tools", seen_params[1])
+        self.assertNotIn("tool_choice", seen_params[1])
+
+    def test_routing_heal_is_openrouter_scoped_and_phrase_gated(self):
+        """The negative space of the routing heal: the predicate matches ONLY
+        OpenRouter (base OpenAI + sibling compat providers keep param-named
+        400s as their sole heal trigger) and ONLY the routing phrasings — a
+        plain capacity 503 keeps its retryable SERVER_ERROR classification
+        even with tools in the payload."""
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.adapters.openai_compat import (
+            DeepSeekProvider, OpenRouterProvider,
+        )
+        from core.llm.types import ErrorCategory, LLMError, LLMRequest, ToolSchema
+
+        class _Routing503(Exception):
+            status_code = 503
+        routing = _Routing503("No endpoints found that support tool use")
+        self.assertTrue(
+            OpenRouterProvider()._is_capability_routing_error(routing))
+        self.assertFalse(
+            OpenAIProvider(api_key="k")._is_capability_routing_error(routing))
+        self.assertFalse(
+            DeepSeekProvider()._is_capability_routing_error(routing))
+
+        class _Plain503(Exception):
+            status_code = 503
+        plain = _Plain503("upstream overloaded")
+        self.assertFalse(
+            OpenRouterProvider()._is_capability_routing_error(plain))
+
+        # End-to-end negative: a phrase-less 503 with tools still classifies
+        # (retryable SERVER_ERROR), never strips.
+        p = OpenRouterProvider(api_key="k")
+        tools = [ToolSchema(name="vault_search", description="d",
+                            parameters={"type": "object", "properties": {}})]
+        req = LLMRequest(model="some/model", max_tokens=64,
+                         messages=[{"role": "user", "content": "q"}],
+                         tools=tools)
+
+        class _Completions:
+            def create(self, **kwargs):
+                raise _Plain503("upstream overloaded")
+
+        class _Client:
+            class chat:
+                completions = _Completions()
+
+        with self.assertRaises(LLMError) as ctx:
+            p._create_with_heal(_Client(), req)
+        self.assertEqual(ctx.exception.category, ErrorCategory.SERVER_ERROR)
+
+    def test_stream_options_is_healable(self):
+        """Lot 6bis: a compat server 400ing on stream_options must be healed
+        (param stripped, call retried) — otherwise every streamed call on that
+        server is a hard failure. Degradation: usage-less streaming."""
+        from core.llm.adapters.openai import OpenAIProvider
+        provider = OpenAIProvider(api_key="k")
+        params = {"stream": True, "stream_options": {"include_usage": True}}
+        healed: set = set()
+
+        class _Err(Exception):
+            status_code = 400
+            body = {"param": "stream_options"}
+        fix = provider._heal_unsupported_param(params, _Err("'stream_options'"), healed)
+        self.assertIn("stream_options", fix)
+        self.assertNotIn("stream_options", params)
+        self.assertIn("stream", params)  # streaming itself untouched
+
 
 class TestRedaction(unittest.TestCase):
     def test_redacts_openai_secret(self):
@@ -415,6 +725,32 @@ class TestRedaction(unittest.TestCase):
         self.assertIn("<redacted>", out)
         self.assertNotIn("Bearer abc", out)
 
+    def test_redacts_zhipu_dotted_key(self):
+        # 2026-07-20 audit M2/B6: Zhipu/Z.AI keys are {id}.{secret} — no sk-
+        # prefix — so they escaped every pattern outside a Bearer context.
+        from core.llm.redact import redact
+        # A realistic shape: 32-hex id . 24-char secret (never a live key).
+        key = "0123456789abcdef0123456789abcdef.aBcDeFgHiJkLmNoPqRsTuVwX"
+        out = redact(f"provider error for key {key}")
+        self.assertIn("<redacted>", out)
+        self.assertNotIn("aBcDeFgHiJ", out)
+
+    def test_redacts_openrouter_key(self):
+        # OpenRouter keys are sk-or-v1-<hex...> — covered by the generic
+        # sk- pattern (no dedicated pattern needed); this pins that coverage
+        # so a future tightening of the sk- rule can't silently open a leak.
+        from core.llm.redact import redact
+        out = redact("call failed for key sk-or-v1-0123456789abcdef0123456789abcdef")
+        self.assertIn("<redacted>", out)
+        self.assertNotIn("sk-or-v1", out)
+
+    def test_redact_does_not_eat_ordinary_dotted_text(self):
+        # The Zhipu pattern must not swallow filenames / version pins.
+        from core.llm.redact import redact
+        for benign in ("torch-2.2.0 installed", "see report.section.notes",
+                       "abc123.txt was written", "1234567890abcdef.notext"):
+            self.assertEqual(redact(benign), benign, benign)
+
     def test_redacts_service_account_and_admin_keys(self):
         # Row 14: keys with a dash after the prefix must be fully redacted.
         from core.llm.redact import redact
@@ -425,6 +761,61 @@ class TestRedaction(unittest.TestCase):
             out = redact(f"authorization: {key}")
             self.assertIn("<redacted>", out)
             self.assertNotIn("abcdefghij", out, f"{key!r} leaked through redaction")
+
+    def test_zotero_api_key_redacted_in_header_and_env_shapes(self):
+        """Zotero keys are a bare 24-char alnum run with no prefix, so they can
+        only be matched in context — pin both shapes that can reach a log."""
+        from core.llm.redact import redact
+        key = "pvscHmnXiVG3pzsF5Dd0reJY"
+        for line in (f"Zotero-API-Key: {key}",
+                     f"zotero-api-key: {key}",
+                     f"ZOTERO_API_KEY={key}",
+                     # E3 (2026-07-20 audit F9): quoted env dump, colon form, and
+                     # a headers-dict repr must all be caught too.
+                     f'ZOTERO_API_KEY="{key}"',
+                     f"ZOTERO_API_KEY: {key}",
+                     f"{{'Zotero-api-key': '{key}'}}"):
+            out = redact(line)
+            self.assertIn("<redacted>", out, line)
+            self.assertNotIn(key, out, f"Zotero key leaked through: {line!r}")
+
+    def test_redaction_does_not_eat_ordinary_alnum_runs(self):
+        """The contextual patterns must not turn sha fragments / item keys —
+        which look exactly like a bare Zotero key — into <redacted>."""
+        from core.llm.redact import redact
+        for benign in ("item ZK1IGMTHZWB unchanged",
+                       "sha256 a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 ok"):
+            self.assertEqual(redact(benign), benign)
+
+    def test_redacting_filter_scrubs_third_party_log_records(self):
+        # The httpx-key-leak fix (2026-07-18): a third-party logger's URL line
+        # (Gemini carries the key in the query string) must be scrubbed at the
+        # handler, since it never passes app-side sanitisation.
+        import logging
+        from core.llm.redact import RedactingFilter
+        rec = logging.LogRecord(
+            name="httpx", level=logging.INFO, pathname="", lineno=0,
+            msg='HTTP Request: POST https://g.example/models?key=%s&alt=sse "200 OK"',
+            args=("AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ-_1234567",),
+            exc_info=None,
+        )
+        self.assertTrue(RedactingFilter().filter(rec))  # never drops the line
+        rendered = rec.getMessage()
+        self.assertIn("<redacted>", rendered)
+        self.assertNotIn("AIzaSyABCDEF", rendered)
+        # Args were consumed at redaction time, so a handler's later
+        # %-formatting cannot resurrect the unredacted value.
+        self.assertEqual(rec.args, ())
+
+    def test_redacting_filter_never_raises_on_bad_record(self):
+        import logging
+        from core.llm.redact import RedactingFilter
+        rec = logging.LogRecord(name="x", level=logging.INFO, pathname="",
+                                lineno=0, msg="%d", args=("not-an-int",), exc_info=None)
+        # Malformed %-args make getMessage() raise inside the filter; the
+        # filter must swallow it and pass the record through (a dropped log
+        # line is worse than an unredacted one).
+        self.assertTrue(RedactingFilter().filter(rec))
 
     def test_sanitise_error_msg_includes_redaction(self):
         from api.security import sanitise_error_msg
@@ -555,6 +946,16 @@ class TestFactory(unittest.TestCase):
             get_llm_provider("not-a-real-provider")
         self.assertEqual(cm.exception.category.value, "invalid_request")
 
+    def test_lmstudio_get_llm_forces_no_retries(self):
+        """B1 (2026-07-13): the LM Studio query-path LLM must carry max_retries=0
+        so one wedged call is bounded by exactly one timeout (parity with
+        get_lmstudio_client / get_embedding)."""
+        from core.providers.lms import LMStudioProvider, _LLAMAINDEX_OPENAI_AVAILABLE
+        if not _LLAMAINDEX_OPENAI_AVAILABLE:
+            self.skipTest("llama-index-llms-openai not installed")
+        llm = LMStudioProvider("http://localhost:1234").get_llm("some-model")
+        self.assertEqual(getattr(llm, "max_retries", None), 0)
+
     def test_is_online_is_local(self):
         from core.llm.factory import is_online, is_local
         self.assertTrue(is_online("openai"))
@@ -599,6 +1000,31 @@ class TestFallbackPolicy(unittest.TestCase):
         self.assertEqual(policy.fallback, "ollama")
         self.assertIn(ErrorCategory.RATE_LIMIT, policy.fallback_on)
 
+    def test_explicit_empty_fallback_on_means_never(self):
+        """`fallback_on: []` is "never fall back" and both layers must agree.
+
+        The Settings window sends `[]` when every category checkbox is
+        cleared and `_coerce_fallback_on` deliberately PERSISTS it, but the
+        reader's truthiness test turned it back into the full default set —
+        silently re-enabling the provider fallback the user just switched off.
+        """
+        from core.llm.policy import parse_policy_from_config
+        policy = parse_policy_from_config({
+            "provider": "openai",
+            "fallback_provider": "ollama",
+            "fallback_on": [],
+        })
+        self.assertEqual(policy.fallback_on, frozenset())
+
+        # An ABSENT key still means "use the recommended defaults", and a
+        # non-empty all-garbage list (which the route refuses to persist)
+        # still degrades to them rather than to silence.
+        self.assertTrue(parse_policy_from_config(
+            {"provider": "openai", "fallback_provider": "ollama"}).fallback_on)
+        self.assertTrue(parse_policy_from_config(
+            {"provider": "openai", "fallback_provider": "ollama",
+             "fallback_on": ["nonsense"]}).fallback_on)
+
     def test_should_fall_back_only_for_listed_categories(self):
         from core.llm.policy import FallbackPolicy
         from core.llm.types import ErrorCategory, LLMError
@@ -627,6 +1053,135 @@ class TestFallbackPolicy(unittest.TestCase):
             "fallback_provider": "openai",
         })
         self.assertIsNone(policy.fallback)
+
+
+class TestResolveChatProviderFallbackModel(unittest.TestCase):
+    """2026-07-20 audit B1: resolve_chat_provider (the agent/deck/docgen
+    fallback path) must re-resolve the MODEL for the fallback provider — the
+    primary's model id (e.g. "gpt-5") 404s on a local fallback, which made
+    cross-provider fallback effectively dead on this path. The streaming twin
+    (stream_with_fallback) always did this; the two must not drift again."""
+
+    def _run(self, fallback_effect):
+        from core.llm.factory import resolve_chat_provider
+        from core.llm.policy import FallbackPolicy
+        from core.llm.types import ErrorCategory, LLMError, LLMRequest, LLMResponse
+
+        primary = MagicMock()
+        primary.generate.side_effect = LLMError(
+            category=ErrorCategory.NETWORK, message="down",
+            provider="openai", retryable=True,
+        )
+        fallback = MagicMock()
+        if isinstance(fallback_effect, Exception):
+            fallback.generate.side_effect = fallback_effect
+        else:
+            fallback.generate.return_value = LLMResponse(
+                text="ok", provider="ollama", model="llama-local"
+            )
+        cfg = {"openai_model": "gpt-5", "llm": "llama-local"}
+        policy = FallbackPolicy(primary="openai", fallback="ollama")
+        req = LLMRequest(model="gpt-5", messages=[{"role": "user", "content": "hi"}])
+        with patch(
+            "core.llm.factory.get_llm_provider", side_effect=[primary, fallback]
+        ):
+            result = resolve_chat_provider(policy, request=req, stream=False, cfg=cfg)
+        return primary, fallback, result
+
+    def test_fallback_request_uses_fallback_providers_model(self):
+        primary, fallback, (resp, used) = self._run(None)
+        self.assertEqual(used, "ollama")
+        self.assertEqual(resp.text, "ok")
+        # The primary was asked with its own model…
+        self.assertEqual(primary.generate.call_args.args[0].model, "gpt-5")
+        # …and the fallback with the fallback provider's persisted model.
+        self.assertEqual(fallback.generate.call_args.args[0].model, "llama-local")
+
+    def test_fallback_nonllm_error_coerced_with_fallback_provider(self):
+        from core.llm.types import LLMError
+        with self.assertRaises(LLMError) as ctx:
+            self._run(RuntimeError("socket exploded"))
+        self.assertEqual(ctx.exception.provider, "ollama")
+        self.assertEqual(ctx.exception.model, "llama-local")
+        self.assertIn("socket exploded", ctx.exception.message)
+
+
+class TestAnthropicStreamErrorEvent(unittest.TestCase):
+    """2026-07-20 audit B2: an in-stream Anthropic ``event: error`` frame
+    (e.g. overloaded_error) must raise a classified LLMError — ignoring it
+    turned provider overload into silent truncation recorded as success."""
+
+    def setUp(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test"
+
+    def tearDown(self):
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    def test_error_event_raises_and_records_failure(self):
+        from core.llm.adapters.anthropic import AnthropicProvider
+        from core.llm.types import ErrorCategory, LLMError, LLMRequest
+
+        fake_httpx, client_mock, _ = _fake_httpx_module({})
+        lines = [
+            "event: message_start",
+            'data: {"type": "message_start", "message": {"usage": {"input_tokens": 5}}}',
+            "event: content_block_delta",
+            'data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "partial"}}',
+            "event: error",
+            'data: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}',
+        ]
+        stream_resp = MagicMock()
+        stream_resp.status_code = 200
+        stream_resp.iter_lines.return_value = iter(lines)
+        stream_cm = MagicMock()
+        stream_cm.__enter__.return_value = stream_resp
+        stream_cm.__exit__.return_value = False
+        client_mock.stream.return_value = stream_cm
+
+        p = AnthropicProvider()
+        req = LLMRequest(
+            model="claude-sonnet-5", messages=[{"role": "user", "content": "hi"}]
+        )
+        with patch.object(p, "_httpx", return_value=fake_httpx), \
+             patch("core.llm.adapters.anthropic.usage_tracker") as tracker:
+            resp = p.stream(req)
+            got = []
+            with self.assertRaises(LLMError) as ctx:
+                for tok in resp.response_gen:
+                    got.append(tok)
+        # Tokens before the error still streamed; the error then surfaced
+        # instead of a clean end-of-stream.
+        self.assertEqual(got, ["partial"])
+        self.assertIs(ctx.exception.category, ErrorCategory.SERVER_ERROR)
+        self.assertTrue(ctx.exception.retryable)
+        self.assertIn("Overloaded", ctx.exception.message)
+        # The finally recorded a FAILED call, not a success.
+        rec = tracker.record.call_args.kwargs
+        self.assertFalse(rec["success"])
+        self.assertEqual(rec["error_category"], "server_error")
+        self.assertIs(resp.final.error, ctx.exception)
+
+    def test_stream_error_type_mapping(self):
+        from core.llm.adapters.anthropic import _stream_error_event_to_llm_error
+        from core.llm.types import ErrorCategory
+
+        def cat(err_type, message="m"):
+            return _stream_error_event_to_llm_error(
+                {"error": {"type": err_type, "message": message}}, "anthropic", "x"
+            ).category
+
+        self.assertIs(cat("overloaded_error"), ErrorCategory.SERVER_ERROR)
+        self.assertIs(cat("api_error"), ErrorCategory.SERVER_ERROR)
+        self.assertIs(cat("rate_limit_error"), ErrorCategory.RATE_LIMIT)
+        self.assertIs(cat("authentication_error"), ErrorCategory.AUTH)
+        self.assertIs(cat("invalid_request_error"), ErrorCategory.INVALID_REQUEST)
+        # Unknown future types degrade to a retryable server error.
+        self.assertIs(cat("mystery_error"), ErrorCategory.SERVER_ERROR)
+        # The quota re-map mirrors the HTTP-status path.
+        self.assertIs(
+            cat("invalid_request_error", "Your credit balance is too low"),
+            ErrorCategory.QUOTA,
+        )
 
 
 class TestQuotaClassification(unittest.TestCase):
@@ -707,6 +1262,52 @@ class TestUsageTracking(unittest.TestCase):
             overrides={"gpt-4o-mini": {"input": 1.00, "output": 1.00}},
         )
         self.assertAlmostEqual(cost, 1.00, places=4)
+
+    def test_override_with_string_cached_input_never_raises(self):
+        """2026-07-22 audit B1 (reproduced live): a quoted number for
+        cached_input ('0.125') survived construction and raised TypeError at
+        the cost multiplication — inside the adapters' streaming `finally`,
+        so a SUCCESSFUL stream ended in an error. Strings must coerce; a
+        malformed row must degrade to table pricing, never raise."""
+        from core.llm.usage import estimate_cost_usd
+        from core.llm.types import LLMUsage
+        usage = LLMUsage(input_tokens=1_000_000, output_tokens=0,
+                         cached_input_tokens=500_000)
+        # Coercible string → applied.
+        cost = estimate_cost_usd(
+            "gpt-4o-mini", usage,
+            overrides={"gpt-4o-mini": {"input": 1.0, "output": 1.0,
+                                       "cached_input": "0.5"}})
+        self.assertAlmostEqual(cost, 0.5 * 1.0 + 0.5 * 0.5, places=4)
+        # Garbage string → row dropped, falls back to the table (never raises).
+        cost2 = estimate_cost_usd(
+            "gpt-4o-mini", usage,
+            overrides={"gpt-4o-mini": {"input": 1.0, "output": 1.0,
+                                       "cached_input": "not-a-number"}})
+        self.assertIsInstance(cost2, float)
+
+    def test_record_survives_a_raising_cost_estimator(self):
+        """record() must never break the caller's path — it runs inside the
+        adapters' stream `finally` blocks (2026-07-22 audit B1)."""
+        from unittest import mock
+        from core.llm.usage import UsageTracker
+        from core.llm.types import LLMUsage
+        tracker = UsageTracker()  # no log path — memory only
+        with mock.patch("core.llm.usage.estimate_cost_usd",
+                        side_effect=TypeError("boom")):
+            tracker.record(provider="openai", model="gpt-4o-mini",
+                           usage=LLMUsage(input_tokens=10, output_tokens=5),
+                           latency_ms=1, stream=True, success=True)
+        # No exception = the contract holds; cost degraded to 0.0.
+
+    def test_gemini_rows_price_cached_input(self):
+        """2026-07-22 audit B9: the Google adapter captures cache-read tokens,
+        so every Gemini row must carry a cached_input rate — a None billed
+        cache reads at the FULL input rate."""
+        from core.llm.usage import PRICING_TABLE
+        for model, row in PRICING_TABLE.items():
+            if model.startswith("gemini-"):
+                self.assertIsNotNone(row.cached_input, model)
 
     def test_record_writes_cost_back_onto_usage(self):
         # Improvement plan 0.3: record() must set estimated_cost_usd on the
@@ -1232,6 +1833,184 @@ class TestLocalAdapter(unittest.TestCase):
         self.assertEqual("".join(collected), "hello")
 
 
+class TestOllamaThinkSuppression(unittest.TestCase):
+    """2026-07-30 fix for the 2026-07-27 OPEN finding: a thinking-capable
+    Ollama model burned num_predict on message.thinking that nothing reads,
+    returning an empty reply. Every chat call now sends think=False with a
+    one-shot fallback (+ per-model memo) when the backend rejects the param."""
+
+    def setUp(self):
+        from core.providers import ollama as ollama_mod
+        ollama_mod._THINK_UNSUPPORTED_MODELS.clear()
+
+    tearDown = setUp
+
+    # ---- helper predicates -------------------------------------------------
+
+    def test_think_param_rejected_matches_only_param_rejections(self):
+        from core.providers.ollama import _think_param_rejected
+        # Server refusals of the parameter itself, in observed phrasings:
+        self.assertTrue(_think_param_rejected(
+            Exception('registry.ollama.ai/library/llama3.2 does not support thinking')))
+        self.assertTrue(_think_param_rejected(Exception("unknown field: think")))
+        # An SDK too old to know the kwarg:
+        self.assertTrue(_think_param_rejected(
+            TypeError("chat() got an unexpected keyword argument 'think'")))
+        # Genuine generation errors must NOT match:
+        self.assertFalse(_think_param_rejected(Exception("model not found")))
+        self.assertFalse(_think_param_rejected(ConnectionError("refused")))
+        # Mentions think but is not a param rejection:
+        self.assertFalse(_think_param_rejected(Exception("I think therefore I am")))
+
+    # ---- non-streaming wrapper (agent tool path) ---------------------------
+
+    def test_chat_with_think_off_sends_flag_and_falls_back_once(self):
+        from core.providers import ollama as ollama_mod
+        calls = []
+
+        def fake_chat(**kwargs):
+            calls.append(kwargs)
+            if "think" in kwargs:
+                raise Exception("m1 does not support thinking")
+            return {"ok": True}
+
+        client = MagicMock()
+        client.chat = fake_chat
+        out = ollama_mod.chat_with_think_off(client, {"model": "m1", "messages": []})
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        self.assertIs(calls[0]["think"], False)
+        self.assertNotIn("think", calls[1])
+        # The model is memoised: the next call skips the doomed attempt.
+        out2 = ollama_mod.chat_with_think_off(client, {"model": "m1", "messages": []})
+        self.assertEqual(out2, {"ok": True})
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("think", calls[2])
+
+    def test_chat_with_think_off_reraises_genuine_errors_unmemoised(self):
+        from core.providers import ollama as ollama_mod
+        client = MagicMock()
+        client.chat = MagicMock(side_effect=ConnectionError("refused"))
+        with self.assertRaises(ConnectionError):
+            ollama_mod.chat_with_think_off(client, {"model": "m2", "messages": []})
+        client.chat.assert_called_once()  # no blind retry on a real failure
+        self.assertNotIn("m2", ollama_mod._THINK_UNSUPPORTED_MODELS)
+
+    def test_tool_path_sends_think_false_and_metadata_opts_in(self):
+        from core.llm.adapters.local import LocalLLMProvider
+        from core.llm.types import LLMRequest, ToolSchema
+
+        ollama_response = {
+            "message": {"role": "assistant", "content": "hi", "tool_calls": []},
+            "done_reason": "stop",
+        }
+        mock_provider = MagicMock()
+        mock_provider.resolve_model.return_value = "llama3.1:latest"
+        chat = MagicMock(return_value=ollama_response)
+        mock_provider._client.return_value.chat = chat
+        spec = ToolSchema(name="vault_search", description="d", parameters={})
+        p = LocalLLMProvider("ollama")
+
+        with patch.object(p, "_provider", return_value=mock_provider):
+            p.generate(LLMRequest(
+                model="llama3.1",
+                messages=[{"role": "user", "content": "q"}],
+                tools=[spec],
+            ))
+        self.assertIs(chat.call_args.kwargs["think"], False)
+
+        chat.reset_mock()
+        with patch.object(p, "_provider", return_value=mock_provider):
+            p.generate(LLMRequest(
+                model="llama3.1",
+                messages=[{"role": "user", "content": "q"}],
+                tools=[spec],
+                metadata={"ollama_think": True},
+            ))
+        self.assertIs(chat.call_args.kwargs["think"], True)
+
+    # ---- streaming wrapper (legacy stream_chat path) -----------------------
+
+    def test_stream_chat_sends_think_false_by_default(self):
+        from core.providers.ollama import OllamaProvider
+        captured = {}
+
+        def fake_chat(**kwargs):
+            captured.update(kwargs)
+            return iter([{"message": {"content": "tok"}}])
+
+        client = MagicMock()
+        client.chat = fake_chat
+        provider = OllamaProvider(host="http://localhost:11434")
+        with patch.object(provider, "resolve_model", side_effect=lambda m: m), \
+                patch.object(provider, "_client", return_value=client):
+            out = list(provider.stream_chat(model="m3", prompt="hi"))
+        self.assertEqual(len(out), 1)
+        self.assertIs(captured["think"], False)
+        self.assertTrue(captured["stream"])
+
+    def test_stream_chat_explicit_think_forwarded_verbatim(self):
+        from core.providers.ollama import OllamaProvider
+        captured = {}
+
+        def fake_chat(**kwargs):
+            captured.update(kwargs)
+            return iter([])
+
+        client = MagicMock()
+        client.chat = fake_chat
+        provider = OllamaProvider(host="http://localhost:11434")
+        with patch.object(provider, "resolve_model", side_effect=lambda m: m), \
+                patch.object(provider, "_client", return_value=client):
+            provider.stream_chat(model="m3", prompt="hi", think=True)
+        self.assertIs(captured["think"], True)
+
+    def test_stream_wrapper_falls_back_pre_first_token(self):
+        from core.providers import ollama as ollama_mod
+        calls = []
+
+        def fake_chat(**kwargs):
+            calls.append(kwargs)
+            if "think" in kwargs:
+                def _boom():
+                    raise Exception("m4 does not support thinking")
+                    yield  # pragma: no cover — makes this a generator
+                return _boom()
+            return iter([{"c": 1}, {"c": 2}])
+
+        client = MagicMock()
+        client.chat = fake_chat
+        out = list(ollama_mod.stream_chat_with_think_off(
+            client, {"model": "m4", "messages": [], "stream": True}))
+        self.assertEqual(out, [{"c": 1}, {"c": 2}])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("m4", ollama_mod._THINK_UNSUPPORTED_MODELS)
+
+    def test_stream_wrapper_chains_first_chunk_on_success(self):
+        from core.providers import ollama as ollama_mod
+        client = MagicMock()
+        client.chat = MagicMock(return_value=iter([{"c": 1}, {"c": 2}, {"c": 3}]))
+        out = list(ollama_mod.stream_chat_with_think_off(
+            client, {"model": "m5", "messages": [], "stream": True}))
+        self.assertEqual(out, [{"c": 1}, {"c": 2}, {"c": 3}])  # first chunk not lost
+        client.chat.assert_called_once()
+
+    def test_local_adapter_stream_metadata_opt_in_reaches_stream_chat(self):
+        from core.llm.adapters.local import LocalLLMProvider
+        from core.llm.types import LLMRequest
+        mock_provider = MagicMock()
+        mock_provider.stream_chat.return_value = iter([])
+        p = LocalLLMProvider("ollama")
+        with patch.object(p, "_provider", return_value=mock_provider):
+            stream = p.stream(LLMRequest(
+                model="llama3.2",
+                messages=[{"role": "user", "content": "hi"}],
+                metadata={"ollama_think": True},
+            ))
+            list(stream.response_gen)
+        self.assertIs(mock_provider.stream_chat.call_args.kwargs["think"], True)
+
+
 # ---------------------------------------------------------------------------
 # Message builders (shared across adapters)
 # ---------------------------------------------------------------------------
@@ -1389,6 +2168,198 @@ def _fake_httpx_module(response_body, status_code=200):
     _anthropic._client_cache.clear()
     _google._client_cache.clear()
     return fake_httpx, client_mock, resp_mock
+
+
+class TestGoogleErrorAndBlockHandling(unittest.TestCase):
+    """Plan-3 (2026-07-30) fixes for two 2026-07-20 audit deferrals in the
+    Google adapter: the never-captured Retry-After, and a prompt-level safety
+    block reading as a malformed turn."""
+
+    # ---- P3.1: Retry-After ------------------------------------------------
+
+    def _err(self, status, *, headers=None, body_message="boom"):
+        from core.llm.adapters.google import _http_error_to_llm_error
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = headers if headers is not None else {}
+        resp.text = json.dumps({"error": {"message": body_message}})
+        return _http_error_to_llm_error(resp, "google", "gemini-2.5-flash")
+
+    def test_429_captures_retry_after_header(self):
+        err = self._err(429, headers={"Retry-After": "42"})
+        from core.llm.types import ErrorCategory
+        self.assertEqual(err.category, ErrorCategory.RATE_LIMIT)
+        self.assertEqual(err.retry_after_s, 42.0)
+
+    def test_429_falls_back_to_body_phrase(self):
+        err = self._err(429, body_message="Rate limited. Please try again in 7s.")
+        self.assertEqual(err.retry_after_s, 7.0)
+
+    def test_non_429_carries_no_hint(self):
+        # A hint on a 500/400 would make retry_with_backoff sleep on a schedule
+        # the provider never asked for.
+        self.assertIsNone(self._err(500, headers={"Retry-After": "42"}).retry_after_s)
+        self.assertIsNone(self._err(400).retry_after_s)
+
+    def test_missing_headers_attribute_is_tolerated(self):
+        from core.llm.adapters.google import _http_error_to_llm_error
+        resp = MagicMock(spec=["status_code", "text"])  # no .headers at all
+        resp.status_code = 429
+        resp.text = "{}"
+        self.assertIsNone(_http_error_to_llm_error(resp, "google", "m").retry_after_s)
+
+    # ---- P3.2: prompt-level block ----------------------------------------
+
+    def test_prompt_block_with_zero_candidates_is_content_filter(self):
+        from core.llm.adapters.google import _extract_text_finish_and_calls
+        from core.llm.types import FinishReason
+        body = {"promptFeedback": {"blockReason": "SAFETY"}}
+        text, finish, calls = _extract_text_finish_and_calls(body)
+        self.assertEqual(text, "")
+        self.assertEqual(finish, FinishReason.CONTENT_FILTER)
+        self.assertEqual(calls, [])
+
+    def test_empty_body_without_block_reason_stays_stop(self):
+        # Preserves the pre-fix reading for a genuinely empty answer, which the
+        # agent loop counts toward its malformed-tool-call streak.
+        from core.llm.adapters.google import _extract_text_finish_and_calls
+        from core.llm.types import FinishReason
+        for body in ({}, {"candidates": []}, {"promptFeedback": {}},
+                     {"promptFeedback": {"blockReason": ""}}):
+            _, finish, _ = _extract_text_finish_and_calls(body)
+            self.assertEqual(finish, FinishReason.STOP, body)
+
+    def test_candidate_finish_reason_still_wins(self):
+        from core.llm.adapters.google import _extract_text_finish_and_calls
+        from core.llm.types import FinishReason
+        body = {
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "candidates": [{"content": {"parts": [{"text": "hi"}]},
+                            "finishReason": "MAX_TOKENS"}],
+        }
+        text, finish, _ = _extract_text_finish_and_calls(body)
+        self.assertEqual(text, "hi")
+        self.assertEqual(finish, FinishReason.LENGTH)
+
+    def test_response_level_safety_unchanged(self):
+        from core.llm.adapters.google import _extract_text_finish_and_calls
+        from core.llm.types import FinishReason
+        body = {"candidates": [{"content": {"parts": []}, "finishReason": "SAFETY"}]}
+        _, finish, _ = _extract_text_finish_and_calls(body)
+        self.assertEqual(finish, FinishReason.CONTENT_FILTER)
+
+
+class TestStreamCancellationAccounting(unittest.TestCase):
+    """P3.3 (2026-07-30): a consumer that abandons a stream raises
+    GeneratorExit through `for chunk in stream`, which `except Exception` does
+    not catch — so the usage record used to claim a clean success. It is now
+    marked `cancelled` (kept success=True on purpose: record() zeroes the cost
+    of a failure, and the provider bills what it generated)."""
+
+    def setUp(self):
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        self._records = []
+        patcher = patch("core.llm.usage.usage_tracker.record",
+                        side_effect=self._capture)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        os.environ.pop("OPENAI_API_KEY", None)
+
+    def _capture(self, **kwargs):
+        self._records.append(kwargs)
+        return MagicMock()
+
+    def test_openai_cancel_marks_record_and_estimates_output(self):
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.types import LLMRequest
+        from core.llm.usage import CANCELLED_ERROR_CATEGORY
+
+        def _chunk(text):
+            c = MagicMock()
+            c.usage = None  # usage rides the FINAL chunk, which never arrives
+            choice = MagicMock()
+            choice.delta.content = text
+            choice.finish_reason = None
+            c.choices = [choice]
+            return c
+
+        provider = OpenAIProvider()
+        with patch.object(provider, "_client", return_value=MagicMock()), \
+                patch.object(provider, "_create_with_heal",
+                             return_value=iter([_chunk("hello "), _chunk("world")])):
+            stream = provider.stream(LLMRequest(
+                model="gpt-5", messages=[{"role": "user", "content": "hi"}]))
+            gen = stream.response_gen
+            self.assertEqual(next(gen), "hello ")
+            gen.close()  # the client disconnect
+
+        self.assertEqual(len(self._records), 1)
+        rec = self._records[0]
+        self.assertEqual(rec["error_category"], CANCELLED_ERROR_CATEGORY)
+        self.assertTrue(rec["success"])  # cost must still be computed
+        # The one token actually streamed is real and billed — not a free call.
+        self.assertGreater(rec["usage"].output_tokens, 0)
+
+    def test_local_cancel_marks_record(self):
+        from core.llm.adapters.local import LocalLLMProvider
+        from core.llm.types import LLMRequest
+        from core.llm.usage import CANCELLED_ERROR_CATEGORY
+
+        mock_provider = MagicMock()
+        mock_provider.stream_chat.return_value = iter([
+            MagicMock(message=MagicMock(content="a")),
+            MagicMock(message=MagicMock(content="b")),
+        ])
+        p = LocalLLMProvider("ollama")
+        with patch.object(p, "_provider", return_value=mock_provider):
+            gen = p.stream(LLMRequest(
+                model="llama3.2",
+                messages=[{"role": "user", "content": "hi"}])).response_gen
+            self.assertEqual(next(gen), "a")
+            gen.close()
+
+        self.assertEqual(self._records[-1]["error_category"], CANCELLED_ERROR_CATEGORY)
+        self.assertTrue(self._records[-1]["success"])
+
+    def test_clean_stream_is_not_marked_cancelled(self):
+        from core.llm.adapters.local import LocalLLMProvider
+        from core.llm.types import LLMRequest
+
+        mock_provider = MagicMock()
+        mock_provider.stream_chat.return_value = iter([
+            MagicMock(message=MagicMock(content="a")),
+        ])
+        p = LocalLLMProvider("ollama")
+        with patch.object(p, "_provider", return_value=mock_provider):
+            list(p.stream(LLMRequest(
+                model="llama3.2",
+                messages=[{"role": "user", "content": "hi"}])).response_gen)
+        self.assertEqual(self._records[-1]["error_category"], "")
+        self.assertTrue(self._records[-1]["success"])
+
+    def test_stream_error_still_reports_its_own_category(self):
+        # A real failure must NOT be relabelled as a cancellation.
+        from core.llm.adapters.local import LocalLLMProvider
+        from core.llm.types import LLMRequest
+
+        def _boom():
+            yield MagicMock(message=MagicMock(content="a"))
+            raise ConnectionRefusedError("backend died")
+
+        mock_provider = MagicMock()
+        mock_provider.stream_chat.return_value = _boom()
+        p = LocalLLMProvider("ollama")
+        with patch.object(p, "_provider", return_value=mock_provider):
+            gen = p.stream(LLMRequest(
+                model="llama3.2",
+                messages=[{"role": "user", "content": "hi"}])).response_gen
+            self.assertEqual(next(gen), "a")
+            with self.assertRaises(Exception):
+                next(gen)
+        self.assertEqual(self._records[-1]["error_category"], "network")
+        self.assertFalse(self._records[-1]["success"])
 
 
 class TestAdapterToolUse(unittest.TestCase):
@@ -2701,6 +3672,227 @@ class TestAnthropicPromptCaching(unittest.TestCase):
         from core.llm.usage import unpriced_curated_models
         self.assertEqual(unpriced_curated_models(), [])
 
+    def test_namespaced_variant_ids_never_fall_back_to_base_pricing(self):
+        """OpenRouter ids are vendor/model[:variant] and a :variant carries
+        its OWN price, distinct from its base (:free is $0) — so the
+        historical split-on-colon fallback (written for ollama name:tag ids)
+        would MIS-report them at the base rate. The 2026-08-08 gate:
+        namespaced ids get exact-match pricing only ($0 unknown-model
+        fallback otherwise); un-namespaced local ids keep the colon
+        fallback."""
+        from core.llm.types import LLMUsage
+        from core.llm.usage import PRICING_TABLE, ModelPricing, estimate_cost_usd
+
+        usage = LLMUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+        # Exact :free row → $0 by its own entry, not by fallback.
+        self.assertEqual(
+            estimate_cost_usd("nvidia/nemotron-3-super-120b-a12b:free", usage), 0.0)
+        # Priced base + unpriced :variant → $0 (under-report), NOT $12 (the
+        # anthropic/claude-sonnet-5 base rate).
+        self.assertIn("anthropic/claude-sonnet-5", PRICING_TABLE)
+        self.assertEqual(
+            estimate_cost_usd("anthropic/claude-sonnet-5:batch", usage), 0.0)
+        # The ollama name:tag fallback the split was written for still works.
+        with patch.dict(PRICING_TABLE,
+                        {"testlocal": ModelPricing(input=1.0, output=1.0)}):
+            self.assertAlmostEqual(
+                estimate_cost_usd("testlocal:8b", usage), 2.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Context budgeting (WP-C1/C2/C5) — core/llm/budget.py + the local adapter's
+# per-request num_ctx. Ollama silently truncates anything past num_ctx
+# (default ~4k), so the client must size the window per request.
+# ---------------------------------------------------------------------------
+
+class TestContextBudget(unittest.TestCase):
+    def test_pick_num_ctx_ladder(self):
+        from core.llm.budget import pick_num_ctx
+        # Tiny prompt → smallest rung.
+        self.assertEqual(pick_num_ctx(100, 1024, 32768), 4096)
+        # prompt+output over 8k → next rung up.
+        self.assertEqual(pick_num_ctx(5000, 4096, 32768), 16384)
+        # Capped at the ceiling even when the need exceeds it.
+        self.assertEqual(pick_num_ctx(100_000, 4096, 32768), 32768)
+        # Garbage / missing ceiling degrades to the top rung, never crashes.
+        self.assertEqual(pick_num_ctx(100, 1024, None), 4096)
+        self.assertEqual(pick_num_ctx(100, 1024, "x"), 4096)
+
+    def test_pick_num_ctx_reserves_default_output(self):
+        from core.llm.budget import DEFAULT_OUTPUT_RESERVE, pick_num_ctx
+        # No max_tokens → the default reserve keeps headroom for the answer.
+        self.assertGreaterEqual(
+            pick_num_ctx(3000, None, 131072), 3000 + DEFAULT_OUTPUT_RESERVE
+        )
+
+    def test_document_budget_tokens(self):
+        from core.llm.budget import document_budget_tokens
+        b = document_budget_tokens(32768, 4096)
+        self.assertGreater(b, 20000)
+        self.assertLess(b, 32768 - 4096)
+        # Pathological window still returns a usable floor.
+        self.assertGreaterEqual(document_budget_tokens(0, 4096), 512)
+
+    def test_fit_text_to_budget_reports_truncation(self):
+        from core.llm.budget import fit_text_to_budget
+        text = "word " * 5000
+        fitted, truncated, kept, total = fit_text_to_budget(text, 100)
+        self.assertTrue(truncated)
+        self.assertLess(len(fitted), len(text))
+        self.assertEqual(kept, 100)
+        self.assertGreater(total, 100)
+
+        same, truncated2, kept2, total2 = fit_text_to_budget("short", 100)
+        self.assertEqual(same, "short")
+        self.assertFalse(truncated2)
+        self.assertEqual(kept2, total2)
+
+
+class TestAutoNumCtx(unittest.TestCase):
+    """The local adapter must send a payload-sized num_ctx to Ollama on every
+    request that doesn't set one explicitly (WP-C1)."""
+
+    def test_stream_path_auto_sets_num_ctx(self):
+        from core.llm.adapters.local import LocalLLMProvider
+        from core.llm.budget import NUM_CTX_LADDER
+        from core.llm.types import LLMRequest
+
+        mock_provider = MagicMock()
+        mock_provider.stream_chat.return_value = iter([])
+        p = LocalLLMProvider("ollama")
+        with patch.object(p, "_provider", return_value=mock_provider):
+            stream = p.stream(LLMRequest(
+                model="llama3.2", messages=[{"role": "user", "content": "hi"}],
+            ))
+            list(stream.response_gen)
+        kwargs = mock_provider.stream_chat.call_args.kwargs
+        self.assertIn(kwargs.get("num_ctx"), NUM_CTX_LADDER)
+
+    def test_stream_path_respects_explicit_num_ctx(self):
+        from core.llm.adapters.local import LocalLLMProvider
+        from core.llm.types import LLMRequest
+
+        mock_provider = MagicMock()
+        mock_provider.stream_chat.return_value = iter([])
+        p = LocalLLMProvider("ollama")
+        req = LLMRequest(
+            model="llama3.2", messages=[{"role": "user", "content": "hi"}],
+            metadata={"num_ctx": 12345},
+        )
+        with patch.object(p, "_provider", return_value=mock_provider):
+            list(p.stream(req).response_gen)
+        kwargs = mock_provider.stream_chat.call_args.kwargs
+        self.assertEqual(kwargs.get("num_ctx"), 12345)
+
+    def test_tool_path_auto_sets_num_ctx_scaled_to_payload(self):
+        from core.llm.adapters.local import LocalLLMProvider
+        from core.llm.budget import NUM_CTX_LADDER
+        from core.llm.types import LLMRequest, ToolSchema
+
+        ollama_response = {
+            "message": {"role": "assistant", "content": "ok"},
+            "done_reason": "stop",
+        }
+        mock_provider = MagicMock()
+        mock_provider.resolve_model.return_value = "llama3.1:latest"
+        mock_provider._client.return_value.chat = MagicMock(return_value=ollama_response)
+        spec = ToolSchema(name="vault_search", description="d", parameters={})
+
+        p = LocalLLMProvider("ollama")
+        # Small payload → bottom rung.
+        small = LLMRequest(
+            model="llama3.1", messages=[{"role": "user", "content": "hi"}],
+            tools=[spec], max_tokens=512,
+        )
+        with patch.object(p, "_provider", return_value=mock_provider):
+            p.generate(small)
+        opts = mock_provider._client.return_value.chat.call_args.kwargs["options"]
+        self.assertEqual(opts["num_ctx"], NUM_CTX_LADDER[0])
+
+        # A payload past the bottom rung climbs the ladder instead of being
+        # silently truncated by Ollama's default window.
+        big = LLMRequest(
+            model="llama3.1",
+            messages=[{"role": "user", "content": "x" * 40_000}],
+            tools=[spec], max_tokens=512,
+        )
+        with patch.object(p, "_provider", return_value=mock_provider):
+            p.generate(big)
+        opts = mock_provider._client.return_value.chat.call_args.kwargs["options"]
+        self.assertGreater(opts["num_ctx"], NUM_CTX_LADDER[0])
+        self.assertIn(opts["num_ctx"], NUM_CTX_LADDER)
+
+
+class TestUsageLogRotation(unittest.TestCase):
+    """P8.3 (2026-07-30): llm_usage.jsonl was append-only and unbounded (one of
+    the Tier-3 items deferred from the 2026-07-03 perf pass)."""
+
+    def setUp(self):
+        from core.llm.usage import UsageTracker
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.log = os.path.join(self.tmp, "llm_usage.jsonl")
+        self.tracker = UsageTracker()
+        self.tracker.configure(self.log)
+
+    def _rec(self):
+        from core.llm.types import LLMUsage
+        self.tracker.record(provider="p", model="m", usage=LLMUsage(
+            input_tokens=1, output_tokens=1), latency_ms=1, stream=False)
+
+    def test_rotates_past_the_cap(self):
+        from core.llm import usage as usage_mod
+        for _ in range(3):
+            self._rec()
+        self.assertFalse(os.path.exists(self.log + ".1"))
+        with patch.object(usage_mod, "_MAX_LOG_BYTES", 10):
+            self._rec()          # appends, then trips the cap
+        self.assertTrue(os.path.exists(self.log + ".1"), "no rotated generation")
+
+    def test_summary_reads_across_one_rotation(self):
+        """A rotation must not punch a hole in the reporting window.
+
+        Driven deterministically: 4 records, ONE forced rotation, then 2 more.
+        (Only one generation is kept by design, so a cap small enough to rotate
+        every record would legitimately drop the older ones — that is what the
+        10 MB production cap makes a non-issue at ~40k records per generation.)
+        """
+        from core.llm import usage as usage_mod
+        for _ in range(4):
+            self._rec()
+        with patch.object(usage_mod, "_MAX_LOG_BYTES", 10):
+            self._rec()          # rotates the 5 records into <log>.1
+        for _ in range(2):
+            self._rec()          # land in a fresh live log
+        self.assertTrue(os.path.exists(self.log + ".1"))
+        self.assertEqual(len(self.tracker._disk_records()), 7)   # 5 + 2
+
+    def test_disk_records_survive_the_rotation_window(self):
+        """2026-08-09 (confirmed 2026-08-08 audit lead): right after a rotation
+        the live log does not exist until the next append; `_disk_records` used
+        to `return []` on that stat failure, losing every on-disk record even
+        though `<log>.1` held them all."""
+        from core.llm import usage as usage_mod
+        for _ in range(4):
+            self._rec()
+        with patch.object(usage_mod, "_MAX_LOG_BYTES", 10):
+            self._rec()          # rotates all 5 records into <log>.1
+        self.assertFalse(os.path.exists(self.log), "precondition: live log gone")
+        self.assertEqual(len(self.tracker._disk_records()), 5)
+
+    def test_no_rotation_below_the_cap(self):
+        for _ in range(3):
+            self._rec()
+        self.assertFalse(os.path.exists(self.log + ".1"))
+        self.assertEqual(len(self.tracker._disk_records()), 3)
+
+    def test_rotation_failure_never_breaks_recording(self):
+        from core.llm import usage as usage_mod
+        with patch.object(usage_mod, "_MAX_LOG_BYTES", 10), \
+                patch("core.llm.usage.os.replace", side_effect=OSError("nope")):
+            self._rec()   # must not raise
+        self.assertTrue(os.path.exists(self.log))

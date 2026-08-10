@@ -54,3 +54,19 @@ describe('layout floors (Track 6d)', () => {
         },
     );
 });
+
+describe('help-badge click-steal geometry (2026-08-04 audit)', () => {
+    it('the badge margin equals the overlay inset — the "pair of 4s"', () => {
+        // The ::after overlay extends `inset: -Npx` beyond the 16px badge to
+        // reach a 24px pointer target; margin-left: Npx on the badge is what
+        // guarantees the overlay stops exactly at the label text it is
+        // inserted after, so it cannot steal the label's clicks. The comment
+        // in styles.css says "the pair of 4s must stay equal" — this pins it,
+        // whatever the value becomes.
+        const margin = css.match(/\.help-badge\s*\{[^}]*margin-left:\s*(\d+)px/);
+        const inset = css.match(/\.help-badge::after\s*\{[^}]*inset:\s*-(\d+)px/);
+        expect(margin, '.help-badge margin-left rule missing').toBeTruthy();
+        expect(inset, '.help-badge::after inset rule missing').toBeTruthy();
+        expect(parseInt(margin[1], 10)).toBe(parseInt(inset[1], 10));
+    });
+});

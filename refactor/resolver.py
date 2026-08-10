@@ -24,6 +24,7 @@ from urllib.parse import unquote
 
 from core.config import load_config
 from core.constants import OBSIDIAN_EXCLUDED_DIR_NAMES, VAULT_IMAGE_EXTS
+from core.utils import nfc
 from rag.vault import (
     _INLINE_LINK_RE,
     _NON_ATTACHMENT_SCHEMES,
@@ -84,7 +85,7 @@ def build_name_index(
                 continue
             if is_excluded(rel, excluded):
                 continue
-            name_index.setdefault(p.name.lower(), []).append(rel)
+            name_index.setdefault(nfc(p.name).lower(), []).append(rel)  # B2
     return name_index
 
 
@@ -115,7 +116,7 @@ def build_link_index(
             continue
         if is_excluded(rel, excluded):
             continue
-        link_index.setdefault(p.name.lower(), []).append(rel)
+        link_index.setdefault(nfc(p.name).lower(), []).append(rel)  # B2
     return link_index
 
 
@@ -154,7 +155,10 @@ def build_file_index(
             continue
         if is_excluded(rel, excluded):
             continue
-        name = p.name.lower()
+        # B2 (2026-07-13): NFC-normalize the basename key so an NFD on-disk name
+        # matches an NFC link target (parity with rag.vault's name_index and
+        # _resolve_md_attachment, which now NFC-normalize the lookup target).
+        name = nfc(p.name).lower()
         link_index.setdefault(name, []).append(rel)
         if p.suffix.lower() in VAULT_IMAGE_EXTS:
             name_index.setdefault(name, []).append(rel)
@@ -296,15 +300,17 @@ def link_target_basenames(text: str) -> frozenset:
     resolved occurrence's target basename is always in this set (resolution
     never changes a target's basename; the bare-name index lookup keys on it).
     """
+    # B2 (2026-07-13): NFC-normalize so a basename in one normalization form in
+    # the note text matches the archive candidate index built from on-disk names.
     out: set[str] = set()
     for m in _OBSIDIAN_WIKILINK_RE.finditer(text):
         target = _normalize_target(m.group(1))
         if target:
-            out.add(os.path.basename(target).lower())
+            out.add(nfc(os.path.basename(target)).lower())
     for m in _INLINE_LINK_RE.finditer(text):
         target = _normalize_target(m.group(1).split(" ", 1)[0])
         if target:
-            out.add(os.path.basename(target).lower())
+            out.add(nfc(os.path.basename(target)).lower())
     return frozenset(out)
 
 

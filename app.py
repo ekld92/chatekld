@@ -35,9 +35,13 @@ from api.routes.about import about_bp
 from api.routes.usage import usage_bp
 from api.routes.audit import audit_bp
 from api.routes.deck import deck_bp
+from api.routes.docgen import docgen_bp
 from api.routes.refactor import refactor_bp
 from api.routes.plainchat import plainchat_bp
 from api.routes.prompts import prompts_bp
+from api.routes.open import open_bp
+from api.routes.tagging import tagging_bp
+from api.routes.widget import widget_bp
 
 logger = logging.getLogger(__name__)
 
@@ -123,9 +127,13 @@ def create_app():
     app.register_blueprint(usage_bp)
     app.register_blueprint(audit_bp)
     app.register_blueprint(deck_bp)
+    app.register_blueprint(docgen_bp)
     app.register_blueprint(refactor_bp)
     app.register_blueprint(plainchat_bp)
     app.register_blueprint(prompts_bp)
+    app.register_blueprint(open_bp)
+    app.register_blueprint(tagging_bp)
+    app.register_blueprint(widget_bp)
 
     # --- Main Index Route ---
     @app.route("/")
@@ -148,6 +156,11 @@ if __name__ == "__main__":
             logging.StreamHandler(sys.stdout)
         ]
     )
+    # Write-time key redaction on every handler (mirrors launch.py — see the
+    # RedactingFilter docstring: httpx logs Gemini URLs with the key inline).
+    from core.llm.redact import RedactingFilter
+    for _h in logging.getLogger().handlers:
+        _h.addFilter(RedactingFilter())
     # Pin the loopback interface explicitly. Flask already defaults to
     # 127.0.0.1, but the whole local-origin CSRF model (api/security.py)
     # assumes the server is unreachable off loopback — make it impossible

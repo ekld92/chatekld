@@ -1,3 +1,4 @@
+import itertools
 import ollama
 import logging
 import threading
@@ -6,6 +7,82 @@ from typing import Any, Optional
 from core.providers.base import Provider, local_request_timeout, resolve_ollama_host
 
 logger = logging.getLogger(__name__)
+
+# Reasoning-model guard (2026-07-30; closes the 2026-07-27 OPEN finding).
+# Ollama counts thinking tokens against num_predict and returns the reasoning
+# in message.thinking, which nothing in this codebase consumes — so a
+# thinking-capable model burned its whole output cap on invisible reasoning and
+# every caller saw an empty reply (measured: qwen3.5:9b-mlx at num_predict=512
+# spent all 512 tokens thinking, content == ""). Every chat call therefore
+# sends think=False unless the caller explicitly opts in (the per-call-site
+# seam: request.metadata["ollama_think"] in the local adapter forwards
+# think=True for a future reasoning-consuming caller). Defensive fallback: a
+# backend/SDK that rejects the parameter itself (older server, older pinned
+# SDK, or a per-model refusal) gets ONE retry without it, and the model is
+# remembered here so later calls skip the doomed attempt. set add/lookup are
+# GIL-atomic; worst case a concurrent race costs one extra fallback round-trip.
+_THINK_UNSUPPORTED_MODELS: set = set()
+
+
+def _think_param_rejected(exc: Exception) -> bool:
+    """True when the failure is the ``think`` parameter being rejected itself,
+    not a genuine generation error (which must surface unchanged)."""
+    if isinstance(exc, TypeError) and "think" in str(exc):
+        return True  # pinned ollama SDK predates the kwarg
+    msg = str(exc).lower()
+    if "think" not in msg:
+        return False
+    return any(
+        phrase in msg
+        for phrase in ("does not support", "unsupported", "unknown", "invalid")
+    )
+
+
+def chat_with_think_off(client: "ollama.Client", call_kwargs: dict) -> Any:
+    """Non-streaming ``client.chat(think=False, ...)`` with the one-shot
+    fallback + per-model memo described at :data:`_THINK_UNSUPPORTED_MODELS`."""
+    model = call_kwargs.get("model", "")
+    if model in _THINK_UNSUPPORTED_MODELS:
+        return client.chat(**call_kwargs)
+    try:
+        return client.chat(think=False, **call_kwargs)
+    except Exception as exc:
+        if not _think_param_rejected(exc):
+            raise
+        logger.warning(
+            "Ollama rejected think=False for %s; retrying without it: %s",
+            model, exc,
+        )
+        _THINK_UNSUPPORTED_MODELS.add(model)
+        return client.chat(**call_kwargs)
+
+
+def stream_chat_with_think_off(client: "ollama.Client", call_kwargs: dict) -> Any:
+    """Streaming twin of :func:`chat_with_think_off`.
+
+    The ollama SDK fires the HTTP request lazily, so a rejected parameter only
+    surfaces on the first pull — the first chunk is drawn inside the guard
+    (pre-first-token, the house retry boundary) and chained back in front of
+    the rest of the stream on success.
+    """
+    model = call_kwargs.get("model", "")
+    if model in _THINK_UNSUPPORTED_MODELS:
+        return client.chat(**call_kwargs)
+    stream = client.chat(think=False, **call_kwargs)
+    try:
+        first = next(stream)
+    except StopIteration:
+        return iter(())
+    except Exception as exc:
+        if not _think_param_rejected(exc):
+            raise
+        logger.warning(
+            "Ollama rejected think=False for %s (stream); retrying without it: %s",
+            model, exc,
+        )
+        _THINK_UNSUPPORTED_MODELS.add(model)
+        return client.chat(**call_kwargs)
+    return itertools.chain([first], stream)
 
 # Cache ollama.Client instances by (host, timeout). Each Client owns an httpx
 # connection pool; creating one per generation call (the agent loop runs several
@@ -196,6 +273,11 @@ class OllamaProvider(Provider):
         ``local_request_timeout_s`` for this call only — the single-paper route
         passes a non-zero floor so a wedged backend can't hang its guard-less
         synchronous SSE stream; callers that omit it keep the configured bound.
+
+        Thinking is suppressed by default (``think=False`` via
+        :func:`stream_chat_with_think_off`); an explicit ``think=`` kwarg is
+        the caller's per-call-site decision and is forwarded verbatim with no
+        fallback.
         """
         resolved = self.resolve_model(model)
         messages = []
@@ -224,4 +306,9 @@ class OllamaProvider(Provider):
             if request_timeout is not None
             else self._client()
         )
-        return client.chat(model=resolved, messages=messages, stream=True, **kwargs)
+        think = kwargs.pop("think", None)
+        call_kwargs = dict(model=resolved, messages=messages, stream=True, **kwargs)
+        if think is not None:
+            call_kwargs["think"] = think
+            return client.chat(**call_kwargs)
+        return stream_chat_with_think_off(client, call_kwargs)

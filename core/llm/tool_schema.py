@@ -273,6 +273,12 @@ def build_gemini_contents(request: LLMRequest) -> list[dict[str, Any]]:
         content = msg.get("content", "")
         if not content:
             continue
+        # SILENT system→user downgrade (2026-07-22 comment repair): Gemini's
+        # real system channel is the request-level `systemInstruction`, which
+        # the adapter populates separately — a system turn appearing in
+        # `messages` has nowhere native to go, so it is demoted to a user turn
+        # rather than dropped. Callers should route system text via
+        # LLMRequest.system_prompt.
         gemini_role = "user" if role in ("user", "system") else "model"
         contents.append({"role": gemini_role, "parts": [{"text": content}]})
     for turn in request.tool_history:

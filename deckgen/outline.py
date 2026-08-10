@@ -97,6 +97,9 @@ def request_outline(
     max_attempts: int = 1,
     retry_backoff_s: float = 0.0,
     should_cancel=None,
+    system_prompt: str = OUTLINE_SYSTEM_PROMPT,
+    build_message=build_outline_message,
+    unit_label: str = "lecture",
 ) -> tuple[list, "ChatResult"]:
     """Ask the agent for an outline; return (sections, raw ChatResult).
 
@@ -105,10 +108,15 @@ def request_outline(
     (``max_attempts=1``) keep the original single-shot behaviour. A transient
     provider failure is retried before the no-outline salvage / ``OutlineError``
     path below ever fires.
+
+    *system_prompt* / *build_message* / *unit_label* are the document-class hooks:
+    they default to the Beamer/lecture values so the deck path is byte-identical,
+    and docgen passes its article equivalents to reuse this whole parse/salvage
+    path unchanged (``parse_outline`` and the fallback are already class-agnostic).
     """
     from .retry import chat_with_retry
 
-    message = build_outline_message(topic, instructions, max_sections)
+    message = build_message(topic, instructions, max_sections)
     result = chat_with_retry(
         client,
         message,
@@ -117,7 +125,7 @@ def request_outline(
         should_cancel=should_cancel,
         label="outline",
         on_event=on_event,
-        system_prompt=OUTLINE_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         provider=provider,
         model=model,
         embed=embed,
@@ -150,8 +158,8 @@ def request_outline(
         if result.error:
             raise OutlineError(f"Outline request failed: {result.error}")
         raise OutlineError(
-            "Could not parse a lecture outline from the model output. Re-run with "
-            "--verbose to inspect the raw response, or try a more capable model."
+            f"Could not parse a {unit_label} outline from the model output. Re-run "
+            "with --verbose to inspect the raw response, or try a more capable model."
         )
     return sections, result
 

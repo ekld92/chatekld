@@ -117,7 +117,7 @@ JOURNAL_FLUSH_EVERY = 25
 
 
 def apply_notes(vault_root: Path, cfg: dict, approved: list[dict],
-                heartbeat: Optional[Callable[[], None]] = None) -> list[dict]:
+                heartbeat: Optional[Callable[[], bool]] = None) -> list[dict]:
     """Apply the callout-only transform to each approved note independently.
 
     *approved* is ``[{rel, content_sha256, proposed_sha256}, ...]`` (already
@@ -129,6 +129,14 @@ def apply_notes(vault_root: Path, cfg: dict, approved: list[dict],
     not passively expire on a large batch (each note re-reads + re-analyzes the
     file). Without it a batch over the lock TTL could be stolen by a concurrent
     indexing run and corrupt the vault / journal.
+
+    **Lost-lock abort (2026-07-20 audit finding 1):** *heartbeat* returns a
+    bool. ``False`` means this holder's TTL lapsed and another operation
+    legitimately took the lock — continuing would write vault notes as a second
+    concurrent writer. We stop cleanly (mirroring the indexer's
+    ``_heartbeat_or_stop``): the manifest is persisted so already-applied notes
+    stay restorable, and every not-yet-processed note is reported as skipped
+    with a ``lock_lost`` reason rather than being silently dropped.
     """
     vault_root = Path(vault_root)
     excluded = excluded_dirs(vault_root)
@@ -143,8 +151,23 @@ def apply_notes(vault_root: Path, cfg: dict, approved: list[dict],
 
     results: list[dict] = []
     for i, item in enumerate(approved, start=1):
-        if heartbeat is not None:
-            heartbeat()
+        if heartbeat is not None and not heartbeat():
+            # Lock lost mid-batch (finding 1): stop before writing any further
+            # note. Persist what we have, then mark the remaining approved notes
+            # skipped so the caller/UI sees the truncation instead of a silent
+            # partial apply.
+            journal.save(vault_root, cfg, manifest)
+            # OFF-BY-ONE CONTRACT (2026-07-22 comment repair): the heartbeat is
+            # checked BEFORE processing item i, so the skipped report must
+            # include the CURRENT item — hence [i - 1:], not [i:]. A "fix" to
+            # [i:] silently drops one note from the skipped list.
+            for remaining in approved[i - 1:]:
+                results.append({
+                    "rel": remaining.get("rel", ""),
+                    "status": "skipped",
+                    "error": "lock_lost",
+                })
+            return results
         rel = item.get("rel", "")
         results.append(_apply_one(
             vault_root, cfg, rel,

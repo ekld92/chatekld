@@ -12,10 +12,13 @@ import * as Vault from './vault.js';
 import * as Summarizer from './summarizer.js';
 import * as Audit from './audit.js';
 import * as Deck from './deck.js';
+import * as Docgen from './docgen.js';
 import * as Refactor from './refactor.js';
 import * as Settings from './settings.js';
 import * as PlainChat from './plainchat.js';
 import * as Prompts from './prompts.js';
+import * as Help from './help.js';
+import * as Tagging from './tagging.js';
 import { secureFetch } from './api.js';
 import { updateProviderBadge } from './ui.js';
 
@@ -57,11 +60,18 @@ async function init() {
     await step('initAuditTab', () => Audit.initAuditTab());
     await step('initRefactorTab', () => Refactor.initRefactorTab(config));
     await step('initDeck', () => Deck.initDeck(config));
+    await step('initDocgen', () => Docgen.initDocgen());
 
     // Bind events
     window.onProviderChange = Config.onProviderChange;
     window.pullModel = Config.pullModel;
+    window.cancelPull = Config.cancelPull;
     window.showTab = UI.showTab;
+    // Single help source (2026-08-05): the sidebar "How to Use" button routes
+    // to the Help tab (guide.md) — the old modal duplicate guide is gone.
+    // showTab alone would not fire the guide's lazy loader (click-bound to
+    // #tab-help), hence the explicit pair. tests/js/helpButton.test.js pins.
+    window.openHowTo = () => { UI.showTab('help'); Help.loadHelpTab(); };
     window.openModal = UI.openModal;
     window.closeModal = UI.closeModal;
     window.pickVaultFolder = Vault.pickVaultFolder;
@@ -71,6 +81,7 @@ async function init() {
     window.cancelVaultIndex = Vault.cancelVaultIndex;
     window.chatWithVault = Vault.chatWithVault;
     window.clearVaultChat = Vault.clearVaultChat;
+    window.exportVaultConversation = Vault.exportVaultConversation;
     window.addExclusion = Vault.addExclusion;
     window.removeExclusion = Vault.removeExclusion;
     window.toggleVaultMaterials = Vault.toggleVaultMaterials;
@@ -86,8 +97,12 @@ async function init() {
     window.resetAppData = resetAppData;
     window.runAuditScan = Audit.runAuditScan;
     window.cancelAuditScan = Audit.cancelAuditScan;
+    window.refreshWidgetSnapshot = Audit.refreshWidgetSnapshot;
     window.selectAuditReport = Audit.selectAuditReport;
     window.saveAuditSettings = Audit.saveAuditSettings;
+    // audit.js delegates the Tagging sub-view body render to this global
+    // (a call, not an import — keeps audit.js -> tagging.js out of the graph).
+    window.taggingRenderInto = Tagging.taggingRenderInto;
     window.deckLoadTemplate = Deck.loadTemplate;
     window.deckPickTemplateFile = Deck.pickTemplateFile;
     window.deckPickOutDir = Deck.pickOutDir;
@@ -96,6 +111,16 @@ async function init() {
     window.deckLoadDeckSections = Deck.loadDeckSections;
     window.deckAugScopeChanged = Deck.augScopeChanged;
     window.deckAugmentPreview = Deck.augmentPreview;
+    window.deckAugPreviewPdf = Deck.augPreviewPdf;
+    window.docgenLoadTemplate = Docgen.loadTemplate;
+    window.docgenPickTemplateFile = Docgen.pickTemplateFile;
+    window.docgenPickOutDir = Docgen.pickOutDir;
+    window.docgenGenerate = Docgen.generate;
+    window.docgenGenerateMarkdown = Docgen.generateMarkdown;
+    window.docgenPickAugmentDoc = Docgen.pickAugmentDoc;
+    window.docgenLoadDocSections = Docgen.loadDocSections;
+    window.docgenAugScopeChanged = Docgen.augScopeChanged;
+    window.docgenAugmentPreview = Docgen.augmentPreview;
     window.refactorRunPlan = Refactor.runPlan;
     window.refactorPickScopeFolder = Refactor.pickScopeFolder;
     window.refactorOpenApply = Refactor.openApply;
@@ -107,6 +132,7 @@ async function init() {
     window.refactorRevertAll = Refactor.revertAll;
     window.chatPlain = PlainChat.chatPlain;
     window.plainchatNew = PlainChat.newChat;
+    window.exportPlainConversation = PlainChat.exportPlainConversation;
     window.promptsRefresh = Prompts.loadPrompts;
     window.setTheme = UI.setTheme;
 
@@ -121,10 +147,22 @@ async function init() {
     // control and keeps System mode following the OS.
     UI.initTheme();
 
+    // No in-app navigation, ever: every anchor click is intercepted and routed
+    // through POST /api/open (http/https → system browser, vault path → Finder
+    // reveal, everything else swallowed). A raw click on a relative link the
+    // LLM emitted used to navigate the whole PyWebView window to a 404.
+    UI.installLinkInterceptor();
+
     // Arrow-key navigation for the ARIA tablists.
     UI.wireTablistKeys(
         document.querySelector('.tabs'),
-        (tab) => UI.showTab(tab.id.replace('tab-', '')),
+        (tab) => {
+            const id = tab.id.replace('tab-', '');
+            UI.showTab(id);
+            // The Help guide's lazy loader is click-bound below — mirror it
+            // here so arrow-key activation doesn't land on an empty guide.
+            if (id === 'help') Help.loadHelpTab();
+        },
     );
     UI.wireTablistKeys(
         document.getElementById('audit-report-tabs'),
@@ -136,6 +174,46 @@ async function init() {
     // wired in refactor.js because its textarea is created per-note at render
     // time; these three live statically in the template.
     wireExamplePrompts();
+
+    // Contextual help: "?" badges on settings (hover tooltip) and actions
+    // (click popover), keyed by existing control/button ids. Idempotent and
+    // tolerant of ids not in the current DOM.
+    Help.installHelp();
+
+    // Every `.control-hint` becomes the aria-describedby of the control above
+    // it (2026-07-26 UX audit): the template had 71 hints and 2
+    // aria-describedby, so a screen-reader user got the control's NAME and none
+    // of its operative instructions. One central pass — see
+    // ui.js::wireControlHints for the association rule and why it is not 71
+    // hand-edits. Runs after installHelp so a "?" badge inserted next to a
+    // label is never mistaken for the described control.
+    UI.wireControlHints();
+
+    // Help tab (Batch H): the guide loads lazily on first activation; the
+    // guided tour starts from its button. ⌘K opens the command palette.
+    const helpTabBtn = document.getElementById('tab-help');
+    if (helpTabBtn) helpTabBtn.addEventListener('click', () => Help.loadHelpTab());
+    const tourBtn = document.getElementById('help-tour-btn');
+    if (tourBtn) tourBtn.addEventListener('click', () => Help.startTour());
+    UI.installCommandPalette(_paletteActions());
+
+    // Remember the last value typed into the main free-text inputs across a
+    // full app quit (axis v — "keep my last prompt"). Client-side localStorage,
+    // per field; only fills an empty field so config-sourced values still win.
+    UI.installDraftPersistence([
+        { id: 'deck-topic' },
+        { id: 'deck-title' },
+        { id: 'deck-subtitle' },
+        { id: 'deck-instructions' },
+        { id: 'deck-audience' },
+        { id: 'docgen-topic' },
+        { id: 'docgen-title' },
+        { id: 'docgen-subtitle' },
+        { id: 'docgen-instructions' },
+        { id: 'docgen-audience' },
+        { id: 'doc-focus-question' },
+        { id: 'plainchat-input' },
+    ]);
 
     // System status loop
     fetchRuntimeStatus();
@@ -154,6 +232,8 @@ function wireExamplePrompts() {
               text: "Présentation de 15 minutes pour un staff. Structure : définition, épidémiologie, clinique, prise en charge. Reste fidèle aux notes du vault." },
             { label: 'Synthèse + sources',
               text: "Ton pédagogique. Ajoute une diapo de synthèse en fin de chaque section et cite les sources clés (auteur, année)." },
+            { label: 'Sources FR/DE/EN',
+              text: "Appuie-toi sur les notes du vault dans les trois langues (français, allemand, anglais), mais rédige les diapos en français. Cite les sources clés." },
         ], { title: 'Examples:', lang: 'fr' });
     }
 
@@ -166,6 +246,8 @@ function wireExamplePrompts() {
               text: "Adopte le point de vue d'un psychiatre hospitalier. Distingue clairement ce qui est étayé par les sources de ce qui relève de l'avis." },
             { label: 'Plan structuré',
               text: "Structure tes réponses : définition, mécanismes, prise en charge. Signale les contre-indications et effets indésirables importants." },
+            { label: 'Sources trilingues',
+              text: "Réponds en français, mais exploite les sources du vault dans les trois langues — français, allemand, anglais — et cite les passages allemands ou anglais au même titre que les français." },
         ], { title: 'Examples:', lang: 'fr' });
     }
 
@@ -189,11 +271,28 @@ function wireExamplePrompts() {
 // invocation may write the DOM.
 const _runtimeStatusGate = UI.makeLatestGate();
 
+/** Flip every status dot to `state` with an "unreachable" label (E2 helper). */
+function _setAllStatusDots(state, label) {
+    for (const id of ['rs-provider-dot', 'rs-vector-dot', 'rs-local-dot']) {
+        const el = document.getElementById(id);
+        if (el) {
+            el.style.background = '';
+            el.dataset.state = state;
+            el.setAttribute('aria-label', label);
+        }
+    }
+}
+
 async function fetchRuntimeStatus() {
     const isCurrent = _runtimeStatusGate.enter();
     let providerOk = false;
     let providerError = null;
     let providerWarnings = [];
+    // E2 (2026-07-22 audit): when the Flask process is GONE both fetches throw
+    // — the old catches only console.error'd, so the dots froze at their last
+    // (likely green) state and the empty-warnings fall-through below actively
+    // HID the banner. The UI asserted health exactly when everything was dead.
+    let serverUnreachable = false;
 
     try {
         const res = await secureFetch('/api/status');
@@ -215,6 +314,7 @@ async function fetchRuntimeStatus() {
         }
     } catch (e) {
         console.error('Status check failed:', e);
+        serverUnreachable = true;
     }
 
     let healthDetails = null;
@@ -241,12 +341,21 @@ async function fetchRuntimeStatus() {
         }
     } catch (e) {
         console.error('Health check failed:', e);
+        serverUnreachable = true;
     }
 
     if (!isCurrent()) return;
+    if (serverUnreachable) {
+        _setAllStatusDots('error', 'App server unreachable');
+    }
     const warningEl = document.getElementById('runtime-warning');
     if (warningEl) {
         const warnings = [];
+        if (serverUnreachable) {
+            warnings.push('App server unreachable — the backend process may '
+                + 'have stopped. Actions will fail until it is back; try '
+                + 'relaunching the app.');
+        }
         if (providerError) warnings.push(providerError);
         warnings.push(...providerWarnings);
 
@@ -264,9 +373,29 @@ async function fetchRuntimeStatus() {
     }
 }
 
+/** G3 (2026-07-22): arm the tab-strip's "more tabs off-screen" fade from the
+ * MEASURED overflow, not a width guess — a large system font overflows the 8
+ * tabs above the old 1024px media query with no cue. */
+function _updateTabsOverflow() {
+    const tabs = document.querySelector('.tabs');
+    if (!tabs) return;
+    tabs.classList.toggle('tabs-overflowing', tabs.scrollWidth > tabs.clientWidth + 1);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    _updateTabsOverflow();
+    window.addEventListener('resize', _updateTabsOverflow);
+});
+
 document.addEventListener('DOMContentLoaded', init);
 
 async function resetAppData() {
+    // C1/#19 (2026-07-13): disable the button for the flight (no double-fire),
+    // and surface a failed reset instead of leaving the modal silently open.
+    const btn = document.getElementById('reset-confirm-btn');
+    const status = document.getElementById('reset-status');
+    if (btn) btn.disabled = true;
+    if (status) { status.style.display = 'none'; status.textContent = ''; }
     try {
         const resp = await secureFetch('/api/reset', {
             method: 'POST',
@@ -275,9 +404,16 @@ async function resetAppData() {
         if (resp.ok) {
             UI.closeModal('reset-modal');
             window.location.reload();
+            return;
         }
+        let msg = `Reset failed (HTTP ${resp.status}).`;
+        try { const d = await resp.json(); if (d && d.error) msg = d.error; } catch (_) { /* ignore */ }
+        if (status) { status.textContent = msg; status.style.display = 'block'; }
+        if (btn) btn.disabled = false;
     } catch (e) {
         console.error('Reset failed:', e);
+        if (status) { status.textContent = 'Reset failed (see console).'; status.style.display = 'block'; }
+        if (btn) btn.disabled = false;
     }
 }
 
@@ -285,3 +421,42 @@ async function resetAppData() {
 window.addEventListener('unhandledrejection', (event) => {
     console.error('[ChatEKLD] Unhandled rejection:', event.reason);
 });
+
+/**
+ * Command-palette action registry (Batch H, 2026-07-22). Navigation + safe,
+ * non-destructive actions only — anything that writes keeps its own confirmed
+ * button. app.js owns the registry (it may import every feature module);
+ * ui.js just renders and runs it.
+ */
+function _paletteActions() {
+    const tab = (id, label) => ({
+        label: `Go to ${label}`, hint: 'view',
+        run: () => UI.showTab(id),
+    });
+    return [
+        tab('obsidian', 'Obsidian Agent'),
+        tab('document', 'Single Paper'),
+        tab('audit', 'Library Audit'),
+        tab('deck', 'Deck Generator'),
+        tab('docgen', 'Report / Article'),
+        tab('refactor', 'Note Refactor'),
+        tab('chat', 'Plain Chat'),
+        tab('prompts', 'Prompt Hub'),
+        {
+            label: 'Go to Help', hint: 'view',
+            run: () => { UI.showTab('help'); Help.loadHelpTab(); },
+        },
+        {
+            label: 'Open LLM Settings', hint: 'modal',
+            run: () => UI.openModal('settings-modal'),
+        },
+        {
+            label: 'Start the guided tour', hint: 'help',
+            run: () => Help.startTour(),
+        },
+        {
+            label: 'New Plain Chat conversation', hint: 'chat',
+            run: () => { UI.showTab('chat'); window.plainchatNew && window.plainchatNew(); },
+        },
+    ];
+}

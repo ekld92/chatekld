@@ -44,6 +44,31 @@ report_types.json
 llamaindex_storage/
 uploads.db
 
+# Retrieval-eval harness artifacts — these EMBED VAULT CONTENT and must never
+# reach a remote. A golden set carries a `chunk_preview` excerpt of the source
+# passage per query (clinical prose in the target vault) plus vault-relative
+# paths; a results file carries the full ranked source-path list for every
+# query x every cell. They belong under BASE_DIR/eval/, but `--out`/`--cells`
+# take any path and the docs' own examples are relative (i.e. resolved against
+# the repo root when run from a checkout), so prose alone is not a control —
+# and this repo has a private->public mirror workflow (see PUBLISHING.md) where
+# one `git add -A` would publish patient-note excerpts.
+# NOTE the leading slash on /eval/: it anchors to the repo root. A bare `eval/`
+# matches at ANY depth and would silently exclude the harness's own tracked
+# source under tests/eval/ from every future commit (caught doing exactly that).
+golden_retrieval*.json
+retrieval_eval_*.json
+/eval/
+# Root-anchored for the same reason as /eval/ above (2026-07-29 audit): a bare
+# *cells*.json matches at ANY depth and would silently swallow a future
+# tracked project file that happens to carry "cells" in its name.
+/*cells*.json
+
+# Config backup left by an interrupted eval sweep (scripts/eval_retrieval.py
+# writes it beside config.json so a crashed run is recoverable). Holds the
+# user's real config bytes — same reason config.json itself is ignored.
+config.json.evalbak
+
 # Log files (written to ~/Library/Logs/ChatEKLD/ in production,
 # but may land in the project root during development)
 *.log
@@ -60,6 +85,18 @@ uploads.db
 *.pdf
 *.png
 !static/img/daphne.png
+# README screenshots. Deliberately narrow: only this ONE directory is exempt
+# from the blanket *.png above, so a stray screenshot elsewhere in the tree
+# (a captured vault note, a test render) still cannot be committed by accident.
+# Anything added here is published to the public mirror PERMANENTLY, git
+# history included — check every image against the redaction checklist in
+# PUBLISHING.md before `git add`.
+#
+# NOTE the location: root-level `screenshots/`, deliberately NOT `docs/`.
+# The publish flow strips `docs/` wholesale (`git rm -r --cached docs/`), so a
+# screenshot under docs/ would be stripped from the mirror while the README
+# still linked to it — broken images on the public page.
+!screenshots/*.png
 *.heic
 
 # LaTeX — deckgen emits Beamer decks (<out_dir>/<slug>/<slug>.tex) and their

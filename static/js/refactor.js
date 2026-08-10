@@ -12,7 +12,7 @@
  * single-note detail pane (#refactor-detail) with a Rendered/Diff view toggle.
  */
 import { secureFetch, consumeSSE, logError, safeJson } from './api.js';
-import { setStatusA11y, taskBegin, taskEnd, sanitiseHtml, openModal, closeModal, copyToClipboard, renderExampleChips, confirmInline } from './ui.js';
+import { setStatusA11y, taskBegin, taskEnd, sanitiseHtml, openModal, closeModal, copyToClipboard, renderExampleChips, confirmInline, announceStatus, announceError } from './ui.js';
 
 let _running = false;
 
@@ -314,8 +314,18 @@ function _addNote(note) {
         cb.className = 'refactor-approve-cb';
         cb.title = 'Approve this note for Apply';
         cb.setAttribute('aria-label', 'Approve ' + note.rel_path + ' for apply');
-        cb.onclick = (e) => { e.stopPropagation(); _toggleApprove(note.rel_path, cb.checked); };
+        // F3 (2026-07-22 audit): tabIndex -1 — a native checkbox is its own
+        // tab stop, so each changed note re-added the per-row stop the roving
+        // tabindex exists to remove (Tab walked hundreds of notes again).
+        // Keyboard path: Space on the focused ROW toggles approval (below);
+        // aria-checked on the option mirrors the state for AT (a deliberate
+        // deviation from the strict option content model — interactive
+        // children are presentational to some AT, so the state must live on
+        // the option itself).
+        cb.tabIndex = -1;
+        cb.onclick = (e) => { e.stopPropagation(); _toggleApprove(note.rel_path, cb.checked); entry.setAttribute('aria-checked', cb.checked ? 'true' : 'false'); };
         entry.appendChild(cb);
+        entry.setAttribute('aria-checked', 'false');
     }
 
     const path = document.createElement('span');
@@ -335,7 +345,21 @@ function _addNote(note) {
 
     entry.onclick = () => _selectNote(note.rel_path);
     entry.onkeydown = (e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _selectNote(note.rel_path); return; }
+        // F3: Enter selects; Space TOGGLES the approval checkbox (when the
+        // note has one) — the checkbox itself is out of the tab order.
+        if (e.key === ' ') {
+            e.preventDefault();
+            const cb = entry.querySelector('.refactor-approve-cb');
+            if (cb) {
+                cb.checked = !cb.checked;
+                _toggleApprove(note.rel_path, cb.checked);
+                entry.setAttribute('aria-checked', cb.checked ? 'true' : 'false');
+            } else {
+                _selectNote(note.rel_path);
+            }
+            return;
+        }
+        if (e.key === 'Enter') { e.preventDefault(); _selectNote(note.rel_path); return; }
         // Listbox arrow-key navigation: move focus + selection between options.
         if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
             const items = Array.from($('refactor-note-list').querySelectorAll('.refactor-note-entry'));
@@ -635,7 +659,7 @@ function _updateInclSummary(note, summary) {
     const inc = imgs.filter(_imgIncluded).length;
     const elig = imgs.filter(_imgInclEligible).length;
     summary.firstChild.textContent =
-        `Images — inclure l’OCR (${inc}/${elig} incluses, ${imgs.length} au total)`;
+        `Images — include OCR (${inc}/${elig} included, ${imgs.length} total)`;
 }
 
 /**
@@ -710,12 +734,12 @@ async function _bulkInclusion(note, included, status) {
             im.handwritten_hidden = im.handwritten && !im.kept_handwritten;
         }
         if (failures) {
-            _status(`${failures} image(s) n'ont pas pu être mises à jour — état affiché = état sauvegardé.`, true);
+            _status(`${failures} image(s) could not be updated — the view shows the saved state.`, true);
         }
         _scheduleReanalyze(note, status);
     } catch (e) {
         logError('Refactor bulk inclusion failed', e);
-        _status('Mise à jour groupée interrompue — état affiché = état sauvegardé.', true);
+        _status('Batch update interrupted — the view shows the saved state.', true);
     } finally {
         _bulkInclusionBusy = false;
     }
@@ -723,7 +747,7 @@ async function _bulkInclusion(note, included, status) {
 
 function _scheduleReanalyze(note, statusEl) {
     if (_reanalyzeTimer) clearTimeout(_reanalyzeTimer);
-    if (statusEl) statusEl.textContent = ' mise à jour de l’aperçu…';
+    if (statusEl) statusEl.textContent = ' updating the preview…';
     _reanalyzeTimer = setTimeout(() => { _reanalyzeTimer = null; _reanalyzeNote(note); }, 400);
 }
 
@@ -826,7 +850,7 @@ function _renderInclRow(im, note, summary, status) {
     snip.className = 'refactor-incl-snippet muted';
     snip.textContent = im.description
         ? (im.description.length > 160 ? im.description.slice(0, 160) + '…' : im.description)
-        : '(pas encore extrait — utilise Extract / Re-describe dans la liste d’images en bas)';
+        : '(not extracted yet — use Extract / Re-describe in the image list below)';
     txt.appendChild(snip);
     row.appendChild(txt);
     return row;
@@ -834,7 +858,7 @@ function _renderInclRow(im, note, summary, status) {
 
 /**
  * Collapsible panel listing every attached image of the note with an
- * include-OCR checkbox (opt-out: checked = inlined), plus Tout inclure / Tout
+ * include-OCR checkbox (opt-out: checked = inlined), plus Include all / Exclude
  * exclure. Toggling persists to the ignore-list / keep_handwritten flag and
  * debounced-re-analyzes this one note so the preview + Apply hashes refresh.
  */
@@ -855,8 +879,8 @@ function _renderImageInclusionPanel(note, detail) {
     bar.className = 'refactor-image-actions';
     const status = document.createElement('span');
     status.className = 'muted refactor-incl-status';
-    const allIn = _mkBtn('Tout inclure');
-    const allOut = _mkBtn('Tout exclure');
+    const allIn = _mkBtn('Include all');
+    const allOut = _mkBtn('Exclude all');
     allIn.onclick = () => _bulkInclusion(note, true, status);
     allOut.onclick = () => _bulkInclusion(note, false, status);
     bar.appendChild(allIn);
@@ -1145,6 +1169,11 @@ function _pending(out, text) {
     p.className = 'muted';
     p.textContent = text;
     out.appendChild(p);
+    // Every LLM-action stage line is also announced through the static status
+    // region — previously only the error twin (_llmErrorMsg) announced, so a
+    // screen-reader user heard failures but nothing during a multi-second
+    // local-model call or on a "nothing to do" outcome.
+    announceStatus(text);
 }
 
 function _llmErrorMsg(out, msg) {
@@ -1152,6 +1181,10 @@ function _llmErrorMsg(out, msg) {
     e.className = 'refactor-extract-error';
     e.textContent = msg;
     out.appendChild(e);
+    // Announced via the STATIC assertive region (project rule: every outcome
+    // both visible and announced) — a minted live region would be unreliable
+    // in WebKit, and this div is minted at render time.
+    announceError(msg);
 }
 
 function _llmError(out, d, resp) {
@@ -1216,6 +1249,7 @@ function _renderLlmActions(note, detail) {
     scopeLbl.textContent = 'Scope: ';
     const sel = document.createElement('select');
     sel.className = 'refactor-section-select';
+    sel.setAttribute('aria-label', 'Section scope for the LLM actions below');
     const whole = document.createElement('option');
     whole.value = '';
     whole.textContent = 'Whole note';
@@ -1247,7 +1281,7 @@ function _renderLlmActions(note, detail) {
         'Reformat the selected scope with the LLM, then review & apply');
     const chartBtn = _mkBtn('Generate diagram (Mermaid)',
         'Advisory Mermaid diagram for the selected scope (display only)');
-    const pdfBtn = _mkBtn('Summarize a PDF…',
+    const pdfBtn = _mkBtn('Summarise a PDF…',
         'Summarize an attached PDF into bullets inlined as a callout');
     actions.appendChild(fmtBtn);
     actions.appendChild(pdfBtn);
@@ -1261,6 +1295,7 @@ function _renderLlmActions(note, detail) {
     customWrap.className = 'refactor-custom';
     const ta = document.createElement('textarea');
     ta.className = 'refactor-custom-instruction';
+    ta.setAttribute('aria-label', 'Free-form instruction for the LLM edit');
     ta.rows = 2;
     ta.lang = 'fr';  // French free-prompt field in an en document (6c)
     ta.placeholder = 'Instruction libre — ex. : reformule en plus clair, corrige la ponctuation, transforme en tableau…';
@@ -1279,7 +1314,7 @@ function _renderLlmActions(note, detail) {
     ], { title: 'Examples:', lang: 'fr' });
     const customRow = document.createElement('div');
     customRow.className = 'refactor-image-actions';
-    const customBtn = _mkBtn('Appliquer l’instruction (LLM)',
+    const customBtn = _mkBtn('Apply the instruction (LLM)',
         'Run your free-form instruction over the selected scope, then review & apply');
     customRow.appendChild(customBtn);
     customWrap.appendChild(customRow);
@@ -1315,12 +1350,88 @@ function _renderStagedPreview(note, out, d, action) {
     const apply = document.createElement('button');
     apply.className = 'btn btn-primary btn-sm';
     apply.textContent = 'Approve & apply (write)';
-    apply.onclick = () => _applyStaged(note, action, d, apply, out);
+    // E11 (2026-07-22 audit): this button overwrites a vault note — the diff
+    // preview shows WHAT, the Track-6e strip is the write ceremony (parity
+    // with deck/docgen apply-augment, which have a preview AND a strip).
+    apply.onclick = () => confirmInline(apply, {
+        message: 'Write this proposal into the note? (Journalled — reversible from Restore.)',
+        confirmLabel: 'Apply',
+        onConfirm: () => _applyStaged(note, action, d, apply, out),
+    });
     const cancel = _mkBtn('Discard');
     cancel.onclick = () => _clear(out);
     row.appendChild(apply);
     row.appendChild(cancel);
     out.appendChild(row);
+}
+
+/**
+ * Offer-on-refusal (Batch D, 2026-07-22): when a WHOLE-NOTE LLM edit 422s on
+ * the size cap, offer the section-by-section run instead of a dead end. The
+ * piecewise run writes nothing (it stages a proposal like the single call);
+ * the confirmed Apply stays the existing /apply-staged ceremony.
+ */
+function _offerPiecewise(note, action, instruction, out, btns, refusalMsg) {
+    _llmErrorMsg(out, refusalMsg);
+    const row = document.createElement('div');
+    row.className = 'refactor-image-actions';
+    const go = _mkBtn('Edit section by section',
+        'Runs one LLM pass per section (over-cap sections are skipped with a reason), then previews one combined diff.');
+    go.onclick = () => _runPiecewise(note, action, instruction, out, btns, go);
+    row.appendChild(go);
+    out.appendChild(row);
+    // The skip caveat matters BEFORE clicking, and a title tooltip is invisible
+    // to keyboard/touch/SR users — so it also gets a visible muted line.
+    const caveat = document.createElement('div');
+    caveat.className = 'muted';
+    caveat.textContent = 'Over-cap or failed sections are skipped and left unchanged.';
+    out.appendChild(caveat);
+}
+
+async function _runPiecewise(note, action, instruction, out, btns, goBtn) {
+    btns.forEach((b) => (b.disabled = true));
+    if (goBtn) goBtn.disabled = true;
+    _clear(out);
+    _pending(out, 'Piecewise edit — one LLM pass per section…');
+    // Run start is announced through the static region; deliberately NO
+    // role="status" on the minted progress div — WebKit drops dynamically-
+    // minted live regions (documented project hazard), so it would be silent
+    // for exactly the users it targets. The div stays as the visible line.
+    announceStatus('Piecewise edit started — one LLM pass per section.');
+    const progress = document.createElement('div');
+    progress.className = 'muted';
+    out.appendChild(progress);
+    let terminal = null;
+    try {
+        const body = { rel: note.rel_path, scope_subdir: _scope, action };
+        if (instruction) body.instruction = instruction;
+        await consumeSSE('/api/refactor/rewrite-piecewise', {
+            method: 'POST', body: JSON.stringify(body),
+        }, {
+            onInfo: (info) => { progress.textContent = info; },
+            onOther: (frame) => { if (frame && frame.piecewise) terminal = frame.piecewise; },
+            onError: (errMsg) => { throw new Error(errMsg); },
+        });
+        _clear(out);
+        if (!terminal) { _llmErrorMsg(out, 'Piecewise edit produced no result.'); return; }
+        const summary = document.createElement('div');
+        summary.className = 'muted';
+        const skipped = (terminal.sections || []).filter((s) => s.status !== 'edited' && s.status !== 'unchanged');
+        summary.textContent = `Piecewise: ${terminal.edited_count} section(s) edited`
+            + (skipped.length ? `, ${skipped.length} skipped (${skipped.map((s) => `${s.title}: ${s.status}`).join('; ')})` : '')
+            + '.';
+        out.appendChild(summary);
+        // Terminal summary was visual-only — echo it to the static region.
+        announceStatus(summary.textContent);
+        if (!terminal.changed) { _pending(out, 'No section produced a change.'); return; }
+        _renderStagedPreview(note, out, terminal, action);
+    } catch (e) {
+        logError('Refactor piecewise failed', e);
+        _clear(out); _llmErrorMsg(out, 'Piecewise edit failed: ' + e.message);
+    } finally {
+        btns.forEach((b) => (b.disabled = false));
+        if (goBtn) goBtn.disabled = false;
+    }
 }
 
 async function _llmRewrite(note, sel, out, btns) {
@@ -1332,7 +1443,14 @@ async function _llmRewrite(note, sel, out, btns) {
         const resp = await secureFetch('/api/refactor/rewrite', { method: 'POST', body: JSON.stringify(body) });
         const d = await safeJson(resp);
         _clear(out);
-        if (!resp.ok || d.error) { _llmError(out, d, resp); return; }
+        if (!resp.ok || d.error) {
+            // Whole-note over-cap refusal → offer the piecewise run instead.
+            if (resp.status === 422 && body.section_index === undefined) {
+                _offerPiecewise(note, 'rewrite', '', out, btns, 'Error: ' + (d.error || 'Note too large.'));
+                return;
+            }
+            _llmError(out, d, resp); return;
+        }
         _renderStagedPreview(note, out, d, 'rewrite');
     } catch (e) {
         logError('Refactor rewrite failed', e);
@@ -1357,7 +1475,13 @@ async function _llmCustom(note, sel, ta, out, btns) {
         const resp = await secureFetch('/api/refactor/custom-edit', { method: 'POST', body: JSON.stringify(body) });
         const d = await safeJson(resp);
         _clear(out);
-        if (!resp.ok || d.error) { _llmError(out, d, resp); return; }
+        if (!resp.ok || d.error) {
+            if (resp.status === 422 && body.section_index === undefined) {
+                _offerPiecewise(note, 'custom', instruction, out, btns, 'Error: ' + (d.error || 'Note too large.'));
+                return;
+            }
+            _llmError(out, d, resp); return;
+        }
         _renderStagedPreview(note, out, d, 'custom');
     } catch (e) {
         logError('Refactor custom-edit failed', e);
@@ -1419,6 +1543,7 @@ async function _llmPdfRefs(note, out, btns) {
         row.className = 'refactor-llm-scope';
         const sel = document.createElement('select');
         sel.className = 'refactor-section-select';
+        sel.setAttribute('aria-label', 'PDF to summarize');
         for (const p of pdfs) {
             const o = document.createElement('option');
             o.value = p.rel_path;
@@ -1441,7 +1566,7 @@ async function _llmPdfRefs(note, out, btns) {
 async function _llmSummarizePdf(note, pdfRel, out, btns) {
     btns.forEach((b) => (b.disabled = true));
     _clear(out);
-    _pending(out, 'Summarizing PDF… (one LLM pass)');
+    _pending(out, 'Summarising PDF… (one LLM pass)');
     try {
         const resp = await secureFetch('/api/refactor/summarize-pdf', {
             method: 'POST',
@@ -1856,31 +1981,29 @@ export async function toggleStripDefault() {
 
 /** Render an inline confirm for archiving one image (a vault write). */
 function _confirmArchive(im, note, out, btn) {
+    // E11 (2026-07-22 audit): was a bespoke inline box with its own DOM and
+    // its own button ordering — one of FOUR different confirmation patterns
+    // in this panel alone. The shared confirmInline gives Cancel-first focus
+    // order, Escape handling and keyboard operability for free, and keeps
+    // "what a vault write looks like" consistent across the app.
     _clear(out);
-    const box = document.createElement('div');
-    box.className = 'refactor-archive-confirm';
-    const msg = document.createElement('div');
-    msg.textContent = 'Move the full-res original OUT of the vault to the archive folder and '
-        + 'leave a ~384px thumbnail here? The embed will point at the thumbnail. '
-        + 'Reversible from Restore.';
-    box.appendChild(msg);
-    const row = document.createElement('div');
-    row.className = 'refactor-image-actions';
-    const yes = document.createElement('button');
-    yes.className = 'btn btn-primary btn-sm';
-    yes.textContent = 'Archive (write)';
-    yes.onclick = () => _doArchive(im, note, out);
-    const no = document.createElement('button');
-    no.className = 'btn btn-outline btn-sm';
-    no.textContent = 'Cancel';
-    no.onclick = () => _clear(out);
-    row.appendChild(yes);
-    row.appendChild(no);
-    box.appendChild(row);
-    out.appendChild(box);
+    confirmInline(btn, {
+        message: 'Move the full-res original OUT of the vault to the archive '
+            + 'folder and leave a ~384px thumbnail here? The embed will point '
+            + 'at the thumbnail. Reversible from Restore.',
+        confirmLabel: 'Archive',
+        onConfirm: () => _doArchive(im, note, out),
+    });
 }
 
+const _archivingRels = new Set();
+
 async function _doArchive(im, note, out) {
+    // C5/#48 (2026-07-13): refuse a second in-flight archive of the same image
+    // (a re-opened confirm strip could otherwise POST twice — the second fails
+    // server-side "already moved" as a confusing error).
+    if (_archivingRels.has(im.rel_path)) return;
+    _archivingRels.add(im.rel_path);
     _clear(out);
     const pending = document.createElement('div');
     pending.className = 'muted';
@@ -1903,9 +2026,11 @@ async function _doArchive(im, note, out) {
             err.textContent = (d.shared ? 'Shared image: ' : 'Error: ')
                 + (d.message || d.error || `HTTP ${resp.status}`);
             out.appendChild(err);
+            announceError(err.textContent);
             return;
         }
         im.archived = true;
+        announceStatus(`Archived ${im.rel_path} — original moved out of the vault, restorable from Restore.`);
         if (d.note_hash_after) note.content_sha256 = d.note_hash_after;
         _activity(`archived ${im.rel_path} → ${d.archive_rel}`);
         if (d.warning) _activity('WARNING: ' + d.warning, true);
@@ -1917,6 +2042,9 @@ async function _doArchive(im, note, out) {
         err.className = 'refactor-extract-error';
         err.textContent = 'Archive failed (see console).';
         out.appendChild(err);
+        announceError('Archive failed.');
+    } finally {
+        _archivingRels.delete(im.rel_path);
     }
 }
 
@@ -1950,12 +2078,26 @@ async function _loadManifest() {
     }
 }
 
+// Per-op-kind Restore labels (2026-07-20 audit A5). The journal now holds
+// four note-ish kinds plus archive_image; a create_note op (a docgen-written
+// note) reverts by DELETING the file — it has no prior snapshot to restore —
+// so it must NOT read as the snapshot-restoring "Applied note" with a plain
+// Revert button, which invited a "restore prior content" expectation and got
+// file deletion instead.
+const _OP_LABELS = {
+    archive_image: 'Archived image',
+    create_note: 'Created note',
+    normalize_note: 'Formatting fix',
+    llm_note: 'LLM edit',
+    write_note: 'Applied note',
+};
+
 function _renderOp(op) {
     const row = document.createElement('div');
     row.className = 'refactor-restore-op';
     const main = document.createElement('div');
     const strong = document.createElement('strong');
-    strong.textContent = op.kind === 'archive_image' ? 'Archived image' : 'Applied note';
+    strong.textContent = _OP_LABELS[op.kind] || 'Applied note';
     main.appendChild(strong);
     const path = document.createElement('span');
     path.className = 'muted';
@@ -1966,10 +2108,22 @@ function _renderOp(op) {
     meta.className = 'muted';
     meta.textContent = (op.ts || '') + ' · ' + (op.state || '');
     row.appendChild(meta);
+    // A create_note revert is a DELETE, so say so plainly on the row and the
+    // button rather than let "Revert" imply a content rollback.
+    const isCreate = op.kind === 'create_note';
+    if (isCreate) {
+        const warn = document.createElement('div');
+        warn.className = 'muted';
+        warn.textContent = 'Reverting deletes this created note.';
+        row.appendChild(warn);
+    }
     const btn = document.createElement('button');
     btn.className = 'btn btn-outline btn-sm';
     if (op.state === 'reverted') { btn.textContent = 'reverted'; btn.disabled = true; }
-    else { btn.textContent = 'Revert'; btn.onclick = () => _revertOp(op.id, btn); }
+    else {
+        btn.textContent = isCreate ? 'Delete note' : 'Revert';
+        btn.onclick = () => _revertOp(op.id, btn);
+    }
     row.appendChild(btn);
     return row;
 }
@@ -1980,7 +2134,7 @@ async function _revertOp(opId, btn) {
     status.textContent = 'Reverting…';
     try {
         const resp = await secureFetch('/api/refactor/restore', {
-            method: 'POST', body: JSON.stringify({ op_id: opId }),
+            method: 'POST', body: JSON.stringify({ op_id: opId, confirm: true }),
         });
         const d = await safeJson(resp);
         if (!resp.ok || d.error) {
@@ -2020,7 +2174,7 @@ async function _doRevertAll() {
     status.textContent = 'Reverting all…';
     try {
         const resp = await secureFetch('/api/refactor/restore', {
-            method: 'POST', body: JSON.stringify({ all: true }),
+            method: 'POST', body: JSON.stringify({ all: true, confirm: true }),
         });
         const d = await safeJson(resp);
         if (!resp.ok || d.error) {

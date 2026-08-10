@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from suite_helpers import join_post_index_daemons
 from rag.lancedb_store import (
     VECTOR_BACKEND_LANCEDB,
     compact_lancedb_vector_store,
@@ -262,6 +263,12 @@ class TestBackendAwareIndexVault(unittest.TestCase):
             patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir),
         ):
             manager.index_vault("llm", "embed", provider_name="ollama")
+            # index_vault returns with its post-run BM25 warm daemon still
+            # alive. Joining it HERE — inside the patch + TemporaryDirectory
+            # scope — is what stops its sidecar write racing the temp dir's
+            # rmtree at teardown (a load-dependent flake that only ever showed
+            # up under the full suite). See suite_helpers.join_post_index_daemons.
+            join_post_index_daemons()
         return manager.drain_status_messages()
 
     def test_fresh_lancedb_build_then_no_reembed(self):

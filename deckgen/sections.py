@@ -18,6 +18,23 @@ if TYPE_CHECKING:
     from .client import ChatEKLDClient
 
 
+def _beamer_placeholder(section) -> str:
+    """The default (Beamer) placeholder body for a section every attempt failed.
+
+    Overridable via ``generate_section(placeholder_builder=…)`` so a prose
+    document class (docgen) can substitute a ``\\section`` + paragraph instead of
+    a frame. Kept as the module default so the deck path is byte-identical.
+    """
+    return (
+        f"\\section{{{section.title}}}\n"
+        f"\\begin{{frame}}{{{section.title}}}\n"
+        f"  \\begin{{itemize}}\n"
+        f"    \\item (no content generated for this section)\n"
+        f"  \\end{{itemize}}\n"
+        f"\\end{{frame}}"
+    )
+
+
 def generate_section(
     client: ChatEKLDClient,
     *,
@@ -40,6 +57,10 @@ def generate_section(
     max_attempts: int = 1,
     retry_backoff_s: float = 0.0,
     should_cancel=None,
+    sanitize=sanitize_section,
+    system_prompt_builder=section_system_prompt,
+    build_message=build_section_message,
+    placeholder_builder=_beamer_placeholder,
 ) -> SectionOutput:
     """Generate and sanitize one section. Errors are surfaced as an info note,
     not raised, so one weak section does not abort the whole deck.
@@ -51,11 +72,20 @@ def generate_section(
     *max_attempts* / *retry_backoff_s* / *should_cancel* drive the cancel-aware
     per-section retry (see :func:`deckgen.retry.chat_with_retry`); the defaults
     (``max_attempts=1``) keep the original single-shot behaviour. A section that
-    still fails after every attempt degrades to the placeholder frame below.
+    still fails after every attempt degrades to the placeholder below.
+
+    *sanitize* / *system_prompt_builder* / *build_message* / *placeholder_builder*
+    are the document-class hooks: they default to the Beamer implementations so
+    the deck path is byte-identical, and a prose document class (docgen) passes
+    its own — the same salvage/retry/checkpoint machinery then serves articles.
+    ``system_prompt_builder`` must accept ``(audience, macros_block, cite_mode,
+    images_enabled)``; ``build_message`` the same kwargs as
+    :func:`deckgen.prompts.build_section_message`; ``placeholder_builder`` a
+    single ``section`` and return the fallback body.
     """
     from .retry import chat_with_retry
 
-    message = build_section_message(
+    message = build_message(
         topic=topic,
         instructions=instructions,
         full_outline=full_outline,
@@ -72,7 +102,7 @@ def generate_section(
         should_cancel=should_cancel,
         label=f"section {index} ({section.title})",
         on_event=on_event,
-        system_prompt=section_system_prompt(
+        system_prompt=system_prompt_builder(
             audience, macros_block=macros_block, cite_mode=cite_mode,
             images_enabled=images_enabled,
         ),
@@ -84,23 +114,55 @@ def generate_section(
         temperature=temperature,
     )
 
-    body = sanitize_section(result.text)
+    body = sanitize(result.text)
     infos = list(result.infos)
     placeholder = False
     if result.error:
         infos.append(f"section generation error: {result.error}")
-    if not body:
-        # Keep the deck assembling: emit a placeholder frame for this section.
-        placeholder = True
-        infos.append("no usable Beamer content returned; inserted a placeholder frame")
-        body = (
-            f"\\section{{{section.title}}}\n"
-            f"\\begin{{frame}}{{{section.title}}}\n"
-            f"  \\begin{{itemize}}\n"
-            f"    \\item (no content generated for this section)\n"
-            f"  \\end{{itemize}}\n"
-            f"\\end{{frame}}"
+    if not body and not (should_cancel is not None and should_cancel()):
+        # WP-A2 salvage pass: every agent attempt burned its budget without
+        # usable Beamer output. Before freezing that failure into a
+        # placeholder (discarding the tokens spent), run ONE tool-free
+        # single-shot RAG turn over the same section brief — the smolagents
+        # "provide_final_answer" pattern. Placeholder only if this also fails.
+        infos.append(
+            "agent turn produced no usable content; "
+            "running a single-shot salvage pass"
         )
+        if on_event is not None:
+            try:
+                on_event({"info": f"section {index}: salvage pass (single-shot, no tools)"})
+            except Exception:
+                pass
+        try:
+            salvage = client.chat(
+                message,
+                system_prompt=system_prompt_builder(
+                    audience, macros_block=macros_block, cite_mode=cite_mode,
+                    images_enabled=images_enabled,
+                ),
+                provider=provider,
+                model=model,
+                embed=embed,
+                agent=False,
+                max_iters=1,
+                temperature=temperature,
+            )
+        except Exception as exc:  # defensive — salvage must never abort the deck
+            salvage = None
+            infos.append(f"salvage pass failed: {exc}")
+        if salvage is not None:
+            if salvage.error:
+                infos.append(f"salvage pass error: {salvage.error}")
+            body = sanitize(salvage.text)
+            if body:
+                result = salvage
+                infos.append("salvage pass produced usable content")
+    if not body:
+        # Keep the document assembling: emit a placeholder for this section.
+        placeholder = True
+        infos.append("no usable content returned; inserted a placeholder section")
+        body = placeholder_builder(section)
 
     return SectionOutput(
         title=section.title, body=body, raw=result.text,

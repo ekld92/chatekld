@@ -32,11 +32,14 @@ to clean them up.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from audit.manager import audit_manager
 
 import flask
 
@@ -345,6 +348,19 @@ class TestAuditManagerStateMachine(unittest.TestCase):
         # worker (theoretical) is rejected.
         self.assertGreater(self.audit_manager._run_id, prev_run_id)
 
+    def test_clear_results_drops_near_duplicates_too(self):
+        # 2026-08-09: clear_results dropped _inventory and _duplicates but
+        # kept _near_duplicates, so has_near_duplicates stayed True and the
+        # report served a stale run against a cleared inventory.
+        self.audit_manager._inventory = object()
+        self.audit_manager._duplicates = ["x"]
+        self.audit_manager._near_duplicates = ["y"]
+        self.audit_manager.clear_results()
+        payload = self.audit_manager.get_status_payload()
+        self.assertFalse(payload["has_results"])
+        self.assertFalse(payload["has_duplicates"])
+        self.assertFalse(payload["has_near_duplicates"])
+
 
 class TestFlaskAppBootDoesNotScan(unittest.TestCase):
     """The critical regression: importing the Flask app and creating the
@@ -428,6 +444,146 @@ class TestAuditRoutesAuth(unittest.TestCase):
         self._no_xrw_returns_403("POST", "/api/audit/config")
         self._no_xrw_returns_403("POST", "/api/audit/mapping")
         self._no_xrw_returns_403("POST", "/api/audit/reveal")
+        self._no_xrw_returns_403("POST", "/api/audit/apply-tag-drift")
+
+    def test_apply_tag_drift_requires_confirm_and_scan(self):
+        headers = {"X-Requested-With": "ChatEKLD"}
+        # confirm missing → 400 before any scan lookup.
+        r = self.client.post(
+            "/api/audit/apply-tag-drift",
+            json={"citation_key": "smith2020", "tags": ["a"]},
+            headers=headers,
+        )
+        self.assertEqual(r.status_code, 400)
+        # Confirmed but no cached scan → deterministic 404 (inventory pinned
+        # empty for this test, so the status can't depend on suite ordering).
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=(None, None)
+        ):
+            r = self.client.post(
+                "/api/audit/apply-tag-drift",
+                json={"citation_key": "smith2020", "tags": ["a"], "confirm": True},
+                headers=headers,
+            )
+        self.assertEqual(r.status_code, 404)
+
+    def _drift_fixture(self, tmp: Path):
+        """A minimal (inventory, settings) pair with one real drifted note."""
+        from types import SimpleNamespace
+        from audit.core.obsidian import NoteInfo
+        from audit.engine.inventory import Record
+
+        vault = tmp / "vault"
+        vault.mkdir(parents=True, exist_ok=True)
+        note = vault / "smith2020.md"
+        note.write_text("---\ntags:\n  - existing\n---\nbody\n", encoding="utf-8")
+
+        rec = Record(citation_key="smith2020")
+        rec.obsidian_note = NoteInfo(
+            path=note, tags=["existing"], has_frontmatter=True)
+        # Zotero note tags via a stub item: drift = {anxiety, sleep}.
+        rec.zotero_item = SimpleNamespace(child_notes=[
+            SimpleNamespace(tags=["existing", "anxiety", "sleep"]),
+        ])
+        inv = mock.MagicMock()
+        inv.records = {"smith2020": rec}
+        settings = SimpleNamespace(vault_root=vault)
+        return inv, settings, note
+
+    def test_apply_tag_drift_happy_path_writes_and_backs_up(self):
+        """Happy path: drift tags land in the frontmatter, the .bak holds the
+        ORIGINAL, and a second apply neither duplicates nor clobbers the .bak."""
+        headers = {"X-Requested-With": "ChatEKLD"}
+        tmp = Path(tempfile.mkdtemp(prefix="audit-tagdrift-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        inv, settings, note = self._drift_fixture(tmp)
+        original = note.read_text(encoding="utf-8")
+
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=(inv, settings)
+        ):
+            r = self.client.post(
+                "/api/audit/apply-tag-drift",
+                json={"citation_key": "smith2020",
+                      "tags": ["anxiety", "not-in-drift"], "confirm": True},
+                headers=headers,
+            )
+            self.assertEqual(r.status_code, 200, r.get_json())
+            d = r.get_json()
+            self.assertEqual(d["added"], ["anxiety"])   # drift-validated
+            self.assertEqual(d["still_missing"], ["sleep"])
+            import yaml
+            fm = yaml.safe_load(note.read_text(encoding="utf-8").split("---")[1])
+            self.assertEqual(fm["tags"], ["existing", "anxiety"])
+            bak = Path(str(note) + ".bak")
+            self.assertEqual(bak.read_text(encoding="utf-8"), original)
+
+            # Second apply: the .bak must still hold the ORIGINAL (non-clobber).
+            r = self.client.post(
+                "/api/audit/apply-tag-drift",
+                json={"citation_key": "smith2020", "tags": ["sleep"],
+                      "confirm": True},
+                headers=headers,
+            )
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(bak.read_text(encoding="utf-8"), original)
+
+    def test_apply_tag_drift_rejects_out_of_drift_tags(self):
+        headers = {"X-Requested-With": "ChatEKLD"}
+        tmp = Path(tempfile.mkdtemp(prefix="audit-tagdrift-rej-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        inv, settings, note = self._drift_fixture(tmp)
+        before = note.read_text(encoding="utf-8")
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=(inv, settings)
+        ):
+            r = self.client.post(
+                "/api/audit/apply-tag-drift",
+                json={"citation_key": "smith2020",
+                      "tags": ["injected-tag"], "confirm": True},
+                headers=headers,
+            )
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(note.read_text(encoding="utf-8"), before)  # untouched
+
+    def test_apply_tag_drift_refuses_variant_spellings(self):
+        """Plan 2026-08-05/2 regression: a tag the note already carries under
+        another spelling is NOT drift — the old ``.lower()`` intersection let a
+        case-variant through, the writer's dedup then no-opped it ("Tags
+        already present"), and the report row could never be cleared. The
+        fingerprint-keyed intersection refuses it up front (400, no write)."""
+        headers = {"X-Requested-With": "ChatEKLD"}
+        tmp = Path(tempfile.mkdtemp(prefix="audit-tagdrift-var-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        inv, settings, note = self._drift_fixture(tmp)
+        # The note now carries "Anxiety" — a case variant of Zotero's
+        # "anxiety" — so only "sleep" is genuinely missing.
+        rec = inv.records["smith2020"]
+        rec.obsidian_note.tags = ["existing", "Anxiety"]
+        before = note.read_text(encoding="utf-8")
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=(inv, settings)
+        ):
+            r = self.client.post(
+                "/api/audit/apply-tag-drift",
+                json={"citation_key": "smith2020",
+                      "tags": ["anxiety"], "confirm": True},
+                headers=headers,
+            )
+            self.assertEqual(r.status_code, 400)
+            self.assertEqual(note.read_text(encoding="utf-8"), before)
+            # A fingerprint-variant REQUEST for a genuinely-missing tag still
+            # lands, written with the drift set's (Zotero's) spelling.
+            r = self.client.post(
+                "/api/audit/apply-tag-drift",
+                json={"citation_key": "smith2020",
+                      "tags": ["SLEEP"], "confirm": True},
+                headers=headers,
+            )
+            self.assertEqual(r.status_code, 200, r.get_json())
+            d = r.get_json()
+            self.assertEqual(d["added"], ["sleep"])
+            self.assertEqual(d["still_missing"], [])
 
 
 class TestAuditConfigValidation(unittest.TestCase):
@@ -487,6 +643,182 @@ class TestAuditConfigValidation(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         cfg = self.client.get("/api/audit/config", headers=self.headers).get_json()
         self.assertEqual(cfg["audit_attachments_subdir"], "MyDocs")
+
+    def test_accepts_accented_relative_subdir(self):
+        """B3 (2026-07-13): accented French paths are valid vault paths and must
+        no longer be rejected by an ASCII-only charset gate."""
+        r = self._post_config({"audit_attachments_subdir": "Études/Dépression (2020)"})
+        self.assertEqual(r.status_code, 200)
+        cfg = self.client.get("/api/audit/config", headers=self.headers).get_json()
+        self.assertEqual(cfg["audit_attachments_subdir"], "Études/Dépression (2020)")
+
+    def test_dup_decision_verbs_and_validation(self):
+        """Plan 2026-08-05/5: dismiss/clear round-trip; clear checked first;
+        garbage bodies 400."""
+        import audit.engine.dup_decisions as dd
+        with mock.patch.object(
+            dd, "decisions_path", lambda: self.tmp / "dup_decisions.json"
+        ):
+            post = lambda body: self.client.post(  # noqa: E731
+                "/api/audit/dup-decision", json=body, headers=self.headers)
+            self.assertEqual(post({}).status_code, 400)
+            self.assertEqual(post({"pair_id": "k:a+b"}).status_code, 400)
+            r = post({"pair_id": "k:a+b", "dismiss": True})
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.get_json()["changed"])
+            self.assertEqual(dd.load_dismissed(), {"k:a+b"})
+            # An undo body carrying dismiss too must be read as CLEAR.
+            r = post({"pair_id": "k:a+b", "clear": True, "dismiss": True})
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.get_json()["cleared"])
+            self.assertEqual(dd.load_dismissed(), set())
+
+    def test_build_pdf_text_provider(self):
+        """Plan 2026-08-05/4 (F4.5): the route-built provider is None without
+        a vault path, a working cache-first callable with one, and swallows
+        extraction errors into None (text is advisory, never fatal)."""
+        from api.routes.audit import _build_pdf_text_provider
+
+        with mock.patch("api.routes.audit.load_config",
+                        return_value={"obsidian_vault_path": ""}):
+            self.assertIsNone(_build_pdf_text_provider())
+
+        with mock.patch("api.routes.audit.load_config",
+                        return_value={"obsidian_vault_path": str(self.vault)}):
+            provider = _build_pdf_text_provider()
+        self.assertIsNotNone(provider)
+        with mock.patch("tagging.text_source.read_pdf_text",
+                        return_value=("page one text", False)) as rpt:
+            self.assertEqual(provider(Path("/x/a.pdf")), "page one text")
+        # fresh extraction bounded to the FIRST page — the whole point of
+        # the seam being cheap enough to run per scan.
+        self.assertEqual(rpt.call_args.kwargs.get("fresh_max_pages"), 1)
+        with mock.patch("tagging.text_source.read_pdf_text",
+                        side_effect=RuntimeError("boom")):
+            self.assertIsNone(provider(Path("/x/a.pdf")))
+        with mock.patch("tagging.text_source.read_pdf_text",
+                        return_value=("", False)):
+            self.assertIsNone(provider(Path("/x/a.pdf")))  # empty → None
+
+    def test_near_duplicates_report_404_when_skipped(self):
+        with mock.patch.object(
+            audit_manager, "get_inventory",
+            return_value=(mock.MagicMock(), mock.MagicMock()),
+        ), mock.patch.object(
+            audit_manager, "get_near_duplicates", return_value=(None, None)
+        ):
+            r = self.client.get(
+                "/api/audit/reports/near_duplicates", headers=self.headers)
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("skipped", r.get_json()["error"])
+
+    def test_apply_tag_drift_synonym_offered_surface_is_applyable(self):
+        """2026-08-05 verification HIGH finding: the drift map's keys are
+        synonym-canonicalised, so the route's lookup of the REQUESTED tag must
+        canonicalise too — a plain tag_key lookup 400'd the very surface the
+        report offered, forever (the unresolvable-row loop, synonym edition).
+        """
+        from types import SimpleNamespace
+        from audit.core.obsidian import NoteInfo
+        from audit.engine.inventory import Record
+        from audit.engine.normalize import tag_key
+
+        vault = self.vault
+        note = vault / "smith2020.md"
+        note.write_text("---\ntags:\n  - existing\n---\nbody\n", encoding="utf-8")
+        rec = Record(citation_key="smith2020")
+        rec.obsidian_note = NoteInfo(path=note, tags=["existing"],
+                                     has_frontmatter=True)
+        rec.zotero_item = SimpleNamespace(child_notes=[
+            SimpleNamespace(tags=["existing", "sleep"])])
+        inv = mock.MagicMock()
+        inv.records = {"smith2020": rec}
+        settings = SimpleNamespace(vault_root=vault)
+        # _tags.md maps the phrase "sleep" to the canonical tag "sommeil" —
+        # the drift map is keyed on the CANONICAL key.
+        synonyms = {tag_key("sleep"): tag_key("sommeil")}
+        with mock.patch.object(audit_manager, "get_inventory",
+                               return_value=(inv, settings)), \
+             mock.patch("api.routes.audit._drift_synonyms",
+                        return_value=synonyms):
+            r = self.client.post(
+                "/api/audit/apply-tag-drift",
+                json={"citation_key": "smith2020", "tags": ["sleep"],
+                      "confirm": True},
+                headers=self.headers,
+            )
+        self.assertEqual(r.status_code, 200, r.get_json())
+        d = r.get_json()
+        self.assertEqual(d["added"], ["sleep"])
+        self.assertEqual(d["still_missing"], [])  # canonical-keyed too
+
+    def test_finder_tag_drift_report_carries_fix_fields(self):
+        """Drift-fix (2026-08-06): the report ships ``variants`` /
+        ``note_rel`` / ``vocab_ids`` — each drift surface resolved to the
+        exact ``_tags.md`` id via the audit fingerprint (separator-folding),
+        so the UI POSTs ids the tagging writers' literal-id gate accepts;
+        an out-of-vocab surface maps to ``null`` (badged, not applyable)."""
+        from types import SimpleNamespace
+        from audit.core.obsidian import NoteInfo
+        from audit.engine.inventory import Record
+
+        vault = self.vault
+        (vault / "_tags.md").write_text(
+            "| Description | Tags |\n|---|---|\n"
+            "| Sleep quality | #sleep-quality |\n",
+            encoding="utf-8")
+        note = vault / "smith2020.md"
+        note.write_text("---\ntags: [cognition]\n---\n", encoding="utf-8")
+        rec = Record(citation_key="smith2020")
+        rec.obsidian_note = NoteInfo(path=note, tags=["cognition"],
+                                     has_frontmatter=True)
+        rec.finder_tag_set = {"sleep quality", "brandnew"}
+        rec.pdf_paths = [vault / "a.pdf"]
+        inv = mock.MagicMock()
+        inv.records = {"smith2020": rec}
+        settings = SimpleNamespace(vault_root=vault)
+        with mock.patch.object(audit_manager, "get_inventory",
+                               return_value=(inv, settings)):
+            r = self.client.get("/api/audit/reports/finder_tag_drift",
+                                headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        row = r.get_json()["rows"][0]
+        self.assertEqual(row["note_rel"], "smith2020.md")
+        self.assertEqual(row["vocab_ids"]["sleep quality"], "sleep-quality")
+        self.assertIsNone(row["vocab_ids"]["brandnew"])
+        self.assertIsNone(row["vocab_ids"]["cognition"])
+        self.assertEqual(row["variants"], [])
+
+    def test_near_dup_ratio_is_range_validated(self):
+        """Plan 2026-08-05/6: the similarity cutoff clamps into [60, 100]
+        (coerce_int_in_range semantics, like the annotations threshold) and
+        rejects garbage."""
+        r = self._post_config({"audit_near_dup_ratio": "nan"})
+        self.assertEqual(r.status_code, 400)
+        r = self._post_config({"audit_near_dup_ratio": 92})
+        self.assertEqual(r.status_code, 200)
+        cfg = self.client.get("/api/audit/config", headers=self.headers).get_json()
+        self.assertEqual(cfg["audit_near_dup_ratio"], 92)
+        r = self._post_config({"audit_near_dup_ratio": 10**9})
+        self.assertEqual(r.status_code, 200)
+        cfg = self.client.get("/api/audit/config", headers=self.headers).get_json()
+        self.assertLessEqual(cfg["audit_near_dup_ratio"], 100)
+
+    def test_drift_parent_tags_flag_is_bool_validated(self):
+        """Plan 2026-08-05/3: the parent-tags toggle is a strict bool — a
+        garbage value 400s (never stored), a valid one round-trips."""
+        r = self._post_config({"audit_drift_include_parent_tags": "banana"})
+        self.assertEqual(r.status_code, 400)
+        r = self._post_config({"audit_drift_include_parent_tags": True})
+        self.assertEqual(r.status_code, 200)
+        cfg = self.client.get("/api/audit/config", headers=self.headers).get_json()
+        self.assertIs(cfg["audit_drift_include_parent_tags"], True)
+
+    def test_still_rejects_control_chars_and_traversal(self):
+        """B3: the denylist still rejects NUL/newline and ``..`` traversal."""
+        self.assertEqual(self._post_config({"audit_attachments_subdir": "a\x00b"}).status_code, 400)
+        self.assertEqual(self._post_config({"audit_attachments_subdir": "a\nb"}).status_code, 400)
+        self.assertEqual(self._post_config({"audit_attachments_subdir": "../escape/x"}).status_code, 400)
 
     def test_rejects_relative_zotero_path(self):
         """Zotero sqlite/storage must be absolute — otherwise
@@ -574,6 +906,38 @@ class TestAuditRevealPathBounds(unittest.TestCase):
             json={"open": str(self.allowed)},
             headers=self.headers,
         )
+        self.assertEqual(r.status_code, 200)
+        popen_mock.assert_called_once()
+
+    @mock.patch("api.routes.audit.subprocess.Popen")
+    def test_open_refuses_non_document_types_failclosed(self, popen_mock):
+        """Finding 7: the launch check is now a fail-closed ALLOWLIST — an
+        extension-less binary or an unlisted script type inside the vault is
+        refused for `open` (LaunchServices would run it), while `reveal` is safe.
+        """
+        # An extension-less file (Mach-O/script) the old denylist would MISS.
+        binary = self.vault / "helper"          # no extension
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        fish = self.vault / "run.fish"           # not in the old denylist
+        fish.write_text("echo hi", encoding="utf-8")
+        for target in (binary, fish):
+            r = self.client.post(
+                "/api/audit/reveal", json={"open": str(target)}, headers=self.headers)
+            self.assertEqual(r.status_code, 400, target)
+            self.assertIn("Refusing", r.get_json().get("error", ""))
+        popen_mock.assert_not_called()
+        # …but reveal (-R, highlight only) is fine for the same files.
+        r = self.client.post(
+            "/api/audit/reveal", json={"path": str(binary)}, headers=self.headers)
+        self.assertEqual(r.status_code, 200)
+        popen_mock.assert_called_once()
+
+    @mock.patch("api.routes.audit.subprocess.Popen")
+    def test_open_allows_a_pdf(self, popen_mock):
+        pdf = self.vault / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        r = self.client.post(
+            "/api/audit/reveal", json={"open": str(pdf)}, headers=self.headers)
         self.assertEqual(r.status_code, 200)
         popen_mock.assert_called_once()
 
@@ -696,8 +1060,11 @@ class TestUnzoterodReportsUseCache(unittest.TestCase):
         }
         inv = SimpleNamespace(
             bridge=SimpleNamespace(
-                unmapped_pdfs=[p_unread, p_read], ambiguous_pdfs={}
+                unmapped_pdfs=[p_unread, p_read],
+                ambiguous_pdfs={Path("/vault/Z_attachments/biblio_articles/amb.pdf"): ["k1", "k2"]},
+                confirmed_no_match_pdfs=[Path("/vault/Z_attachments/biblio_articles/nm.pdf")],
             ),
+            pdfs_skipped=[Path("/vault/Z_attachments/biblio_articles/z_item_x.pdf")],
             unmapped_annotations=cache,
         )
         settings = SimpleNamespace(annotations_read_threshold=5)
@@ -713,6 +1080,21 @@ class TestUnzoterodReportsUseCache(unittest.TestCase):
         self.assertEqual({r.pdf for r in read.rows}, {p_unread, p_read})
         # read_unzoterod sorts by annotation count desc.
         self.assertEqual([r.pdf for r in read.rows], [p_read, p_unread])
+        # ...and it is the SUPERSET: unread_unzoterod is a filtered view of the
+        # same source list, never its complement. Pinning the containment
+        # because the two tabs were named as if they partitioned the set.
+        self.assertTrue({r.pdf for r in unread.rows} <= {r.pdf for r in read.rows})
+
+        # Exclusion disclosure (2026-07-31): the buckets that are NOT in `rows`
+        # must still be counted, or the tab silently under-reports what is
+        # missing from Zotero. Counts only — never rows.
+        self.assertEqual(read.ambiguous_count, 1)
+        self.assertEqual(read.confirmed_no_match_count, 1)
+        self.assertEqual(read.skipped_count, 1)
+        self.assertNotIn(
+            Path("/vault/Z_attachments/biblio_articles/nm.pdf"),
+            {r.pdf for r in read.rows},
+        )
 
 
 class TestReadAnnotationsParallel(unittest.TestCase):
@@ -758,6 +1140,419 @@ class TestReadAnnotationsParallel(unittest.TestCase):
         # (that would be timing-flaky).
         self.assertIsInstance(out, dict)
         self.assertLessEqual(len(out), len(paths))
+
+
+class TestAuditSearch(unittest.TestCase):
+    """GET /api/audit/search — the cross-report free-text index."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="audit-test-search-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        (self.tmp / "config.json").write_text(
+            json.dumps({"obsidian_vault_path": str(self.vault)}), encoding="utf-8",
+        )
+        cfg_path = str(self.tmp / "config.json")
+        for target in ("core.constants.CONFIG_FILE", "core.config.CONFIG_FILE"):
+            p = mock.patch(target, cfg_path)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch("core.constants.BASE_DIR", str(self.tmp))
+        p.start()
+        self.addCleanup(p.stop)
+
+        self.client = _build_audit_only_app().test_client()
+        self.headers = {"X-Requested-With": "ChatEKLD"}
+        # The corpus is memoised per (Inventory, Settings) identity; a stale
+        # entry from another test's fixture would mask a rebuild bug here.
+        from api.routes.audit import _clear_search_cache
+        _clear_search_cache()
+        self.addCleanup(_clear_search_cache)
+
+    def _fixture(self):
+        """A real (Inventory, Settings) pair spanning three reports.
+
+        Not a MagicMock: build_corpus runs every report builder over it, so the
+        inventory has to behave like the real dataclass.
+        """
+        from types import SimpleNamespace
+        from audit.core.bib import BibEntry
+        from audit.core.obsidian import NoteInfo
+        from audit.engine.bridge import BridgeResult
+        from audit.engine.inventory import Inventory, Record
+
+        note = self.vault / "dupont2019.md"
+        note.write_text("---\ntags:\n  - insomnie\n---\n", encoding="utf-8")
+        pdf = self.vault / "attachments" / "dupont_2019.pdf"
+        pdf.parent.mkdir(parents=True, exist_ok=True)
+        pdf.write_bytes(b"%PDF-1.4\n")
+
+        rec = Record(citation_key="dupont2019")
+        rec.bib_entry = BibEntry(
+            citation_key="dupont2019",
+            entry_type="article",
+            title="Étude sur le sommeil",
+            year="2019",
+            authors=["Dupont, Marie"],
+        )
+        rec.obsidian_note = NoteInfo(
+            path=note, tags=["insomnie"], has_frontmatter=True)
+        rec.pdf_paths = [pdf]
+        # A second record that must NOT match the queries below.
+        other = Record(citation_key="smith2020")
+        other.bib_entry = BibEntry(
+            citation_key="smith2020", entry_type="article",
+            title="Cardiac outcomes", year="2020", authors=["Smith, John"],
+        )
+
+        ambiguous = self.vault / "attachments" / "unclear_2019.pdf"
+        ambiguous.write_bytes(b"%PDF-1.4\n")
+        bridge = BridgeResult()
+        bridge.ambiguous_pdfs = {ambiguous: ["dupont2019", "smith2020"]}
+
+        inv = Inventory(
+            records={"dupont2019": rec, "smith2020": other},
+            bridge=bridge,
+            pdfs_skipped=[],
+            zotero_matched_by_title=0,
+        )
+        settings = SimpleNamespace(
+            vault_root=self.vault,
+            biblio_skip_prefix="z_item",
+            annotations_read_threshold=3,
+        )
+        return inv, settings
+
+    def _search(self, q):
+        # The corpus is now built OFF the request thread (finding: the inline
+        # build convoyed keystrokes and could exhaust the WSGI pool). The first
+        # request 202s while the background build runs; poll until it lands,
+        # mirroring what the JS client does. The fixture corpus is tiny, so this
+        # resolves in a few ms.
+        import time as _time
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=self._inv_settings
+        ), mock.patch.object(
+            audit_manager, "get_duplicates", return_value=(None, None)
+        ):
+            for _ in range(200):
+                r = self.client.get(f"/api/audit/search?q={q}", headers=self.headers)
+                if r.status_code != 202:
+                    return r
+                _time.sleep(0.01)
+            return r
+
+    def test_requires_xrw_header(self):
+        r = self.client.get("/api/audit/search?q=dupont")
+        self.assertEqual(r.status_code, 403)
+
+    def test_short_or_missing_query_is_400(self):
+        for url in ("/api/audit/search", "/api/audit/search?q=", "/api/audit/search?q=a"):
+            r = self.client.get(url, headers=self.headers)
+            self.assertEqual(r.status_code, 400, url)
+
+    def test_no_scan_is_404(self):
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=(None, None)
+        ):
+            r = self.client.get("/api/audit/search?q=dupont", headers=self.headers)
+        self.assertEqual(r.status_code, 404)
+
+    def test_matches_across_reports(self):
+        self._inv_settings = self._fixture()
+        r = self._search("dupont")
+        self.assertEqual(r.status_code, 200, r.get_json())
+        d = r.get_json()
+        reports = {g["report"] for g in d["groups"]}
+        # The key appears as an inventory record AND as an ambiguous candidate.
+        self.assertIn("inventory", reports)
+        self.assertIn("ambiguous_pdfs", reports)
+        self.assertGreaterEqual(d["total"], 2)
+
+    def test_accent_and_case_insensitive(self):
+        """'etude' must find 'Étude' — the vault is bilingual FR/EN."""
+        self._inv_settings = self._fixture()
+        for q in ("etude", "ÉTUDE", "Étude"):
+            d = self._search(q).get_json()
+            inv_rows = [g for g in d["groups"] if g["report"] == "inventory"]
+            self.assertTrue(inv_rows, f"{q!r} found nothing")
+            self.assertEqual(inv_rows[0]["rows"][0]["citation_key"], "dupont2019")
+
+    def test_all_tokens_must_match(self):
+        """Multi-token queries AND, so adding a word narrows the result.
+
+        Note the ambiguous-PDF row legitimately carries BOTH candidates' titles
+        in one haystack, so ``etude cardiac`` correctly still matches it — the
+        narrowing assertion below uses a tag that only one record has.
+        """
+        self._inv_settings = self._fixture()
+        self.assertGreaterEqual(self._search("etude sommeil").get_json()["total"], 1)
+        # A token present nowhere zeroes the whole query.
+        self.assertEqual(self._search("etude zebra").get_json()["total"], 0)
+        # Narrowing: 'cardiac' alone hits, but not together with a tag that
+        # belongs solely to the other record.
+        self.assertGreaterEqual(self._search("cardiac").get_json()["total"], 1)
+        self.assertEqual(self._search("cardiac insomnie").get_json()["total"], 0)
+
+    def test_matches_tags_and_pdf_paths(self):
+        self._inv_settings = self._fixture()
+        self.assertGreaterEqual(self._search("insomnie").get_json()["total"], 1)
+        self.assertGreaterEqual(self._search("dupont_2019.pdf").get_json()["total"], 1)
+
+    def test_corpus_is_memoised_per_scan_identity(self):
+        """A second query reuses the corpus; a new scan object rebuilds it."""
+        from audit import search as audit_search
+        from api.routes import audit as audit_routes
+
+        self._inv_settings = self._fixture()
+        with mock.patch.object(
+            audit_search, "build_corpus", wraps=audit_search.build_corpus
+        ) as spy:
+            self._search("dupont")
+            self._search("etude")
+            self.assertEqual(spy.call_count, 1)   # same scan → one build
+            self._inv_settings = self._fixture()  # a "new scan"
+            self._search("dupont")
+            self.assertEqual(spy.call_count, 2)
+        # The 404 path must drop the cached Inventory reference.
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=(None, None)
+        ):
+            self.client.get("/api/audit/search?q=dupont", headers=self.headers)
+        self.assertIsNone(audit_routes._SEARCH_CACHE)
+
+    def test_first_query_202s_while_the_corpus_builds_off_thread(self):
+        """The corpus build must never run on the request thread (convoy fix).
+
+        A slow build (a count_annotations=off scan falling back to per-PDF
+        reads) previously blocked the request under a lock, so every debounced
+        keystroke queued behind it and could exhaust the WSGI pool. Now the
+        build is kicked to a background thread and the route 202s until ready.
+        """
+        from api.routes import audit as audit_routes
+        import threading as _th
+
+        audit_routes._clear_search_cache()
+        with audit_routes._SEARCH_CACHE_LOCK:
+            audit_routes._SEARCH_BUILDING = False
+            audit_routes._SEARCH_BUILD_ERROR = None
+        self._inv_settings = self._fixture()
+
+        # Make the build block until we release it, so we can observe the 202.
+        gate = _th.Event()
+        real_build = audit_routes.audit_search.build_corpus
+
+        def _slow_build(*a, **k):
+            gate.wait(2.0)
+            return real_build(*a, **k)
+
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=self._inv_settings
+        ), mock.patch.object(
+            audit_manager, "get_duplicates", return_value=(None, None)
+        ), mock.patch.object(audit_routes.audit_search, "build_corpus", _slow_build):
+            first = self.client.get("/api/audit/search?q=dupont", headers=self.headers)
+            self.assertEqual(first.status_code, 202, first.get_json())
+            self.assertTrue(first.get_json().get("building"))
+            # A concurrent keystroke also 202s (does NOT block on the build).
+            second = self.client.get("/api/audit/search?q=dupont", headers=self.headers)
+            self.assertEqual(second.status_code, 202)
+            gate.set()  # let the build finish; a retry now lands 200.
+            r = self._search("dupont")
+            self.assertEqual(r.status_code, 200, r.get_json())
+
+    def test_result_listener_drops_cache_on_scan_replacement(self):
+        """A replaced scan result must release the memoised corpus promptly.
+
+        The manager fires its result listeners on replace/clear; the route
+        registers _clear_search_cache, so a superseded Inventory is not pinned
+        in the memo until the next search (finding 4).
+        """
+        from api.routes import audit as audit_routes
+
+        self._inv_settings = self._fixture()
+        self._search("dupont")
+        self.assertIsNotNone(audit_routes._SEARCH_CACHE)
+        # Simulate a new scan replacing the cached result.
+        audit_manager._fire_result_listeners()
+        self.assertIsNone(audit_routes._SEARCH_CACHE)
+
+    def test_group_reports_true_count_when_capped(self):
+        """A capped group still reports how many it actually matched."""
+        from audit import search as audit_search
+
+        corpus = [
+            audit_search._Entry("inventory", audit_search.fold(f"paper {i}"),
+                                {"label": f"paper {i}"})
+            for i in range(audit_search.MAX_ROWS_PER_GROUP + 25)
+        ]
+        out = audit_search.search(corpus, "paper")
+        g = out["groups"][0]
+        self.assertEqual(len(g["rows"]), audit_search.MAX_ROWS_PER_GROUP)
+        self.assertEqual(g["count"], audit_search.MAX_ROWS_PER_GROUP + 25)
+        self.assertTrue(g["truncated"])
+        self.assertTrue(out["truncated"])
+        self.assertEqual(out["total"], audit_search.MAX_ROWS_PER_GROUP + 25)
+
+
+class TestClearCuration(unittest.TestCase):
+    """bridge.clear_curation — the ambiguous-PDF triage deck's undo primitive.
+
+    The two existing writers can only REPLACE a decision with the other kind;
+    only this one returns a PDF to its un-curated state so the next scan
+    re-derives it.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="audit-clear-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.vault = self.tmp / "vault"
+        (self.vault / "att").mkdir(parents=True)
+        self.pdf = self.vault / "att" / "smith_2020.pdf"
+        self.pdf.write_bytes(b"%PDF-1.4\n")
+        self.mapping = self.tmp / "mapping.json"
+
+    def _state(self):
+        from audit.engine.bridge import _load_mapping_full
+        return _load_mapping_full(self.mapping)
+
+    def test_clears_a_match_and_prunes_its_hash(self):
+        from audit.engine import bridge
+        bridge.add_match(self.mapping, self.pdf, "smith2020", self.vault)
+        matches, _no_match, hashes = self._state()
+        self.assertIn("smith2020", matches)
+        self.assertTrue(hashes)   # anchored on write
+
+        self.assertTrue(bridge.clear_curation(self.mapping, self.pdf, self.vault))
+        matches, no_match, hashes = self._state()
+        # The key's last path went, so the key goes with it.
+        self.assertNotIn("smith2020", matches)
+        self.assertNotIn("att/smith_2020.pdf", no_match)
+        # save_mapping prunes hash entries no longer referenced.
+        self.assertNotIn("att/smith_2020.pdf", hashes)
+
+    def test_clears_a_no_match(self):
+        from audit.engine import bridge
+        bridge.add_no_match(self.mapping, self.pdf, self.vault)
+        self.assertIn("att/smith_2020.pdf", self._state()[1])
+        self.assertTrue(bridge.clear_curation(self.mapping, self.pdf, self.vault))
+        self.assertNotIn("att/smith_2020.pdf", self._state()[1])
+
+    def test_keeps_sibling_paths_under_the_same_key(self):
+        """Clearing one PDF must not un-curate the key's other copies."""
+        from audit.engine import bridge
+        other = self.vault / "att" / "smith_2020_copy.pdf"
+        other.write_bytes(b"%PDF-1.4\n")
+        bridge.add_match(self.mapping, self.pdf, "smith2020", self.vault)
+        bridge.add_match(self.mapping, other, "smith2020", self.vault)
+
+        bridge.clear_curation(self.mapping, self.pdf, self.vault)
+        matches = self._state()[0]
+        self.assertEqual(matches["smith2020"], ["att/smith_2020_copy.pdf"])
+
+    def test_is_idempotent_on_an_uncurated_pdf(self):
+        from audit.engine import bridge
+        self.assertFalse(bridge.clear_curation(self.mapping, self.pdf, self.vault))
+        bridge.add_match(self.mapping, self.pdf, "smith2020", self.vault)
+        self.assertTrue(bridge.clear_curation(self.mapping, self.pdf, self.vault))
+        self.assertFalse(bridge.clear_curation(self.mapping, self.pdf, self.vault))
+
+
+class TestAuditPdfAndClearRoutes(unittest.TestCase):
+    """GET /api/audit/pdf and the mapping route's `clear` action."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="audit-pdfroute-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.vault = self.tmp / "vault"
+        (self.vault / "att").mkdir(parents=True)
+        self.pdf = self.vault / "att" / "paper.pdf"
+        self.pdf.write_bytes(b"%PDF-1.4\nfake\n")
+        (self.tmp / "config.json").write_text(
+            json.dumps({"obsidian_vault_path": str(self.vault)}), encoding="utf-8",
+        )
+        cfg_path = str(self.tmp / "config.json")
+        for target in ("core.constants.CONFIG_FILE", "core.config.CONFIG_FILE"):
+            p = mock.patch(target, cfg_path)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch("core.constants.BASE_DIR", str(self.tmp))
+        p.start()
+        self.addCleanup(p.stop)
+        self.client = _build_audit_only_app().test_client()
+        self.headers = {"X-Requested-With": "ChatEKLD"}
+
+    def test_requires_xrw_header(self):
+        self.assertEqual(self.client.get("/api/audit/pdf?rel=att/paper.pdf").status_code, 403)
+
+    def test_serves_pdf_bytes(self):
+        r = self.client.get("/api/audit/pdf?rel=att/paper.pdf", headers=self.headers)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.mimetype, "application/pdf")
+        self.assertTrue(r.data.startswith(b"%PDF"))
+
+    def test_rejects_traversal_and_absolute_paths(self):
+        for rel in ("../secret.pdf", "att/../../secret.pdf", "/etc/passwd",
+                    "att/paper.pdf\x00.png", ""):
+            r = self.client.get(
+                f"/api/audit/pdf?rel={rel}", headers=self.headers)
+            self.assertEqual(r.status_code, 400, rel)
+
+    def test_rejects_non_pdf_and_missing(self):
+        (self.vault / "att" / "notes.md").write_text("x", encoding="utf-8")
+        for rel in ("att/notes.md", "att/nope.pdf"):
+            r = self.client.get(f"/api/audit/pdf?rel={rel}", headers=self.headers)
+            self.assertEqual(r.status_code, 404, rel)
+
+    def test_rejects_a_symlink_escaping_the_vault(self):
+        """The realpath re-check is what guards a symlink planted post-scan."""
+        outside = self.tmp / "outside.pdf"
+        outside.write_bytes(b"%PDF-1.4\nsecret\n")
+        link = self.vault / "att" / "link.pdf"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("symlinks unavailable")
+        r = self.client.get("/api/audit/pdf?rel=att/link.pdf", headers=self.headers)
+        self.assertEqual(r.status_code, 400)
+        self.assertNotIn(b"secret", r.data)
+
+    def test_mapping_clear_action_round_trips(self):
+        from audit.engine import bridge
+        from audit.config import load_settings
+        settings = load_settings()
+        r = self.client.post(
+            "/api/audit/mapping",
+            json={"pdf": "att/paper.pdf", "citation_key": "smith2020"},
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertIn("smith2020", bridge._load_mapping_full(settings.mapping_file)[0])
+
+        r = self.client.post(
+            "/api/audit/mapping",
+            json={"pdf": "att/paper.pdf", "clear": True},
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200, r.get_json())
+        d = r.get_json()
+        self.assertEqual(d["action"], "clear")
+        self.assertTrue(d["changed"])
+        self.assertNotIn("smith2020", bridge._load_mapping_full(settings.mapping_file)[0])
+
+    def test_clear_wins_over_a_leftover_citation_key(self):
+        """An undo body carrying the key it reverses must not re-add it."""
+        from audit.engine import bridge
+        from audit.config import load_settings
+        settings = load_settings()
+        r = self.client.post(
+            "/api/audit/mapping",
+            json={"pdf": "att/paper.pdf", "citation_key": "smith2020", "clear": True},
+            headers=self.headers,
+        )
+        self.assertEqual(r.get_json()["action"], "clear")
+        self.assertEqual(bridge._load_mapping_full(settings.mapping_file)[0], {})
 
 
 if __name__ == "__main__":

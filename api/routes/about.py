@@ -2,11 +2,17 @@
 
 ``GET /api/about`` returns a small HTML blob describing the app. Rather than
 ship the whole vendored ``marked`` bundle to this rarely-seen window, a minimal
-in-Python Markdown subset is rendered here. The renderer is XSS-safe by
-construction: all text is ``html.escape``-d before formatting, and links are
-allowed only for ``http(s)`` / in-page ``#`` targets (any other URL degrades to
-plain text), so the ``about_md`` source — though currently a hard-coded
-constant — cannot inject script even if it later became dynamic.
+in-Python Markdown subset is rendered here. The renderer is XSS-safe *provided its input is pre-escaped*: ``parse``
+``html.escape``-s every line (quote=True → ``"`` becomes ``&quot;``) BEFORE
+:func:`_inline_fmt` builds any tag, so a URL interpolated into an ``href``
+attribute can't break out of the double-quotes, and links are additionally
+restricted to ``http(s)`` / in-page ``#`` targets (any other scheme degrades to
+plain text). The safety therefore rests on that pre-escaping — it is NOT an
+independent attribute-escape inside ``_inline_fmt`` — which is sound for the
+hard-coded ``about_md`` constant and for any future source that stays routed
+through ``parse``. (2026-07-20 audit L5: the earlier claim that the href was
+safe "even if it became dynamic" overstated — dynamic content bypassing
+``parse``'s escape would not be safe; keep all rendering behind ``parse``.)
 """
 import html
 import re

@@ -1218,6 +1218,7 @@ def extract_structured_from_pdf(
     ocr_cb: Optional[Callable] = None,
     ocr_max_pages: int | None = None,
     page_done_cb: Optional[Callable] = None,
+    use_markitdown: bool = True,
 ) -> ArticleSections:
     """
     Extract text from a PDF with layout-aware structural parsing and resource safety.
@@ -1260,6 +1261,14 @@ def extract_structured_from_pdf(
     page_done_cb : callable | None
         Optional ``(abs_page_index) -> None`` hook called after each OCR'd page
         (heartbeat / progress).  Exceptions from it are swallowed.
+    use_markitdown : bool
+        When ``False``, the MarkItDown (pdfminer.six) fallback tiers are
+        skipped entirely.  MarkItDown parses the WHOLE file regardless of
+        ``end_page``/``char_budget`` (the budget only truncates its output),
+        so page-bounded interactive callers (the tagging snippet/propose
+        text source) disable it to keep a scanned PDF from costing a
+        multi-minute full-file pdfminer pass.  Default ``True`` keeps every
+        existing caller byte-identical.
 
     Safety limits (applied to the extracted range, not the whole document):
     - Maximum 1000 pages per extraction call.
@@ -1323,7 +1332,8 @@ def extract_structured_from_pdf(
         # engine found nothing.  Before falling to the expensive GLM-OCR path,
         # try MarkItDown (pdfminer.six) which uses a different text-stream
         # algorithm that can recover text where PyMuPDF's block parser cannot.
-        _mid_result = _try_markitdown_extraction(file_path, char_budget, page_count)
+        _mid_result = (_try_markitdown_extraction(file_path, char_budget, page_count)
+                       if use_markitdown else None)
         if _mid_result is not None:
             return _mid_result
         # MarkItDown also found nothing; the document likely has no text layer
@@ -1347,7 +1357,8 @@ def extract_structured_from_pdf(
         # "blocks" are decorative images rejected by the geometry filter).
         # Before escalating to GLM-OCR, try MarkItDown — it may recover text
         # from a content stream that PyMuPDF misclassified as non-body blocks.
-        _mid_result = _try_markitdown_extraction(file_path, char_budget, page_count)
+        _mid_result = (_try_markitdown_extraction(file_path, char_budget, page_count)
+                       if use_markitdown else None)
         if _mid_result is not None:
             return _mid_result
         if ocr_cb is not None and page_count > 0:
@@ -1366,7 +1377,8 @@ def extract_structured_from_pdf(
     # but contain only whitespace or control characters after cleaning.
     # Try MarkItDown first (fast, CPU-only), then GLM-OCR if still blank.
     if len(full_text.strip()) < _OCR_MIN_CHARS:
-        _mid_result = _try_markitdown_extraction(file_path, char_budget, page_count)
+        _mid_result = (_try_markitdown_extraction(file_path, char_budget, page_count)
+                       if use_markitdown else None)
         if _mid_result is not None:
             return _mid_result
         if ocr_cb is not None:

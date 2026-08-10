@@ -87,6 +87,24 @@ def test_tag_rows_parsed():
     assert ("Sommeil", "insomnie", "troubles du sommeil") in descs
 
 
+def test_parse_tags_empty_desc_rows_gated_by_flag():
+    # Default: a description-less row is skipped (a thesaurus row without
+    # phrases contributes no synonyms). With include_empty_desc=True the row's
+    # tag ids still come through — the tagging vocabulary (the write gate)
+    # needs every defined tag id, gloss or not (2026-07-19).
+    table = ("| Description | Tags |\n| --- | --- |\n"
+             "| | #glossless |\n"
+             "| Sommeil | #sleep |\n")
+    default_rows = parse_tags(table)
+    assert all("glossless" not in r.tags for r in default_rows)
+    flagged = parse_tags(table, include_empty_desc=True)
+    assert any(r.tags == ["glossless"] and r.phrases == [] for r in flagged)
+    # A row with neither description nor tags stays skipped either way.
+    empty_both = parse_tags("| Description | Tags |\n| --- | --- |\n|  |  |\n",
+                            include_empty_desc=True)
+    assert empty_both == []
+
+
 # --------------------------------------------------------------------------- #
 # expansion
 

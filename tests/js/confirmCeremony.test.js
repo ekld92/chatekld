@@ -57,6 +57,38 @@ describe('confirmInline primitive (Track 6e)', () => {
         expect(strips.length).toBe(1);
         expect(strips[0].textContent).toContain('b');
     });
+
+    // 2026-07-19 keyboard-trap fix: consumers (the tagging deck) bind
+    // container-level verb handlers that preventDefault Enter/Space, which
+    // cancelled the focused strip button's native activation — the confirm
+    // was mouse-only. The strip now stops those keys from propagating and
+    // handles Escape itself.
+    it('Enter/Space inside the strip never propagate to ancestor verb handlers', () => {
+        const anchor = document.getElementById('anchor');
+        const wrap = document.getElementById('wrap');
+        const seen = vi.fn();
+        wrap.addEventListener('keydown', seen);
+        const strip = ui.confirmInline(anchor, { message: 'm', confirmLabel: 'Go', onConfirm: () => {} });
+        const cancel = strip.querySelectorAll('button')[0];
+        for (const key of ['Enter', ' ']) {
+            cancel.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+        }
+        expect(seen).not.toHaveBeenCalled();
+        // An unrelated key still propagates (the strip only owns its own verbs).
+        cancel.dispatchEvent(new KeyboardEvent('keydown', { key: 'x', bubbles: true }));
+        expect(seen).toHaveBeenCalledTimes(1);
+    });
+
+    it('Escape dismisses the strip without firing and refocuses the anchor', () => {
+        const anchor = document.getElementById('anchor');
+        const onConfirm = vi.fn();
+        const strip = ui.confirmInline(anchor, { message: 'm', confirmLabel: 'Go', onConfirm });
+        strip.querySelectorAll('button')[0].dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        expect(onConfirm).not.toHaveBeenCalled();
+        expect(document.querySelector('.inline-confirm-strip')).toBeNull();
+        expect(document.activeElement).toBe(anchor);
+    });
 });
 
 describe('Revert all requires the ceremony (Track 6e)', () => {
@@ -94,7 +126,9 @@ describe('Revert all requires the ceremony (Track 6e)', () => {
         await new Promise((r) => setTimeout(r, 20));
         const calls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/refactor/restore'));
         expect(calls.length).toBe(1);
-        expect(JSON.parse(calls[0][1].body)).toEqual({ all: true });
+        // B8 (2026-07-13): restore is now server-side confirm-gated, so the
+        // client sends confirm: true alongside the revert-all flag.
+        expect(JSON.parse(calls[0][1].body)).toEqual({ all: true, confirm: true });
     });
 });
 
@@ -119,5 +153,80 @@ describe('destructive-defaults markup + deck wiring ratchet (Track 6e)', () => {
         // No direct single-click binding of the writers remains.
         expect(src).not.toMatch(/addEventListener\('click',\s*\(\)\s*=>\s*_applyRepair/);
         expect(src).not.toMatch(/addEventListener\('click',\s*\(\)\s*=>\s*_applyAugment/);
+    });
+
+    it('docgen.js routes its Markdown vault write + article overwrite through confirmInline', () => {
+        // The Markdown "Generate note" button writes a NEW note into the vault,
+        // and "Apply to the article" overwrites a user .tex — both must arm the
+        // Track 6e ceremony before writing.
+        const src = readFileSync(resolve(root, 'static/js/docgen.js'), 'utf-8');
+        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,400}?_runMarkdown\(topic, scope\)/);
+        expect(src).not.toMatch(/onclick[\s\S]{0,40}_runMarkdown/);
+        expect(src).toMatch(/confirmInline\(applyBtn,[\s\S]{0,400}?_applyAugment\(aug, applyBtn\)/);
+        expect(src).not.toMatch(/addEventListener\('click',\s*\(\)\s*=>\s*_applyAugment/);
+    });
+
+    it('audit.js routes its vault write through confirmInline, never window.confirm', () => {
+        // Review lot 3.1 ratchet: apply-tag-drift overwrites a user vault
+        // note, so it must use the Track 6e ceremony. A bare window.confirm
+        // anywhere in audit.js reintroduces the violation.
+        const src = readFileSync(resolve(root, 'static/js/audit.js'), 'utf-8');
+        expect(src).not.toMatch(/window\.confirm/);
+        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,700}?apply-tag-drift/);
+    });
+
+    it('the finder-drift fix verbs all arm the ceremony (drift-fix 2026-08-06)', () => {
+        // Three new vault/PDF/vocabulary-writing buttons in the finder drift
+        // report: [→ note] / [→ Finder] (via _finderDriftApply), [+ vocab]
+        // (via _finderVocabAdd), and the per-row [undo] (a restore rewrites
+        // user data too). Each must route through confirmInline.
+        const src = readFileSync(resolve(root, 'static/js/audit.js'), 'utf-8');
+        expect(src).toMatch(/function _finderDriftApply[\s\S]{0,900}?confirmInline\(btn,/);
+        expect(src).toMatch(/function _finderVocabAdd[\s\S]{0,900}?confirmInline\(btn,/);
+        expect(src).toMatch(/function _finderDriftUndoBtn[\s\S]{0,900}?confirmInline\(undo,/);
+        // The dispatch never calls the writers directly.
+        expect(src).not.toMatch(/if \(action === 'finder-apply-note'\) \{ await secureFetch/);
+    });
+
+    it('the near-duplicate dismiss AND its undo both arm the ceremony (2026-08-09)', () => {
+        // The [restore]/[undo] of a dismissal was the lone unconfirmed write
+        // verb in the Possible Duplicates report while its sibling [not a
+        // duplicate] and every other undo in the app were gated — asymmetric
+        // ceremony inside one report teaches users the strip is noise.
+        const src = readFileSync(resolve(root, 'static/js/audit.js'), 'utf-8');
+        expect(src).toMatch(/function _dupDismiss[\s\S]{0,600}?confirmInline\(btn,/);
+        expect(src).toMatch(/function _dupUndismiss[\s\S]{0,600}?confirmInline\(btn,/);
+        // Neither dispatch path calls the writer directly.
+        expect(src).not.toMatch(/if \(action === 'dup-undismiss'\) \{ await _dupDecision/);
+        expect(src).not.toMatch(/addEventListener\('click',\s*\(\)\s*=>\s*_dupDecision/);
+    });
+
+    it('compile & auto-fix arms the ceremony in BOTH panels (2026-07-22 E10)', () => {
+        // The compile-fix loop writes LLM-authored repairs into the user's
+        // .tex — identical risk to apply-repair/apply-augment, which carry a
+        // strip. An unceremonied sibling teaches users the strip is noise.
+        const deckSrc = readFileSync(resolve(root, 'static/js/deck.js'), 'utf-8');
+        expect(deckSrc).toMatch(/confirmInline\(compileBtn,[\s\S]{0,500}?runCompileFix\(/);
+        expect(deckSrc).not.toMatch(/addEventListener\('click',\s*\(\)\s*=>\s*runCompileFix/);
+        const docSrc = readFileSync(resolve(root, 'static/js/docgen.js'), 'utf-8');
+        expect(docSrc).toMatch(/confirmInline\(fixBtn,[\s\S]{0,500}?runDocCompileFix\(/);
+        expect(docSrc).not.toMatch(/addEventListener\('click',\s*\(\)\s*=>\s*runDocCompileFix/);
+    });
+
+    it('the ambiguous-PDF TABLE view confirm-gates its mapping writes (2026-07-22 E9)', () => {
+        // The deck view was built precisely because the table assigned a key
+        // on one unconfirmed click; the kept table must not retain the defect.
+        const src = readFileSync(resolve(root, 'static/js/audit.js'), 'utf-8');
+        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,400}?_assignAmbiguous\(btn\)/);
+        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,400}?_markNoMatch\(btn\)/);
+        expect(src).not.toMatch(/if \(action === 'pick-key'\) \{ await _assignAmbiguous/);
+    });
+
+    it('refactor.js gates Approve & apply and Archive through confirmInline (2026-07-22 E11)', () => {
+        const src = readFileSync(resolve(root, 'static/js/refactor.js'), 'utf-8');
+        expect(src).toMatch(/confirmInline\(apply,[\s\S]{0,400}?_applyStaged\(/);
+        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,600}?_doArchive\(/);
+        // The bespoke archive confirm box (its own DOM + ordering) is gone.
+        expect(src).not.toMatch(/refactor-archive-confirm/);
     });
 });

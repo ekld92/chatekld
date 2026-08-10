@@ -55,10 +55,30 @@ def origin_is_local() -> bool:
     if request.headers.get("X-Requested-With") != "ChatEKLD":
         return False
 
+    allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+
+    # Host allowlist — the DNS-rebinding gate (2026-07-20 audit H1). A page at
+    # evil.com whose DNS is rebound to 127.0.0.1 becomes SAME-ORIGIN with this
+    # server: the custom header sails through (no CORS preflight), a
+    # no-referrer GET carries neither Origin nor Referer, and remote_addr is
+    # genuinely loopback — so every pre-Host check passes and /api/config,
+    # /api/log/tail etc. are exfiltratable. The Host header on such a request
+    # is the attacker's domain, so a fail-closed reject-if-not-local check
+    # catches exactly this. (An earlier comment here dismissed Host checking
+    # as "attacker-controllable" — true for FORGING localhost from afar, which
+    # remote_addr already covers, but irrelevant to rejecting a wrong Host.)
+    raw_host = request.host or ""
+    if raw_host.startswith("["):
+        # Bracketed IPv6 literal, e.g. "[::1]:5000".
+        host = raw_host.split("]", 1)[0].lstrip("[")
+    else:
+        host = raw_host.rsplit(":", 1)[0] if ":" in raw_host else raw_host
+    if host.lower() not in allowed_hosts:
+        return False
+
     origin = request.headers.get("Origin", "")
     referer = request.headers.get("Referer", "")
-    allowed_hosts = {"127.0.0.1", "localhost"}
-    
+
     if origin:
         parsed_origin = urlparse(origin)
         return parsed_origin.hostname in allowed_hosts
@@ -67,8 +87,8 @@ def origin_is_local() -> bool:
         return parsed_referer.hostname in allowed_hosts
 
     # Neither Origin nor Referer present (normal for PyWebView's embedded renderer).
-    # Use the server-derived remote address rather than the client-supplied Host
-    # header, which an attacker can set to "localhost" from a non-local connection.
+    # remote_addr is server-derived (unforgeable), and the Host allowlist above
+    # already rejected rebound names.
     return request.remote_addr in {"127.0.0.1", "::1"}
 
 def sanitise_error_msg(error: Exception | str) -> str:
@@ -80,5 +100,12 @@ def sanitise_error_msg(error: Exception | str) -> str:
         from core.llm.redact import redact
         msg = redact(msg)
     except Exception:
+        # Deliberate swallow (2026-07-22 comment repair): this function runs
+        # on ERROR paths, some during early boot — an import cycle or a bug in
+        # redact must never turn "sanitise the error" into a second exception
+        # that masks the first. The path/port scrubbing above already ran; the
+        # degraded case only loses the API-key redaction layer, and keys reach
+        # exceptions only via provider SDK messages, which the adapters
+        # classify long after boot.
         pass
     return msg

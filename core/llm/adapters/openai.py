@@ -30,12 +30,15 @@ from core.llm.types import (
     LLMResponse,
     LLMUsage,
 )
-from core.llm.usage import usage_tracker
+from core.llm.usage import CANCELLED_ERROR_CATEGORY, estimate_tokens, usage_tracker
 
 logger = logging.getLogger(__name__)
 
-# Cached ``openai.OpenAI`` clients, keyed by (base_url, timeout, max_retries,
-# organization, api_key_fingerprint). A fresh client per generate()/stream()
+# Cached ``openai.OpenAI`` clients, keyed by (base_url, timeout, organization,
+# api_key_fingerprint) — see the actual key below. (max_retries is NOT in the
+# key: it is a constant 0 for every client, so it can't vary; if it ever
+# becomes per-client, add it here — 2026-07-20 audit B13.) A fresh client per
+# generate()/stream()
 # opened — and never closed — a new httpx connection pool + TLS session on EVERY
 # online round-trip; in agent mode (N iterations), deck generation (per-section),
 # and multi-turn chat that meant N TLS handshakes to the same host with each pool
@@ -347,7 +350,23 @@ class OpenAIProvider(LLMProvider):
 
     # Params the heal pass may rename/strip, at most once each per call.
     # Anything else in a 400 is a genuine caller bug and must surface.
-    _HEALABLE_PARAMS = ("max_tokens", "max_completion_tokens", "temperature", "top_p")
+    # ``stream_options`` (lot 6bis): the streaming path always requests the
+    # final usage chunk via stream_options={"include_usage": true}; an
+    # OpenAI-compatible server that predates/rejects that param would
+    # otherwise hard-400 EVERY streamed call — stripping it degrades to
+    # usage-less streaming (tokens recorded as 0 for that call), which beats
+    # a dead provider.
+    # ``tools`` / ``tool_choice`` (audit #7, 2026-07-13): lot 6bis emptied the
+    # compat adapters' proactive MODELS_WITHOUT_TOOLS strip on the belief that
+    # every curated id supports function calling — this reactive strip is the
+    # safety net when that belief is wrong for some model/gateway: dropping
+    # tools degrades the agent turn to a plain answer (the same graceful path
+    # a tool-less Ollama model takes) instead of a terminal 400 on every
+    # agent/deck/docgen turn.
+    _HEALABLE_PARAMS = (
+        "max_tokens", "max_completion_tokens", "temperature", "top_p",
+        "stream_options", "tools", "tool_choice",
+    )
 
     def _heal_unsupported_param(self, params: dict, exc: BaseException, healed: set) -> str:
         """Self-healing for parameter-shape 400s: mutate *params* and retry.
@@ -375,6 +394,13 @@ class OpenAIProvider(LLMProvider):
             if named == candidate or f"'{candidate}'" in message:
                 offender = candidate
                 break
+        if offender is None and "tools" in params and "tools" not in healed:
+            # Compat servers often phrase a tool-capability rejection without
+            # quoting the param name ("This model does not support function
+            # calling"); treat that as a tools 400 so the strip below fires.
+            lowered = message.lower()
+            if "function calling" in lowered or "function call" in lowered:
+                offender = "tools"
         if offender is None:
             return ""
         healed.add(offender)
@@ -385,10 +411,27 @@ class OpenAIProvider(LLMProvider):
             # An OpenAI-compatible server that predates the new name.
             params["max_tokens"] = params.pop("max_completion_tokens")
             return "renamed max_completion_tokens -> max_tokens"
+        if offender == "tools":
+            # tool_choice without tools is itself a 400 — drop both together.
+            params.pop("tools", None)
+            params.pop("tool_choice", None)
+            return "dropped tools (model lacks function calling; degrading to a plain answer)"
         params.pop(offender, None)
         return f"dropped unsupported {offender}"
 
-    def _create_with_heal(self, client, request: LLMRequest, **create_kwargs):
+    def _is_capability_routing_error(self, exc: BaseException) -> bool:
+        """Whether *exc* is an aggregator "no endpoint supports this request
+        shape" rejection (see ``OpenRouterProvider``'s override). The official
+        endpoint signals capability problems as param-named 400s, which
+        :meth:`_heal_unsupported_param` already handles — so the base
+        implementation matches nothing.
+        """
+        return False
+
+    def _create_with_heal(self, client, request: LLMRequest, *,
+                          _params: Optional[dict] = None,
+                          _healed: Optional[set] = None,
+                          **create_kwargs):
         """``chat.completions.create`` with the parameter-400 heal loop.
 
         Bounded: each healable param is fixed at most once, so the loop runs
@@ -396,18 +439,41 @@ class OpenAIProvider(LLMProvider):
         classification path takes over. Heal retries are immediate (no
         backoff) — they replace a guaranteed-terminal 400, not a transient.
         """
-        params = self._common_params(request)
-        healed: set = set()
+        # Fold the caller's transport kwargs (stream=, stream_options=) into
+        # the SAME dict the heal loop mutates, so a 400 naming any of them —
+        # e.g. a compat server rejecting stream_options — is strippable too.
+        # ``_params``/``_healed`` let generate() hoist this state across
+        # retry_with_backoff attempts (see there); when absent (stream(),
+        # which is never retried) the state is built fresh as before.
+        params = _params if _params is not None else {**create_kwargs, **self._common_params(request)}
+        healed: set = _healed if _healed is not None else set()
         while True:
             try:
                 return client.chat.completions.create(
                     messages=self._build_messages(request),
-                    **create_kwargs,
                     **params,
                 )
             except Exception as exc:
                 is_400 = getattr(exc, "status_code", None) == 400
                 fix = self._heal_unsupported_param(params, exc, healed) if is_400 else ""
+                if (not fix and "tools" in params and "tools" not in healed
+                        and self._is_capability_routing_error(exc)):
+                    # Aggregator capability mismatch (OpenRouter: 404/503 "No
+                    # endpoints found…" / "routing requirements") — not a 400
+                    # and the param name is never quoted, so the heal above
+                    # cannot see it, yet it is deterministic for this request
+                    # shape: classifying it SERVER_ERROR would burn every
+                    # retry on identical failures and then trigger provider
+                    # fallback. Same degradation as the tools 400 instead:
+                    # drop tools, answer plain. At most once ("tools" enters
+                    # `healed`), and only when tools are in the payload — a
+                    # genuinely transient 5xx without tools keeps its normal
+                    # retry semantics.
+                    healed.add("tools")
+                    params.pop("tools", None)
+                    params.pop("tool_choice", None)
+                    fix = ("dropped tools (no upstream endpoint supports tool "
+                           "use; degrading to a plain answer)")
                 if not fix:
                     raise self._classify_error(exc, request.model)
                 logger.info(
@@ -428,10 +494,18 @@ class OpenAIProvider(LLMProvider):
         start = time.monotonic()
         client = self._client()
 
+        # Heal state hoisted OUTSIDE _do_call (parity with anthropic.py's
+        # generate — 2026-07-22 audit B5): rebuilt per attempt, a healed param
+        # (e.g. max_tokens→max_completion_tokens) was re-learned with one
+        # guaranteed extra 400 round-trip after every transient retry.
+        heal_params = {"stream": False, **self._common_params(request)}
+        healed_state: set = set()
+
         def _do_call() -> LLMResponse:
             # _create_with_heal classifies and raises LLMError itself (after
             # exhausting the parameter-400 heal pass).
-            resp = self._create_with_heal(client, request, stream=False)
+            resp = self._create_with_heal(
+                client, request, _params=heal_params, _healed=healed_state)
 
             choice = resp.choices[0] if resp.choices else None
             text = choice.message.content if choice and choice.message else ""
@@ -455,6 +529,7 @@ class OpenAIProvider(LLMProvider):
             usage_tracker.record(
                 provider=self.name,
                 model=request.model,
+                workflow=request.workflow,
                 usage=usage,
                 latency_ms=latency_ms,
                 stream=False,
@@ -474,6 +549,9 @@ class OpenAIProvider(LLMProvider):
         return retry_with_backoff(
             _do_call, max_attempts=self.max_retries,
             deadline_monotonic_s=deadline,
+            # Interruptible backoff (2026-07-22 audit B8): the agent loop puts
+            # its cancel probe in request.metadata; absent for other callers.
+            should_cancel=(request.metadata or {}).get("should_cancel"),
         )
 
     def stream(self, request: LLMRequest) -> StreamingResponse:
@@ -508,6 +586,7 @@ class OpenAIProvider(LLMProvider):
             cached_in: int = 0
             finish_reason: FinishReason = FinishReason.STOP
             stream_error: LLMError | None = None
+            cancelled = False
             try:
                 for chunk in stream:
                     if chunk.usage is not None:
@@ -525,6 +604,12 @@ class OpenAIProvider(LLMProvider):
                             yield content
                     if choice.finish_reason:
                         finish_reason = _FINISH_REASONS.get(choice.finish_reason, FinishReason.STOP)
+            except GeneratorExit:
+                # Consumer abandoned the stream (client disconnect). NOT an
+                # error — the provider generated and bills what it sent — so it
+                # is marked, not failed. See CANCELLED_ERROR_CATEGORY.
+                cancelled = True
+                raise
             except Exception as exc:
                 stream_error = self._classify_error(exc, request.model)
                 raise stream_error
@@ -532,6 +617,12 @@ class OpenAIProvider(LLMProvider):
                 final.text = "".join(buf)
                 final.finish_reason = FinishReason.ERROR if stream_error else finish_reason
                 final.latency_ms = int((time.monotonic() - start) * 1000)
+                if cancelled and not usage_out:
+                    # This adapter asks for usage on the FINAL chunk, which a
+                    # cancel means never arrived. The streamed text is real, so
+                    # estimate from it rather than record a free call; input
+                    # tokens stay unfabricated (documented residual).
+                    usage_out = estimate_tokens(final.text)
                 final.usage = LLMUsage(
                     input_tokens=usage_in,
                     output_tokens=usage_out,
@@ -541,11 +632,16 @@ class OpenAIProvider(LLMProvider):
                 usage_tracker.record(
                     provider=self.name,
                     model=request.model,
+                    workflow=request.workflow,
                     usage=final.usage,
                     latency_ms=final.latency_ms,
                     stream=True,
                     success=stream_error is None,
-                    error_category=stream_error.category.value if stream_error else "",
+                    error_category=(
+                        stream_error.category.value if stream_error
+                        else CANCELLED_ERROR_CATEGORY if cancelled
+                        else ""
+                    ),
                 )
 
         return StreamingResponse(response_gen=_iter(), final=final)
@@ -671,18 +767,25 @@ def _openai_tool_call_to_dict(raw) -> dict:
 
 
 def _cached_tokens_from_usage(usage) -> int:
-    """Read OpenAI's prompt-cache hit count from ``usage.prompt_tokens_details``.
+    """Read the prompt-cache hit count from an OpenAI-shaped ``usage`` object.
 
-    Returns 0 when the field is absent (older models / no cache hit). These
-    cached input tokens are billed at a discount, so the usage tracker records
-    them separately for accurate cost estimation.
+    Two wire shapes (audit finding #6, 2026-07-13): OpenAI proper nests it as
+    ``usage.prompt_tokens_details.cached_tokens``; DeepSeek's OpenAI-compatible
+    endpoint reports it TOP-LEVEL as ``usage.prompt_cache_hit_tokens``
+    (api-docs.deepseek.com — its cache-hit rate is ~2% of input, so missing it
+    over-reported DeepSeek costs by up to ~50×). Nested shape wins when both
+    are present. Returns 0 when neither is set (older models / no cache hit).
+    These cached input tokens bill at ``ModelPricing.cached_input``, so the
+    usage tracker records them separately for accurate cost estimation.
     """
     if usage is None:
         return 0
     details = getattr(usage, "prompt_tokens_details", None)
-    if details is None:
-        return 0
-    cached = getattr(details, "cached_tokens", None)
-    if isinstance(cached, int):
+    if details is not None:
+        cached = getattr(details, "cached_tokens", None)
+        if isinstance(cached, int) and cached > 0:
+            return cached
+    cached = getattr(usage, "prompt_cache_hit_tokens", None)
+    if isinstance(cached, int) and cached > 0:
         return cached
     return 0

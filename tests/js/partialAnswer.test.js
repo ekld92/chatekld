@@ -58,7 +58,7 @@ describe('plain chat partial answers + draft-safe retry (Track 3.5)', () => {
         const historyEl = document.getElementById('plainchat-history');
         // Pre-fix the bubble was removed wholesale.
         expect(historyEl.textContent).toContain('Début de réponse utile.');
-        expect(historyEl.textContent).toContain('interrompue');
+        expect(historyEl.textContent).toContain('interrupted');   // E13: UI standardized to English
     });
 
     it('Retry re-sends the failed question without clobbering a fresh draft', async () => {

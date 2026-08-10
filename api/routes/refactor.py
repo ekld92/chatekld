@@ -701,6 +701,129 @@ def api_refactor_custom_edit():
     })
 
 
+# Single-flight gate for the piecewise runner (its own gate, not the per-action
+# registry: the run spans MANY LLM calls on the SSE worker thread, and a second
+# concurrent run would interleave on LOCAL_MODEL_LOCK for no benefit).
+_PIECEWISE_GATE = threading.Lock()
+
+
+@refactor_bp.route("/api/refactor/rewrite-piecewise", methods=["POST"])
+def api_refactor_rewrite_piecewise():
+    """Section-by-section LLM edit of an over-cap note (SSE) — Batch D.
+
+    Body: ``{rel, scope_subdir?, action ∈ {rewrite, custom}, instruction?}``.
+    Offered by the UI when the single-call ``/rewrite`` / ``/custom-edit``
+    422s on the whole-note cap: each section ≤ ``REWRITE_MAX_CHARS`` gets its
+    own bounded LLM call (over-cap sections are skipped WITH a reason, never
+    clipped), the results are spliced back-to-front over the original spans
+    (``refactor/piecewise.py``), and the combined whole-note proposal is
+    **staged** under the same action so the existing confirmed
+    ``/apply-staged`` (stale-diff + WYSIWYG + journal) applies it unchanged.
+
+    Frames: ``{"info"}`` per section, terminal ``{"piecewise": {rel, action,
+    content_sha256, proposed_sha256, diff, changed, edited_count,
+    sections:[{index,title,status,detail}]}}``. 429 when a piecewise run is
+    already in flight; the note changing on disk mid-run aborts (staging
+    would bind a stale base).
+    """
+    vault_root, err = _vault_root_or_error()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    cfg = load_config()
+    rel, raw, rerr = _read_scope_note(data, cfg, vault_root)
+    if rerr:
+        return rerr
+    text, derr = _decode_strict_or_error(raw)
+    if derr:
+        return derr
+    action = coerce_enum(data.get("action"), ("rewrite", "custom"))
+    if action is None:
+        return jsonify({"error": "action must be 'rewrite' or 'custom'."}), 400
+    instruction = coerce_string_max_len(data.get("instruction"), _INSTRUCTION_MAX)
+    if action == "custom" and (not instruction or not instruction.strip()):
+        return jsonify({"error": "instruction is required for a custom edit."}), 400
+
+    if not _PIECEWISE_GATE.acquire(blocking=False):
+        return jsonify({"error": "A piecewise edit is already running; wait for it to finish."}), 429
+
+    content_sha256 = sha256_bytes(raw)
+    from refactor import piecewise as piecewise_mod
+
+    def _worker(put, cancel):
+        try:
+            def _run_edit(section_body: str) -> dict:
+                if action == "custom":
+                    return llm_edit_mod.custom_edit(
+                        section_body, instruction, cfg,
+                        should_cancel=cancel.is_set)
+                return llm_edit_mod.rewrite_formatting(
+                    section_body, cfg, should_cancel=cancel.is_set)
+
+            def _progress(i, n, title):
+                put({"info": f"Editing section {i}/{n}: {title}…"})
+
+            result = piecewise_mod.piecewise_edit(
+                text,
+                run_edit=_run_edit,
+                max_chars=llm_edit_mod.REWRITE_MAX_CHARS,
+                should_cancel=cancel.is_set,
+                progress_cb=_progress,
+            )
+            if cancel.is_set():
+                return
+            if result.error:
+                put({"error": result.error})
+                return
+            # The note changing mid-run would bind the staged proposal to a
+            # stale base — apply-staged would 409, but refuse early with a
+            # clear message instead of staging something unusable.
+            try:
+                current = (Path(vault_root) / rel).read_bytes()
+            except OSError as exc:
+                put({"error": f"Note became unreadable: {sanitise_error_msg(exc)}"})
+                return
+            if sha256_bytes(current) != content_sha256:
+                put({"error": "The note changed on disk during the run — "
+                              "re-run the piecewise edit."})
+                return
+            changed = result.proposed != text
+            payload = {
+                "rel": rel, "action": action,
+                "content_sha256": content_sha256,
+                "changed": changed, "edited_count": result.edited_count,
+                "sections": [o.to_jsonable() for o in result.outcomes],
+                "model": result.model, "provider": result.provider,
+            }
+            if changed:
+                try:
+                    desc = staging_mod.stage(
+                        Path(vault_root), rel, content_sha256,
+                        result.proposed, action)
+                except Exception as exc:  # noqa: BLE001
+                    put({"error": sanitise_error_msg(exc)})
+                    return
+                payload["proposed"] = result.proposed
+                payload["proposed_sha256"] = desc["proposed_sha256"]
+                payload["diff"] = _unified_diff(text, result.proposed, rel)
+            put({"piecewise": payload})
+        except Exception as exc:  # noqa: BLE001
+            if not cancel.is_set():
+                put({"error": sanitise_error_msg(exc)})
+
+    # Consumer stall bound: each section emits an info BEFORE its LLM call, so
+    # the drain advances per section — the guard only needs to outlast ONE
+    # call, which is the same bound the single-shot actions use. The gate
+    # release rides the skeleton's _SSEOpGuard (fires exactly once, stream
+    # ended AND worker exited — the deck-op-lock discipline), so a consumer
+    # that disconnects before first iteration can't leak the gate.
+    return run_sse_worker(
+        _worker,
+        consumer_timeout_s=_llm_action_deadline_s(cfg),
+        release=_PIECEWISE_GATE.release,
+    )
+
+
 @refactor_bp.route("/api/refactor/pdf-refs", methods=["POST"])
 def api_refactor_pdf_refs():
     """List a note's resolvable PDF embeds for the summary action — request c.
@@ -1063,6 +1186,10 @@ def api_refactor_apply():
         from pathlib import Path
         results = apply_mod.apply_notes(
             Path(vault_root), cfg, approved, heartbeat=lambda: obsidian_manager.heartbeat(op_epoch))
+    except journal.JournalUnreadableError as exc:
+        # Existing-but-unreadable manifest: writing would overwrite the restore
+        # history (see JournalUnreadableError). 503 = retryable, nothing written.
+        return jsonify({"error": sanitise_error_msg(exc)}), 503
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     finally:
@@ -1127,6 +1254,8 @@ def api_refactor_normalize():
         from pathlib import Path
         results = format_fix_mod.apply_normalize(
             Path(vault_root), cfg, approved, heartbeat=lambda: obsidian_manager.heartbeat(op_epoch))
+    except journal.JournalUnreadableError as exc:
+        return jsonify({"error": sanitise_error_msg(exc)}), 503
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     finally:
@@ -1181,6 +1310,8 @@ def api_refactor_apply_staged():
     try:
         result = llm_apply_mod.apply_staged_note(
             Path(vault_root), cfg, rel, ch.strip(), ph.strip(), action)
+    except journal.JournalUnreadableError as exc:
+        return jsonify({"error": sanitise_error_msg(exc)}), 503
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     finally:
@@ -1233,6 +1364,8 @@ def api_refactor_archive():
         result = archive_mod.archive_image(
             Path(vault_root), cfg, scope, note_rel, image_rel, content_sha256.strip(),
             heartbeat=lambda: obsidian_manager.heartbeat(op_epoch))
+    except journal.JournalUnreadableError as exc:
+        return jsonify({"error": sanitise_error_msg(exc)}), 503
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     finally:
@@ -1261,6 +1394,10 @@ def api_refactor_manifest():
     try:
         from pathlib import Path
         manifest = journal.load(Path(vault_root), cfg)
+    except journal.JournalUnreadableError as exc:
+        # Read-only route, but the same message matters: the history exists and
+        # is intact on disk — nothing should "fix" it by overwriting.
+        return jsonify({"error": sanitise_error_msg(exc)}), 503
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     return jsonify({"ok": True, "ops": manifest.get("ops", [])})
@@ -1276,6 +1413,12 @@ def api_refactor_restore():
     if err:
         return err
     data = request.get_json(silent=True) or {}
+    # B8 (2026-07-13): restore mutates the vault (rewrites note bodies, moves
+    # images, DELETES docgen-created notes) — gate it on confirm like the other
+    # vault-write endpoints. The JS client already sends confirm: true; the
+    # server never enforced it (doc/contract drift).
+    if coerce_bool(data.get("confirm")) is not True:
+        return jsonify({"error": "Restore must be explicitly confirmed (confirm: true)."}), 400
     cfg = load_config()
     if (e := _archive_dir_ok_or_error(vault_root, cfg)):
         return e
@@ -1309,6 +1452,20 @@ def api_refactor_restore():
             targets = [op]
         results = []
         for op in targets:
+            # B8 (2026-07-13): heartbeat per op so a long {all:true} restore over
+            # many ops (large archived images copied back on a slow disk) cannot
+            # let the 600 s op-lock TTL lapse mid-restore and admit a second
+            # writer — parity with the apply/normalize/archive writers.
+            # Finding 1 (2026-07-20 audit): act on the heartbeat's return. If it
+            # is False the TTL already lapsed and another operation took the
+            # lock, so any further revert would write as a second concurrent
+            # writer. Stop cleanly — the manifest is already persisted per-op, so
+            # the reverts done so far are durable — and surface the truncation.
+            if not obsidian_manager.heartbeat(op_epoch):
+                results.append({"op_id": None, "status": "aborted",
+                                "message": "lock_lost: restore stopped to avoid "
+                                           "a concurrent writer; retry it."})
+                break
             r = journal.revert_op(root, cfg, op)
             results.append({"op_id": op.get("id"), **r})
             # Persist after EACH revert (not once after the loop): revert_op has
@@ -1321,6 +1478,8 @@ def api_refactor_restore():
         # over-cap history so the manifest/`.bak` disk stays bounded.
         journal.prune(root, cfg, manifest)
         journal.save(root, cfg, manifest)
+    except journal.JournalUnreadableError as exc:
+        return jsonify({"error": sanitise_error_msg(exc)}), 503
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     finally:

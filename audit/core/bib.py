@@ -32,6 +32,27 @@ class BibEntry:
     year: str | None = None
     authors: list[str] = field(default_factory=list)
     keywords: set[str] = field(default_factory=set)
+    # Normalised DOI (lowercased, ``https://doi.org/`` / ``doi:`` prefixes
+    # stripped) — additive 2026-08-05, feeds the near-duplicate identifier
+    # tier (two entries sharing a DOI = record-level duplicate candidate).
+    doi: str | None = None
+
+
+def normalise_doi(raw: str) -> str | None:
+    """Canonicalise a DOI string: strip URL/``doi:`` prefixes, lowercase.
+
+    Returns ``None`` for anything that does not look like a ``10.xxxx/...``
+    DOI after stripping — a malformed field must not create a spurious
+    identifier-match key.
+    """
+    s = (raw or "").strip()
+    for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/",
+                   "http://dx.doi.org/", "doi:"):
+        if s.lower().startswith(prefix):
+            s = s[len(prefix):].strip()
+            break
+    s = s.lower().rstrip(".,;")
+    return s if s.startswith("10.") and "/" in s else None
 
 
 def _strip_braces(s: str) -> str:
@@ -113,6 +134,7 @@ def parse_bib(path: Path) -> list[BibEntry]:
                 year=year,
                 authors=authors,
                 keywords=keywords,
+                doi=normalise_doi(_strip_braces(entry.get("doi", ""))),
             )
         )
 

@@ -267,7 +267,10 @@ def build_inventory(
     # everything".  Without this guard ``str.startswith("")`` is True for
     # every filename and the active set collapses to zero, which silently
     # produces an empty inventory.
-    skip_prefix = settings.biblio_skip_prefix or None
+    # B3 (2026-07-13): compare case-insensitively on BOTH sides. The filenames
+    # are already lower()ed but the configured prefix kept the user's case, so a
+    # prefix saved as ``Z_item`` silently matched nothing.
+    skip_prefix = (settings.biblio_skip_prefix or "").lower() or None
     if skip_prefix:
         pdfs_skipped = [
             p for p in all_pdfs if p.name.lower().startswith(skip_prefix)

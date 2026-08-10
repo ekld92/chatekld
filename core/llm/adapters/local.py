@@ -40,7 +40,8 @@ from core.llm.types import (
     LLMUsage,
     ToolCall,
 )
-from core.llm.usage import estimate_tokens, usage_tracker
+from core.llm.budget import estimate_prompt_tokens, pick_num_ctx
+from core.llm.usage import CANCELLED_ERROR_CATEGORY, estimate_tokens, usage_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,25 @@ def _effective_local_timeout(request: LLMRequest) -> Optional[float]:
     return float(max(1, round(min(candidates))))
 
 
+def _auto_ollama_num_ctx(request: LLMRequest, prompt_tokens: int) -> int:
+    """Per-request ``num_ctx`` sized to the actual payload (WP-C1).
+
+    Ollama silently truncates a prompt exceeding ``num_ctx`` (default ~4k) —
+    the server never signals it, so the client must size the window itself
+    (ollama/ollama #8099/#4967). Quantised to :data:`~core.llm.budget.
+    NUM_CTX_LADDER` rungs so consecutive requests reuse a loaded model
+    instead of re-loading per size, and capped at the ``context_window``
+    config key (the user's statement of what the local model can take).
+    """
+    from core.config import load_config_readonly
+
+    try:
+        ceiling = load_config_readonly().get("context_window", 32768)
+    except Exception:
+        ceiling = 32768
+    return pick_num_ctx(prompt_tokens, request.max_tokens, ceiling)
+
+
 class LocalLLMProvider(LLMProvider):
     """Thin adapter around the existing :class:`core.providers.base.Provider`.
 
@@ -230,6 +250,11 @@ class LocalLLMProvider(LLMProvider):
         if request.tools:
             return self._generate_with_tools(request)
         text_chunks: list[str] = []
+        # Accounting fix (2026-07-22 audit B10): this non-streaming call drains
+        # the stream internally, so the stream's finally-recorder must log it
+        # as stream=False — every deckgen salvage pass / plain generate was
+        # otherwise recorded as streamed in llm_usage.jsonl.
+        request.metadata["_record_as_stream"] = False
         stream = self.stream(request)
         for token in stream.response_gen:
             text_chunks.append(token)
@@ -279,6 +304,7 @@ class LocalLLMProvider(LLMProvider):
         usage_tracker.record(
             provider=self.name,
             model=request.model,
+            workflow=request.workflow,
             usage=response.usage,
             latency_ms=latency_ms,
             stream=False,
@@ -313,6 +339,17 @@ class LocalLLMProvider(LLMProvider):
         ctx = request.metadata.get("num_ctx") if request.metadata else None
         if ctx is not None:
             options["num_ctx"] = int(ctx)
+        else:
+            # WP-C1: Ollama silently truncates to its ~4k default num_ctx —
+            # an agent turn whose tool history outgrew that lost its earliest
+            # tool results with no signal. Size the window to the actual
+            # payload (quantised ladder, capped at the context_window config).
+            options["num_ctx"] = _auto_ollama_num_ctx(
+                request,
+                estimate_prompt_tokens(
+                    request.system_prompt, messages, tools_payload,
+                ),
+            )
 
         call_kwargs: dict = {
             "model": resolved,
@@ -327,7 +364,16 @@ class LocalLLMProvider(LLMProvider):
         # wedged backend cannot outlive the agent turn's wall-clock budget.
         timeout = _effective_local_timeout(request)
         client = provider._client() if timeout is None else provider._client(timeout=timeout)
-        raw = client.chat(**call_kwargs)
+        # Suppress thinking unless this call site opted in (2026-07-30): a
+        # reasoning model otherwise burns num_predict on message.thinking that
+        # nothing here reads, returning an empty reply. metadata["ollama_think"]
+        # is the per-call-site opt-in seam for a future reasoning consumer.
+        from core.providers.ollama import chat_with_think_off
+        if (request.metadata or {}).get("ollama_think"):
+            call_kwargs["think"] = True
+            raw = client.chat(**call_kwargs)
+        else:
+            raw = chat_with_think_off(client, call_kwargs)
 
         msg = _ollama_attr(raw, "message") or {}
         content = _ollama_attr(msg, "content") or ""
@@ -367,8 +413,9 @@ class LocalLLMProvider(LLMProvider):
         """One non-streaming OpenAI-shape ``chat.completions.create(tools=...)``
         call against the LM Studio server.
 
-        Builds a one-shot ``openai.OpenAI`` client pointed at LM Studio's
-        ``base_url`` (placeholder api key), bounded by
+        Uses the shared cached client from
+        :func:`core.providers.lms.get_lmstudio_client` (whole-second timeout,
+        ``max_retries=0``), bounded by
         :func:`_effective_local_timeout` like the Ollama branch, then parses the
         OpenAI-native ``tool_calls`` and estimates usage when missing.
         """
@@ -445,6 +492,7 @@ class LocalLLMProvider(LLMProvider):
         usage_tracker.record(
             provider=self.name,
             model=request.model,
+            workflow=request.workflow,
             usage=LLMUsage(),
             latency_ms=latency_ms,
             stream=False,
@@ -478,12 +526,26 @@ class LocalLLMProvider(LLMProvider):
                 kwargs["num_predict"] = request.max_tokens
             else:
                 kwargs["max_tokens"] = request.max_tokens
-        ctx = request.metadata.get("num_ctx")
-        if ctx is not None and self.name == "ollama":
-            kwargs["num_ctx"] = int(ctx)
+        ctx = request.metadata.get("num_ctx") if request.metadata else None  # guard parity with the tools path
+        if self.name == "ollama":
+            if ctx is not None:
+                kwargs["num_ctx"] = int(ctx)
+            else:
+                # WP-C1: see _ollama_chat_with_tools — same silent-truncation
+                # guard for the flattened streaming path (plain chat, refactor
+                # LLM edits, deck compile-fix repairs).
+                kwargs["num_ctx"] = _auto_ollama_num_ctx(
+                    request,
+                    estimate_prompt_tokens(system_prompt, prompt),
+                )
         repeat_penalty = request.metadata.get("repeat_penalty")
         if repeat_penalty is not None and self.name == "ollama":
             kwargs["repeat_penalty"] = repeat_penalty
+        if self.name == "ollama" and (request.metadata or {}).get("ollama_think"):
+            # Per-call-site opt-in: forward think=True verbatim (see the
+            # think-suppression note in core/providers/ollama.py). Default is
+            # suppression inside stream_chat itself, so every caller is covered.
+            kwargs["think"] = True
 
         start = time.monotonic()
         try:
@@ -501,12 +563,35 @@ class LocalLLMProvider(LLMProvider):
 
         def _iter() -> Iterator[str]:
             stream_error: LLMError | None = None
+            cancelled = False
+            # Real token counts when the backend reports them (lot 6bis):
+            # Ollama's FINAL streamed chunk (done=true) carries
+            # prompt_eval_count / eval_count (github.com/ollama/ollama
+            # docs/api.md, verified 2026-07-12) — capture them from every
+            # chunk (only the last one has them) and prefer them over the
+            # tiktoken estimate. LM Studio's OpenAI-compat stream returns no
+            # usage on this legacy path, so it keeps the estimate.
+            counted_in = 0
+            counted_out = 0
             try:
                 for chunk in stream_iter:
                     token = self._extract_token(chunk)
                     if token:
                         buf.append(token)
                         yield token
+                    pe = _ollama_attr(chunk, "prompt_eval_count")
+                    ev = _ollama_attr(chunk, "eval_count")
+                    if pe:
+                        counted_in = int(pe)
+                    if ev:
+                        counted_out = int(ev)
+            except GeneratorExit:
+                # Consumer abandoned the stream (client disconnect) — marked,
+                # not failed. See CANCELLED_ERROR_CATEGORY. The estimate
+                # fallbacks below already cover the counts a cancel denies us
+                # (Ollama reports real ones only on its final chunk).
+                cancelled = True
+                raise
             except Exception as exc:
                 stream_error = _classify_local_error(exc, provider=self.name, model=request.model)
                 raise stream_error
@@ -515,18 +600,26 @@ class LocalLLMProvider(LLMProvider):
                 final.latency_ms = int((time.monotonic() - start) * 1000)
                 final.finish_reason = FinishReason.ERROR if stream_error else FinishReason.STOP
                 final.usage = LLMUsage(
-                    input_tokens=estimate_tokens(self._concat_prompt(prompt, system_prompt)),
-                    output_tokens=estimate_tokens(final.text),
+                    input_tokens=counted_in or estimate_tokens(
+                        self._concat_prompt(prompt, system_prompt)),
+                    output_tokens=counted_out or estimate_tokens(final.text),
                 )
                 final.error = stream_error
                 usage_tracker.record(
                     provider=self.name,
                     model=request.model,
+                    workflow=request.workflow,
                     usage=final.usage,
                     latency_ms=final.latency_ms,
-                    stream=True,
+                    # generate() drains this same stream internally and flags
+                    # itself via metadata — record those as non-streamed.
+                    stream=bool((request.metadata or {}).get("_record_as_stream", True)),
                     success=stream_error is None,
-                    error_category=stream_error.category.value if stream_error else "",
+                    error_category=(
+                        stream_error.category.value if stream_error
+                        else CANCELLED_ERROR_CATEGORY if cancelled
+                        else ""
+                    ),
                 )
 
         return StreamingResponse(response_gen=_iter(), final=final)

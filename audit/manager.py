@@ -25,7 +25,9 @@ from typing import Optional
 
 from .config import AuditConfigError, Settings, load_settings
 from .engine import duplicates as eng_duplicates
+from .engine import dup_decisions as eng_dup_decisions
 from .engine import inventory as eng_inventory
+from .engine import near_duplicates as eng_near_duplicates
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +61,23 @@ class AuditManager:
         # so a stale inventory cannot leak into a new run.
         self._inventory: Optional[eng_inventory.Inventory] = None
         self._duplicates: Optional[list[eng_duplicates.DuplicateSet]] = None
+        self._near_duplicates: Optional[eng_near_duplicates.NearDupReport] = None
         self._settings: Optional[Settings] = None
+        # Route-injected page-1 PDF-text provider for the near-duplicate
+        # tiers (plan 2026-08-05/4); None on the CLI path.
+        self._pdf_text_provider = None
         self._error: str = ""
         self._started_at: float = 0.0
         self._finished_at: float = 0.0
         # Run-id increments per scan so a stale cancel request from the
         # previous run cannot abort the current one.
         self._run_id: int = 0
+        # Opaque callbacks fired whenever the cached result is REPLACED or
+        # CLEARED (finding 4, 2026-07-20 audit). The route layer registers its
+        # search-corpus cache invalidator here so a replaced Inventory is not
+        # pinned in the corpus memo until the next search. Kept opaque so this
+        # vendored module never imports the route (dependency direction holds).
+        self._result_listeners: list = []
 
     # ------------------------------------------------------------------
     # Status / messages
@@ -114,6 +126,7 @@ class AuditManager:
             finished = self._finished_at
             has_results = self._inventory is not None
             has_duplicates = self._duplicates is not None
+            has_near = self._near_duplicates is not None
         return {
             "state": state,
             "error": error,
@@ -121,6 +134,7 @@ class AuditManager:
             "finished_at": finished or None,
             "has_results": has_results,
             "has_duplicates": has_duplicates,
+            "has_near_duplicates": has_near,
             "messages": self.drain_messages(),
         }
 
@@ -132,6 +146,8 @@ class AuditManager:
         *,
         count_annotations: bool = True,
         include_duplicates: bool = True,
+        include_near_duplicates: bool = True,
+        pdf_text_provider=None,
     ) -> tuple[bool, str]:
         """Start a scan thread. Returns ``(started, message)``.
 
@@ -139,6 +155,13 @@ class AuditManager:
         the audit config is incomplete (no vault path, etc.). Either
         condition is communicated to the caller as a string rather than
         raised, since the route layer turns it into a 4xx response.
+
+        ``pdf_text_provider`` (plan 2026-08-05/4) is an optional
+        ``Callable[[Path], str | None]`` giving cache-first, page-bounded
+        page-1 text for a PDF — built by the ROUTE layer over the app's PDF
+        text cache and injected here, per the vendored-tree rule (the same
+        seam shape ``search.build_corpus`` uses for ``vocab``). ``None`` (the
+        CLI path) degrades the text-based near-duplicate tiers to hash-only.
         """
         with self._state_lock:
             if self._state == STATE_SCANNING:
@@ -155,6 +178,7 @@ class AuditManager:
             # during the brief gap; the cached result is replaced under
             # the same lock once the worker finishes.
             self._settings = settings
+            self._pdf_text_provider = pdf_text_provider
             self._stop_event = threading.Event()
             self._error = ""
             self._started_at = time.time()
@@ -162,6 +186,13 @@ class AuditManager:
             self._state = STATE_SCANNING
             self._run_id += 1
             run_id = self._run_id
+            # B10/#38 (2026-07-13): capture THIS run's stop event and pass it to
+            # the worker, which polls it by local reference. Polling
+            # ``self._stop_event`` let a reset_to_idle + immediate re-scan replace
+            # the attribute before the old worker observed the set event, silently
+            # losing its cancellation (two scans then run concurrently). The
+            # run_id still drops the stale result; this stops the wasted work.
+            stop_event = self._stop_event
 
         self.clear_messages()
         self._emit(f"Starting audit scan against {settings.vault_root}")
@@ -169,7 +200,8 @@ class AuditManager:
         thread = threading.Thread(
             target=self._run,
             name=f"audit-scan-{run_id}",
-            args=(settings, count_annotations, include_duplicates, run_id),
+            args=(settings, count_annotations, include_duplicates,
+                  include_near_duplicates, run_id, stop_event),
             daemon=True,
         )
         with self._state_lock:
@@ -219,11 +251,36 @@ class AuditManager:
         with self._state_lock:
             return self._duplicates, self._settings
 
+    def get_near_duplicates(self) -> tuple[Optional["eng_near_duplicates.NearDupReport"], Optional[Settings]]:
+        """Return the cached near-duplicate report + settings (None until ready
+        or when the phase was skipped on the last run)."""
+        with self._state_lock:
+            return self._near_duplicates, self._settings
+
+    def register_result_listener(self, cb) -> None:
+        """Register a callback fired when the cached result is replaced/cleared.
+
+        The route layer registers its search-corpus invalidator so a superseded
+        Inventory is dropped promptly (finding 4). Idempotent per callback.
+        """
+        if cb not in self._result_listeners:
+            self._result_listeners.append(cb)
+
+    def _fire_result_listeners(self) -> None:
+        """Call every result listener outside the state lock (never raises)."""
+        for cb in list(self._result_listeners):
+            try:
+                cb()
+            except Exception:  # noqa: BLE001 — a listener must never break a scan
+                logger.exception("AuditManager result listener failed")
+
     def clear_results(self) -> None:
         """Drop cached results without touching the running state."""
         with self._state_lock:
             self._inventory = None
             self._duplicates = None
+            self._near_duplicates = None
+        self._fire_result_listeners()
 
     def reset_to_idle(self) -> None:
         """Cancel any in-flight scan, drop cached results, return to idle.
@@ -242,11 +299,13 @@ class AuditManager:
             self._run_id += 1
             self._inventory = None
             self._duplicates = None
+            self._near_duplicates = None
             self._error = ""
             self._state = STATE_IDLE
             self._started_at = 0.0
             self._finished_at = 0.0
         self.clear_messages()
+        self._fire_result_listeners()
 
     # ------------------------------------------------------------------
     # Worker
@@ -256,7 +315,9 @@ class AuditManager:
         settings: Settings,
         count_annotations: bool,
         include_duplicates: bool,
+        include_near_duplicates: bool,
         run_id: int,
+        stop_event: "threading.Event",
     ) -> None:
         """The scan worker body (one per thread); never called directly.
 
@@ -274,22 +335,36 @@ class AuditManager:
         defence — an unhandled error becomes ``STATE_ERROR``, not a dead thread.
         """
         try:
+            # Full curated-hash re-anchor, ONCE per scan (2026-07-20 audit
+            # finding 2). This picks up a PDF annotated since it was curated so
+            # a later move stays recoverable. It used to run on every /api/audit/
+            # mapping POST — O(curated) full-file hashes per triage click, so a
+            # deck session against a large curation set grew each Assign's
+            # latency without bound. The scan is the right (infrequent) home; the
+            # per-POST writers still anchor the PDF they just wrote. Best-effort.
+            try:
+                from .engine import bridge as _eng_bridge
+                _eng_bridge.refresh_mapping_hashes(settings.mapping_file, settings.vault_root)
+            except Exception:  # noqa: BLE001 — a stale anchor must not fail a scan
+                logger.debug("scan-time mapping-hash re-anchor skipped", exc_info=True)
+
             self._emit("Building inventory (bib + bridge + Zotero + Obsidian)...")
             inv = eng_inventory.build_inventory(
                 settings,
                 count_annotations=count_annotations,
-                cancel_fn=self._stop_event.is_set,
+                cancel_fn=stop_event.is_set,
                 # Route the unmapped-PDF annotation phase's progress lines into
                 # the status feed so the (potentially multi-second) parallel
                 # read is visible in the UI and Cancel has something to act on.
                 progress_fn=self._emit,
             )
-            if self._stop_event.is_set():
+            if stop_event.is_set():
                 # Cancelled before duplicate detection ever ran: clear the
                 # duplicate cache so /api/audit/reports/duplicates does
                 # not serve stale results from a prior run.
                 self._finalise(
-                    STATE_CANCELLED, run_id, inv=inv, dupes=None, clear_dupes=True
+                    STATE_CANCELLED, run_id, inv=inv, dupes=None,
+                    clear_dupes=True, near=None, clear_near=True,
                 )
                 self._emit("Scan cancelled after inventory phase.")
                 return
@@ -312,31 +387,66 @@ class AuditManager:
                     "malformed frontmatter — see chatekld.log for the full list."
                 )
 
+            # Persistent full-hash memo (plan 2026-08-05/4): unchanged files
+            # never re-read. Loaded once for both hash-driven phases,
+            # saved after whichever ran last; a cancelled run still keeps
+            # whatever it hashed.
+            from .core import hash_cache as core_hash_cache
+            _hash_memo = core_hash_cache.load_cache()
+
             duplicates: Optional[list[eng_duplicates.DuplicateSet]] = None
             if include_duplicates:
                 self._emit(
                     f"Hashing PDFs under {settings.biblio_articles_dir} for duplicates..."
                 )
                 duplicates = eng_duplicates.find_biblio_duplicates(
-                    settings, cancel_fn=self._stop_event.is_set
+                    settings, cancel_fn=stop_event.is_set,
+                    hash_cache=_hash_memo,
                 )
-                if self._stop_event.is_set():
-                    self._finalise(STATE_CANCELLED, run_id, inv=inv, dupes=duplicates)
+                if stop_event.is_set():
+                    core_hash_cache.save_cache(_hash_memo)
+                    self._finalise(
+                        STATE_CANCELLED, run_id, inv=inv, dupes=duplicates,
+                        near=None, clear_near=True,
+                    )
                     self._emit("Scan cancelled during duplicate detection.")
                     return
 
-                self._finalise(STATE_DONE, run_id, inv=inv, dupes=duplicates)
-            else:
-                # User explicitly opted out of duplicate detection on this
-                # run; clear any prior duplicates so the UI does not
-                # report ``has_duplicates: true`` against a fresh inventory.
-                self._finalise(
-                    STATE_DONE, run_id, inv=inv, dupes=None, clear_dupes=True
+            near: Optional[eng_near_duplicates.NearDupReport] = None
+            if include_near_duplicates:
+                self._emit("Scanning for near-duplicate candidates...")
+                near = eng_near_duplicates.find_near_duplicates(
+                    settings, inv, duplicates or [],
+                    pdf_text_provider=self._pdf_text_provider,
+                    hash_cache=_hash_memo,
+                    dismissed=eng_dup_decisions.load_dismissed(),
+                    ratio_cutoff=settings.near_dup_ratio,
+                    cancel_fn=stop_event.is_set,
+                    progress_fn=self._emit,
                 )
+            core_hash_cache.save_cache(_hash_memo)
+            if stop_event.is_set():
+                self._finalise(
+                    STATE_CANCELLED, run_id, inv=inv,
+                    dupes=duplicates, clear_dupes=duplicates is None,
+                    near=near, clear_near=near is None,
+                )
+                self._emit("Scan cancelled during near-duplicate detection.")
+                return
+
+            # ``clear_*`` fires when the user opted out of that phase on this
+            # run, so the UI never reports stale results against a fresh
+            # inventory.
+            self._finalise(
+                STATE_DONE, run_id, inv=inv,
+                dupes=duplicates, clear_dupes=duplicates is None,
+                near=near, clear_near=near is None,
+            )
             self._emit(
                 f"Scan complete: {len(inv.records)} records, "
                 f"{len(inv.bridge.unmapped_pdfs)} unmapped PDFs"
                 + (f", {len(duplicates)} duplicate sets" if duplicates is not None else "")
+                + (f", {len(near.candidates)} near-duplicate candidates" if near is not None else "")
                 + "."
             )
         except Exception as exc:  # pragma: no cover - defensive
@@ -353,6 +463,8 @@ class AuditManager:
         dupes: Optional[list[eng_duplicates.DuplicateSet]] = None,
         error: str = "",
         clear_dupes: bool = False,
+        near: Optional["eng_near_duplicates.NearDupReport"] = None,
+        clear_near: bool = False,
     ) -> None:
         """Atomically update the result cache + state under ``_state_lock``.
 
@@ -362,7 +474,11 @@ class AuditManager:
         cached duplicates because this run did not produce a fresh set";
         the worker passes it whenever ``include_duplicates`` was false or
         the scan was cancelled before duplicate detection began.
+        ``near``/``clear_near`` carry the exact same semantics for the
+        near-duplicate report (plan 2026-08-05/5) — note an EMPTY list/report
+        is "ran, found nothing" and is stored, never confused with ``None``.
         """
+        replaced_result = False
         with self._state_lock:
             # Stale run completion (a new scan started while this one was
             # still finishing): drop the result on the floor and leave
@@ -371,14 +487,24 @@ class AuditManager:
                 return
             if inv is not None:
                 self._inventory = inv
+                replaced_result = True
             if dupes is not None:
                 self._duplicates = dupes
             elif clear_dupes:
                 self._duplicates = None
+            if near is not None:
+                self._near_duplicates = near
+            elif clear_near:
+                self._near_duplicates = None
             self._state = state
             if error:
                 self._error = error
             self._finished_at = time.time()
+        # Finding 4: a fresh Inventory replaced the old one — drop any cache
+        # (the route's search corpus) that still references the superseded
+        # object. Fired outside the state lock so a listener can't deadlock it.
+        if replaced_result:
+            self._fire_result_listeners()
 
 
 # Module-level singleton imported by the route layer and by tests that

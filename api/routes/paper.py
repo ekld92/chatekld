@@ -31,7 +31,6 @@ from core.constants import (
     PROMPT_PRESETS,
     SYSTEM_PROMPT_LIMIT,
     TARGET_AUDIENCE_OPTIONS,
-    SSE_SINGLE_SHOT_FLOOR_S,
     SSE_STALL_MARGIN_S,
 )
 from core.database import get_db_connection, DB_LOCK
@@ -42,12 +41,13 @@ from core.utils import (
 )
 from api.security import sanitise_error_msg
 from api.validators import (
+    coerce_bool,
     coerce_enum,
     coerce_int_in_range,
     coerce_non_empty_string,
     coerce_regex,
 )
-from api.sse import run_sse_worker
+from api.sse import online_aware_floor_s, run_sse_worker
 from rag.summarizer import summarise_stream
 
 paper_bp = Blueprint('paper', __name__)
@@ -219,6 +219,22 @@ def api_summarise():
         def _info_cb(msg: str) -> None:
             put({"info": msg})
 
+        # Export provenance (2026-07-22): announce the resolved provider/model
+        # + generation params so the client can stamp them into MD/TXT exports
+        # (the params resolve body → paper_* config server-side, so the client
+        # cannot reconstruct them reliably from its own controls).
+        put({"meta": {
+            "provider": summarise_provider,
+            "model": model,
+            "temperature": params["temperature"],
+            "max_tokens": params["max_tokens"],
+            "num_ctx": params["num_ctx"],
+            "top_p": params["top_p"],
+            "repeat_penalty": params["repeat_penalty"],
+        }})
+        from datetime import datetime, timezone
+        from core.llm.usage import usage_frame_payload, usage_tracker
+        start_iso = datetime.now(timezone.utc).isoformat()
         try:
             for token in summarise_stream(
                 stored_text,
@@ -236,6 +252,9 @@ def api_summarise():
                 repeat_penalty=params["repeat_penalty"],
                 provider_name=summarise_provider,
                 info_cb=_info_cb,
+                # The map phase yields nothing, so the per-token cancel check
+                # below can't stop it — the summariser polls this instead.
+                should_stop=cancel.is_set,
             ):
                 if cancel.is_set():
                     break
@@ -244,10 +263,26 @@ def api_summarise():
         except Exception as e:
             if not cancel.is_set():
                 put({"error": sanitise_error_msg(e)})
+            return
+        if cancel.is_set():
+            return
+        # Best-effort real token/cost totals for this summary (map-reduce runs
+        # make several calls; all are tagged workflow=paper_summary). Never
+        # fails the stream.
+        try:
+            payload = usage_frame_payload(
+                usage_tracker.records_since(start_iso, workflow="paper_summary")
+            )
+            if payload:
+                put({"usage": payload})
+        except Exception:
+            logger.debug("paper usage frame failed", exc_info=True)
 
     return run_sse_worker(
         _paper_worker,
-        consumer_timeout_s=SSE_SINGLE_SHOT_FLOOR_S + SSE_STALL_MARGIN_S,
+        # Floor widened to online_timeout_s (timeout-chain repair, 2026-07-22
+        # audit M2) — see api.sse.online_aware_floor_s.
+        consumer_timeout_s=online_aware_floor_s(load_config()) + SSE_STALL_MARGIN_S,
     )
 
 @paper_bp.route("/api/upload", methods=["POST"])
@@ -331,14 +366,22 @@ def api_export_summary():
     raw_name = str(data.get("filename", "summary")).replace(".pdf", "")
     safe_name = _safe_export_basename(raw_name)
     content = cap(data.get("content", ""), limit=500_000)
-    if export_format == "md":
+    # ``raw: true`` (review lot 4.3) means "write my content verbatim under my
+    # filename": no injected `# Summary -` heading and no `Summary_` filename
+    # prefix. The conversation exports use it — their content already carries
+    # its own title, so the default decoration produced a double H1 and a
+    # misleading `Summary_VaultChat_…` filename. Default (absent/false) keeps
+    # the legacy single-paper behaviour byte-identical.
+    raw_mode = coerce_bool(data.get("raw")) is True
+    if export_format == "md" and not raw_mode:
         title = safe_name.replace("_", " ").strip() or "Summary"
         content = f"# Summary - {title}\n\n{content}\n"
-    
+
     try:
         downloads = os.path.expanduser("~/Downloads")
         os.makedirs(downloads, exist_ok=True)
-        out_path = os.path.join(downloads, f"Summary_{safe_name}.{export_format}")
+        prefix = "" if raw_mode else "Summary_"
+        out_path = os.path.join(downloads, f"{prefix}{safe_name}.{export_format}")
         # Atomic write (temp sibling in ~/Downloads + rename): a crash or
         # disk-full mid-write must not leave a silently truncated summary
         # that the user only discovers after deleting the original chat.

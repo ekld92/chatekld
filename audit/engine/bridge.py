@@ -23,6 +23,7 @@ Bib-side author normalization:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
@@ -36,7 +37,16 @@ from typing import Any
 
 from ..config import Settings
 from ..core import bib as core_bib
+from ..core import hashing as core_hashing
 from ..core import obsidian as core_obs
+
+logger = logging.getLogger(__name__)
+
+# Hash-recovery candidate budget per scan (Step 1b). Bounds the worst case a
+# PERMANENT orphan creates: without a cap, one dead mapping entry would make
+# every future scan full-hash the entire unmapped corpus. 500 files at the
+# typical article size is a few seconds; hitting the cap WARNs.
+_HASH_RECOVERY_MAX_FILES = 500
 
 # Filename patterns
 _LEADING_NUM_PREFIX_RE = re.compile(r"^(?:\d+_)+", re.IGNORECASE)
@@ -74,6 +84,11 @@ class BridgeResult:
     # Diagnostics
     fm_pointer_fields_seen: dict[str, int] = field(default_factory=dict)
     notes_with_fm: int = 0
+    # Curated mapping entries whose stored path no longer resolves (hash
+    # recovery ran for them this scan — recovered or not). Non-zero after the
+    # scan means dead entries linger in mapping.json; surfaced in the summary
+    # so the user can re-curate instead of paying the recovery pass forever.
+    mapping_orphans: int = 0
 
 
 # -------- normalization helpers --------
@@ -250,21 +265,91 @@ def _fm_pointer_field_present(fm: dict[str, Any]) -> str | None:
 # -------- mapping.json I/O --------
 
 
-def _load_mapping(path: Path) -> tuple[dict[str, list[str]], set[str]]:
-    """Load ``mapping.json`` → ``(matches, no_match)``; ``({}, set())`` if absent.
+def _load_mapping_full(
+    path: Path,
+) -> tuple[dict[str, list[str]], set[str], dict[str, dict]]:
+    """ONE read of ``mapping.json`` → ``(matches, no_match, hashes)``.
 
-    ``matches`` is ``{citation_key: [vault-relative-pdf, ...]}`` and
-    ``no_match`` is the set of vault-relative PDFs the user confirmed are not
-    in the bib. Any read/parse error degrades to empty rather than raising —
-    a corrupt overrides file must not block a scan, only forfeit the curation.
+    ``matches`` is ``{citation_key: [vault-relative-pdf, ...]}``; ``no_match``
+    the set of PDFs the user confirmed are not in the bib; ``hashes`` the
+    hash-anchoring index ``{rel: {"sha256": str, "size": int|None}}`` (the
+    ``size`` is the cheap pre-filter for recovery — see ``build_bridge`` Step
+    1b). Legacy entries where the value is a bare sha256 string are normalised
+    to the dict shape with ``size=None`` (no pre-filter, still recoverable).
+
+    A single read matters: the two-call predecessor (`_load_mapping` +
+    `_load_hashes`) could observe two different on-disk versions around a
+    concurrent atomic save, pairing new matches with old hashes. Any read /
+    parse error degrades to empty rather than raising — a corrupt overrides
+    file must not block a scan, only forfeit the curation.
     """
     if not path.exists():
-        return {}, set()
+        return {}, set(), {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {}, set()
-    return data.get("matches", {}) or {}, set(data.get("no_match", []) or [])
+        return {}, set(), {}
+    matches = data.get("matches", {}) or {}
+    no_match = set(data.get("no_match", []) or [])
+    hashes: dict[str, dict] = {}
+    for k, v in (data.get("hashes", {}) or {}).items():
+        if isinstance(v, str) and v:
+            hashes[str(k)] = {"sha256": v, "size": None}
+        elif isinstance(v, dict) and isinstance(v.get("sha256"), str) and v["sha256"]:
+            size = v.get("size")
+            hashes[str(k)] = {
+                "sha256": v["sha256"],
+                "size": int(size) if isinstance(size, (int, float)) else None,
+            }
+    return matches, no_match, hashes
+
+
+def _preserve_corrupt_mapping(path: Path) -> None:
+    """If ``path`` holds non-empty, unparseable JSON, rename it aside before a
+    writer clobbers it (B10/#39, 2026-07-13).
+
+    ``_load_mapping_full`` degrades a corrupt file to empty for the SCAN read
+    path (a corrupt overrides file must not block a scan). But the RMW writers
+    then save an empty-loaded file over the corrupt one — permanently replacing a
+    hand-recoverable curation file (mapping.json is unregenerable). Preserve the
+    bytes in a non-clobbering ``mapping.json.corrupt-N`` sibling first. Called
+    under ``_MAPPING_RMW_LOCK`` by the writers only. Best-effort — never raises.
+    """
+    try:
+        if not path.exists():
+            return
+        raw = path.read_text(encoding="utf-8")
+        if not raw.strip():
+            return
+        json.loads(raw)   # parses fine → nothing to preserve
+        return
+    except OSError:
+        return
+    except Exception:
+        pass  # unparseable → fall through to preserve
+    try:
+        n = 0
+        while True:
+            dest = path.with_name(f"{path.name}.corrupt-{n}")
+            if not dest.exists():
+                os.replace(str(path), str(dest))
+                logger.warning("Preserved corrupt %s as %s before overwrite.", path.name, dest.name)
+                return
+            n += 1
+    except OSError:
+        logger.warning("Could not preserve corrupt %s before overwrite.", path.name, exc_info=True)
+
+
+def _load_mapping(path: Path) -> tuple[dict[str, list[str]], set[str]]:
+    """Back-compat wrapper over :func:`_load_mapping_full` (tests import it)."""
+    matches, no_match, _hashes = _load_mapping_full(path)
+    return matches, no_match
+
+
+def _load_hashes(path: Path) -> dict[str, dict]:
+    """Back-compat wrapper over :func:`_load_mapping_full` (tests import it)."""
+    _matches, _no_match, hashes = _load_mapping_full(path)
+    return hashes
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -308,18 +393,34 @@ def _write_text_atomic(path: Path, text: str) -> None:
         raise
 
 
-def save_mapping(path: Path, matches: dict[str, list[str]], no_match: set[str]) -> None:
+def save_mapping(
+    path: Path,
+    matches: dict[str, list[str]],
+    no_match: set[str],
+    hashes: dict[str, dict] | None = None,
+) -> None:
     """Persist the mapping atomically, fully sorted for a stable diff.
 
     Keys, per-key path lists, and the no-match set are all sorted so the
     on-disk file is deterministic (clean git/iCloud diffs, no spurious churn).
+    ``hashes`` (optional) is the anchoring index ``{rel: {sha256, size}}``; it
+    is pruned to only the paths still referenced by ``matches``/``no_match``
+    so a removed entry never leaves a stale hash behind, and omitted entirely
+    when empty so legacy files that never used anchoring stay byte-identical.
     Writes via :func:`_write_text_atomic` since this is the audit's only
     writable file and the data is hand-curated.
     """
-    payload = {
+    payload: dict[str, Any] = {
         "matches": {k: sorted(v) for k, v in sorted(matches.items())},
         "no_match": sorted(no_match),
     }
+    if hashes:
+        referenced = set(no_match)
+        for paths in matches.values():
+            referenced.update(paths)
+        pruned = {k: hashes[k] for k in sorted(hashes) if k in referenced}
+        if pruned:
+            payload["hashes"] = pruned
     _write_text_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False))
 
 
@@ -343,19 +444,46 @@ def _rel_to_vault(pdf: Path, vault_root: Path) -> str:
 _MAPPING_RMW_LOCK = threading.Lock()
 
 
+def _hash_entry(pdf: Path) -> dict | None:
+    """``{"sha256", "size"}`` for *pdf*, or ``None`` when unreadable.
+
+    Best-effort: a read failure (missing file, permissions) leaves the entry
+    un-anchored — path matching still works; hash recovery just won't kick in
+    for it. Deliberately called OUTSIDE ``_MAPPING_RMW_LOCK`` (the digest
+    depends only on the PDF, never on mapping state), so hashing a multi-MB
+    file can't serialise concurrent mapping POSTs behind disk-bound work.
+    """
+    digest = core_hashing.full_hash(pdf)
+    if not digest:
+        return None
+    try:
+        size = pdf.stat().st_size
+    except OSError:
+        size = None
+    return {"sha256": digest, "size": size}
+
+
 def add_matches(
     mapping_file: Path, items: list[tuple[Path, str]], vault_root: Path
 ) -> None:
     """Append multiple manual PDF→key matches, saving once."""
+    # Hash outside the lock (see _hash_entry).
+    new_hashes = {
+        _rel_to_vault(pdf, vault_root): entry
+        for pdf, _key in items
+        if (entry := _hash_entry(pdf)) is not None
+    }
     with _MAPPING_RMW_LOCK:
-        matches, no_match = _load_mapping(mapping_file)
+        _preserve_corrupt_mapping(mapping_file)   # B10/#39
+        matches, no_match, hashes = _load_mapping_full(mapping_file)
         for pdf, citation_key in items:
             rel = _rel_to_vault(pdf, vault_root)
             paths = matches.setdefault(citation_key, [])
             if rel not in paths:
                 paths.append(rel)
             no_match.discard(rel)
-        save_mapping(mapping_file, matches, no_match)
+        hashes.update(new_hashes)
+        save_mapping(mapping_file, matches, no_match, hashes)
 
 
 def add_match(
@@ -367,8 +495,15 @@ def add_match(
 
 def add_no_matches(mapping_file: Path, pdfs: list[Path], vault_root: Path) -> None:
     """Mark multiple PDFs as 'confirmed not in the bibliography', saving once."""
+    # Hash outside the lock (see _hash_entry).
+    new_hashes = {
+        _rel_to_vault(pdf, vault_root): entry
+        for pdf in pdfs
+        if (entry := _hash_entry(pdf)) is not None
+    }
     with _MAPPING_RMW_LOCK:
-        matches, no_match = _load_mapping(mapping_file)
+        _preserve_corrupt_mapping(mapping_file)   # B10/#39
+        matches, no_match, hashes = _load_mapping_full(mapping_file)
         for pdf in pdfs:
             rel = _rel_to_vault(pdf, vault_root)
             for key in list(matches):
@@ -377,12 +512,90 @@ def add_no_matches(mapping_file: Path, pdfs: list[Path], vault_root: Path) -> No
                     if not matches[key]:
                         del matches[key]
             no_match.add(rel)
-        save_mapping(mapping_file, matches, no_match)
+        hashes.update(new_hashes)
+        save_mapping(mapping_file, matches, no_match, hashes)
 
 
 def add_no_match(mapping_file: Path, pdf: Path, vault_root: Path) -> None:
     """Mark a PDF as 'confirmed not in the bibliography', dropping any prior match."""
     add_no_matches(mapping_file, [pdf], vault_root)
+
+
+def clear_curation(mapping_file: Path, pdf: Path, vault_root: Path) -> bool:
+    """Remove every curated decision for *pdf*; return whether anything changed.
+
+    The undo primitive behind the ambiguous-PDF triage deck: a mis-assigned
+    match or an over-eager "not in the bib" is otherwise unreachable — the two
+    writers above can only *replace* a decision with the other kind, never
+    return the PDF to its un-curated state so the next scan re-derives it.
+
+    Drops the PDF from every match list (deleting a key whose last path goes),
+    from the no-match set, and — via ``save_mapping``'s prune of unreferenced
+    entries — its stored content hash. Idempotent: clearing an un-curated PDF
+    is a no-op returning ``False``.
+    """
+    rel = _rel_to_vault(pdf, vault_root)
+    with _MAPPING_RMW_LOCK:
+        _preserve_corrupt_mapping(mapping_file)   # B10/#39
+        matches, no_match, hashes = _load_mapping_full(mapping_file)
+        changed = False
+        for key in list(matches):
+            if rel in matches[key]:
+                matches[key].remove(rel)
+                changed = True
+                if not matches[key]:
+                    del matches[key]
+        if rel in no_match:
+            no_match.discard(rel)
+            changed = True
+        if not changed:
+            return False
+        save_mapping(mapping_file, matches, no_match, hashes)
+        return True
+
+
+def refresh_mapping_hashes(mapping_file: Path, vault_root: Path) -> int:
+    """Re-hash every curated entry whose path still resolves; return the count.
+
+    The anchoring limitation this addresses: the stored hash reflects the file
+    as of the LAST curation action, and annotating a PDF changes its bytes —
+    so *annotate → move* would not be recoverable if nothing re-hashed the
+    still-present file in between. Called at SCAN time only (audit/manager._run)
+    — cost is O(curated) full-file hashes, which the 2026-07-21 audit finding 2
+    moved OFF the per-POST path (`add_match`/`add_no_match` anchor just the
+    written PDF); do not "restore" a per-POST call here, that was the fixed
+    perf bug. Missing files are left as-is — they are exactly the orphans
+    Step 1b needs the OLD hash for.
+
+    Hashing runs outside the RMW lock (same rationale as ``_hash_entry``); the
+    lock is retaken only for the re-read + save, and entries curated away by a
+    concurrent writer in the window are simply not re-added (`rel in hashes`
+    guard against the freshly-loaded state).
+    """
+    _matches, _no_match, hashes = _load_mapping_full(mapping_file)
+    refreshed: dict[str, dict] = {}
+    for rel in hashes:
+        p = vault_root / rel
+        try:
+            if not p.is_file():
+                continue
+        except OSError:
+            continue
+        entry = _hash_entry(p)
+        if entry is not None:
+            refreshed[rel] = entry
+    if not refreshed:
+        return 0
+    with _MAPPING_RMW_LOCK:
+        matches, no_match, hashes = _load_mapping_full(mapping_file)
+        updated = 0
+        for rel, entry in refreshed.items():
+            if rel in hashes and hashes[rel] != entry:
+                hashes[rel] = entry
+                updated += 1
+        if updated:
+            save_mapping(mapping_file, matches, no_match, hashes)
+        return updated
 
 
 # -------- bridge --------
@@ -414,20 +627,73 @@ def build_bridge(
     vault = settings.vault_root
     bib_by_key = {e.citation_key: e for e in bib_entries}
 
-    matches_raw, no_match_raw = _load_mapping(settings.mapping_file)
+    # ONE read: matches/no_match/hashes must come from the same on-disk
+    # version (a two-call load could straddle a concurrent atomic save).
+    matches_raw, no_match_raw, hashes_raw = _load_mapping_full(settings.mapping_file)
     manual_pdf_to_bib: dict[Path, str] = {}
+    mapped_rels: set[str] = set()
     for key, paths in matches_raw.items():
         for rel in paths:
+            mapped_rels.add(rel)
             try:
                 manual_pdf_to_bib[(vault / rel).resolve()] = key
             except OSError:
                 continue
     manual_no_match: set[Path] = set()
     for rel in no_match_raw:
+        mapped_rels.add(rel)
         try:
             manual_no_match.add((vault / rel).resolve())
         except OSError:
             continue
+
+    # Hash-anchoring recovery index (axis-ii): map each ORPHANED curated
+    # entry (a stored rel that no longer resolves to a file on disk) by its
+    # stored content hash, so a renamed/moved PDF is re-linked automatically
+    # on the next scan. Only orphaned entries are indexed — a still-present
+    # path is claimed directly above and needs no hashing — which bounds the
+    # extra hashing below to the actual recovery case. A digest shared by TWO
+    # orphaned entries mapped to DIFFERENT keys (byte-identical duplicate PDFs
+    # curated under distinct keys, then both moved) is ambiguous — recovery
+    # for it is refused rather than picking an iteration-order-dependent
+    # winner (the rows resurface as unmapped, where the user can re-curate).
+    orphan_hash_to_key: dict[str, str] = {}
+    orphan_hash_no_match: set[str] = set()
+    orphan_sizes: set[int] = set()
+    orphan_sizes_unknown = False
+    ambiguous_digests: set[str] = set()
+    if hashes_raw:
+        no_match_rels = set(no_match_raw)
+        for rel, entry in hashes_raw.items():
+            try:
+                exists = (vault / rel).is_file()
+            except OSError:
+                exists = False
+            if exists:
+                continue  # path still present → claimed by direct matching
+            digest = entry["sha256"]
+            if entry.get("size") is not None:
+                orphan_sizes.add(entry["size"])
+            else:
+                # Legacy entry without a size: the pre-filter can't screen for
+                # it, so candidates must be hashed regardless of their size.
+                orphan_sizes_unknown = True
+            if rel in no_match_rels:
+                orphan_hash_no_match.add(digest)
+            else:
+                for key, paths in matches_raw.items():
+                    if rel in paths:
+                        prior = orphan_hash_to_key.get(digest)
+                        if prior is not None and prior != key:
+                            ambiguous_digests.add(digest)
+                        else:
+                            orphan_hash_to_key[digest] = key
+                        break
+        for digest in ambiguous_digests:
+            orphan_hash_to_key.pop(digest, None)
+    result_orphan_count = (
+        len(orphan_hash_to_key) + len(orphan_hash_no_match) + len(ambiguous_digests)
+    )
 
     pdfs_by_name: dict[str, list[Path]] = defaultdict(list)
     pdfs_by_authoryear: dict[tuple[str, str], list[Path]] = defaultdict(list)
@@ -464,7 +730,7 @@ def build_bridge(
         result.source_per_pdf[p] = source
         matched.add(p)
 
-    # -- Step 1: manual mapping --
+    # -- Step 1: manual mapping (by path) --
     for p in pdfs:
         rp = p.resolve()
         if rp in manual_pdf_to_bib:
@@ -472,6 +738,64 @@ def build_bridge(
         elif rp in manual_no_match:
             result.confirmed_no_match_pdfs.append(p)
             matched.add(p)
+
+    # -- Step 1b: hash-anchoring recovery (renamed/moved curated PDFs) --
+    # Only runs when there are orphaned curated entries, and only hashes PDFs
+    # whose current rel path is NOT already in the mapping (a "new" location
+    # that could be the moved file) and that no path step has claimed. So a
+    # library with no moved files pays nothing here. Two further bounds keep
+    # a PERMANENT orphan (a curated PDF deleted outright, or moved out of the
+    # vault) from turning every future scan into a full-corpus hashing pass:
+    # (1) a size pre-filter — a candidate is hashed only when its byte size
+    # matches some orphan's recorded size (identical content ⇒ identical
+    # size; legacy entries without a size disable the filter for that scan);
+    # (2) a hard cap on hashed candidates per scan, WARNING-logged when hit
+    # so truncated recovery is never silent.
+    if orphan_hash_to_key or orphan_hash_no_match:
+        # Read-only consult of the duplicate scan's persistent hash memo
+        # (plan 2026-08-05/4): a size+mtime-valid entry saves the full read.
+        # Deliberately NOT saved back from here — the duplicates phase (same
+        # scan, later) owns the load→save cycle, so two writers never race.
+        from ..core import hash_cache as core_hash_cache
+        _hash_memo = core_hash_cache.load_cache()
+        hashed_candidates = 0
+        recovered = 0
+        for p in pdfs:
+            if p in matched:
+                continue
+            rel = _rel_to_vault(p, vault)
+            if rel in mapped_rels:
+                continue
+            if not orphan_sizes_unknown:
+                try:
+                    if p.stat().st_size not in orphan_sizes:
+                        continue
+                except OSError:
+                    continue
+            if hashed_candidates >= _HASH_RECOVERY_MAX_FILES:
+                logger.warning(
+                    "hash-recovery: candidate cap (%d) reached; remaining "
+                    "unmapped PDFs were not checked this scan. Re-curate or "
+                    "remove dead mapping entries to shrink the orphan set.",
+                    _HASH_RECOVERY_MAX_FILES,
+                )
+                break
+            digest = core_hashing.cached_full_hash(p, _hash_memo)
+            hashed_candidates += 1
+            if not digest:
+                continue
+            if digest in orphan_hash_to_key:
+                _link(p, orphan_hash_to_key[digest], "manual_hash")
+                recovered += 1
+            elif digest in orphan_hash_no_match:
+                result.confirmed_no_match_pdfs.append(p)
+                matched.add(p)
+                recovered += 1
+        logger.info(
+            "hash-recovery: %d orphaned entrie(s), %d candidate(s) hashed, "
+            "%d recovered", result_orphan_count, hashed_candidates, recovered,
+        )
+    result.mapping_orphans = result_orphan_count
 
     # -- Step 2a: frontmatter direct PDF pointers --
     fm_field_counter: dict[str, int] = defaultdict(int)

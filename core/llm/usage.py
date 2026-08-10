@@ -84,13 +84,61 @@ PRICING_TABLE: dict[str, ModelPricing] = {
     "claude-3-opus-20240229": ModelPricing(input=15.00, output=75.00, cached_input=1.50),
 
     # Google Gemini
-    "gemini-2.5-pro": ModelPricing(input=1.25, output=10.00),
-    "gemini-2.5-flash": ModelPricing(input=0.30, output=2.50),
-    "gemini-2.5-flash-lite": ModelPricing(input=0.10, output=0.40),
-    "gemini-2.0-flash": ModelPricing(input=0.10, output=0.40),
-    "gemini-2.0-flash-exp": ModelPricing(input=0.10, output=0.40),
-    "gemini-1.5-pro": ModelPricing(input=1.25, output=5.00),
-    "gemini-1.5-flash": ModelPricing(input=0.075, output=0.30),
+    # cached_input filled 2026-07-22 (audit B9): the Google adapter captures
+    # cachedContentTokenCount into cached_input_tokens, so a None here billed
+    # Gemini cache reads at the FULL input rate (systematic over-report —
+    # published cached rate is 25 % of input). Known residual: gemini-2.5-pro's
+    # >200k-prompt long-context tier (higher $/Mtok) is not modelled; these
+    # single-rate rows under-report very large-context calls.
+    "gemini-2.5-pro": ModelPricing(input=1.25, output=10.00, cached_input=0.31),
+    "gemini-2.5-flash": ModelPricing(input=0.30, output=2.50, cached_input=0.075),
+    "gemini-2.5-flash-lite": ModelPricing(input=0.10, output=0.40, cached_input=0.025),
+    "gemini-2.0-flash": ModelPricing(input=0.10, output=0.40, cached_input=0.025),
+    "gemini-2.0-flash-exp": ModelPricing(input=0.10, output=0.40, cached_input=0.025),
+    "gemini-1.5-pro": ModelPricing(input=1.25, output=5.00, cached_input=0.3125),
+    "gemini-1.5-flash": ModelPricing(input=0.075, output=0.30, cached_input=0.01875),
+
+    # DeepSeek — verified vs api-docs.deepseek.com/quick_start/pricing,
+    # 2026-07-12, RE-verified 2026-07-13 (audit #12 suspected a transcription
+    # slip): the ~2% cache-hit rates ARE correct — DeepSeek V4 prices cache
+    # hits at ~98% off input, far below the ~10-25% ratio other providers
+    # use; do not "fix" them upward. (cache-miss input / output; cached_input
+    # = cache-hit rate.) The deepseek-chat / deepseek-reasoner alias rows were
+    # dropped 2026-07-30: the ids retired at the provider's 2026-07-24 sunset
+    # and the 3→4 config migration resets any persisted selection, so no new
+    # call can carry them (historical usage records store cost at write time).
+    "deepseek-v4-flash": ModelPricing(input=0.14, output=0.28, cached_input=0.0028),
+    "deepseek-v4-pro": ModelPricing(input=0.435, output=0.87, cached_input=0.003625),
+
+    # Z.AI / Zhipu GLM — verified vs docs.z.ai/guides/overview/pricing,
+    # 2026-07-12. glm-4.7-flash and glm-4.5-flash are free-tier ($0).
+    "glm-5.2": ModelPricing(input=1.40, output=4.40, cached_input=0.26),
+    "glm-5": ModelPricing(input=1.00, output=3.20, cached_input=0.20),
+    "glm-4.7": ModelPricing(input=0.60, output=2.20, cached_input=0.11),
+    "glm-4.7-flash": ModelPricing(input=0.0, output=0.0),
+    "glm-4.6": ModelPricing(input=0.60, output=2.20, cached_input=0.11),
+    "glm-4.5": ModelPricing(input=0.60, output=2.20, cached_input=0.11),
+    "glm-4.5-air": ModelPricing(input=0.20, output=1.10, cached_input=0.03),
+    "glm-4.5-flash": ModelPricing(input=0.0, output=0.0),
+
+    # OpenRouter — verified against its public GET /api/v1/models (per-model
+    # pricing, USD/token converted to USD/Mtok), 2026-08-08. Ids are the
+    # aggregator's namespaced form and priced EXACTLY as listed there (the
+    # anthropic/claude-sonnet-5 row is OpenRouter's current $2/$10 intro rate,
+    # deliberately different from the direct-API "claude-sonnet-5" row above).
+    # A ":variant" suffix (:free, :batch) has its OWN price — hence the
+    # explicit :free row at $0 and the namespaced-id guard in
+    # estimate_cost_usd (no base-id fallback for vendor/model ids).
+    "anthropic/claude-haiku-4.5": ModelPricing(input=1.00, output=5.00, cached_input=0.10),
+    "anthropic/claude-sonnet-5": ModelPricing(input=2.00, output=10.00, cached_input=0.20),
+    "openai/gpt-5.4-mini": ModelPricing(input=0.75, output=4.50, cached_input=0.075),
+    "openai/gpt-5.4": ModelPricing(input=2.50, output=15.00, cached_input=0.25),
+    "google/gemini-3.6-flash": ModelPricing(input=1.50, output=7.50, cached_input=0.15),
+    "google/gemini-2.5-pro": ModelPricing(input=1.25, output=10.00, cached_input=0.125),
+    "deepseek/deepseek-v4-flash": ModelPricing(input=0.14, output=0.28, cached_input=0.028),
+    "meta-llama/llama-4-maverick": ModelPricing(input=0.20, output=0.80),
+    "moonshotai/kimi-k2.6": ModelPricing(input=0.5795, output=2.44, cached_input=0.0976),
+    "nvidia/nemotron-3-super-120b-a12b:free": ModelPricing(input=0.0, output=0.0),
 }
 
 LOCAL_PROVIDER_NAMES = frozenset({"ollama", "lm_studio"})
@@ -106,15 +154,32 @@ def estimate_cost_usd(model: str, usage: LLMUsage, overrides: Optional[dict] = N
     pricing = None
     if overrides and model in overrides:
         try:
+            # cached_input MUST be float()ed inside this guard too: a quoted
+            # number in a hand-edited config ('"0.125"') previously survived
+            # construction and only blew up as a TypeError at the cost
+            # multiplication — inside the adapters' streaming `finally`, so a
+            # fully successful stream ended in an error (2026-07-22 audit M1).
+            raw_cached = overrides[model].get("cached_input")
             pricing = ModelPricing(
                 input=float(overrides[model]["input"]),
                 output=float(overrides[model]["output"]),
-                cached_input=overrides[model].get("cached_input"),
+                cached_input=None if raw_cached is None else float(raw_cached),
             )
         except (KeyError, TypeError, ValueError):
             pricing = None
     if pricing is None:
-        pricing = PRICING_TABLE.get(model) or PRICING_TABLE.get(model.split(":")[0])
+        pricing = PRICING_TABLE.get(model)
+    if pricing is None and "/" not in model:
+        # split(":"): ollama ids are name:tag ("llama3.2:8b"); the bare name is
+        # retried so a hypothetical priced local model still matches. Local
+        # models are unpriced today, so this is future-proofing, not dead code.
+        # Gated to UN-namespaced ids (2026-08-08): OpenRouter ids are
+        # "vendor/model[:variant]" and a :variant carries its OWN price,
+        # distinct from its base (typically cheaper — :free is $0 — but not
+        # guaranteed for every variant kind), so falling back to the base row
+        # would mis-report — the unknown-model $0 fallback under-reports
+        # instead, which is the house rule. Curated :variant ids get exact rows.
+        pricing = PRICING_TABLE.get(model.split(":")[0])
     if pricing is None:
         return 0.0
     cost = (usage.output_tokens / 1_000_000) * pricing.output
@@ -164,6 +229,13 @@ class UsageRecord:
     # the on-disk JSONL in summary().  Defaults to "" so legacy records
     # written before this field still deserialize via UsageRecord(**data).
     uid: str = ""
+    # Which app feature made the call (the LLMRequest.workflow Prompt-Hub tag:
+    # "vault_chat", "tagging_propose", …). Added 2026-07-18 because the field
+    # was threaded through requests but never persisted — every JSONL row read
+    # workflow-less, which made the tagging-propose truncation bug undiagnosable
+    # from the usage log (nothing attributed the 7-token Gemini replies to
+    # Propose). Defaulted so legacy rows still deserialize.
+    workflow: str = ""
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -234,6 +306,7 @@ class UsageTracker:
         success: bool = True,
         error_category: str = "",
         pricing_overrides: Optional[dict] = None,
+        workflow: str = "",
     ) -> UsageRecord:
         """Cost out a request, append it to the ring, and persist it to JSONL.
 
@@ -262,7 +335,13 @@ class UsageTracker:
                 pricing_overrides = dict(overrides) if isinstance(overrides, dict) else None
             except Exception:  # noqa: BLE001 — costing must never break recording
                 pricing_overrides = None
-        cost = estimate_cost_usd(model, usage, pricing_overrides) if success else 0.0
+        # Belt-and-braces on the same contract: record() runs inside the
+        # adapters' stream `finally` blocks, so ANY exception out of the cost
+        # estimator turns a successful generation into a reported failure.
+        try:
+            cost = estimate_cost_usd(model, usage, pricing_overrides) if success else 0.0
+        except Exception:  # noqa: BLE001 — costing must never break recording
+            cost = 0.0
         usage.estimated_cost_usd = cost
         record = UsageRecord(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -278,6 +357,7 @@ class UsageTracker:
             success=success,
             error_category=error_category,
             uid=uuid.uuid4().hex,
+            workflow=workflow,
         )
         with self._lock:
             self._recent.append(record)
@@ -287,6 +367,10 @@ class UsageTracker:
                 os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
                 with open(log_path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(record.as_dict()) + "\n")
+                    # tell() after the append is the file size for free — no
+                    # extra stat on this per-request path.
+                    size = fh.tell()
+                self._rotate_log_if_large(log_path, size)
             except OSError:
                 logger.debug("could not append usage record to %s", log_path, exc_info=True)
         return record
@@ -299,6 +383,41 @@ class UsageTracker:
         """
         with self._lock:
             return list(self._recent)[-limit:]
+
+    def records_since(
+        self,
+        start_iso: str,
+        *,
+        workflow: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> list[UsageRecord]:
+        """Ring records recorded at/after *start_iso*, optionally filtered.
+
+        Powers the per-answer ``{"usage"}`` SSE frame (export provenance,
+        2026-07-22): a streaming route snapshots the UTC ISO timestamp before
+        generation and, after the stream ends, sums the matching records. Ring
+        only (never disk) — the records of interest were appended seconds ago,
+        and the disk parse is the expensive path. ISO-8601 UTC strings compare
+        lexicographically, matching :meth:`summary`'s convention. Best-effort by
+        design: a concurrent request against the same (workflow, provider,
+        model) triple could add its rows to the window — acceptable for a
+        single-user app, and the frame is documented as approximate.
+        """
+        with self._lock:
+            snapshot = list(self._recent)
+        out: list[UsageRecord] = []
+        for record in snapshot:
+            if record.timestamp < start_iso:
+                continue
+            if workflow is not None and record.workflow != workflow:
+                continue
+            if provider is not None and record.provider != provider:
+                continue
+            if model is not None and record.model != model:
+                continue
+            out.append(record)
+        return out
 
     def summary(self, since_iso: Optional[str] = None) -> UsageSummary:
         """Aggregate across the in-memory ring plus on-disk JSONL.
@@ -342,7 +461,15 @@ class UsageTracker:
             stat = os.stat(log_path)
             key = (stat.st_size, stat.st_mtime_ns)
         except OSError:
-            return []
+            # Right after a rotation the live log does not exist until the
+            # next append, but the .1 generation holds every record —
+            # returning [] here lost the whole on-disk window (2026-08-08
+            # audit lead, confirmed + fixed 2026-08-09).
+            try:
+                rstat = os.stat(log_path + _ROTATED_SUFFIX)
+            except OSError:
+                return []
+            key = ("rotated-only", rstat.st_size, rstat.st_mtime_ns)
         if cached_key == key:
             return cached
         records = list(self._iter_disk_records())
@@ -358,26 +485,59 @@ class UsageTracker:
         line, or a row with unexpected keys (``TypeError`` from ``UsageRecord(**data)``)
         is skipped rather than aborting the whole summary. Called only by
         :meth:`_disk_records`, which caches the result by the file's (size, mtime).
+
+        Reads the rotated ``<log>.1`` FIRST, then the live log (2026-07-30), so a
+        rotation does not punch a hole in a summary window that spans it. Records
+        are de-duplicated by ``uid`` downstream, so an overlap would be harmless
+        anyway.
         """
         log_path = self._log_path
-        if not log_path or not os.path.exists(log_path):
+        if not log_path:
+            return
+        for path in (log_path + _ROTATED_SUFFIX, log_path):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        try:
+                            yield UsageRecord(**data)
+                        except TypeError:
+                            continue
+            except OSError:
+                continue
+
+    def _rotate_log_if_large(self, log_path: str, size: int) -> None:
+        """Roll the append-only log over to ``<log>.1`` once it exceeds the cap.
+
+        ``llm_usage.jsonl`` was append-only and unbounded — one of the Tier-3
+        items deferred from the 2026-07-03 perf pass (fixed 2026-07-30). One
+        generation is kept: ``os.replace`` is atomic and overwrites any previous
+        ``.1``, and :meth:`_iter_disk_records` reads both, so a summary window
+        spanning the rotation still sees its records. Best-effort — a failed
+        rotation must never break the caller's request path; the log simply
+        keeps growing until the next attempt.
+        """
+        if size <= _MAX_LOG_BYTES:
             return
         try:
-            with open(log_path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    try:
-                        yield UsageRecord(**data)
-                    except TypeError:
-                        continue
+            os.replace(log_path, log_path + _ROTATED_SUFFIX)
         except OSError:
+            logger.debug("could not rotate usage log %s", log_path, exc_info=True)
             return
+        with self._lock:
+            # The parsed-disk cache is keyed on the LIVE file's (size, mtime),
+            # which the rotation just invalidated; drop it so the next summary
+            # re-reads both generations instead of trusting a stale parse.
+            self._disk_cache = []
+            self._disk_cache_key = None
 
     @staticmethod
     def _accumulate(summary: UsageSummary, record: UsageRecord) -> None:
@@ -415,6 +575,28 @@ class UsageTracker:
 usage_tracker = UsageTracker()
 
 
+def usage_frame_payload(records: list[UsageRecord]) -> Optional[dict]:
+    """Sum *records* into the ``{"usage"}`` SSE frame payload, or ``None``.
+
+    Shared by the streaming routes (plain chat, single-paper summarise, vault
+    single-shot) that attribute an answer's real token/cost figures for export
+    provenance. Returns ``None`` when there is nothing to report so callers can
+    skip the frame entirely. ``requests`` counts the underlying LLM calls
+    (map-reduce summaries and fallback retries make >1 per answer).
+    """
+    if not records:
+        return None
+    payload = {
+        "input_tokens": sum(r.input_tokens for r in records),
+        "output_tokens": sum(r.output_tokens for r in records),
+        "cost_usd": round(sum(r.cost_usd for r in records), 6),
+        "requests": len(records),
+    }
+    if payload["input_tokens"] <= 0 and payload["output_tokens"] <= 0:
+        return None
+    return payload
+
+
 def configure_default_usage_tracker(base_dir: str) -> None:
     """Point the singleton tracker at ``<base_dir>/llm_usage.jsonl``."""
     usage_tracker.configure(os.path.join(base_dir, "llm_usage.jsonl"))
@@ -437,12 +619,22 @@ def unpriced_curated_models() -> list[tuple[str, str]]:
         from core.llm.adapters.anthropic import CURATED_MODELS as anthropic_models
         from core.llm.adapters.google import CURATED_MODELS as google_models
         from core.llm.adapters.openai import CURATED_MODELS as openai_models
+        from core.llm.adapters.openai_compat import (
+            DEEPSEEK_CURATED_MODELS as deepseek_models,
+        )
+        from core.llm.adapters.openai_compat import ZAI_CURATED_MODELS as zai_models
+        from core.llm.adapters.openai_compat import (
+            OPENROUTER_CURATED_MODELS as openrouter_models,
+        )
     except Exception:  # noqa: BLE001 — a broken adapter must not break costing
         return pairs
     for provider, models in (
         ("openai", openai_models),
         ("anthropic", anthropic_models),
         ("google", google_models),
+        ("deepseek", deepseek_models),
+        ("zai", zai_models),
+        ("openrouter", openrouter_models),
     ):
         for model_id in models:
             if model_id not in PRICING_TABLE:
@@ -474,6 +666,37 @@ def _cl100k_encoding():
     return tiktoken.get_encoding("cl100k_base")
 
 
+#: ``error_category`` for a stream ABANDONED BY ITS CONSUMER — a client
+#: disconnect (or any caller closing the generator) propagates ``GeneratorExit``
+#: through the adapters' ``for chunk in stream``, which ``except Exception``
+#: deliberately does not catch. Before 2026-07-30 that landed in the ``finally``
+#: unmarked, so the record claimed a clean ``success=True`` stream.
+#:
+#: Recorded with ``success=True`` **on purpose**: `record()` forces
+#: ``cost = 0.0`` for a failure, but the provider really did generate — and
+#: really will bill — the tokens produced up to the cancel, so flagging it as a
+#: failure would zero real spend and make the under-reporting worse rather than
+#: visible. The category is what makes a cancelled stream identifiable in
+#: ``llm_usage.jsonl`` / ``/api/usage``.
+#:
+#: Residual, deliberately not papered over: on providers whose usage rides the
+#: FINAL chunk (OpenAI + the compat adapters), a cancel means no usage block
+#: ever arrived. Output tokens are re-estimated from the text actually streamed
+#: (those provably existed), but the prompt's input tokens are not fabricated —
+#: the payload is not in the generator's scope, and this file's rule is "better
+#: to under-report than to surface a fabricated number". Anthropic (usage on
+#: ``message_start``), Gemini (per-chunk ``usageMetadata``) and the local
+#: adapter (estimate fallback) are unaffected.
+CANCELLED_ERROR_CATEGORY = "cancelled"
+
+#: Size cap for ``llm_usage.jsonl`` before it rolls over to ``<log>.1``, and
+#: that suffix. One generation is kept and BOTH are read by the summary, so a
+#: rotation never punches a hole in a reporting window. 10 MB is ~40k records —
+#: far more than the 500-record ring or any realistic /api/usage window.
+_MAX_LOG_BYTES = 10 * 1024 * 1024
+_ROTATED_SUFFIX = ".1"
+
+
 def estimate_tokens(text: str) -> int:
     """Cheap heuristic when a provider does not return usage figures.
 
@@ -487,3 +710,46 @@ def estimate_tokens(text: str) -> int:
         return len(_cl100k_encoding().encode(text))
     except Exception:
         return max(1, len(text) // 4)
+
+
+def record_local_usage(
+    provider: str,
+    model: str,
+    *,
+    input_text: str = "",
+    output_text: str = "",
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    latency_ms: int = 0,
+    stream: bool = True,
+    success: bool = True,
+    error_category: str = "",
+    workflow: str = "",
+) -> None:
+    """Record a LOCAL generation (chat / summary / vision) in the usage log.
+
+    Local providers never return a usage block through the ``core.llm``
+    adapter seam (some bypass it entirely — LlamaIndex vault RAG, the
+    single-paper summariser's direct ``provider.stream_chat``, the vision
+    managers), so those calls were invisible to ``/api/usage``. This helper
+    estimates tokens with :func:`estimate_tokens` (unless the caller passes
+    exact counts) and appends a record so every call is *visible* even though
+    local models are unpriced (cost stays $0). Best-effort and never raises —
+    usage accounting must not break a generation path.
+    """
+    try:
+        in_tok = input_tokens if input_tokens is not None else estimate_tokens(input_text)
+        out_tok = output_tokens if output_tokens is not None else estimate_tokens(output_text)
+        usage = LLMUsage(input_tokens=int(in_tok or 0), output_tokens=int(out_tok or 0))
+        usage_tracker.record(
+            provider=provider or "local",
+            model=model or "",
+            usage=usage,
+            latency_ms=int(latency_ms or 0),
+            stream=stream,
+            success=success,
+            error_category=error_category,
+            workflow=workflow,
+        )
+    except Exception:  # noqa: BLE001 — recording must never break the caller
+        logger.debug("record_local_usage failed", exc_info=True)

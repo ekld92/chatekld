@@ -187,19 +187,84 @@ def test_screen_repair_accepts_clean_augment():
     assert accepted == proposed
 
 
+@pytest.mark.parametrize("macro", [
+    "\\verbatiminput{/Users/x/.ssh/id_rsa}",
+    "\\lstinputlisting{/etc/passwd}",
+    "\\InputIfFileExists{/etc/passwd}{}{}",
+    "\\ShellEscape{rm -rf /}",
+    "\\CatchFileEdef{\\x}{/etc/passwd}{}",
+    # 2026-07-20 audit finding 3: sibling file-readers the earlier list missed.
+    "\\VerbatimInput{/Users/x/.ssh/id_rsa}",
+    "\\import{/etc/}{passwd}",
+    "\\subimport{/etc/}{passwd}",
+    "\\includepdf{/etc/passwd}",
+    "\\inputminted{text}{/etc/passwd}",
+])
+def test_screen_repair_rejects_added_file_read_macros(macro):
+    # 2026-07-20 audit M2: these plain control words are the same file-read/
+    # exec class as \input and must be refused when INTRODUCED by a repair —
+    # a prompt-injected compile-fix could otherwise typeset a secret file.
+    parts = split_deck(_DECK)
+    evil = f"\\section{{Intro}}\n\\begin{{frame}}{{Intro}}\n  {macro}\n\\end{{frame}}"
+    proposed = replace_section(parts.tex, parts.sections[0], evil)
+    accepted, warnings = screen_repair(_DECK, proposed)
+    assert accepted is None
+    assert warnings and "unsafe" in warnings[0].lower()
+
+
+def test_screen_repair_rejects_added_occurrence_of_existing_macro():
+    """2026-07-22 audit M4: a deck legitimately containing one \\input must
+    NOT license a repair that adds MORE \\input occurrences — the old
+    name-set diff saw an empty 'introduced' set and let the second
+    occurrence (with an attacker-chosen path) through."""
+    parts = split_deck(_DECK)
+    original = replace_section(
+        parts.tex, parts.sections[0],
+        "\\section{Intro}\n\\begin{frame}{Intro}\n  \\input{preamble-extra}\n\\end{frame}",
+    )
+    o_parts = split_deck(original)
+    evil = ("\\section{Intro}\n\\begin{frame}{Intro}\n  \\input{preamble-extra}\n"
+            "  \\input{/Users/x/.ssh/id_rsa}\n\\end{frame}")
+    proposed = replace_section(o_parts.tex, o_parts.sections[0], evil)
+    accepted, warnings = screen_repair(original, proposed)
+    assert accepted is None
+    assert warnings and "unsafe" in warnings[0].lower()
+
+
+def test_screen_repair_allows_same_count_of_existing_macro():
+    """Count-equal is allowed: moving/re-arguing an existing occurrence is a
+    legitimate edit (e.g. a repair fixing the path of the deck's own \\input);
+    only an INCREASE is refused."""
+    parts = split_deck(_DECK)
+    original = replace_section(
+        parts.tex, parts.sections[0],
+        "\\section{Intro}\n\\begin{frame}{Intro}\n  \\input{preamble-extra}\n\\end{frame}",
+    )
+    o_parts = split_deck(original)
+    moved = ("\\section{Intro}\n\\begin{frame}{Intro}\n  \\input{preamble-fixed}\n"
+             "  \\begin{itemize}\\item deepened\\end{itemize}\n\\end{frame}")
+    proposed = replace_section(o_parts.tex, o_parts.sections[0], moved)
+    accepted, warnings = screen_repair(original, proposed)
+    assert accepted == proposed
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
 def test_augment_system_prompt_within_limit_and_op_specific():
     big_macros = "\n".join(f"  \\macro{i}{{arg}} — desc {i}" for i in range(400))
-    for op in ("deepen", "table", "new_section"):
+    for op in ("deepen", "table", "new_section", "reformat"):
         p = augment_system_prompt("residents", operation=op, macros_block=big_macros, cite_mode="bib")
         assert len(p) <= SYSTEM_PROMPT_LIMIT
         assert "residents" in p
     assert "DEEPEN" in augment_system_prompt("x", operation="deepen")
     assert "TABLE" in augment_system_prompt("x", operation="table")
     assert "NEW SECTION" in augment_system_prompt("x", operation="new_section")
+    reformat = augment_system_prompt("x", operation="reformat")
+    assert "REFORMAT" in reformat
+    # The content-preservation constraint is the load-bearing part of the rule.
+    assert "WITHOUT changing its content" in reformat
 
 
 def test_build_augment_message_wraps_existing_as_source():
@@ -240,3 +305,28 @@ def test_section_title_handles_nested_braces():
     deck = _DECK.replace("\\section{Intro}", "\\section{The \\textbf{bold} intro}")
     parts = split_deck(deck)
     assert parts.sections[0].title == "The \\textbf{bold} intro"
+
+
+# --- replace_sections (piecewise splice, Batch E 2026-07-22) ----------------
+
+def test_replace_sections_back_to_front_invariants():
+    from deckgen.augment import replace_sections
+    parts = split_deck(_DECK)
+    secs = parts.sections
+    assert len(secs) >= 2
+    # Identity: splicing every section's own body back returns the original.
+    ident = replace_sections(_DECK, [(s, s.body) for s in secs])
+    assert ident == _DECK
+    # Multi-edit: replace first and last, leave the middle untouched; bytes
+    # outside the edited spans are identical.
+    new_first = "\\section{Intro}\n\\begin{frame}{X}\n NEW1 \\end{frame}\n\n"
+    new_last = "\\section{Fin}\n\\begin{frame}{Y}\n NEW2 \\end{frame}\n\n"
+    out = replace_sections(_DECK, [(secs[0], new_first), (secs[-1], new_last)])
+    assert "NEW1" in out and "NEW2" in out
+    # The pre-section opening and the closing survive verbatim.
+    assert out.startswith(_DECK[:secs[0].start])
+    assert out.endswith(_DECK[secs[-1].end:])
+    # Order independence: passing the edits pre-sorted forward gives the same
+    # result (the function sorts descending internally).
+    out2 = replace_sections(_DECK, [(secs[-1], new_last), (secs[0], new_first)])
+    assert out == out2

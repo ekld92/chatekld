@@ -7,7 +7,7 @@ retrieval, embedding, or LLM code of its own and **never imports the app**.
 
 It **emits `.tex` only** (you compile it yourself), cites sources as **plain prose**
 (e.g. `(source: note.md)`), and works with **offline** (Ollama / LM Studio) and
-**online** (OpenAI / Anthropic / Google) providers.
+**online** (OpenAI / Anthropic / Google / DeepSeek / Z.AI / OpenRouter) providers.
 
 ## How it works
 
@@ -194,7 +194,8 @@ Note Refactor's preview-then-confirm write model. The deckgen **core stays app-i
 7. preview    return the proposed .tex + a frame/section count delta + a raw-byte
               sha256 token; STAGE the proposal server-side. Writes NOTHING to the deck.
 8. apply      POST /api/deck/apply-augment (confirm) — read the staged proposal,
-              stale-diff guard, re-screen, BACK UP <deck>.tex.bak, then write back
+              preview-binding + stale-diff guards, re-screen, BACK UP <deck>.tex.bak,
+              then write back
 ```
 
 The load-bearing invariant in [`augment.py`](augment.py) is `replace_section(tex, sec, sec.body)
@@ -207,8 +208,13 @@ the existing deck content (and any retrieved vault note) is *untrusted source* w
 (it matches Note Refactor's vault writers rather than apply-repair):
 
 - **server-side staging** — the preview stages the screened proposal under the app data dir
-  (`BASE_DIR/deckgen/staging/`); `apply-augment`'s body is `{deck_path, base_sha256, confirm}` and
-  the proposal is read **from staging, never from the client** (a page can't apply arbitrary `.tex`);
+  (`BASE_DIR/deckgen/staging/`); `apply-augment`'s body is `{deck_path, base_sha256,
+  proposed_sha256, confirm}` and the proposal is read **from staging, never from the client**
+  (a page can't apply arbitrary `.tex`);
+- **preview-binding** — the client's `proposed_sha256` (carried on the augment frame) must match
+  the staged digest, else **409**: staging is ONE slot per deck path, so a second window's preview
+  silently replaces the first and the stale-diff guard cannot see the swap (the deck on disk is
+  unchanged) — without this, Apply could write a proposal the user never reviewed;
 - **stale-diff** — the on-disk raw-byte sha must equal both the client's `base_sha256` and the
   staged base, else **409**;
 - **re-screen** — the staged proposal is run back through `screen_repair` against the current deck
@@ -263,9 +269,22 @@ it truly produced no usable content.
 | `1` | Written, but with `validate` warnings and/or *some* sections that produced no usable content (placeholder frames inserted). |
 | `2` | Written, but *every* section was a placeholder — the deck is effectively empty (bad model/vault). |
 
+## Preview PDF (in-app, write-free)
+
+Both deck panels (generate + augment) have a **Preview PDF** button (`POST
+/api/deck/compile-preview` + `GET /api/deck/preview-pdf`, 2026-07-12): one plain
+`latexmk -no-shell-escape` pass over the deck **as-is** — it never rewrites the `.tex`, only
+drops the same build artifacts (`.pdf`/`.aux`/`.log`) `make` would — then the compiled PDF is
+fetched header-authenticated and rendered in-app via a blob: URL (an `<iframe src>` at an `/api`
+route would be 403'd by the origin guard). A compile failure shows the log tail instead; an
+**Open in PDF viewer** fallback (`open-pdf`, macOS `open`) covers WKWebView builds that refuse
+inline blob PDFs. Runs under the same single deck-op lock (409 if another deck op is active),
+timeout capped at `min(deck_compile_timeout_s, 300)` because the route is synchronous.
+
 ## Compile & Auto-Fix (in-app only, opt-in)
 
-The one exception to "emit-only": after generating (or on any existing validated deck), the UI's
+The second exception to "emit-only" (and the only one that can rewrite the `.tex`): after
+generating (or on any existing validated deck), the UI's
 **Compile & Auto-Fix** button drives `POST /api/deck/compile-fix` — our **own** bounded
 `latexmk -interaction=nonstopmode -no-shell-escape` run (never the suite's `make`, whose mk could
 enable shell escape), with `TEXINPUTS`/`BIBINPUTS` pointed at the deck dir + the suite's `common/`
@@ -297,9 +316,10 @@ at the repo root (which *is* hermetic).
 
 ## Limitations
 
-- No in-app LaTeX **compilation** — emit-only. The opt-in integrity review (step 6, app
-  only) is an *LLM* pass + screened auto-repair, not a real `latexmk`/`pdflatex` run, so it
-  catches likely compile-blockers but cannot guarantee the deck compiles.
+- The **CLI** never compiles — emit-only. In-app, real `latexmk` runs exist as two opt-ins:
+  **Preview PDF** (write-free single pass) and **Compile & Auto-Fix** (repair loop) — see
+  their sections above. The integrity review (step 6, app only) remains an *LLM* pass +
+  screened auto-repair, not a compile, so on its own it cannot guarantee the deck compiles.
 - No automated figures (`\includegraphics` / `\commonlogo`); text frames only. (The model
   *may* emit a `\commonlogo{...}` it sees advertised, but deckgen does not place real images.)
 - `\citefoot{key}` cite mapping (template mode) is best-effort over a relevance-bounded

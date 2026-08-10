@@ -131,6 +131,14 @@ WORKFLOWS: tuple[dict, ...] = (
         "role": ROLE_SYSTEM,
     },
     {
+        "id": "tagging_propose",
+        "label": "Biblio Tagging · tag proposal",
+        "description": "Vocabulary-constrained classification prompt: the paper's cached PDF "
+        "text (untrusted source) + the _tags.md legend; the reply is re-constrained to real "
+        "tag ids before anything is offered to the user.",
+        "role": ROLE_SYSTEM,
+    },
+    {
         "id": "vision_describe",
         "label": "Vision · image description",
         "description": "Instruction sent to the vision model to describe + transcribe an image. "

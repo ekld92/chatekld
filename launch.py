@@ -17,6 +17,7 @@ This module orchestrates the full application lifecycle:
    behind.
 """
 
+import atexit
 import os
 import sys
 import signal
@@ -48,6 +49,16 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+# Redact API-key shapes on EVERY handler at write time: third-party loggers
+# (httpx logs full request URLs at INFO; Gemini carries the key in the query
+# string) bypass app-side sanitisation, so without this the raw key sat in
+# chatekld.log on disk (2026-07-18). /api/log/tail's read-time redaction only
+# protected the in-app viewer, not the file itself. Imported here (after
+# basicConfig, before any provider import) so no early log line escapes it.
+from core.llm.redact import RedactingFilter  # noqa: E402
+
+for _h in logging.getLogger().handlers:
+    _h.addFilter(RedactingFilter())
 
 logger = logging.getLogger(__name__)
 
@@ -481,6 +492,33 @@ def main():
             )
             sys.exit(1)
 
+        # Server-discovery handshake (2026-07-22 audit C0): record this
+        # process's port in BASE_DIR/server.json so the CLI/MCP driver can find
+        # the GUI's random port. Written exactly at the probe-verified "socket
+        # is accepting" moment (Flask 3 has no before_first_request and
+        # waitress.serve blocks, so the launch site IS the right hook). A
+        # pre-existing record from another LIVE server is logged and then
+        # overwritten — GUI wins, last-writer-wins, and readers always
+        # re-probe health so a stale record can never misroute a request.
+        try:
+            from core.server_info import (clear_server_info, pid_alive,
+                                          read_server_info, write_server_info)
+            _prev_info = read_server_info()
+            if _prev_info and _prev_info.get("pid") != os.getpid() \
+                    and pid_alive(_prev_info["pid"]):
+                logger.warning(
+                    "Another ChatEKLD server appears to be running on port %s "
+                    "(pid %s); the CLI/MCP tools will now target THIS instance.",
+                    _prev_info.get("port"), _prev_info.get("pid"),
+                )
+            write_server_info(port)
+            # Belt-and-braces for exits that skip the post-window cleanup
+            # (clear_server_info only deletes its OWN pid's record, so this
+            # can never race another instance's file).
+            atexit.register(clear_server_info)
+        except Exception:  # noqa: BLE001 — discovery is best-effort, never fatal
+            logger.warning("could not write server discovery file", exc_info=True)
+
         # Determine the configured LLM provider before spawning any background
         # threads so that each provider's startup thread is launched exactly once.
         # load_config() is safe to call here — Flask is already accepting requests
@@ -604,6 +642,16 @@ def main():
         # ----------------------------------------------------------------
         # webview.start() returned → user closed the window (Cmd+Q / ✕).
 
+        # Drop the server-discovery record first — the Flask thread is a
+        # daemon about to die with the process, and a lingering record would
+        # only cost the CLI one wasted health probe (pid-gated: only OUR
+        # record is ever deleted).
+        try:
+            from core.server_info import clear_server_info
+            clear_server_info()
+        except Exception:  # noqa: BLE001 — cleanup is best-effort
+            pass
+
         if _provider == "lm_studio":
             # LM Studio is a user-owned GUI process — we must not terminate it.
             # The startup thread is daemon=True so it will be cleaned up
@@ -615,10 +663,13 @@ def main():
             # start_ollama_server().  Without this join, a quick close could call
             # shutdown_ollama() before _ollama_process is assigned, leaving a
             # stray Ollama process running.
-            # 15 s matches the poll loop in start_ollama_server() (15 × 1 s).
-            # If the timeout expires, shutdown_ollama() reads _ollama_process
-            # under _ollama_process_lock and terminates it if it was ever set.
-            _ollama_thread.join(timeout=15.0)
+            # B10/#30 (2026-07-13): the readiness poll in start_ollama_server()
+            # is 30 × 1 s, so match the join to it (the old comment/timeout
+            # claimed 15 — a fast quit could then return with the non-daemon
+            # startup thread still polling a dead server for ~15 s more). If the
+            # timeout expires, shutdown_ollama() reads _ollama_process under
+            # _ollama_process_lock and terminates it if it was ever set.
+            _ollama_thread.join(timeout=30.0)
             try:
                 shutdown_ollama()
             except Exception as _e:

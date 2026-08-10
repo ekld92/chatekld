@@ -8,12 +8,17 @@
  * per-request; the server re-resolves them body → persisted paper_* → default.
  */
 import { secureFetch, consumeSSE } from './api.js';
-import { showTaskError, clearTaskError, copyToClipboard, announceStatus } from './ui.js';
+import { showTaskError, clearTaskError, copyToClipboard, announceStatus, announceError } from './ui.js';
 import { getActiveProvider } from './config.js';
 
 let _currentUploadId = null;
 let _currentFilename = 'summary';
+// Provenance of the LAST generated summary (the {"meta"}/{"usage"} SSE frames);
+// stamped into exports. Cleared on reset/upload alongside _currentFilename.
+let _lastSummaryMeta = null;
+let _lastSummaryUsage = null;
 let _summaryAbortController = null;
+let _uploadAbortController = null;   // C5/#47: abortable in-flight upload
 
 /** Populate the document-type <select> from /api/report-types (built-ins merged
  * with saved custom/overridden types server-side). Falls back to a lone
@@ -69,12 +74,22 @@ export function wireUploadDropzone() {
         const file = e.dataTransfer?.files?.[0];
         if (!file) return;
         if (!file.name.toLowerCase().endsWith('.pdf')) {
-            const content = document.getElementById('document-summary-content');
-            if (content) {
-                document.getElementById('upload-overlay').style.display = 'none';
-                document.getElementById('summary-view').style.display = 'flex';
-                content.textContent = 'Only .pdf files can be uploaded.';
+            // E8 (2026-07-22 audit): the old handler DESTROYED the dropzone
+            // (hid the overlay, showed the empty summary view) to display
+            // this one line — the only way back was the unhighlighted "New
+            // Paper" button. Keep the dropzone; show the error inline on it.
+            let err = document.getElementById('upload-drop-error');
+            if (!err) {
+                err = document.createElement('div');
+                err.id = 'upload-drop-error';
+                err.className = 'upload-drop-error';
+                zone.appendChild(err);
             }
+            const dropMsg = 'Only .pdf files can be uploaded — drop a PDF to continue.';
+            err.textContent = dropMsg;
+            // Static assertive region, not a role minted in the same tick as
+            // the text write (unreliable in WebKit — liveRegions ratchet class).
+            announceError(dropMsg);
             return;
         }
         input.files = e.dataTransfer.files;
@@ -101,13 +116,24 @@ export async function uploadPDF() {
     const formData = new FormData();
     formData.append('file', file);
 
+    // C5/#47 (2026-07-13): make the upload abortable so resetUpload() during an
+    // in-flight upload can cancel it — otherwise a late resolve re-enables
+    // Summarise and caches an upload_id while the tab shows the empty overlay.
+    if (_uploadAbortController) { try { _uploadAbortController.abort(); } catch (_) {} }
+    const uploadCtrl = new AbortController();
+    _uploadAbortController = uploadCtrl;
+
     try {
         const resp = await fetch('/api/upload', {
             method: 'POST',
             headers: { 'X-Requested-With': 'ChatEKLD' },
-            body: formData
+            body: formData,
+            signal: uploadCtrl.signal
         });
         const data = await resp.json();
+        // Superseded by a reset or a newer upload while we awaited — drop the
+        // result so we don't mutate a torn-down / newer view.
+        if (uploadCtrl.signal.aborted || _uploadAbortController !== uploadCtrl) return;
         if (data.upload_id) {
             // Item 3.8: free the superseded server-side upload. Re-uploading
             // used to just overwrite the id — the old extraction lingered on
@@ -128,7 +154,10 @@ export async function uploadPDF() {
             content.textContent = 'Upload failed: ' + data.error;
         }
     } catch (e) {
+        if (e.name === 'AbortError') return;   // C5/#47: cancelled upload — stay quiet
         content.textContent = 'Upload error: ' + e.message;
+    } finally {
+        if (_uploadAbortController === uploadCtrl) _uploadAbortController = null;
     }
 }
 
@@ -147,6 +176,12 @@ export async function summarisePDF() {
     // Show a waiting indicator until the first token arrives — a large doc or
     // a cold model can take many seconds, and a blank pane reads as "stuck".
     content.innerHTML = '<span class="typing-indicator"><span></span></span>';
+    // E1 (2026-07-22): stage line + persistent notices for the {info} frames
+    // (map-reduce progress, coverage/clip warnings) — see the markup comment.
+    const stageEl = document.getElementById('summarise-stage');
+    const noticesEl = document.getElementById('summarise-notices');
+    if (stageEl) { stageEl.hidden = true; stageEl.textContent = ''; }
+    if (noticesEl) { noticesEl.hidden = true; noticesEl.textContent = ''; }
     const btn = document.getElementById('summarise-btn');
     const exportBtn = document.getElementById('export-summary-btn');
     const exportMdBtn = document.getElementById('export-summary-md-btn');
@@ -165,6 +200,23 @@ export async function summarisePDF() {
     // clears the field if it still owns it (identity check).
     const controller = new AbortController();
     _summaryAbortController = controller;
+
+    // C5/#18 (2026-07-13): a dedicated Stop button so a long (map-reduce)
+    // summary can be cancelled WITHOUT discarding the uploaded paper — the only
+    // prior abort path was resetUpload(), which also clears the upload.
+    let stopBtn = document.getElementById('summarise-stop-btn');
+    if (!stopBtn) {
+        stopBtn = document.createElement('button');
+        stopBtn.id = 'summarise-stop-btn';
+        stopBtn.type = 'button';
+        stopBtn.className = 'btn btn-outline btn-sm';
+        stopBtn.textContent = 'Stop';
+        stopBtn.setAttribute('aria-label', 'Stop generating the summary');
+        btn.parentElement.insertBefore(stopBtn, btn.nextSibling);
+    }
+    stopBtn.style.display = '';
+    stopBtn.disabled = false;
+    stopBtn.onclick = () => { controller.abort(); stopBtn.disabled = true; stopBtn.textContent = 'Stopping…'; };
 
     const payload = {
         upload_id: _currentUploadId,
@@ -186,18 +238,45 @@ export async function summarisePDF() {
 
     try {
         let receivedText = false;
+        _lastSummaryMeta = null;
+        _lastSummaryUsage = null;
         await consumeSSE('/api/summarise', {
             method: 'POST',
             body: JSON.stringify(payload),
             signal: controller.signal
         }, {
-            onInfo: () => {},
+            onInfo: (msg) => {
+                // E1: the server engineered this path to be "slower, never
+                // silent" — render it. Transient progress lines end with an
+                // ellipsis ("Summarising part 3/12…") and replace each other
+                // in the stage line; anything else is a NOTICE (coverage cap,
+                // bibliography strip, fallback) that must persist beside the
+                // finished summary — dropping it made a partial summary read
+                // as complete.
+                if (!msg) return;
+                const transient = /(…|\.\.\.)\s*$/.test(String(msg).trim());
+                if (transient) {
+                    if (stageEl) { stageEl.hidden = false; stageEl.textContent = msg; }
+                } else if (noticesEl) {
+                    noticesEl.hidden = false;
+                    const line = document.createElement('div');
+                    line.textContent = msg;
+                    noticesEl.appendChild(line);
+                    announceStatus(msg);
+                }
+            },
             onToken: (token) => {
                 if (!receivedText) content.textContent = '';
                 content.textContent += token;
                 receivedText = true;
             },
-            onOther: () => {},
+            onOther: (frame) => {
+                // Export provenance (2026-07-22): the server resolves the
+                // generation params body → paper_* config, so this frame is
+                // the authoritative record of what ran.
+                if (frame && frame.meta) _lastSummaryMeta = frame.meta;
+                if (frame && frame.usage) _lastSummaryUsage = frame.usage;
+            },
             onError: (err) => { throw new Error(err); }
         });
 
@@ -207,7 +286,11 @@ export async function summarisePDF() {
         exportMdBtn.disabled = !canExport;
         announceStatus(receivedText ? 'Summary ready.' : 'No summary was generated.');
     } catch (e) {
-        if (e.name !== 'AbortError') {
+        if (e.name === 'AbortError') {
+            // C5/#18: user Stop — keep the upload, show a non-error notice.
+            content.textContent = 'Summary cancelled. The paper is still loaded — click Summarise to try again.';
+            announceStatus('Summary cancelled.');
+        } else {
             content.textContent = '';
             const el = document.getElementById('doc-error-boundary');
             showTaskError(el, 'Error: ' + e.message, [
@@ -218,6 +301,10 @@ export async function summarisePDF() {
     } finally {
         btn.disabled = false;
         btn.textContent = 'Summarise';
+        // The stage line is progress-only — clear it; NOTICES stay visible
+        // beside the summary (that's their whole point).
+        if (stageEl) { stageEl.hidden = true; stageEl.textContent = ''; }
+        if (stopBtn) { stopBtn.style.display = 'none'; stopBtn.textContent = 'Stop'; }
         if (_summaryAbortController === controller) _summaryAbortController = null;
     }
 }
@@ -251,10 +338,27 @@ export async function exportSummary(format = 'txt') {
     btn.disabled = true;
     btn.textContent = 'Exporting...';
 
+    // Provenance footer (2026-07-22): stamp the generating model + real usage
+    // beneath the summary body. Plain lines so the txt export stays readable;
+    // the server still injects its own "# Summary — …" heading for md.
+    let exportText = text;
+    if (_lastSummaryMeta) {
+        const m = _lastSummaryMeta;
+        const bits = [`Generated by ChatEKLD — ${[m.provider, m.model].filter(Boolean).join(' / ')}`];
+        if (typeof m.temperature === 'number') bits.push(`temperature ${m.temperature}`);
+        const u = _lastSummaryUsage;
+        if (u && (u.input_tokens || u.output_tokens)) {
+            bits.push(`${u.input_tokens || 0} in / ${u.output_tokens || 0} out tokens`);
+            if (u.cost_usd > 0) bits.push(`$${Number(u.cost_usd).toFixed(4)}`);
+        }
+        bits.push(new Date().toISOString().slice(0, 10));
+        exportText = `${text}\n\n---\n${bits.join(' · ')}\n`;
+    }
+
     try {
         const resp = await secureFetch('/api/export-summary', {
             method: 'POST',
-            body: JSON.stringify({ filename: _currentFilename, content: text, format })
+            body: JSON.stringify({ filename: _currentFilename, content: exportText, format })
         });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || 'Export failed.');
@@ -287,8 +391,16 @@ export async function resetUpload() {
         try { _summaryAbortController.abort(); } catch (_) {}
         _summaryAbortController = null;
     }
+    // C5/#47: also abort an in-flight UPLOAD so its late resolve can't re-enable
+    // Summarise / cache an upload_id after we've reset to the empty overlay.
+    if (_uploadAbortController) {
+        try { _uploadAbortController.abort(); } catch (_) {}
+        _uploadAbortController = null;
+    }
     _currentUploadId = null;
     _currentFilename = 'summary';
+    _lastSummaryMeta = null;
+    _lastSummaryUsage = null;
     document.getElementById('upload-overlay').style.display = 'flex';
     document.getElementById('summary-view').style.display = 'none';
     document.getElementById('pdf-upload').value = '';

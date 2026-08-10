@@ -1,17 +1,48 @@
 """Turn the model's per-section output into one valid Beamer ``.tex`` document.
 
-This is the load-bearing module: because ChatEKLD's ``system_prompt`` is only a
-*prefix* over its answer template, the model's section output is treated as
-untrusted "Beamer body" — we strip anything that does not belong inside the
+This is the load-bearing Beamer module: because ChatEKLD's ``system_prompt`` is
+only a *prefix* over its answer template, the model's section output is treated
+as untrusted "Beamer body" — we strip anything that does not belong inside the
 document body, assemble a known-good preamble around the sections ourselves, and
 run a light structural sanity check (no compiler — emit-only by design).
+
+The document-class-agnostic machinery (metadata escaping, title substitution,
+dangerous-macro / citation / graphics scanning, comment stripping, template
+assembly, and the common structural checks) lives in :mod:`deckgen.latex` and is
+**re-exported below** so every existing ``from deckgen.assemble import …`` keeps
+working byte-for-byte. This module keeps only the Beamer-specific pieces (the
+frame-centric preamble, ``sanitize_section``'s frame gate, and the frame-balance
+checks) and binds them into the ``BEAMER`` :class:`~deckgen.latex.DocClassStrategy`.
 """
 from __future__ import annotations
 
-import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+
+from .latex import (
+    DocClassStrategy,
+    SectionOutput,
+    _DOCUMENT_ENV_RE,
+    _FENCE_RE,
+    _PREAMBLE_LINE_RE,
+    _SECTION_RE,
+    _sections_block,
+    _strip_latex_comments,
+    latex_escape_metadata,
+    validate_common,
+)
+# Re-exported for backward compatibility (consumers import these from
+# deckgen.assemble): review.py, deck.py, __main__.py and the tests.
+from .latex import (  # noqa: F401
+    assemble_with_template,
+    comment_out_missing_graphics,
+    count_dangerous_macros,
+    extract_cite_keys,
+    extract_graphics_keys,
+    find_dangerous_macros,
+    substitute_title,
+)
 
 # Sentinel tokens for the preamble template. We deliberately do NOT use
 # str.format / string.Template because the LaTeX body is full of ``{``/``}`` and
@@ -45,120 +76,12 @@ _PREAMBLE_TEMPLATE = r"""\documentclass{beamer}
 \end{document}
 """
 
-# Lines that belong to the preamble / document scaffold and must never appear
-# inside a section body (we own the scaffold). Matched at line start after
-# optional whitespace.
-_PREAMBLE_LINE_RE = re.compile(
-    r"^\s*\\(?:documentclass|usepackage|usetheme|usecolortheme|usefonttheme"
-    r"|title|subtitle|author|institute|date|maketitle)\b"
-)
-_DOCUMENT_ENV_RE = re.compile(r"^\s*\\(?:begin|end)\{document\}")
+# Beamer-specific scaffold anchors (the frame environment and the owned title /
+# outline frames sanitize_section must strip from a section body).
 _TITLEPAGE_RE = re.compile(r"^\s*\\frame\{\\titlepage\}")
 _TOC_FRAME_HINT_RE = re.compile(r"\\tableofcontents")
-
-# A fenced code block wrapper the model may wrap its answer in.
-_FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*$")
-
 _FRAME_BEGIN_RE = re.compile(r"\\begin\{frame\}")
 _FRAME_END_RE = re.compile(r"\\end\{frame\}")
-_SECTION_RE = re.compile(r"\\section\b")
-
-# LaTeX macros that can execute shell commands or read/write arbitrary files at
-# *compile* time. The model's output is grounded in untrusted vault notes, so a
-# prompt-injection (or accident) could emit one of these; we never strip them
-# (that could corrupt legitimate content) but we WARN so the user reviews the
-# file and compiles without shell-escape. The list is intentionally broad —
-# shell-escape / file write (write, incl. `\write18`/`\write16`; openout;
-# immediate), file read (input/include/openin/read), and the LuaTeX escape
-# hatches (directlua/luaexec) plus the catch-all \special — because it is
-# advisory-only here and, in review.screen_repair, only ever blocks a repair
-# that INTRODUCES one not in the original (a legitimate template using e.g.
-# \special is never falsely refused; it just earns an advisory warning).
-#
-# The terminator is ``\d*(?![a-zA-Z])`` (NOT ``\b``): a TeX control word ends at
-# the first non-letter, so this matches stream-numbered forms like ``\write18`` /
-# ``\openout15`` (where ``\b`` fails — it counts the trailing digit as a word
-# char) and CAPTURES the digits so the warning names the exact macro
-# (``\write18`` = shell-escape, not just ``\write``); the ``(?![a-zA-Z])`` still
-# excludes a longer letter-suffixed macro such as the safe, common
-# ``\includegraphics`` (``\include`` followed by the letter ``g``). See
-# validate() and review.screen_repair().
-_DANGEROUS_MACRO_RE = re.compile(
-    r"\\(?:write|immediate|openin|openout|input|include|read"
-    r"|special|directlua|luaexec|@@?input)\d*(?![a-zA-Z])"
-)
-
-# A ``\csname … \endcsname`` construction. LaTeX builds a control sequence from the
-# literal text between the two macros at expansion time, so ``\csname write18\endcsname``
-# IS ``\write18`` — a shell-escape the plain ``\macro`` regex above never matches
-# (there is no backslash before ``write18``). We reconstruct the built name and run
-# it through the same dangerous-word test. ``re.DOTALL`` so a multi-line build is
-# still caught.
-_CSNAME_RE = re.compile(r"\\csname\s*(.*?)\\endcsname", re.DOTALL)
-
-# The dangerous control-word stems, as bare names (no leading backslash), for the
-# reconstructed-``\csname`` test. Kept in sync with the alternation above.
-_DANGEROUS_WORDS = (
-    "write", "immediate", "openin", "openout", "input", "include", "read",
-    "special", "directlua", "luaexec", "@@input", "@input",
-)
-
-
-def find_dangerous_macros(tex: str) -> set[str]:
-    """Return the set of dangerous compile-time macros found in *tex*.
-
-    THE single detector shared by :func:`validate` and
-    :func:`deckgen.review.screen_repair` so the advisory warning and the repair
-    safety-gate can never disagree. Catches both the direct ``\\write18`` form AND
-    the ``\\csname write18\\endcsname`` / ``\\@@input`` obfuscations a prompt-injected
-    vault note could use to smuggle a shell-escape past a naive ``\\macro`` scan.
-    Comments are stripped first (a commented-out ``\\input`` is inert).
-
-    KNOWN RESIDUAL LIMITS (documented honestly, not over-claimed): a determined
-    attacker can still defeat a regex-only screen via catcode tricks or char-by-char
-    construction (``\\string`` / ``\\lowercase{…}`` / ``\\expandafter`` chains that
-    assemble the name from fragments). This screen RAISES THE BAR; it is not a
-    sandbox. The real safety net is the emit-only design plus the standing advice to
-    compile WITHOUT shell-escape (``pdflatex -no-shell-escape``).
-    """
-    scan = _strip_latex_comments(tex or "")
-    found: set[str] = set(_DANGEROUS_MACRO_RE.findall(scan))
-    for inner in _CSNAME_RE.findall(scan):
-        bare = "".join(inner.split()).lstrip("\\")   # builder ignores whitespace; drop a written-in backslash
-        for word in _DANGEROUS_WORDS:
-            # Match the word optionally followed by a stream number (write18) but
-            # not a longer letter-suffixed macro (includegraphics) — same semantics
-            # as the ``\d*(?![a-zA-Z])`` terminator on the direct-form regex.
-            if bare == word or (bare.startswith(word)
-                                and bare[len(word):].lstrip("0123456789") == ""):
-                found.add(f"\\csname {bare}\\endcsname")
-                break
-    return found
-
-# Citation commands whose argument is a (comma-separated list of) bib key(s).
-# Used by the hallucinated-key guard in validate() and is biblatex/natbib-aware.
-_CITE_MACRO_RE = re.compile(
-    r"\\(?:cite|citefoot|textcite|parencite|autocite|smartcite|footcite"
-    r"|citeauthor|citeyear|citep|citet|citealp|citealt|citenum)\*?"
-    r"(?:\[[^\]]*\])*\s*\{([^}]*)\}"
-)
-
-_GRAPHICS_RE = re.compile(
-    r"\\includegraphics\*?(?:\[[^\]]*\])*\s*\{([^}]*)\}"
-)
-
-# Characters to escape when injecting CLI-supplied metadata into LaTeX macros.
-# Order matters: backslash is not escaped (metadata is plain text and a stray
-# backslash is far rarer than the listed specials); we keep this conservative.
-_METADATA_ESCAPES = {
-    "&": r"\&",
-    "%": r"\%",
-    "$": r"\$",
-    "#": r"\#",
-    "_": r"\_",
-    "{": r"\{",
-    "}": r"\}",
-}
 
 
 @dataclass
@@ -171,23 +94,8 @@ class DeckMeta:
     theme: str = "Madrid"
 
 
-@dataclass
-class SectionOutput:
-    """One section's sanitized Beamer body plus provenance for logging."""
-    title: str
-    body: str
-    raw: str = ""
-    infos: list = field(default_factory=list)
-    placeholder: bool = False  # True when no usable content was generated
-
-
-def latex_escape_metadata(value: str) -> str:
-    """Escape LaTeX specials in a short metadata string (title/author/...)."""
-    return "".join(_METADATA_ESCAPES.get(ch, ch) for ch in value)
-
-
 def sanitize_section(text: str) -> str:
-    """Reduce a model answer to just the section body we will embed.
+    """Reduce a model answer to just the Beamer section body we will embed.
 
     Strips markdown code fences, drops any preamble / document-scaffold lines the
     model emitted despite instructions, and trims leading/trailing prose by
@@ -238,108 +146,6 @@ def sanitize_section(text: str) -> str:
     return body
 
 
-def _sections_block(sections: list[SectionOutput]) -> str:
-    """Join the non-empty sanitized section bodies, or a placeholder comment."""
-    bodies = [sec.body.strip() for sec in sections if sec.body.strip()]
-    return "\n\n".join(bodies) if bodies else "% (no section content generated)"
-
-
-def assemble_with_template(
-    sections: list[SectionOutput],
-    *,
-    preamble: str,
-    opening: str,
-    closing: str,
-) -> str:
-    """Assemble a deck around a user-supplied template shell.
-
-    *preamble* / *opening* / *closing* come from
-    :func:`deckgen.template.split_template`; the generated section bodies are
-    injected between *opening* (title + TOC scaffold, already containing
-    ``\\begin{document}``) and *closing* (the ``\\end{document}`` tail). The
-    template parts are trusted (user-authored); only the section bodies are
-    model output.
-    """
-    parts = [
-        preamble.rstrip(),
-        "",
-        opening.rstrip(),
-        "",
-        _sections_block(sections),
-        "",
-        closing.strip(),
-        "",
-    ]
-    return "\n".join(parts)
-
-
-def extract_cite_keys(tex: str) -> list[str]:
-    """Return every bib key referenced by a citation command in *tex*."""
-    keys: list[str] = []
-    for m in _CITE_MACRO_RE.finditer(tex):
-        for raw in m.group(1).split(","):
-            k = raw.strip()
-            if k:
-                keys.append(k)
-    return keys
-
-
-def extract_graphics_keys(tex: str) -> list[str]:
-    """Return every graphics path referenced by an \\includegraphics command in *tex*."""
-    keys: list[str] = []
-    for m in _GRAPHICS_RE.finditer(tex):
-        k = m.group(1).strip()
-        if k:
-            keys.append(k)
-    return keys
-
-
-def comment_out_missing_graphics(tex: str, resolved_basenames: set[str]) -> str:
-    """Comment out every ``\\includegraphics`` whose basename is unresolved.
-
-    *resolved_basenames* is the caller's verdict (vault-copied figures plus
-    anything the caller chose to keep — e.g. files already present next to
-    the deck); filesystem knowledge deliberately stays with the caller so
-    this module remains pure.
-
-    Line-safe: a ``%`` comments out the REST of its line, so a command that
-    shares a line with other content is moved onto its own commented line and
-    the surrounding pieces are preserved on adjacent lines (a single newline
-    is just a space to LaTeX, inside braces too, so meaning is unchanged).
-    The naive whole-match ``% <cmd>`` replacement this fixes swallowed
-    whatever followed the command on the line — a closing brace, an
-    ``\\end{...}`` — breaking the very decks it was meant to protect. A
-    command whose optional args span multiple lines is left untouched (kept),
-    the safe default for a rewrite that only ever *removes* content.
-    """
-    def _unresolved(line: str) -> list:
-        return [
-            m for m in _GRAPHICS_RE.finditer(line)
-            if os.path.basename(m.group(1).strip()) not in resolved_basenames
-        ]
-
-    out_lines: list[str] = []
-    for line in tex.split("\n"):
-        matches = _unresolved(line)
-        if not matches:
-            out_lines.append(line)
-            continue
-        pieces: list[str] = []
-        cursor = 0
-        for m in matches:
-            pre = line[cursor:m.start()]
-            if pre.strip():
-                pieces.append(pre)
-            basename = os.path.basename(m.group(1).strip())
-            pieces.append(f"% {m.group(0)} % Figure not found: {basename}")
-            cursor = m.end()
-        post = line[cursor:]
-        if post.strip():
-            pieces.append(post)
-        out_lines.append("\n".join(pieces))
-    return "\n".join(out_lines)
-
-
 def assemble(sections: list[SectionOutput], meta: DeckMeta) -> str:
     """Wrap sanitized section bodies in the Beamer preamble template."""
     sections_block = _sections_block(sections)
@@ -357,24 +163,35 @@ def assemble(sections: list[SectionOutput], meta: DeckMeta) -> str:
     return out
 
 
-def _strip_latex_comments(text: str) -> str:
-    """Drop LaTeX line comments (an unescaped ``%`` to end-of-line).
+def _beamer_structural_checks(scan_tex: str) -> list[str]:
+    """Beamer-specific structural warnings over comment-stripped *scan_tex*:
+    balanced frame environments, at least one frame, at least one section.
 
-    validate() must not be fooled by *commented-out* LaTeX: a ``% \\end{frame}``
-    is not a real frame close, and a commented ``\\input`` / ``\\cite`` is inert.
-    Counting/scanning the comment-stripped text fixes both false positives and
-    false negatives. (Mirrors ``template.strip_comments``; kept local so this
-    module stays dependency-free, like the rest of the deckgen core.)
+    Bound into ``BEAMER.structural_checks``; the class-agnostic checks (document
+    env, dangerous macros, citations, graphics) are :func:`validate_common`.
     """
-    out = []
-    for line in text.splitlines():
-        cut = None
-        for i, ch in enumerate(line):
-            if ch == "%" and (i == 0 or line[i - 1] != "\\"):
-                cut = i
-                break
-        out.append(line if cut is None else line[:cut])
-    return "\n".join(out)
+    warnings: list[str] = []
+    n_begin = len(_FRAME_BEGIN_RE.findall(scan_tex))
+    n_end = len(_FRAME_END_RE.findall(scan_tex))
+    if n_begin != n_end:
+        warnings.append(
+            f"Unbalanced frame environments: {n_begin} \\begin{{frame}} vs "
+            f"{n_end} \\end{{frame}} — the deck will not compile until fixed."
+        )
+    if not _SECTION_RE.search(scan_tex):
+        warnings.append("No \\section found — the table of contents will be empty.")
+    if n_begin == 0:
+        warnings.append("No frames found — the generated deck has no slides.")
+    return warnings
+
+
+# The Beamer document-class strategy. A future docgen binds an ARTICLE strategy
+# with a section-based structural_checks and an article preamble.
+BEAMER = DocClassStrategy(
+    name="beamer",
+    preamble_template=_PREAMBLE_TEMPLATE,
+    structural_checks=_beamer_structural_checks,
+)
 
 
 def validate(
@@ -384,87 +201,27 @@ def validate(
     known_bib_keys: Optional[set] = None,
     copied_figures: Optional[set] = None,
 ) -> list[str]:
-    """Best-effort structural checks. Returns a list of human-readable warnings.
+    """Best-effort structural checks for a Beamer deck. Returns human-readable
+    warnings.
 
     No LaTeX compiler is invoked (emit-only design); these catch the failures we
     can detect cheaply: unbalanced ``frame`` environments, a missing/duplicated
-    ``document`` environment, and a deck with no sections.
+    ``document`` environment, a deck with no sections/slides, unsafe compile-time
+    macros, invented citation keys, and unresolved graphics.
 
     Structural checks run over the whole *tex*. The dangerous-macro and
     citation-key checks run over *generated_tex* when supplied (the
     model-generated section span) so the **trusted** template preamble/scaffold
     is not flagged — e.g. a legitimate ``\\input`` in the user's own preamble.
     When *generated_tex* is ``None`` the whole document is scanned (legacy
-    no-template path). *known_bib_keys*, when given, enables a guard that warns
-    about ``\\citefoot{key}`` / ``\\cite{key}`` keys absent from the bibliography
-    (an invented citation to review before compiling).
-    *copied_figures*, when given, validates that every graphics target exists.
+    no-template path). *known_bib_keys*, when given, enables the invented-citation
+    guard; *copied_figures*, when given, validates every graphics target exists.
     """
-    warnings: list[str] = []
-    # Strip comments before counting/scanning so a commented-out \end{frame},
-    # \input or \cite is not mistaken for live LaTeX (both false negatives in
-    # the frame balance and false positives in the danger/cite guards).
-    scan_tex = _strip_latex_comments(tex)
-    untrusted = _strip_latex_comments(tex if generated_tex is None else generated_tex)
-
-    n_begin = len(_FRAME_BEGIN_RE.findall(scan_tex))
-    n_end = len(_FRAME_END_RE.findall(scan_tex))
-    if n_begin != n_end:
-        warnings.append(
-            f"Unbalanced frame environments: {n_begin} \\begin{{frame}} vs "
-            f"{n_end} \\end{{frame}} — the deck will not compile until fixed."
-        )
-
-    n_doc_begin = len(re.findall(r"\\begin\{document\}", scan_tex))
-    n_doc_end = len(re.findall(r"\\end\{document\}", scan_tex))
-    if n_doc_begin != 1 or n_doc_end != 1:
-        warnings.append(
-            f"Expected exactly one document environment, found "
-            f"{n_doc_begin} \\begin{{document}} / {n_doc_end} \\end{{document}}."
-        )
-
-    if not _SECTION_RE.search(scan_tex):
-        warnings.append("No \\section found — the table of contents will be empty.")
-
-    if n_begin == 0:
-        warnings.append("No frames found — the generated deck has no slides.")
-
-    danger = sorted(find_dangerous_macros(tex if generated_tex is None else generated_tex))
-    if danger:
-        warnings.append(
-            "Potentially unsafe LaTeX found in generated content: "
-            f"{', '.join(danger)}. The deck is built from untrusted vault notes — "
-            "review these before compiling, and compile WITHOUT shell-escape "
-            "(e.g. `pdflatex -no-shell-escape`)."
-        )
-
-    if known_bib_keys is not None:
-        unknown = sorted({
-            k for k in extract_cite_keys(untrusted) if k not in known_bib_keys
-        })
-        if unknown:
-            warnings.append(
-                "Citation key(s) not found in the bibliography: "
-                f"{', '.join(unknown)}. The model may have invented these — "
-                "remove the \\citefoot/\\cite or add the entry to your .bib "
-                "before compiling (an undefined key compiles to '[?]')."
-            )
-
-    if copied_figures is not None:
-        # Commented-out figures were already stripped with the other comments
-        # above, so only figures that SURVIVED resolution un-resolved warn
-        # here (e.g. a multi-line command the line-safe pass left untouched).
-        graphics_keys = extract_graphics_keys(untrusted)
-        unknown_figs = sorted({
-            os.path.basename(k) for k in graphics_keys if os.path.basename(k) not in copied_figures
-        })
-        for fig in unknown_figs:
-            warnings.append(
-                f"Figure not found: {fig}. The model may have invented this target or it could not be resolved in the vault."
-            )
-        if graphics_keys and not re.search(r"\\usepackage(?:\[[^\]]*\])*\s*\{graphicx\}", scan_tex):
-            warnings.append(
-                "The LaTeX preamble does not load 'graphicx' — graphics targets may fail to compile. Add \\usepackage{graphicx} to your template."
-            )
-
+    warnings = list(BEAMER.structural_checks(_strip_latex_comments(tex)))
+    warnings += validate_common(
+        tex,
+        generated_tex=generated_tex,
+        known_bib_keys=known_bib_keys,
+        copied_figures=copied_figures,
+    )
     return warnings

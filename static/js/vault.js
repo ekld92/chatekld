@@ -15,8 +15,8 @@
  *  - all user-controlled strings (paths, folder names, answers) go through
  *    createElement/textContent or sanitiseHtml — never raw innerHTML.
  */
-import { secureFetch, consumeSSE } from './api.js';
-import { taskBegin, taskEnd, setStatusA11y, announceStatus, openModal, closeModal, sanitiseHtml, copyToClipboard, enhanceCodeBlocks, showTaskError, clearTaskError, makeAnswerRenderer } from './ui.js';
+import { secureFetch, consumeSSE, safeJson, logError } from './api.js';
+import { taskBegin, taskEnd, setStatusA11y, announceStatus, openModal, closeModal, sanitiseHtml, copyToClipboard, enhanceCodeBlocks, showTaskError, clearTaskError, makeAnswerRenderer, buildConversationExport, confirmInline } from './ui.js';
 import { getActiveProvider, getSelectedEmbed, getSelectedModel, saveSelectedModels } from './config.js';
 
 // Item 3.1 (improvement plan 2026-07-04): TWO flags, one per state machine.
@@ -32,6 +32,37 @@ import { getActiveProvider, getSelectedEmbed, getSelectedModel, saveSelectedMode
 // never clears the chat guard.
 let _isChatting = false;
 let _isIndexing = false;
+let _pollFailures = 0;
+// Client-side transcript for the "export conversation" action (axis iv). The
+// server holds no vault-chat history (each POST is independent), so this array
+// is the only place a full conversation exists — recorded here, exported by
+// exportVaultConversation(), cleared by clearVaultChat(). Capped (oldest turns
+// dropped) because a session can live for days: the export is a convenience,
+// not an archival log, and unbounded growth would pin every answer's full
+// text in memory forever.
+const _vaultHistory = [];
+const _VAULT_HISTORY_MAX_TURNS = 200;
+
+function _pushVaultTurn(turn) {
+    _vaultHistory.push(turn);
+    if (_vaultHistory.length > _VAULT_HISTORY_MAX_TURNS) {
+        _vaultHistory.splice(0, _vaultHistory.length - _VAULT_HISTORY_MAX_TURNS);
+    }
+}
+
+// A partial failure records {user, assistant+"[interrupted]"} so the export
+// keeps the text the user watched arrive. Retry then re-asks the SAME
+// question, and its success path pushed the user turn a SECOND time — the
+// export showed the question twice (2026-07-20 audit; fixed 2026-07-30).
+// Remember which question already has a user turn on record; a retry of that
+// exact question appends only the assistant side.
+let _recordedRetryQuestion = null;
+
+function _pushUserTurnOnce(question, fromRetry) {
+    if (fromRetry && _recordedRetryQuestion === question) return;
+    _pushVaultTurn({ role: 'user', content: question });
+    _recordedRetryQuestion = null;
+}
 let _vaultPollDeadline = 0;
 let _chatParamsSaveTimer = null;
 let _prewarmPolling = false;
@@ -45,7 +76,9 @@ const _PREWARM_STAGE_LABELS = {
 };
 
 const _CHAT_PARAM_DEFAULTS = {
-    top_k: 6,
+    // Matches the server default (CLAUDE.md Vault Rules: top_k default 8). Only
+    // used when the #vault-top-k control is missing; the two must not drift.
+    top_k: 8,
     similarity_cutoff: 0.25,
     prompt_mode: 'strict',
     temperature: 0.3,
@@ -62,6 +95,7 @@ const _CHAT_PARAM_DEFAULTS = {
     wikilink_expansion: false,
     thesaurus_expansion: false,
     primer_enabled: false,
+    web_search_enabled: false,
 };
 
 const _SYSTEM_PROMPT_MAX = 4000;
@@ -114,6 +148,10 @@ function _ensureAgentTrace(traceCtx, botMsg, chat) {
     return trace;
 }
 
+// Card Catalog (2026-07-20): the retrieval panel is a numbered REFERENCE
+// LIST — footnote number, source link + kind label, relevance bar + score —
+// instead of the old inline-styled bullet dump with a raw float and an emoji
+// image marker. Class-driven (styles.css .retrieval-*), createElement-only.
 function _renderRetrievalTrace(retrieval, botMsg, chat) {
     if (!Array.isArray(retrieval) || retrieval.length === 0) return;
     const details = document.createElement('details');
@@ -121,27 +159,62 @@ function _renderRetrievalTrace(retrieval, botMsg, chat) {
     details.open = false;
 
     const summary = document.createElement('summary');
-    summary.textContent = `Retrieval Context · ${retrieval.length} chunk${retrieval.length === 1 ? '' : 's'}`;
+    summary.textContent = `Sources · ${retrieval.length} chunk${retrieval.length === 1 ? '' : 's'}`;
     details.appendChild(summary);
 
-    const list = document.createElement('ul');
-    list.style.margin = '0';
-    list.style.paddingLeft = '20px';
-    list.style.fontSize = '0.9em';
-    list.style.color = 'var(--text-muted, #666)';
+    const list = document.createElement('div');
+    list.className = 'retrieval-list';
 
-    retrieval.forEach(item => {
-        const li = document.createElement('li');
-        const score = typeof item.score === 'number' ? ` (score: ${item.score.toFixed(3)})` : '';
-        const imgIndicator = item.is_image ? ' 🖼️' : '';
+    retrieval.forEach((item, i) => {
+        const row = document.createElement('div');
+        row.className = 'retrieval-row';
+
+        const num = document.createElement('span');
+        num.className = 'retrieval-num';
+        num.textContent = String(i + 1);
+        row.appendChild(num);
+
+        const src = document.createElement('div');
+        src.className = 'retrieval-src';
         if (item.source) {
-            const span = document.createElement('span');
-            span.textContent = item.source + imgIndicator + score;
-            li.appendChild(span);
+            // A real anchor whose href is the vault-relative source path: the
+            // global link interceptor (ui.js) routes the click to
+            // POST /api/open, which reveals the file in Finder — the anchor
+            // itself never navigates.
+            const link = document.createElement('a');
+            link.href = item.source;
+            link.textContent = item.source;
+            link.title = 'Reveal in Finder';
+            src.appendChild(link);
         } else {
-            li.textContent = 'unknown source' + score;
+            const unk = document.createElement('span');
+            unk.textContent = 'unknown source';
+            src.appendChild(unk);
         }
-        list.appendChild(li);
+        const kind = document.createElement('span');
+        kind.className = 'retrieval-kind';
+        kind.textContent = item.is_image
+            ? 'image'
+            : (String(item.source || '').toLowerCase().endsWith('.pdf') ? 'pdf' : 'note');
+        src.appendChild(kind);
+        row.appendChild(src);
+
+        if (typeof item.score === 'number') {
+            const rel = document.createElement('div');
+            rel.className = 'retrieval-rel';
+            const bar = document.createElement('span');
+            bar.className = 'retrieval-rel-bar';
+            const fill = document.createElement('span');
+            fill.style.width = `${Math.round(Math.max(0, Math.min(1, item.score)) * 100)}%`;
+            bar.appendChild(fill);
+            const val = document.createElement('span');
+            val.className = 'retrieval-rel-val';
+            val.textContent = item.score.toFixed(2);
+            rel.appendChild(bar);
+            rel.appendChild(val);
+            row.appendChild(rel);
+        }
+        list.appendChild(row);
     });
 
     details.appendChild(list);
@@ -241,6 +314,7 @@ function getVaultChatParams() {
         wikilink_expansion: _readCheckbox('vault-wikilink-enabled', _CHAT_PARAM_DEFAULTS.wikilink_expansion),
         thesaurus_expansion: _readCheckbox('vault-thesaurus-enabled', _CHAT_PARAM_DEFAULTS.thesaurus_expansion),
         primer_enabled: _readCheckbox('vault-primer-enabled', _CHAT_PARAM_DEFAULTS.primer_enabled),
+        web_search_enabled: _readCheckbox('vault-websearch-enabled', _CHAT_PARAM_DEFAULTS.web_search_enabled),
     };
 }
 
@@ -298,6 +372,7 @@ export function applyVaultChatParams(cfg) {
         wikilink_expansion: cfg.vault_wikilink_expansion ?? _CHAT_PARAM_DEFAULTS.wikilink_expansion,
         thesaurus_expansion: cfg.vault_thesaurus_expansion ?? _CHAT_PARAM_DEFAULTS.thesaurus_expansion,
         primer_enabled: cfg.vault_primer_enabled ?? _CHAT_PARAM_DEFAULTS.primer_enabled,
+        web_search_enabled: cfg.vault_web_search_enabled ?? _CHAT_PARAM_DEFAULTS.web_search_enabled,
     };
     _setRange(
         document.getElementById('vault-top-k'),
@@ -364,6 +439,8 @@ export function applyVaultChatParams(cfg) {
     if (thEl) thEl.checked = !!params.thesaurus_expansion;
     const prEl = document.getElementById('vault-primer-enabled');
     if (prEl) prEl.checked = !!params.primer_enabled;
+    const wsEl = document.getElementById('vault-websearch-enabled');
+    if (wsEl) wsEl.checked = !!params.web_search_enabled;
 }
 
 function _saveVaultChatParams() {
@@ -388,6 +465,7 @@ function _saveVaultChatParams() {
             vault_wikilink_expansion: p.wikilink_expansion,
             vault_thesaurus_expansion: p.thesaurus_expansion,
             vault_primer_enabled: p.primer_enabled,
+            vault_web_search_enabled: p.web_search_enabled,
         }),
     }).catch(() => { /* best-effort; the request body is still authoritative */ });
 }
@@ -442,6 +520,8 @@ export function wireVaultChatParamControls() {
     if (thCb) thCb.addEventListener('change', debounce);
     const prCb = document.getElementById('vault-primer-enabled');
     if (prCb) prCb.addEventListener('change', debounce);
+    const wsCb = document.getElementById('vault-websearch-enabled');
+    if (wsCb) wsCb.addEventListener('change', debounce);
 }
 
 function _updateIndexButtons(state) {
@@ -462,20 +542,28 @@ function _updateIndexButtons(state) {
 
 export async function pickVaultFolder() {
     const displayEl = document.getElementById('vault-path-display');
+    const statusEl = document.getElementById('obsidian-status-msg');
     try {
         const resp = await secureFetch('/api/native-pick-folder', { method: 'POST' });
         const data = await resp.json();
-        if (data.path) {
-            const setResp = await secureFetch('/api/config', {
-                method: 'POST',
-                body: JSON.stringify({ obsidian_vault_path: data.path })
-            });
-            if (setResp.ok) {
-                displayEl.textContent = data.path;
-            }
+        if (!data.path) return;   // user cancelled the picker
+        const setResp = await secureFetch('/api/config', {
+            method: 'POST',
+            body: JSON.stringify({ obsidian_vault_path: data.path })
+        });
+        if (setResp.ok) {
+            displayEl.textContent = data.path;
+            if (statusEl) setStatusA11y(statusEl, '', false);
+        } else {
+            // C1/#4 (2026-07-13): the server rejects broad roots / system dirs by
+            // design — surface WHY instead of silently closing the picker.
+            const err = await safeJson(setResp);
+            const msg = (err && err.error) || `Could not set vault (HTTP ${setResp.status}).`;
+            if (statusEl) setStatusA11y(statusEl, msg, true);
         }
     } catch (e) {
-        console.error('Folder pick error:', e);
+        logError('Folder pick failed', e);
+        if (statusEl) setStatusA11y(statusEl, 'Could not open the folder picker (see console).', true);
     }
 }
 
@@ -484,9 +572,13 @@ export async function pickVaultFolder() {
  * 24 h poll deadline as a runaway backstop; on a start failure surfaces a
  * retryable error in the vault error boundary and resets the buttons to idle.
  */
-export async function indexVault() {
+// `forceFresh` (2026-07-29 audit 0.1) is sent ONLY by the confirm-gated
+// "Rebuild from scratch" action offered on an `embed_backend_mismatch` error
+// — it discards the vector index (archived server-side, not deleted) and
+// re-embeds the whole vault, so no other caller may pass it.
+export async function indexVault(forceFresh) {
     if (_isIndexing) return;
-    
+
     const statusDiv = document.getElementById('obsidian-status-msg');
     _isIndexing = true;
     clearTaskError(document.getElementById('vault-error-boundary'));
@@ -499,7 +591,11 @@ export async function indexVault() {
             body: JSON.stringify({
                 provider: getActiveProvider(),
                 llm: getSelectedModel(),
-                embed: getSelectedEmbed()
+                embed: getSelectedEmbed(),
+                // Strict-boolean so a stray event object from an onclick
+                // handler (`indexVault` used directly as a listener receives
+                // the Event as its first arg) can never read as "rebuild".
+                force_fresh: forceFresh === true,
             })
         });
         if (resp.ok) {
@@ -574,7 +670,16 @@ async function pollVaultStatus() {
             taskEnd('vault-index'); _setIndexProgress(false);
             _updateIndexButtons('error');
             setStatusA11y(document.getElementById('obsidian-status-msg'), '', false);
-            _showVaultError('Indexing failed.', indexVault);
+            // 2026-07-29 audit 0.1: this branch used to blank the status line
+            // (which had just received the server's one copy of the reason via
+            // the destructive `messages` drain) and show a generic "Indexing
+            // failed." + Retry — so the embed-backend gate's refusal, whose
+            // whole value is its recovery instructions, was erased in the same
+            // poll tick that delivered it, and Retry re-ran the refusing gate
+            // forever. The persistent `error_detail`/`error_code` payload
+            // fields carry the reason past the drain; the renderer keys its
+            // actions on the code (a refusal offers Rebuild, not Retry).
+            _showVaultIndexError(data);
             return;
         } else if (data.state === 'paused' || data.state === 'paused_partial') {
             _isIndexing = false;
@@ -590,7 +695,20 @@ async function pollVaultStatus() {
         }
 
         setTimeout(pollVaultStatus, 2000);
+        _pollFailures = 0;
     } catch (e) {
+        // E7 (2026-07-22 audit): silent rescheduling left the "Indexing…"
+        // progress strip asserting activity long after the server died. After
+        // three consecutive failures, say so (and keep retrying — the
+        // state is recoverable if the server comes back).
+        _pollFailures = (_pollFailures || 0) + 1;
+        if (_pollFailures === 3) {
+            const statusDiv = document.getElementById('obsidian-status-msg');
+            if (statusDiv) {
+                setStatusA11y(statusDiv,
+                    'Server unreachable — status unknown; retrying…', true);
+            }
+        }
         setTimeout(pollVaultStatus, 5000);
     }
 }
@@ -666,7 +784,7 @@ export async function pollPrewarmStatus() {
     try {
         while (true) {
             if (Date.now() > deadline) {
-                _renderPrewarmBanner('error', 'Le préchauffage ne répond plus — relancez l\u2019application ou vérifiez le serveur.');
+                _renderPrewarmBanner('error', 'Prewarm is not responding — relaunch the app or check the server.');
                 return;
             }
             let data;
@@ -793,6 +911,20 @@ function _attachCopyButton(messageEl, getText, ariaLabel) {
 
 
 
+/**
+ * Digit-blind identity of a progress/info message (2026-07-29 audit 11).
+ *
+ * Two frames share a key exactly when they differ only in numbers — the shape
+ * every periodic ticker produces ("Still waiting … (30s)…" / "(60s)…", "[3/98]
+ * …"). Used by the chat `onInfo` handler to update a heartbeat's bubble in
+ * place instead of appending one per beat; two messages with any wording
+ * difference keep distinct keys, so genuinely new stage labels are never
+ * suppressed. Exported for tests.
+ */
+export function progressKey(msg) {
+    return String(msg || '').replace(/\d+/g, '#');
+}
+
 // Surface a recoverable vault error in the shared boundary. `retry`, when
 // given, becomes a "Retry" button; a "Dismiss" button always clears it.
 function _showVaultError(message, retry) {
@@ -802,6 +934,45 @@ function _showVaultError(message, retry) {
         actions.push({ label: 'Retry', primary: true, onClick: () => { clearTaskError(el); retry(); } });
     }
     actions.push({ label: 'Dismiss', onClick: () => clearTaskError(el) });
+    showTaskError(el, message, actions);
+}
+
+/**
+ * Render an indexing-run error from the status payload's persistent
+ * `error_detail`/`error_code` fields (2026-07-29 audit 0.1).
+ *
+ * The action set keys on the machine code, never on regexing the prose (the
+ * SSE `size_cap` precedent): `embed_backend_mismatch` is a REFUSAL — retrying
+ * re-runs the same gate and refuses identically, so offering Retry was
+ * actively harmful. It gets a confirm-gated "Rebuild from scratch" instead
+ * (→ `indexVault(true)` → the server's `force_fresh` opt-in; the old index is
+ * archived server-side, not deleted). Every other code keeps Retry.
+ */
+function _showVaultIndexError(data) {
+    const el = document.getElementById('vault-error-boundary');
+    const message = (data && data.error_detail) || 'Indexing failed.';
+    const code = (data && data.error_code) || '';
+    if (code !== 'embed_backend_mismatch') {
+        _showVaultError(message, indexVault);
+        return;
+    }
+    const actions = [
+        {
+            label: 'Rebuild from scratch…',
+            primary: true,
+            // `btn` is the pressed button (showTaskError hands it over) so the
+            // confirm strip anchors where the user is looking. The rebuild is
+            // hours of re-embedding — it MUST go through the confirmInline
+            // ceremony like every other destructive action.
+            onClick: (btn) => confirmInline(btn, {
+                message: 'Re-embed the entire vault from scratch? The current '
+                    + 'index is archived (not deleted); a large vault can take hours.',
+                confirmLabel: 'Rebuild',
+                onConfirm: () => { clearTaskError(el); indexVault(true); },
+            }),
+        },
+        { label: 'Dismiss', onClick: () => clearTaskError(el) },
+    ];
     showTaskError(el, message, actions);
 }
 
@@ -837,6 +1008,10 @@ export async function chatWithVault(retryQuestion) {
     if (!question) return;
 
     _isChatting = true;
+    // C5/#50 (2026-07-13): disable Send for the in-flight turn (parity with
+    // plainchat's _setSending) so it doesn't look pressable during a multi-minute
+    // agent turn. The Enter-key path is still guarded by the _isChatting check above.
+    _setVaultSendDisabled(true);
     clearTaskError(document.getElementById('vault-error-boundary'));
     const chat = document.getElementById('obsidian-chat');
 
@@ -864,6 +1039,14 @@ export async function chatWithVault(retryQuestion) {
     const chatTimeout = setTimeout(() => controller.abort(), _chatAbortMs());
 
     let fullAnswer = '';
+    let turnSources = [];   // retrieval sources for the export transcript
+    // Export provenance (2026-07-22): server-confirmed provider/model, real
+    // usage figures, and the agent tool-call list — all captured per turn so
+    // the MD/TXT export can stamp what actually ran (the trace/retrieval DOM
+    // panels are display-only and were previously lost on export).
+    let turnMeta = null;
+    let turnUsage = null;
+    let turnTrace = [];
     try {
         await saveSelectedModels();
         const chatParams = getVaultChatParams();
@@ -889,18 +1072,53 @@ export async function chatWithVault(retryQuestion) {
             wikilink_expansion: chatParams.wikilink_expansion,
             thesaurus_expansion: chatParams.thesaurus_expansion,
             primer_enabled: chatParams.primer_enabled,
+            web_search_enabled: chatParams.web_search_enabled,
         });
 
         const traceCtx = { trace: null, currentIter: null, iterCount: 0 };
+        // Progress-frame dedupe state (2026-07-29 audit 11) — per send, so a
+        // new question always starts with a fresh bubble.
+        let lastInfoNode = null;
+        let lastInfoKey = '';
 
         await consumeSSE('/api/obsidian/chat', { method: 'POST', signal: controller.signal, body: bodyStr }, {
             onInfo: (info) => {
+                // Heartbeat dedupe (2026-07-29 audit 11): the reranker/BM25
+                // load tickers emit the SAME sentence every 30 s with only the
+                // elapsed-seconds figure changing — a 20-minute first-time
+                // model download appended ~40 near-identical bubbles and fired
+                // ~40 screen-reader announcements. A frame whose digit-blind
+                // key matches the PREVIOUS info frame updates that bubble in
+                // place and is not re-announced (the first occurrence was);
+                // any genuinely different stage label still appends + announces
+                // exactly as before — the key comparison is only against the
+                // immediately preceding frame, so an A/B/A sequence renders
+                // three bubbles, never a rewritten history.
+                const key = progressKey(info);
+                if (lastInfoNode && key && key === lastInfoKey) {
+                    lastInfoNode.textContent = info;
+                    chat.scrollTop = chat.scrollHeight;
+                    return;
+                }
                 const note = document.createElement('div');
                 note.className = 'message message-info';
-                note.setAttribute('role', 'status');
+                // NOT role="status" here (2026-07-26 UX audit): this node is
+                // created, roled and populated in the SAME tick — the exact
+                // defect class tests/js/liveRegions.test.js exists to prevent
+                // (WebKit can miss a live region minted the same tick it is
+                // filled), so the role was decorative and the message was
+                // likely never announced. Consequence: during a slow stage —
+                // a multi-GB reranker load, a provider fallback — a VoiceOver
+                // user heard "Generating response…" then silence, with the one
+                // notice that EXPLAINS the wait inaudible. The bubble stays
+                // visual-only; the announcement goes through the static
+                // #sr-status-announcer region, which ships in the markup.
                 note.textContent = info;
                 chat.insertBefore(note, botMsg);
                 chat.scrollTop = chat.scrollHeight;
+                lastInfoNode = note;
+                lastInfoKey = key;
+                announceStatus(info);
             },
             onToken: (token) => {
                 if (fullAnswer === '') botMsg.innerHTML = '';
@@ -909,14 +1127,32 @@ export async function chatWithVault(retryQuestion) {
             },
             onOther: (payload) => {
                 if (payload.retrieval) {
+                    // Keep the full retrieval objects ({source, score,
+                    // is_image}) for the export transcript (lot 4.3 +
+                    // 2026-07-22): the Retrieval Context panel is DOM-only, so
+                    // without this the export would lose the provenance —
+                    // often the most valuable part of a vault answer.
+                    turnSources = payload.retrieval
+                        .filter((r) => r && r.source);
                     _renderRetrievalTrace(payload.retrieval, botMsg, chat);
+                } else if (payload.meta) {
+                    turnMeta = payload.meta;
+                } else if (payload.usage) {
+                    turnUsage = payload.usage;
                 } else if (payload.iteration !== undefined) {
                     _renderAgentIteration(payload.iteration, traceCtx, botMsg, chat);
                 } else if (typeof payload.thought === 'string') {
                     _renderAgentThought(payload.thought, traceCtx, botMsg, chat);
                 } else if (payload.tool_call) {
+                    turnTrace.push(payload.tool_call);
                     _renderAgentToolCall(payload.tool_call, traceCtx, botMsg, chat);
                 } else if (payload.tool_result) {
+                    if (payload.tool_result.is_error && turnTrace.length) {
+                        // Mark the matching call so the export shows failures.
+                        const match = turnTrace.find(
+                            (c) => c.id === payload.tool_result.tool_call_id);
+                        if (match) match.is_error = true;
+                    }
                     _renderAgentToolResult(payload.tool_result, traceCtx, botMsg, chat);
                 }
             },
@@ -928,6 +1164,14 @@ export async function chatWithVault(retryQuestion) {
         if (fullAnswer) {
             _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
             enhanceCodeBlocks(botMsg);
+            _pushUserTurnOnce(question, fromRetry);
+            _pushVaultTurn({
+                role: 'assistant', content: fullAnswer, sources: turnSources,
+                meta: turnMeta || undefined,
+                usage: turnUsage || undefined,
+                trace: turnTrace.length ? turnTrace : undefined,
+            });
+            _recordedRetryQuestion = null;   // this question is fully answered
         }
         announceStatus('Response ready.');
     } catch (e) {
@@ -943,10 +1187,20 @@ export async function chatWithVault(retryQuestion) {
             answerRenderer.flush();
             const note = document.createElement('div');
             note.className = 'muted';
-            note.lang = 'fr';
-            note.textContent = '⚠ Réponse interrompue — le texte ci-dessus est partiel.';
+            note.textContent = '⚠ Response interrupted — the text above is partial.';
             botMsg.appendChild(note);
             _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
+            _pushUserTurnOnce(question, fromRetry);
+            _pushVaultTurn({
+                role: 'assistant', content: fullAnswer + '\n[interrupted]',
+                sources: turnSources,
+                meta: turnMeta || undefined,
+                trace: turnTrace.length ? turnTrace : undefined,
+            });
+            // This question now has a user turn on record; a Retry of it must
+            // not add a second one (a retry that ALSO fails partially appends
+            // only its own [interrupted] assistant turn).
+            _recordedRetryQuestion = question;
         } else {
             answerRenderer.cancel();
             botMsg.remove();
@@ -961,9 +1215,19 @@ export async function chatWithVault(retryQuestion) {
     } finally {
         clearTimeout(chatTimeout);
         _isChatting = false;
+        _setVaultSendDisabled(false);
         taskEnd('vault-chat');
         chat.scrollTop = chat.scrollHeight;
     }
+}
+
+/** C5/#50: toggle the vault-chat Send button, unless prewarm already owns it. */
+function _setVaultSendDisabled(disabled) {
+    const sendBtn = document.getElementById('vault-send-btn');
+    if (!sendBtn) return;
+    // Don't re-enable while prewarm is still in flight (it owns the button then).
+    if (!disabled && _prewarmInFlight) return;
+    sendBtn.disabled = disabled;
 }
 
 export function clearVaultChat() {
@@ -977,15 +1241,71 @@ export function clearVaultChat() {
     }
     const chat = document.getElementById('obsidian-chat');
     if (chat) chat.innerHTML = '';
+    _vaultHistory.length = 0;
     const statusDiv = document.getElementById('obsidian-status-msg');
     if (statusDiv) setStatusA11y(statusDiv, '', false);
 }
 
-export async function pauseVaultIndex() {
+/**
+ * Export the current vault conversation to the user's Downloads as md or txt
+ * (axis iv). Serialises the client-side transcript and reuses the existing
+ * /api/export-summary writer (format-agnostic; it just writes the string).
+ */
+export async function exportVaultConversation(format) {
+    if (!_vaultHistory.length) {
+        const statusDiv = document.getElementById('obsidian-status-msg');
+        if (statusDiv) setStatusA11y(statusDiv, 'No conversation to export yet.', false);
+        return;
+    }
+    const statusDiv = document.getElementById('obsidian-status-msg');
+    // Provenance header (2026-07-22): export date, last-confirmed model, and a
+    // snapshot of the retrieval knobs as they are set NOW (per-turn meta lines
+    // carry each answer's own model when it differed).
+    const lastMeta = [..._vaultHistory].reverse().find((t) => t.meta)?.meta || null;
+    const header = { 'Exported': new Date().toISOString() };
+    if (lastMeta) {
+        header['Model'] = [lastMeta.provider, lastMeta.model].filter(Boolean).join(' / ');
+        if (lastMeta.agent_enabled) header['Mode'] = 'agent';
+    }
     try {
-        await secureFetch('/api/obsidian/pause', { method: 'POST' });
+        const p = getVaultChatParams();
+        header['Retrieval'] = `top_k=${p.top_k} · mode=${p.prompt_mode} · hybrid=${p.hybrid_enabled} · reranker=${p.reranker_enabled}`;
+    } catch (_) { /* knobs unavailable — header stays minimal */ }
+    const { format: fmt, content } = buildConversationExport(
+        _vaultHistory, format, 'Vault Conversation', { header });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    try {
+        // raw: true — the transcript carries its own title, and the file
+        // should be VaultChat_<stamp>.md, not Summary_VaultChat_… with a
+        // second injected heading (see /api/export-summary's raw flag).
+        const r = await secureFetch('/api/export-summary', {
+            method: 'POST',
+            body: JSON.stringify({ format: fmt, filename: `VaultChat_${stamp}`, content, raw: true }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            if (statusDiv) setStatusA11y(statusDiv, d.error || `Export failed (${r.status})`, true);
+            return;
+        }
+        if (statusDiv) setStatusA11y(statusDiv, `Exported to ${d.path || 'Downloads'}`, false);
+    } catch (err) {
+        if (statusDiv) setStatusA11y(statusDiv, String(err), true);
+    }
+}
+
+export async function pauseVaultIndex() {
+    // C5/#41 (2026-07-13): give immediate feedback and surface failure.
+    const statusEl = document.getElementById('obsidian-status-msg');
+    if (statusEl) setStatusA11y(statusEl, 'Pausing…', false);
+    try {
+        const resp = await secureFetch('/api/obsidian/pause', { method: 'POST' });
+        if (!resp.ok && statusEl) {
+            const err = await safeJson(resp);
+            setStatusA11y(statusEl, (err && err.error) || 'Pause failed.', true);
+        }
     } catch (e) {
-        console.error('Pause error:', e);
+        logError('Pause failed', e);
+        if (statusEl) setStatusA11y(statusEl, 'Pause failed (see console).', true);
     }
 }
 
@@ -994,16 +1314,29 @@ export async function resumeVaultIndex() {
 }
 
 export async function cancelVaultIndex() {
+    // C1/#16 (2026-07-13): only claim "cancelled" when the POST actually
+    // succeeded — on failure the server keeps indexing, so keep polling and say
+    // so instead of falsely reporting the run dead.
+    const statusEl = document.getElementById('obsidian-status-msg');
+    let ok = false;
     try {
-        await secureFetch('/api/obsidian/cancel', { method: 'POST' });
+        const resp = await secureFetch('/api/obsidian/cancel', { method: 'POST' });
+        ok = resp.ok;
+        if (!ok && statusEl) {
+            const err = await safeJson(resp);
+            const detail = (err && err.error) ? ` (${err.error})` : '';
+            setStatusA11y(statusEl, `Cancel failed — indexing continues${detail}.`, true);
+        }
     } catch (e) {
-        console.error('Cancel error:', e);
+        logError('Cancel failed', e);
+        if (statusEl) setStatusA11y(statusEl, 'Cancel failed — indexing continues (see console).', true);
     }
+    if (!ok) return;   // leave _isIndexing + polling alone; the run is still live
     // Only the INDEXING machine's guard — a live chat keeps its own flag.
     _isIndexing = false;
     taskEnd('vault-index'); _setIndexProgress(false);
     _updateIndexButtons('idle');
-    setStatusA11y(document.getElementById('obsidian-status-msg'), 'Indexing cancelled.', false);
+    if (statusEl) setStatusA11y(statusEl, 'Indexing cancelled.', false);
 }
 
 export async function addExclusion() {
@@ -1074,18 +1407,26 @@ function renderVaultWarnings(warnings) {
 }
 
 export async function removeExclusion(path) {
+    const status = document.getElementById('excl-status');
     try {
         const cfgResp = await secureFetch('/api/config');
         const cfg = await cfgResp.json();
         const currentExcl = cfg.vault_exclude_dirs || [];
         const filtered = currentExcl.filter(p => p !== path);
-        await secureFetch('/api/config', {
+        const resp = await secureFetch('/api/config', {
             method: 'POST',
             body: JSON.stringify({ vault_exclude_dirs: filtered })
         });
+        // C1/#42 (2026-07-13): surface a failed save (contrast addExclusion,
+        // which already does) — otherwise the row silently reappears on re-render.
+        if (!resp.ok && status) {
+            const err = await safeJson(resp);
+            status.textContent = (err && err.error) || `Could not update exclusions (HTTP ${resp.status}).`;
+        }
         renderExclusions();
     } catch (e) {
-        console.error('Remove exclusion error:', e);
+        logError('Remove exclusion failed', e);
+        if (status) status.textContent = 'Could not update exclusions (see console).';
     }
 }
 
@@ -1121,7 +1462,15 @@ export async function renderExclusions() {
                 btn.className = 'btn btn-outline btn-sm';
                 btn.dataset.path = path;
                 btn.textContent = 'Remove';
-                btn.onclick = () => removeExclusion(path);
+                // Ceremony parity (Track 6e): removing an exclusion re-includes
+                // the folder in the next index run — gate it like every other
+                // config-mutating action instead of firing on a single click.
+                btn.onclick = () => confirmInline(btn, {
+                    message: `Remove the exclusion for "${path}"? The folder is re-included at the next index run.`,
+                    confirmLabel: 'Remove',
+                    tone: 'confirm',
+                    onConfirm: () => removeExclusion(path),
+                });
                 item.appendChild(name);
                 item.appendChild(btn);
                 list.appendChild(item);
@@ -1204,6 +1553,13 @@ export async function refreshIndexState() {
         }
         if (Array.isArray(data.warnings) && data.warnings.length) {
             renderVaultWarnings(data.warnings);
+        }
+        // A run that errored before this tab mounted (or before a reload) left
+        // its reason only in the persistent error_detail field — the live poll
+        // that would have rendered it is long gone. Re-surface it here so the
+        // refusal (and its Rebuild recovery) survives a reload (2026-07-29).
+        if (data.state === 'error' && data.error_detail) {
+            _showVaultIndexError(data);
         }
         // Render the current prewarm state up-front so the banner appears
         // even if the prewarm finished before the UI mounted.  pollPrewarmStatus

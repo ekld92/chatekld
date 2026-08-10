@@ -2,6 +2,2125 @@
 
 This file tracks the current refactor line. Older entries were removed because they described deleted integrations and stale endpoints.
 
+## 2026-08-09 (Phase 2 consolidation — docs truth pass + UI/UX pass)
+
+An 8-agent doc-against-code verification sweep (root + subtree `CLAUDE.md`s,
+README/PUBLISHING/guide/help, Known Issues registry) plus a static+dynamic
+UI/UX pass. No new features.
+
+### docs (lot 1)
+
+- **~60 doc-follows-code corrections** across `CLAUDE.md` (root),
+  `rag/CLAUDE.md`, `core/llm/CLAUDE.md`, `core/agent/CLAUDE.md`,
+  `audit/CLAUDE.md`, README, `PUBLISHING.md`, `static/help/guide.md`,
+  `.env.example`, `deckgen/README.md`, `docgen/README.md`,
+  `packaging/widgets/README.md`, `tests/eval/README.md`. Highlights: the
+  audit *scan* DOES write `mapping.json`'s `hashes` re-anchor (the "scan
+  writes nothing" invariant was overstated; the annotate-then-move
+  limitation is correspondingly narrower), the SSE-skeleton consumer list
+  ("five routes") became "every SSE route" (15 call sites / 7 modules),
+  the OpenRouter sweep was finished in the 8 places it missed (README ×6,
+  guide, `.env.example`), FR/EN → FR/DE/EN where the trilingual pass had
+  missed, stale symbol names (`TestUnzoterodReportsUseCache`,
+  `_iter_vault_scan_files`, `_cached_lancedb_count`, `get_lmstudio_client`
+  in the vision bullet), and the dev `py_compile` gate now matches CI
+  (`api/*.py` + the three `scripts/` entry points). `docs/` strip step in
+  `PUBLISHING.md` now covers the whole directory (a second tracked plan
+  tree, `docs/feature_plans_2026-08-05/`, would have leaked under the old
+  per-directory command).
+- **Known Issues registry consolidated**: every 2026-08-08 entry re-verified
+  still open (nothing struck in error); promotions per the single-registry
+  rule — Ollama think-suppression residuals (query-expansion LLM + the
+  vision/OCR path) out from under a struck CLOSED heading, the Übersicht
+  `.jsx` no-CI-gate note, the Anthropic 1-h cache-write pricing tier
+  (inert), the agent-tool PDF-extraction interruptibility residual folded
+  into the wedge entry; the deck/docgen stall-guard entry retitled
+  (plain-chat's backend floor IS online-aware — the residual there is
+  frontend-only); two former "leads" adjudicated (below).
+- **Hardcoded audit report counts eradicated** (the banned 9-vs-11 drift
+  class): `audit/search.py` docstring, `audit/__init__.py`, `audit.js`,
+  two `templates/index.html` comments — all now countless phrasings.
+- Stale code comments fixed where the doc was right and the comment wrong:
+  `rag/build.py` (fresh-build default is `simple`), `rag/engine.py` (the
+  cutoff is skipped under fusion, not rescaled), `core/agent/loop.py`
+  (capability state lives in the route singleton), `core/llm/adapters/local.py`
+  (LM Studio uses the shared cached client), `.github/workflows/ci.yml`
+  (its own superset comment).
+
+### fixes (lot 1, found by the doc pass)
+
+- **`UsageTracker._disk_records` lost the whole on-disk history right after
+  a rotation** (confirmed 2026-08-08 lead): the live log does not exist
+  until the next append, and the stat failure returned `[]` even though
+  `<log>.1` held every record. Now falls through to the rotated generation.
+  Pinned by `test_llm.py::TestUsageLogRotation::test_disk_records_survive_the_rotation_window`.
+- **`audit_manager.clear_results()` kept `_near_duplicates`**, so
+  `has_near_duplicates` stayed true and the report could serve a stale run
+  against a cleared inventory (`reset_to_idle` already cleared all three).
+  Pinned by `test_audit.py::test_clear_results_drops_near_duplicates_too`.
+- `api/routes/audit.py::_SEARCH_CACHE` type annotation matches the 4-tuple.
+
+### ui (lot 2)
+
+- **Empty states**: every audit report table now renders a visible
+  "No rows in this report for the last scan." row instead of a bare header
+  (`audit.js::_tbodyHtml`, tagging-table parity).
+- **Ceremony symmetry**: the near-duplicate `[restore]`/`[undo]` (undo of a
+  dismissal) is now `confirmInline`-gated like its `[not a duplicate]`
+  sibling and every other undo in the app — it was the lone unconfirmed
+  write verb in the report. Ratcheted in `confirmCeremony.test.js`.
+- **Screen-reader announcements** (the minted-role-at-write-time defect
+  class): plain chat's `{info}` notices now announce through the static
+  region (parity with vault chat), refactor's LLM-action stage lines
+  (`_pending`) announce (previously only failures were audible), and the
+  Single Paper drop-zone error announces via `announceError`. `liveRegions`
+  ratchets extended to plainchat + refactor, and the 11 remaining static
+  `role="status"` regions in `index.html` are now pinned (removing any role
+  used to pass the suite).
+- **Wording**: "Summarize/Summarizing" → "Summarise/Summarising" in the
+  refactor LLM-actions panel + Settings hint + README (BrE is the app's
+  dominant existing spelling — `/api/summarise`, the Single Paper tab).
+- Help: the six `docgen-*` generation knobs got "?" entries (clones of
+  their deck twins), `vault-cutoff`'s tip notes it is inert while the
+  reranker is on, the tour's closing step no longer claims badges "on
+  every control", and the triage-deck key lists in README document `V`.
+
+## 2026-08-08 (OpenRouter chat provider + Cursor MCP registration)
+
+### OpenRouter provider
+
+- **New online provider `openrouter`** (`core/llm/adapters/openai_compat.py::OpenRouterProvider`) —
+  the third `_OpenAICompatProvider` subclass (DeepSeek/Z.AI pattern: `name`,
+  `OPENROUTER_API_KEY`, base `https://openrouter.ai/api/v1` with an
+  `OPENROUTER_BASE_URL` override, curated list). One key, ~400 upstream models,
+  namespaced ids (`vendor/model[:variant]`). Curated set = 10 ids, each
+  verified **tools-capable** against OpenRouter's public `GET /api/v1/models`
+  on 2026-08-08; default `anthropic/claude-haiku-4.5` (the app's own Anthropic
+  default tier, through the aggregator). Design decisions recorded in
+  `core/llm/CLAUDE.md`: static curated pricing (live-priced lookup rejected —
+  `estimate_cost_usd` is pure/synchronous and runs in streaming `finally`
+  blocks), attribution headers (`HTTP-Referer`/`X-Title`) deliberately not
+  sent, OpenRouter's internal upstream routing composes with (does not
+  replace) the app-level `fallback_provider` policy, and a live-listed
+  no-tools model degrades to a plain answer via the capability-routing heal
+  (added by the same-day post-review fix below — the entry as first written
+  claimed the reactive tools-heal covered this, which assumed a 400 OpenRouter
+  never sends).
+- **All registration points wired** (the C4/2026-07-13 checklist):
+  `core/llm/factory.py::ONLINE_PROVIDER_NAMES` + factory branch,
+  `core/config.py` (`_ONLINE_PROVIDER_NAMES`, `_ONLINE_MODEL_KEYS`,
+  `_ONLINE_DEFAULT_MODELS`, `_DEFAULTS["openrouter_model"]`),
+  `core/constants.py::DEFAULT_OPENROUTER_MODEL`,
+  `api/routes/config.py` (`_PROVIDER_NAMES` + `openrouter_model` shape
+  validator), `core/llm/usage.py` (10 `PRICING_TABLE` rows transcribed from
+  the live catalog — the `anthropic/claude-sonnet-5` row is OpenRouter's own
+  $2/$10 intro rate — + the `unpriced_curated_models` loop), the two
+  `templates/index.html` `<option>`s, `config.js::_ONLINE_MODEL_KEYS`, and
+  `ui.js::_ONLINE_PROVIDERS`/`_PROVIDER_LABELS`.
+- **Namespaced-id pricing guard** (`core/llm/usage.py::estimate_cost_usd`): the
+  split-on-colon base-id fallback (written for ollama `name:tag` ids) now
+  applies only to un-namespaced ids. An OpenRouter `:variant` carries its own
+  price, distinct from its base (typically cheaper — `:free` is $0), so the old
+  fallback would have mis-reported an unpriced variant at base rate; a
+  namespaced miss now costs out at the documented unknown-model $0
+  (under-report, the house rule). Curated `:variant` ids get exact rows
+  (`nvidia/nemotron-3-super-120b-a12b:free` at $0).
+- **Registration ratchets, both sides** (the test that was missing in
+  2026-07-13): `test_llm.py::test_online_provider_registries_agree` pins the
+  four server-side registries against each other, and the new
+  `tests/js/providerRegistry.test.js` pins the `index.html` online optgroup ↔
+  `config.js::_ONLINE_MODEL_KEYS` ↔ `ui.js::_ONLINE_PROVIDERS`/`_PROVIDER_LABELS`
+  parity (plus the fallback selector), so a future provider missing point 8
+  fails the suite instead of shipping as a LOCAL-looking online provider.
+- **Test parity in the existing classes** (`test_llm.py`):
+  `test_compat_providers_registered_everywhere` +
+  `test_online_model_keys_are_shape_validated` (namespaced + `:variant` ids
+  round-trip the validator) extended to `openrouter`; new
+  `test_openrouter_provider_contract` (env-only key naming
+  `OPENROUTER_API_KEY` in the AUTH error, base-URL override, legacy
+  `max_tokens` + tools kept) and
+  `test_namespaced_variant_ids_never_fall_back_to_base_pricing`;
+  `TestRedaction::test_redacts_openrouter_key` pins that `sk-or-v1-…` is
+  covered by the generic `sk-` pattern (no new pattern needed).
+- **Docs**: `.env.example` + README (provider list, setup, per-provider model
+  keys), `CLAUDE.md` §Provider Rules (registration checklist now names the
+  validator/default/constants points and the two ratchet tests),
+  `core/llm/CLAUDE.md` (OpenRouter block), and the online-provider
+  enumerations in `scripts/gen_golden_retrieval.py`'s disclosure docstrings.
+
+### Post-review fixes (same day — adversarial review of this lot)
+
+- **Capability-routing heal (M1, the review's one behavioural finding):**
+  OpenRouter signals "no upstream endpoint supports this request shape" (e.g.
+  tools sent to a model with no tool-capable endpoint) as a **503** "There is
+  no available model provider that meets your routing requirements" (or a 404
+  "No endpoints found…") — never the param-named 400 the inherited heal
+  understands — so a live-listed no-tools model in agent/deck/docgen mode
+  burned every `online_max_retries` attempt as a retryable SERVER_ERROR and
+  then triggered app-level provider fallback (a *different* model silently
+  answering). `OpenAIProvider._create_with_heal` now consults a subclass
+  predicate (`_is_capability_routing_error`, base = False; overridden ONLY by
+  `OpenRouterProvider`, 404/503 + routing phrasings) and strips
+  `tools`/`tool_choice` for one immediate retry — the same plain-answer
+  degradation as the tools-400 heal, bounded by the same `healed` set, and
+  gated on tools being in the payload so genuine transient 5xx keep their
+  retry semantics. Pinned by
+  `test_openrouter_tools_routing_503_heals_to_plain_answer` +
+  `test_routing_heal_is_openrouter_scoped_and_phrase_gated`.
+- **Ratchet strengthening (B1/B3):** `test_online_provider_registries_agree`
+  now also asserts every `ONLINE_MODEL_KEYS` value has a `_CONFIG_VALIDATORS`
+  row (an unmapped `*_model` key passes through `_validate_llm_config_keys`
+  unvalidated and persists garbage as-is), and
+  `test_online_model_keys_are_shape_validated` derives its key list from the
+  registry instead of a hardcoded tuple; `providerRegistry.test.js`'s entry
+  regexes are digit-safe (`[a-z0-9_]`) and attribute-safe
+  (`<option value="…"[^>]*>`) — with the old classes a provider id carrying a
+  digit vanished from every extracted set consistently, passing parity while
+  silently dropping out of ratchet coverage.
+- **Cursor registration IO (B4):** `register_cursor` resolves the config path
+  through `os.path.realpath` so a dotfiles-managed symlinked
+  `~/.cursor/mcp.json` is written THROUGH (the old `os.replace` on the link
+  path swapped the link itself for a regular file), and a failed write cleans
+  up its `.tmp`. Pinned by `test_register_writes_through_symlink`.
+- **Doc truth (B5):** the stale "both endpoints/adapters" wording in
+  `core/llm/CLAUDE.md` + the `openai_compat.py` docstring (three compat
+  providers now), and the ":variant always cheaper" overclaim softened to "own
+  price, distinct from its base" here and in `usage.py`/the pricing test.
+- **Deferred, recorded in Known Issues (B2):** `_NON_CHAT_OPENAI_TOKENS`
+  substring-filters OpenRouter's ~400-id live catalog with a denylist tuned
+  for api.openai.com — the `codex` token drops chat/tools-capable
+  `openai/gpt-5*-codex` ids from the live merge (curated ids unaffected).
+
+### Cursor MCP registration
+
+- **`scripts/install_mcp.py` now registers the stdio MCP server with Cursor**
+  (`register_cursor()`): Cursor has no registration CLI, so the script merges a
+  `papermind` entry into `~/.cursor/mcp.json` — conservative IO: other servers
+  and unrelated keys preserved, a stale entry (moved repo/venv) refreshed, and
+  an unparseable existing file NEVER overwritten (the snippet is printed for a
+  manual merge instead). The shared `{command, args, env}` entry was extracted
+  into `server_entry()` and reused by the OpenClaw snippet; Claude Code
+  registration (`claude mcp add`) unchanged. Pinned by
+  `tests/test_mcp_server.py::TestInstallMcpCursorRegistration` (merge purity,
+  parent-dir creation, existing-config merge, unparseable/non-object refusal).
+
+## 2026-08-08 (consolidation: correctness fixes, dead code, UI, docs)
+
+A five-strand consolidation pass — no new features. Volets A/B (review +
+flawed-logic) ran as a 12-seam multi-agent review weighted toward the SEAMS
+between subsystems, with every finding put through two independent adversarial
+lenses (refutation + concrete-reproduction) before anything was touched. 22
+findings survived both lenses; the six below were fixed here and the rest are
+recorded in `CLAUDE.md` → *Deferred from the 2026-08-08 consolidation audit*,
+along with ten leads whose verifiers were cut off by a session limit.
+
+### Correctness
+
+- **Batch tagging-restore crashed before reverting anything** (`api/routes/tagging.py`).
+  Phase 1 called the SSE skeleton's `threading.Event` as `cancel()` — the only
+  such call in the file, every other worker uses `.is_set()`. That line is
+  reached only when the batch contains a Zotero op, so the note+vocab
+  round-trip test never touched it; with one present it raised `TypeError`,
+  `_runner`'s blanket handler turned it into an `{"error"}` frame BEFORE the
+  op-lock was taken, and a retire that had already mutated notes, Finder tags
+  and Zotero items reverted **zero** ops — HTTP 200 throughout, one-click undo
+  silently unavailable. New regression test builds a Zotero-carrying batch.
+- **`POST /api/obsidian/cancel` stole the op-lock from other vault writers**
+  (`rag/vault.py`). The route is ungated (no index-state check, no holder
+  check) and the Cancel button stays visible after a pause, so a Cancel pressed
+  during a Note Refactor Apply / tagging write / docgen note write
+  `force_release()`d that holder's lock and admitted a SECOND concurrent
+  writer; each loads its own copy of the restore manifest, so the last
+  `journal.save` erased the other's op records — notes already rewritten, no
+  longer restorable. `cancel_indexing` now records the indexing run's epoch and
+  releases only that acquisition. Nothing leaks: the indexer's own `finally`
+  releases when the aborted run unwinds, and `force_release` stays the
+  operator escape hatch (`/api/reset`). Two regression tests.
+- **The tagging journal evicted the op the same request had just written**
+  (`tagging/journal.py`). Applied finder/zotero ops are deliberately never
+  evictable, and the triage deck journals two per Accept, so after ~100 accepts
+  the manifest is entirely protected ops and the next write's `note_tag` op is
+  the only evictable record — the cap loop dropped it and unlinked its snapshot
+  *before* the note was overwritten, while the response still returned its
+  `op_id`. New `protect_op_ids` exemption (the `protect_batch_id` idiom),
+  passed by all six writer sites and both batch prunes.
+- **`fallback_on: []` silently re-enabled provider fallback** (`core/llm/policy.py`).
+  The Settings window sends `[]` when every category is unchecked and
+  `_coerce_fallback_on` deliberately PERSISTS it as "fall back on nothing" —
+  but the reader's truthiness test turned it back into the full default set.
+  Absent-key and all-garbage-list still resolve to the defaults.
+- **Four path validators CWD-anchored a relative input** (`api/routes/_latexdoc.py`,
+  `api/routes/deck.py`). The P8.2 fix had reached `deck._resolve_out_dir`
+  alone; its three siblings and the two docgen twins still ran `realpath()`
+  on a relative path, resolving it against the SERVER's process CWD. All six
+  now share the pre-`realpath` `isabs` guard. **The ratchet was the reason this
+  survived**: `test_relative_input_is_rejected` passed for the
+  existence-checking validators only because nothing of that name happened to
+  sit in the CWD — it now chdirs into the fixture dir so the relative names
+  resolve to real files, and covers the two missing `_latexdoc` twins.
+- **A non-string `provider` in `POST /api/config` 500'd** (`api/routes/config.py`)
+  where every other malformed value is coerced or dropped.
+
+### Dead code
+
+Removed after proving zero references (grep + suite): `rag/vault.py::
+_legacy_pdf_signatures_path` — a back-compat shim whose docstring justified it
+by "external callers/tests" that do not exist (the live merge path is the
+plural `_legacy_pdf_signature_paths`) — and `refactor/sections.py::
+section_sha256` + its now-unused `hashlib` import, a section-level drift
+tripwire superseded by the whole-note `content_sha256` guards. Everything else
+vulture flagged is a structural false positive (Flask/click decorators, mixin
+methods, documented test patch targets, LlamaIndex overrides) and stays. The
+config-key and `HELP_ENTRIES` sweeps came back clean: 127/127 keys have a code
+reader, 40/40 help entries have a DOM element.
+
+### UI
+
+- **Prompt Hub clipped 16px of every row and the tail of its intro line**
+  (`static/css/styles.css`). `.content-area` is `flex-direction: row`, so the
+  `flex: 0 0 auto` override — added for VERTICAL growth — released the card on
+  the HORIZONTAL axis instead; it then sized to content and spilled past the
+  panel, where `overflow: hidden` clipped it with no scrollbar to reach it.
+  `#prompts-tab` was in that selector by mistake: unlike `#audit-tab` /
+  `#refactor-tab` its card has no `.pane-view` wrapper to constrain the width,
+  and it already scrolls internally via `.prompts-list`.
+- **`.btn-link` used the non-text-grade accent** — `--accent`, which the token
+  comment reserves for fills/outlines and the contrast lint holds only to 3:1.
+  Measured 3.57:1 as 12px text on the dark card (AA wants 4.5). Now
+  `--accent-hover`, the text-grade token, which is also darker in light mode.
+  The contrast lint's existing pair now names `.btn-link`.
+
+A full accessible-contrast sweep of every tab plus the Settings modal, in both
+themes with proper alpha compositing, found no other failure.
+
+### Docs
+
+`CLAUDE.md`: dropped the hardcoded "nine reports" from the `audit/search.py`
+bullet (the corpus covers 12 groups, and the file's own rule forbids hardcoding
+that count); `rag/vault.py` re-measured (5,131, not 5,143); the mypy note
+re-baselined from "~60" to the measured 179, with the finding that 96 of them
+are the Plan 9 mixin `[attr-defined]` tax rather than debt. Verified mechanically
+and found accurate: every documented constant, every referenced file path, and
+the quick-gate ⊆ CI-superset invariant (57 test modules, all covered).
+
+## 2026-08-07 (prompt-writing guide + trilingual FR/DE/EN source prompts)
+
+Two coupled changes: the Help tab gains a **"Writing good prompts"** section,
+and every default prompt that describes the vault's sources now names all
+THREE languages — French, **German** and English (the old defaults assumed a
+bilingual FR/EN corpus, so models routinely discarded German passages).
+
+- **Help guide (`static/help/guide.md`).** New "Writing good prompts" section:
+  cross-workflow prompt-engineering rules (scope specificity + question
+  decomposition, naming the expected languages of answer AND sources — with
+  the cross-lingual retrieval mechanic made concrete: put the key term in the
+  target source's language, since dense retrieval aligns same-language text
+  more strongly and BM25 needs the exact token (multilingual-RAG literature,
+  e.g. arXiv 2502.11175); answer-mode selection (strict/balanced/exploratory/
+  concise) as a first-class prompting lever; show-the-format few-shot
+  micro-examples; short positively-phrased system prompts under the
+  4000-char prefix cap; focus question over system-prompt stuffing; honest
+  "retrieval is not a full read" framing; iterate-not-mega-prompt) plus
+  concrete FR examples per workflow — vault chat single-shot vs agent, the optional knobs
+  (thesaurus/wikilink/web search) with the honest FR/EN-only thesaurus limit
+  stated, Plain Chat, Single Paper focus questions, deck/article
+  instructions, and Note Refactor free-prompt edits. Chrome stays English,
+  examples are vault-domain French (2026-07-22 language policy). The
+  reranker upgrade note and its `help.js` "?" entry now say FR/DE/EN.
+- **Trilingual prompt defaults.** `rag/engine.py` — a single shared
+  `_MULTILINGUAL_RULE` constant (one constant, four modes, so the wording
+  can't drift) added to all four vault-chat answer modes: FR/DE/EN passages
+  are equally valid evidence, never discard by language, answer in the
+  question's language. `core/agent/loop.py::_AGENT_PREAMBLE` — same rule
+  plus a cross-language retry nudge (an empty search should be retried with
+  the terms in another of the three languages). `rag/thesaurus.py::
+  _PRIMER_HEADER` — "bilingual French/English" → "trilingual
+  French/German/English"; **no config migration needed**: the persisted
+  `vault_primer_header` default is `""` (= use the built-in), so existing
+  installs pick the new header up automatically; only a user-customised
+  header keeps its own text, which is the intent. `deckgen/prompts.py`,
+  `docgen/prompts.py`, `docgen/markdown.py` — outline/section/augment
+  prompts told to use vault sources in all three languages and to write the
+  output in the language of the user's topic/instructions (augment: keep
+  the document's existing language). `tagging/propose.py` — the paper-text
+  wrapper now says FR/DE/EN instead of "bilingual FR-EN" (byte-identity of
+  the knobs-off prompt shape is preserved — the change is inside the single
+  static string all variants share). `chat_system_prompt` (Plain Chat) is
+  deliberately untouched: it is RAG-free, no vault sources to describe.
+- **Example chips (`app.js::wireExamplePrompts`).** One new trilingual chip
+  each for the vault-chat system prompt ("Sources trilingues") and the deck
+  instructions ("Sources FR/DE/EN").
+- **Tests.** `test_prompts.py` gains `TestMultilingualSourceRules` — the
+  deliberate-update record pinning that every vault-describing default
+  prompt names all three languages (RAG modes share the one constant, agent
+  preamble, primer header, all eight generator prompts, tagging propose).
+
+## 2026-08-07 (review fixes — widget same-day stability, refresh 409/500, SwiftBar/Übersicht input hardening)
+
+Code review of the 2026-08-05/06 commits (three parallel review passes +
+manual audit of the tagging write path). No HIGH findings; the tagging/vocab
+bridge, near-duplicates bounds, hash-memo pairing and textclean regexes all
+verified clean. Fixed:
+
+- **BUG (widget): same-day refresh advanced the paper.** The pick was
+  appended to its own anti-repeat history, so the next same-day rebuild
+  *excluded* it from the pool and the stable date seed drew a different
+  paper on every refresh/scan — "paper of the day" degraded to "paper of
+  the click". `api/routes/widget.py::_build_and_write` now filters the
+  previous same-day pick back out of the history it passes to
+  `build_payload` when using the stable seed (same pool → same seed → same
+  pick; the append guard then no-ops). A `redraw` keeps the full history —
+  a new draw is the point. Pinned by
+  `test_widget.py::test_same_day_refresh_is_stable`.
+- **BUG (widget): a failed build answered "Run a scan first".**
+  `_build_and_write` returns `None` both for "no cached scan" and "build
+  crashed"; the refresh route mapped both to the 409. It now re-checks
+  `get_inventory()` and answers **500** ("see chatekld.log") when a scan IS
+  cached — telling a user with a full disk to re-run a multi-minute scan
+  was actively wrong advice. Also: `scan_finished_at` ships `null` instead
+  of `0.0` when a refresh lands mid-scan (`start_scan` resets
+  `_finished_at` to the epoch, and widgets do age arithmetic on it), and
+  `widget/store.py`'s temp-sibling cleanup catches non-`OSError` failures
+  (a `TypeError` from `json.dump` no longer strands the `.widget-*` file).
+- **HARDENING (SwiftBar plugin): payload/server.json values reached menu
+  lines raw.** Defence in depth — `BASE_DIR` is 0700, so every writer
+  already runs as the user — but two shapes converted a file write into
+  code-execution-on-click and were cheap to close. `chatekld.1d.py` now:
+  validates `server.json` like `core/server_info.py` does (version, `int`
+  port in range, **loopback host only** — a string port injected curl
+  arguments into the refresh action's `param6=`, and a foreign host both
+  carried the app header off-box and let the returned payload chain into
+  the `href` hole); validates every `href=` via `safe_href` (scheme
+  allowlist, no whitespace/quotes/controls — a space-bearing `note_uri`
+  terminated the value and everything after became SwiftBar params,
+  `bash=` included); collapses ALL whitespace forms in `esc()` (`\r`/`\v`/
+  `\f`/U+2028 could fabricate a new menu line); caps the live GET read at
+  1 MB behind a no-redirect opener (`web_tools.py` discipline); and
+  type-guards the payload slots so a wrong-typed `paper`/`suggestions`/
+  `notion` degrades instead of raising a plugin-error card. New ratchet
+  `test_widget.py::TestSwiftBarPluginHardening` (the plugin previously had
+  zero coverage of these helpers).
+- **HARDENING (Übersicht card): `openUri` opened any payload string.**
+  `shq()` was verified sound (no command injection), but the scheme was
+  payload data: clicks now only `open` `obsidian://` links and fall back to
+  opening the app otherwise; the `notion` slot requires `.tag` (no more
+  bare "# — " row on `{}`), and `paper`/`suggestions` are type-guarded like
+  the plugin's.
+- **HARDENING (near-duplicates): `_load_fuzz` caught only `ImportError`.**
+  A broken/ABI-mismatched rapidfuzz wheel raising `OSError`/`RuntimeError`
+  at import would have crashed the scan phase; it now degrades to the
+  deterministic tiers with `similarity_available:false`, as designed.
+
+Known accepted residuals from the review (all LOW, deliberate):
+`looks_like_latex` can trip on a backslash-bearing PDF excerpt (display-only,
+rare in this corpus); `_save` in `dup_decisions.py` truncates past 10 000
+ids; the sentinel `U+E000` could collide with PUA glyphs in extracted prose.
+
+## 2026-08-06 (widget polish — de-LaTeXed payload, redesigned card, working actions)
+
+Post-QA pass over the two desktop widgets, from a visual review of the first
+live snapshot.
+
+- **BUG: bibliographic LaTeX reached the widgets raw.** Both surfaces printed
+  `Approches computationnelles de la schizophr\'enie` — BibTeX fields are
+  LaTeX *source* and neither widget has a TeX renderer. New pure, stdlib-only
+  **`widget/textclean.py`** (`delatex` / `looks_like_latex` / `clean_display`
+  / `clean_prose`) resolves accent commands via combining marks + NFC (so
+  every base letter is covered, not a 200-row table), the special letters
+  (`\o`, `\ss`, `\ae`, `\H{o}`…), escaped punctuation, inline math
+  delimiters, `\emph{…}`-style wrappers, dash/quote ligatures and protective
+  braces; an unknown macro loses its name and keeps its argument, the safe
+  failure mode for a display string. TeX's own "whitespace after a control
+  word is eaten" rule is implemented, so `\O stergaard` is "Østergaard".
+  Applied **server-side, once**, to `paper.title` / `paper.authors` — and to
+  the excerpt only when it actually contains a command (`clean_prose`), so a
+  page-1 PDF excerpt's legitimate `$` and `~` survive byte-identically.
+  Deliberately NOT applied to the audit's `Record`s: the fingerprint and
+  every PDF↔bib join key on the raw parsed value.
+- **BUG: "Open ChatEKLD" never worked.** Both widgets ran `open -a ChatEKLD`,
+  but the app installs under a *dated* bundle name
+  (`ChatEKLD_2026-08-06.app`), so the call failed with "Unable to find
+  application named 'ChatEKLD'". Both now use `open -b com.chatekld.app` —
+  the bundle id `install_and_build.sh` hard-codes, stable across builds.
+- **Payload, additive within version 1** (an older widget ignores the new
+  fields and keeps working, so no version bump): `paper.note_uri` (the
+  `obsidian://open?path=` deep link, built app-side from the vault root so a
+  widget no longer has to open `config.json`; verified live against
+  Obsidian), and `paper.author_line` — the bibliographic short form
+  ("Jardri", "Jardri & Dubé", "Jardri et al."), because joining raw
+  `"Last, First"` entries produced "Jardri, Renaud, Dubé, François" where a
+  reader cannot tell names from surnames. Excerpt clipping now cuts on a word
+  boundary instead of mid-word.
+- **Übersicht card redesigned** ("index card", chosen from three treatments
+  reviewed at true size over light / dark / high-contrast wallpapers):
+  opaque warm paper so legibility is unconditional, a ruled excerpt block,
+  the citation key as a call number, 3-line clamps on title *and* excerpt so
+  a long French title can no longer push the card off-screen, and the
+  snapshot age demoted to a 9.5 px footer that only turns amber past 7 days.
+  Deliberately **single-appearance**: an index card has no dark mode, and a
+  dark variant would only be legible over half of all wallpapers.
+- **Übersicht is now clickable** — `onClick` → `run()` opens the note
+  (`obsidian://`) or the app. Übersicht only delivers clicks once the user
+  sets an interaction shortcut *and* grants Accessibility access, so the card
+  stays glanceable-first, says "click to open" in one micro-line, and the
+  handlers are simply never called until then. SwiftBar remains the
+  no-setup action surface.
+- **Backlog counters no longer shout** — the batch line dropped its
+  "(1903 untagged in total)" parenthetical (which undid the completable
+  batch it followed); counts fall to 10.5 px grey with per-store colour dots
+  and thin-space thousands (`4 411`), and a zero count drops out entirely.
+- **SwiftBar menu polished** — typographic hierarchy (14 pt title / 11 pt
+  labels / 10 pt footer), the excerpt moved from a `length=`-clipped
+  one-liner into a **submenu** of wrapped lines, an "Open note in Obsidian"
+  item, and a new **Refresh snapshot** action that POSTs
+  `/api/widget/refresh` with the required header (rendered as an inert grey
+  line when no live server is in `server.json` — it never starts a scan).
+- Tests: `TestDelatex` (accents / escapes / math / wrappers / ligatures /
+  unknown macros / prose gate), plus author-line, `note_uri` and
+  word-boundary-clip cases in `test_widget.py`.
+
+## 2026-08-06 (Lot 3 — the two desktop widgets + packaging)
+
+- **`packaging/widgets/`** — the external consumers of Lot 2's snapshot:
+  `chatekld.1d.py` (SwiftBar/xbar menu-bar plugin, stdlib-only python3:
+  menu-bar count = the completable tag batch; dropdown = paper of the day
+  with an `obsidian://` note link when `config.json` names the vault, the
+  suggestion counts, the notion of the day, a staleness-coloured snapshot
+  age; reads `widget.json` first and prefers a live `GET /api/widget` when
+  `server.json` names a live pid — never the draining status endpoints,
+  never a scan) and `chatekld-widget.jsx` (Übersicht desktop card, Card
+  Catalog styling, display-only `cat` of the file, zero API calls), plus an
+  install `README.md`. Both check `version` and render a "please update this
+  widget" state on schema drift.
+- **DMG staging**: `install_and_build.sh` copies `packaging/widgets/` into
+  the image (the `seed_models.command` precedent) and the generated
+  "READ ME FIRST.txt" gains a step 6 pointing at it. Not bundled into the
+  `.app`. `packaging/widgets/*.py` added to both `py_compile` sweeps.
+
+## 2026-08-06 (Lot 2 — widget snapshot: `widget.json` + `/api/widget*` + Refresh button)
+
+- **New `widget/` subsystem** — the durable feed for the desktop widgets
+  (Lot 3): `snapshot.py` builds a small JSON payload from the audit's cached
+  (previously memory-only) `Inventory` — *paper of the day* (date-seeded
+  weighted draw, anti-repeat history `widget_history.json` cap 14 with an
+  all-in-history fallback; excerpt chain `> [!summary]` callout → cache-first
+  page-1 PDF text → null), one primary **completable** suggestion
+  (`tag_batch`: biblio-scoped untagged count, batch ≤ 10 — Readwise-style
+  micro-dose, not a dashboard of backlog counts) + `finder_drift` /
+  `note_drift` / `unread` counts, and a *notion of the day* from the
+  `_tags.md` glosses. `store.py` persists `BASE_DIR/widget.json`
+  (atomic, no-fsync — regenerable) with `server.json`-style schema-checked
+  reads.
+- **Write triggers: scan completion + manual button only. No scheduler, no
+  auto-scan** — `api/routes/widget.py` registers an
+  `audit_manager.register_result_listener` callback (the search-corpus
+  invalidator precedent; passive at import, `TestFlaskAppBootDoesNotScan`
+  untouched) that no-ops on clear/reset firings, plus
+  `POST /api/widget/refresh` (409 without a cached scan; `redraw:true` forces
+  a new draw) behind the audit tab's new **Refresh widget** button.
+  `GET /api/widget` serves the payload for widgets that prefer freshness
+  while the server runs; the snapshot deliberately survives `/api/reset`.
+  Each write best-effort pokes SwiftBar (`swiftbar://refreshplugin`).
+- Pinned by the new `test_widget.py` (builder determinism/anti-repeat/
+  excerpt chain/scoping, store degrade + history cap, routes 404/409/round-
+  trip, listener no-op + never-scans), added to the dev quick-gate AND
+  `.github/workflows/ci.yml` (the both-lists rule), with `widget/*.py` in the
+  `py_compile` sweeps.
+
+## 2026-08-06 (Lot 1 — Finder Tag Drift correctable from the report)
+
+- **`finder_tag_drift` gains per-row fix verbs, routed through the tagging
+  writers** (the path `plan-03-tag-drift-coverage.md` pre-specified — no new
+  audit write surface; the vendored `audit/` tree still writes nothing).
+  `[→ note]` applies the `finder_only` gap via `POST /api/tagging/apply-note-tags`,
+  `[→ Finder]` applies `note_only` via `apply-finder-tags`; both confirmInline-
+  gated, journalled, with per-row `[undo]` over `/api/tagging/restore`
+  (peek-not-pop) — strictly better recovery than `apply-tag-drift`'s `.bak`.
+- **The two tag identities are bridged server-side.** The report/serializer now
+  ships per-surface `vocab_ids` (`api/routes/audit.py::_vocab_id_resolver`:
+  `_tags.md` ids indexed by `canonical_tag_key` with the SAME `_drift_synonyms`
+  map as the drift comparison), so the UI POSTs the exact literal id the
+  writers' `nfc().lower()` vocab gate accepts — `sleep quality` (Finder)
+  resolves to vocab id `sleep-quality` and the row genuinely closes at the
+  next scan instead of re-offering forever (the unresolvable-row-loop class).
+- **Out-of-vocab surfaces are badged, with a case-by-case admit verb.** A
+  surface with no vocab id renders "(not in vocab)" and is excluded from the
+  direction buttons; its `[+ vocab]` chains the NEW journalled
+  `POST /api/tagging/add-vocab-tag` (pure `tagging/vocab.py::add_tag_to_vocab`
+  appends one `_tags.md` table row — column-count-preserving, header-only
+  tables handled, `|`-in-gloss folded; duplicate ids answer `already:true`
+  with no op; op kind `vocab_add`, reverted by the content-agnostic snapshot
+  restore like `vocab_retire`) then the single-tag apply — one confirm, one
+  undo covering both ops (apply reverted before the vocab entry). A
+  multi-word surface (Finder tags like "sleep quality") is slugified
+  client-side to a single-token id (spaces → `-`; the confirm names the exact
+  id) because `_tags.md` ids must be single tokens — the fingerprint folds
+  separators, so the hyphenated id still closes the row at the next scan.
+- **The report also stops hiding spelling near-misses**: `variants`
+  (`variant_pairs` reused from note_tag_drift — a variants-only row is now
+  emitted) + `note_rel` ride the payload and the search corpus haystack.
+- Pinned by `tests/audit/test_finder_tag_drift.py` (extended),
+  `test_audit.py::test_finder_tag_drift_report_carries_fix_fields`,
+  `test_tagging.py::TestAddVocabTag`/`TestAddTagToVocabPure`,
+  `tests/js/auditFinderDriftApply.test.js` (new) and the widened
+  `confirmCeremony.test.js` ratchet.
+
+## 2026-08-05 (audit sensitivity + single help source — `docs/feature_plans_2026-08-05/`)
+
+- **Plan 1 — single help source.** The sidebar `#howto-modal` — a second,
+  independently-authored full guide that had drifted from `guide.md` (it said
+  "eleven report tabs" where the guide said "nine"; the template renders 11) —
+  is deleted. Its three exclusive fragments (Tips & limits, the fuller Reset
+  wording, Pause/Cancel-resumable indexing) were ported into `guide.md`, which
+  is now the app's only full guide; hardcoded report-tab counts were removed
+  from help copy so the drift class can't recur. The sidebar "How to Use"
+  button routes to the Help tab (`window.openHowTo` — `showTab('help')` +
+  `loadHelpTab()`, the loader being lazy); the duplicate ⌘K "Open How to Use"
+  action is gone ("Go to Help" covers it). The `semanticsLabels` gear-glyph
+  ratchet became relative (wrapped == total) instead of a fixed floor that
+  counted the deleted modal's glyphs. Pinned by `tests/js/helpButton.test.js`.
+- **Plan 2 — tag drift compares by fingerprint, not raw strings.** New
+  vendored-tree-local `audit/engine/normalize.py` (`clean_tag` /
+  `fingerprint` / `tag_key` — the OpenRefine recipe extracted from Tag
+  Hygiene, which now imports it; NFC+casefold fallback keeps non-Latin tags
+  distinct). `note_tag_drift.find_drift` now reports two classes per row:
+  `missing_in_obs` (absent from the note in EVERY spelling — the applyable
+  set, one representative Zotero surface per fingerprint) and the additive
+  `variants` (`[{zotero, note, reason}]` — present under another spelling; a hygiene
+  signal the UI renders in its own column with no Apply). Zotero-side tags
+  are now cleaned too (`#`-prefix / padding no longer permanent false drift).
+  `apply-tag-drift`'s server intersection re-keyed on the same
+  `missing_by_key` helper — closing a real defect: a case-only drift row
+  passed the old `.lower()` check, no-opped in the writer's case-insensitive
+  dedup ("Tags already present", no write), and reappeared on every scan,
+  forever. Serializer/search/CLI carry the new field. Pinned by
+  `tests/audit/test_note_tag_drift.py` (15 tests at plan close; later plans
+  extend the file) +
+  `test_audit.py::test_apply_tag_drift_refuses_variant_spellings`.
+- **Plan 3 — tag drift coverage.** (a) `audit_drift_include_parent_tags`
+  (validated bool, Audit Settings checkbox, default off; read fresh at
+  request time so flipping it needs no rescan) unions the Zotero *item*'s own
+  tags into the drift comparison — item-only missing tags ride
+  `item_only_missing` and render badged "(item)". (b) The read-only reverse
+  direction: per-row `note_only` (note tags absent from the Zotero side) —
+  never actionable, Zotero writes stay in the tagging subsystem. (c) An
+  FR/EN synonym tier: `_drift_synonyms` builds `{tag_key → canonical}` from
+  the vault's `_tags.md` single-tag rows (multi-tag rows assert facets, not
+  synonyms) and injects it into BOTH drift routes and the search corpus, so
+  `sommeil` on a note satisfies a Zotero `sleep` as a `variants` entry with
+  reason `synonym`. (d) New read-only report **`finder_tag_drift`** — the
+  per-paper Finder-vs-note comparison Tag Hygiene's global counts could not
+  answer; asymmetric gate (only papers with ≥1 Finder tag; non-macOS gets an
+  empty report, not noise); new tab + serializer + search section. Pinned by
+  `tests/audit/test_finder_tag_drift.py` + drift plan-3 tests + the config
+  bool-validation test. Audit suites 209/209, JS 375/375.
+- **Plan 4 — duplicate-scan infra.** (a) Persistent full-hash memo
+  `BASE_DIR/audit/hash_cache.json` (`audit/core/hash_cache.py`, the RAG
+  signature-cache pattern vendored-tree-local): every scan used to re-hash
+  every candidate byte; now memo-valid files skip both read stages, the
+  bridge's hash-recovery consults it read-only, and the unique-partial prune
+  is memo-aware (a memoised file still pairs with a byte-identical newcomer).
+  Unreadable files are counted + logged instead of silently vanishing from
+  the search. (b) The duplicates walk finally prunes `ignored_dirs`
+  (`.trash` copies no longer count as duplicates) via the shared
+  `candidate_pdfs`. (c) `audit/core/naming.py` — dead since it was vendored —
+  now powers `suggested_keep` (★ in the UI): the cleanest filename of each
+  duplicate set, advice only. (d) `BibEntry.doi` parsed + normalised
+  (`normalise_doi`). (e) `start_scan(pdf_text_provider=…)`: the route builds
+  a cache-first, page-1-bounded PDF-text callable over
+  `tagging/text_source.py` and injects it (search-corpus seam pattern) for
+  the plan-5 near-duplicate tiers; CLI passes none. Pinned by
+  `tests/audit/test_duplicates_infra.py` (8 tests at plan close, 9 after the
+  verification pass). Audit suites 217/217.
+- **Plan 5 — near-duplicates engine ("Possible Duplicates" report).** The
+  exact scan sees only byte-identical files; every watermark/annotation/OCR
+  pass hid a real duplicate. New `audit/engine/near_duplicates.py` produces
+  labelled candidates from deterministic evidence tiers: `page1_text`
+  (normalized first-page token key — digits dropped, so per-download
+  watermark timestamps/IPs cancel out), `identifier` (first DOI/arXiv id on
+  page 1, v1/v2 folded — the preprint-vs-published catcher), `bib_doi`,
+  `multi_pdf` (one citation key, ≥2 byte-distinct PDFs), and
+  `record_title`/`title_only` (normalized-title collisions, confirmed
+  Zotero-style: year ±1 + first-author surname). File groups require ≥2
+  distinct shas (byte-identical stays the exact report's business); text
+  tiers run only with the route-injected page-1 provider (CLI degrades to
+  hash-only); `no_text_count`/`dismissed_count` are disclosed in the meta —
+  no silent coverage gaps. Third scan phase (`include_near_duplicates`,
+  default on; skipped ⇒ 404 like `duplicates`), search-corpus section, new
+  tab with kind badges. **Dismissals**: `BASE_DIR/audit/dup_decisions.json`
+  (`dup_decisions.py`, RMW-locked atomic+fsync — the zoplicate
+  "non-duplicate marklist" on the mapping.json discipline) via
+  `POST /api/audit/dup-decision {pair_id, dismiss|clear}` — `clear` is the
+  undo, checked first; UI rows use confirmInline + peek-not-pop undo,
+  snapshot semantics. Pinned by `tests/audit/test_near_duplicates.py`
+  (14 tests at plan close) + route verb/404 tests. Audit suites 233/233.
+- **Plan 6 — content-similarity tier (`rapidfuzz`).** New runtime dep
+  (`rapidfuzz>=3.9,<4.0`, pinned 3.14.5 in constraints), imported lazily and
+  gated (`_load_fuzz`): an env without it keeps every deterministic tier and
+  the report discloses `similarity_available: false` instead of crashing.
+  Every file-level candidate group now carries a weakest-link pairwise
+  `similarity` % (normalized page-1 token strings), and a **blocked sweep**
+  adds `content_similarity` pairs for the last uncovered class —
+  same-article/different-origin PDFs with no shared identifier: pairs
+  compared only inside a filename author+year block, Jaccard ≥ 0.35
+  pre-filtered, `fuzz.ratio(score_cutoff=…)` short-circuited — never
+  full-corpus O(n²), `compared_pairs` disclosed in the meta. Cutoff knob
+  `audit_near_dup_ratio` (60–100, default 88; `Settings.near_dup_ratio`,
+  validated in the audit config POST, Audit Settings field) with the
+  paperless-ngx 88/92/97 ladder rendered as likely / very likely /
+  near-certain badges. Calibration rationale recorded in `audit/CLAUDE.md`.
+  Pinned by 4 new engine tests + the knob range-validation route test.
+- **Same-day verification pass** (two fresh-eyes agents over the whole diff +
+  every doc claim; five code findings, all fixed with regression tests):
+  (1) HIGH — the apply-tag-drift route looked the REQUESTED tag up by plain
+  `tag_key` against a synonym-canonicalised drift map, making every
+  synonym-remapped missing tag unapplyable (400 on the very surface the
+  report offered — the unresolvable-row loop, synonym edition); fixed via the
+  new shared `normalize.canonical_tag_key`, used by `group_by_key`, the
+  lookup AND `still_missing`. (2) The near-dup text key now hashes only the
+  first `_KEY_TOKENS = 150` tokens — the cache-first provider returns
+  whole-document text for indexed PDFs but genuine page-1 text for fresh
+  copies, so unbounded keys could never match across that split (the
+  flagship re-downloaded-copy case was a silent false negative; sparse
+  <150-token cover pages remain a disclosed residual). (3) The search-corpus
+  memo now keys on the drift options too — a parent-tags toggle or
+  `_tags.md` edit rebuilds it instead of serving rows the drift tabs no
+  longer render. (4) The memo-aware unique-partial-prune exception is
+  snapshot before the miss loop, so earlier full hashes in a size group no
+  longer widen it (pure wasted I/O, never a wrong result). (5) The
+  dup-decision write verbs use a strict RMW load — a corrupt
+  `dup_decisions.json` now raises (route 500s) instead of being clobbered by
+  a fresh-from-empty save; the scan-time filter still degrades to empty.
+  Doc corrections in the same pass: the swallowed `## 2026-08-04` CHANGELOG
+  header restored, the stale "fingerprint helper is local to the report
+  module" sentences updated to `audit/engine/normalize.py`, the `variants`
+  wire shape corrected to `[{zotero, note, reason}]`, and the guide's
+  outbound-egress list completed with the HuggingFace model downloads.
+
+## 2026-08-04 (four-pillar audit of the 2026-07-30 sprint: one blocker, then polish)
+
+A full audit of `d906cea..e5595b3` (architecture / docs / UX / deployment)
+found the sprint healthy — Plan 9 verified byte-faithful, both external
+bridges intact, deployment ready — with ONE blocker and a tail of polish,
+all fixed in five commits:
+
+- **CI was red on main (the blocker).** `e5595b3`'s flake fix imported the
+  daemon-join helper as `from conftest import join_post_index_daemons`; the
+  repo has two `conftest.py` files (root and `tests/audit/`, neither a
+  package), both imported under the bare name `conftest`, so under full-suite
+  collection the `tests/audit/` one occupied `sys.modules["conftest"]` and the
+  WHOLE suite aborted at collection — while the file passed alone, which is
+  how it slipped through. The helper now lives in **`suite_helpers.py`**
+  (re-exported by the root conftest); rule recorded in `CLAUDE.md`: test files
+  never import from `conftest`. All nine `index_vault` call sites in
+  `test_vault_regressions.py` now call the guard too (they carried the same
+  latent teardown race).
+- **A partial tagging batch-restore destroyed its own retry affordance**
+  (`audit.js`): the undo button was removed on ANY terminal frame, though the
+  server deliberately keeps failed/skipped ops `applied` and even streams
+  "re-run to revert the rest". Kept + relabelled with the remaining count on
+  `reverted < total`; removed only on a full revert. The restore stream also
+  gained a `[cancel undo]` abort (honestly scoped: already-reverted ops stay
+  reverted). Pinned by `tests/js/auditRetireUndo.test.js`.
+- **Preview-cancel honesty reached AT users** (`deck.js`/`docgen.js`): the
+  "UI-only, server compile finishes anyway" scope lived in `title` alone while
+  the inherited aria-label claimed a server-side cancel; and the preview-pdf
+  blob fetch ignored the abort signal, so Cancel during the download was
+  inert. Both fixed in both modules, ratcheted in `deckPreview.test.js`; the
+  help-badge "pair of 4s" click-steal geometry is now test-pinned too.
+- **Audit tab a11y/polish**: the "↳ Unread Only" tab carries
+  `aria-label="PDFs Without Zotero · Unread Only"` (its parent was inaudible
+  in out-of-order SR listings), and the superset cross-link uses the same
+  `[bracketed]` grammar as the sibling tab's actions.
+- **Docs re-synced**: root `CLAUDE.md`'s migration ladder now records 3→4 (the
+  DeepSeek alias reset — it stopped at 2→3 while `CONFIG_VERSION` is 4, the
+  one drift that could cause a future migration collision);
+  `docs/fix_plans_2026-07-30/OVERALL.md`'s header/progress board caught up
+  with its own per-plan sections (Plan 9 steps, 7.2/7.5, 6.2, the completed
+  push); README fixed its dev check commands (missing `docgen`/`tagging`/
+  `cli`/`mcp_server` sweeps + `test_path_validators.py`), the stale "six
+  tabs" count, the adapter/provider lists (DeepSeek/Z.AI), the Plan 9 `rag/`
+  layout, and the per-acquisition lock-TTL wording.
+- **Deployment cosmetics**: `TAVILY_API_KEY` documented in `.env.example` and
+  the DMG's READ ME FIRST (previously a packaged-app user had no discoverable
+  way to enable web search); the literal `\n` in that heredoc fixed;
+  `ruff==0.12.12` pinned in `constraints.txt` (matching the pre-commit hook);
+  the stale "Plan 9 step 4a" phase-header comment removed from
+  `rag/vault.py`.
+
+## 2026-07-31 (audit: the un-Zotero'd PDF tabs were named as a partition)
+
+- **"Read PDFs Missing Zotero" has never filtered to read PDFs.**
+  `read_unzoterod.find()` applies no threshold at all — it lists EVERY PDF the
+  bridge could not resolve to a bib entry, read and unread alike, ranked by
+  annotation count. `unread_unzoterod` walks the same `bridge.unmapped_pdfs`
+  and keeps only `annotations < threshold`, i.e. it is a strict SUBSET. The two
+  tabs were called "Read PDFs Missing Zotero" and "Unread PDFs", which reads as
+  a partition — so the complete list was already on screen and effectively
+  undiscoverable. Renamed to **"PDFs Without Zotero"** and **"↳ Unread Only"**,
+  reordered adjacent with the superset first. Report ids are unchanged, so the
+  `/api/audit/reports/<name>` contract, the cross-report search corpus and the
+  `python -m audit --check` names are untouched.
+- **Exclusion disclosure — the substantive half.** `unmapped_pdfs` is only ONE
+  of the bridge's residual buckets and the `biblio_skip_prefix` files never
+  reach the bridge at all, so "every unmapped PDF appears" was never the same
+  claim as "every PDF missing from Zotero". `read_unzoterod` now carries
+  `ambiguous_count` / `confirmed_no_match_count` / `skipped_count` — counts
+  only, never rows — and the meta line names each one, with cross-links to the
+  reports that own those rows. Zero counts are dropped rather than printed as
+  "0 excluded". `audit/scan.py::check_read_unzoterod` prints the same three.
+  Confirmed-no-match PDFs stay counted-but-unlisted by choice: the user already
+  triaged them, and listing them would re-clutter the queue they just cleared.
+- **Docs corrected, not just extended.** Three places (root `CLAUDE.md`,
+  `audit/CLAUDE.md`, the `/api/audit/pdf` docstring) justified that route's
+  vault-root containment by claiming "ambiguous PDFs come from the whole
+  scanned attachments tree". They do not — `inventory._walk_biblio_pdfs` walks
+  `biblio_articles_dir` and nothing else, so every ambiguous PDF is
+  biblio-scoped. The containment is left as-is (wider than needed = defence in
+  depth, and narrowing a security boundary is not a drive-by) but the reason is
+  now accurate.
+- **Fixed a pre-existing full-suite-only flake** (unrelated to the audit
+  change; it just kept surfacing during this session's runs).
+  `index_vault` ends by kicking a fire-and-forget `bm25-postindex-rebuild`
+  daemon, which is **still alive when `index_vault` returns** — proven directly,
+  not inferred. In production that is fine (the index dir is stable), but in a
+  test it outlives the enclosing `patch("rag.vault.OBSIDIAN_INDEX_DIR", tmp)`
+  and the `TemporaryDirectory`, so its sidecar write races
+  `TemporaryDirectory.__exit__`'s `rmtree`. Load-dependent, hence a rare flake
+  under the full suite that never reproduced on the file alone (~2 failures in
+  20 full runs; 12 consecutive clean runs after the fix). New
+  `conftest.join_post_index_daemons()` joins the daemon, and
+  `test_lancedb_migration.py::_index` calls it INSIDE the patch/tempdir scope —
+  an autouse teardown fixture would be too late, the directory is already gone.
+  Also stops the daemon leaking a sidecar into the shared test BASE_DIR. The
+  other ~9 `index_vault` call sites in `test_vault_regressions.py` have the same
+  latent exposure and can adopt the same one-liner if they ever flake.
+- Pinned by `tests/js/auditUnzoteroedTabs.test.js` (naming, ordering, the
+  aria-hidden containment glyph, no glyph leaking into the search-panel group
+  headings, zero-suppression, delegated cross-links) and by the containment
+  invariant `unread.rows ⊆ read.rows` plus the three counts in
+  `test_audit.py::TestReportsServeFromCache`.
+
+## 2026-07-30 (fix-plan Plan 9: `rag/vault.py` decomposition, 6,300 → 5,143 lines)
+
+- **Four move + re-export extractions, zero test edits, suite green after each.**
+  `rag/storage_io.py` (stdlib-only leaf: `_write_json_atomic`,
+  `_json_file_has_complete_tail`, `_simple_vector_store_has_any_embedding`),
+  `rag/sidecars.py` (`RetrievalCacheMixin` — the BM25 + wikilink sidecars —
+  plus `_WikilinkGraph`, `_closest_note_by_dir` and the shared vault link
+  regexes), and `rag/build.py` (`IndexBuildMixin` + `_PersistTarget`).
+  `rag.vault` re-exports every moved name; `obsidian_manager` is unchanged.
+- **`index_vault` 654 → 216 lines.** Split in place first (step 4a) into eight
+  named phases, then moved (4b). The ORCHESTRATION stayed in `rag/vault.py` on
+  purpose — every early return, and specifically which of them sit inside the
+  outer `try` (i.e. which reach `finally: gc.collect()`), is the part that must
+  be readable in one place. `_PersistTarget` bundles the seven locals the
+  mid-run checkpoint and the final persist both closed over, so the two paths
+  writing the same meta for the same index cannot drift apart.
+- **The constraint that shaped all of it.** A method reading a module global the
+  suite patches as `rag.vault.<name>` (`OBSIDIAN_INDEX_DIR`, `load_config`,
+  `get_provider`, `lancedb_available`, …) cannot simply be relocated: the global
+  would resolve against the new module's namespace and silently ignore the
+  patch, leaving ~90 patch sites as no-ops — tests passing while asserting
+  nothing. Two sanctioned workarounds, both used: leave the read behind in a
+  thin accessor the mixin reaches through `self` (`_bm25_sidecar_dir`,
+  `_wikilink_sidecar_path`), or make it a keyword-only parameter whose name
+  **shadows the global exactly**, read at the call site (`rag/build.py`). That
+  shadowing is why the moved bodies are byte-identical apart from 8 ×
+  `OBSIDIAN_INDEX_DIR` → `index_dir` — verified by statement-level AST diff at
+  both steps, not by eye.
+- **Steps 1 and 3 dropped deliberately** (index meta/archive; PDF/image caches):
+  209/326 and 324/508 of their lines read patched globals, so moving them would
+  split a cohesive family across two files for ~110 usable lines each. **The
+  plan's ≤2,000-line target is not reachable under its own ground rules** — the
+  residual bulk (`_index_documents_streaming` 463, `_load_vault_documents` 364,
+  `_chunk_raw_documents` 199) would need 5–6 threaded parameters each, at which
+  point the indirection costs more than the split returns. Recorded for a
+  maintainer call in `docs/fix_plans_2026-07-30/OVERALL.md` (P9.5).
+- A rare flake surfaced during this work in
+  `test_lancedb_migration.py::TestBackendAwareIndexVault::test_index_with_no_recorded_embed_rebuilds`.
+  **Diagnosed and fixed under the 2026-07-31 entry; it was pre-existing and
+  unrelated to this decomposition** (a broken `OBSIDIAN_INDEX_DIR` patch would
+  have failed that test every run, not twice in twenty).
+
+## 2026-07-30 (fix-plan Plan 7.2 + 7.5: per-vault PDF signatures, archive footprint)
+
+- **The PDF signature map is per-vault (P7.2).** It was ONE shared
+  `pdf_signatures.json` keyed by vault-RELATIVE path. Two vaults sharing a rel
+  shared an entry, and — the cost that actually bit — the loader persists the
+  whole map it built for the vault it just scanned, silently **evicting** the
+  other vault's entries and forcing a full re-hash of every large PDF there on
+  its next run (hundreds of MB per textbook; this cache exists precisely to
+  avoid that). Now `obsidian_cache/pdf_signatures/<vault_key>.json`, matching
+  the sibling `pdf_cache/<vault_key>/` and `image_cache/<vault_key>/` that have
+  been per-vault all along. The two legacy shared files are still **read and
+  merged** so the upgrade costs no re-hashing — and a *second* vault can adopt
+  them too — but are **never written again**. Cross-vault adoption is safe
+  because `_pdf_file_signature` re-validates size + mtime_ns before reusing a
+  sha, so a foreign or stale entry degrades to a full hash rather than serving
+  wrong text. The read-path stat cache now keys on the per-vault PATH as well
+  as the file signatures, so a vault switch can't be served the previous
+  vault's parsed map. No configured vault degrades to the old shared file.
+- **Index-archive footprint is disclosed (P7.5).** Retention is count-bounded
+  (2 routine / 5 protected), so a multi-GB index could sit on tens of GB of
+  archives with nothing saying so. A byte cap was rejected again — it needs a
+  du-walk on every archive — but the archive is now measured **once**, right
+  after the rename (`_dir_size_note`, off the indexing hot path, bounded by
+  `_DIR_SIZE_WALK_BUDGET_S`), and the size + the retention counts go to the log
+  AND the status ring. A walk that runs out of budget reports **nothing**
+  rather than an undercount presented as the archive's size.
+
+**P7.1 and P7.3 are deliberately NOT in this commit.** P7.1 (batching the
+changed-chunk lancedb deletes) is a restructure of the delete-then-reinsert
+interleave in the streaming indexer — the most data-safety-critical loop in the
+app, where the 2026-07-22 A6 audit already found that a swallowed delete failure
+produced permanent duplicate rows. Batching changes the failure semantics (a
+partial batch failure is an ambiguous subset, where today one chunk fails
+alone), so it wants a session with the maintainer's attention and dedicated
+fixtures, not a tail-end refactor. P7.3 (offsetting add/delete drift) is
+specified as "measure `lancedb_list_doc_ids` on a large index first, then choose
+the gate" — that measurement can only be taken against the real index with the
+app closed, so the gate cannot be chosen here. Both stay in Known Issues.
+
+## 2026-07-30 (fix-plan Plan 6.2: Cancel for the two longest LaTeX operations)
+
+Generate and Augment have had a Cancel button since their SSE wiring landed;
+**compile-fix and preview — the longest deck/article operations — had none**, so
+a user watching a doomed repair loop could only wait or reload the app.
+
+- **compile-fix (deck + docgen)** now POSTs with an `AbortController` signal.
+  Aborting closes the SSE stream, and the server's existing consumer-disconnect
+  path does the rest: the worker's cancel event is set, latexmk's process group
+  is TERM→KILLed on its own timeout, and `_SSEOpGuard` releases the op lock once
+  the worker exits. No server change was needed.
+- **compile-preview** is a *synchronous* route, so its Cancel frees the UI and
+  the fetch only — the server's latexmk pass runs out its
+  `min(deck_compile_timeout_s, 300)` cap. That limit is stated in the button's
+  title and the status line rather than implied away, and since preview never
+  rewrites the `.tex` an abandoned pass leaves only regenerable build artifacts.
+- A cancelled run now reports cancellation instead of logging a crash.
+
+Ratcheted in `tests/js/deckCompileFix.test.js` over BOTH `deck.js` and
+`docgen.js` (signal present in the same options object as the body; controller +
+Cancel button per op; cancellation messaging). JS suite 351 passed.
+
+**P6.1 (the piecewise global-lock hold) is deliberately NOT in this commit.**
+It has three viable shapes — a per-path lock registry (~20 acquisition sites;
+also closes the 2026-07-20 global-lock deferral), release/re-acquire between
+sections (3 sites, but a failed re-acquire discards completed agent turns), or
+acquiring the lock LATE (the piecewise agent turns are read-only, so the lock
+protects nothing during them; changes the documented "one op at a time ⇒ 409"
+contract). They change different contracts on a lock that guards user `.tex`
+writes, so the choice is recorded in the tracker for the maintainer rather than
+made in passing. `CLAUDE.md` already warns against restructuring
+`_SSEOpGuard`'s release ownership as a drive-by. P6.3 (apply-repair
+server-owned bytes) is held with it, since it introduces the same staging shape.
+
+## 2026-07-30 (fix-plan Plan 8: long-tail hardening)
+
+Five of the six long-tail items; two deliberate scope calls are recorded below.
+
+- **Vault-chat export no longer duplicates the question (P8.1).** A partial
+  failure records `{user, assistant+"[interrupted]"}`; the Retry then re-asked
+  the SAME question and its success path pushed the user turn again, so the
+  exported transcript showed the question twice. `_pushUserTurnOnce` +
+  `_recordedRetryQuestion` make the user turn idempotent per question, keeping
+  BOTH assistant outcomes. Covers the retry-fails-again and
+  new-different-question cases too. Pinned by `tests/js/vaultExportRetry.test.js`.
+- **Parity ratchet over the six hand-rolled path validators (P8.2).** `CLAUDE.md`
+  warned that a hardening of `resolve_under_root` "must be mirrored into those
+  hand-rolled validators" with nothing enforcing it. `test_path_validators.py`
+  pins the shared contract (embedded NUL/LF/CR, empty/non-string/over-long,
+  relative-vs-absolute shape) across all six at once, each group carrying a
+  POSITIVE control so a rejection can't be satisfied by a validator that returns
+  None for everything. Registered in BOTH the CLAUDE.md quick-gate and CI.
+  **It immediately earned its keep:** `deck.py::_resolve_out_dir` was the one
+  validator of six that accepted a RELATIVE path — `realpath` anchored it to the
+  server's CWD, so `out_dir: ".."` scaffolded a deck somewhere the caller never
+  named. A footgun over HTTP and over the CLI alike (the CLI is a client; the
+  path resolves in the server's process, not the user's shell). Now rejected
+  before `realpath`, `~` expansion still honoured.
+- **`llm_usage.jsonl` rotates (P8.3).** Append-only and unbounded (a Tier-3 item
+  deferred from the 2026-07-03 perf pass). At 10 MB it rolls over to `<log>.1`
+  via an atomic `os.replace`; `_iter_disk_records` reads the rotated generation
+  FIRST and then the live log, so a summary window spanning a rotation keeps its
+  records. Size comes from the append's own `tell()` (no extra stat on the
+  per-request path) and a failed rotation never breaks recording.
+- **Truncated vision descriptions are now visible (P8.4, partial by choice).**
+  Both transports gained an additive `meta` out-dict reporting the stop cause,
+  and `describe_image` logs a WARNING naming the cap and the remedy when a
+  description was cut off. The description is **still cached** — deliberately:
+  not caching it would re-run an expensive vision call on every indexing run,
+  a worse trade for a large vault than a truncated-but-searchable description.
+  The self-healing variant (record the cap, re-run when it rises) stays open in
+  Known Issues rather than being half-built into the indexing hot path.
+- **`vision_failure_cooldown_s` has a Settings control (P8.5).** The validator
+  already existed; the knob was config-only. Added to the OCR/Vision section
+  with a help tip, and both docs that called it UI-less are corrected. `0` (the
+  disable value) survives the client's `Number.isFinite` collection.
+- **Not done, recorded not silently dropped:** P8.6 (the three uncovered
+  image-link resolver shapes) needs a read-only survey of the maintainer's real
+  vault first — fixing them changes WHICH files index, i.e. additive vision +
+  embed churn on the next reindex, so it must be gated on evidence that each
+  shape actually occurs. Stays in Known Issues.
+
+## 2026-07-30 (fix-plan Plan 5: Zotero/tagging robustness)
+
+Three carried deferrals — two from the 2026-07-21 audit, one from 2026-07-23.
+
+- **The 429 itself now arms the read backoff (P5.1).** `_backoff_until` was
+  armed only by a `Backoff` header on a *successful* response, so the one
+  signal that actually means "you are being throttled" — the 429/503 — was
+  captured onto `ZoteroRateLimited.retry_after_s` and then dropped; the next
+  read re-hit the same 429 immediately. `_raise_for_http` now calls the
+  extracted `_arm_backoff`. The invariant holds: only READ paths consult it
+  (`_await_backoff`), so a write under the obsidian op-lock still never sleeps,
+  and the wait stays bounded by `_MAX_BACKOFF_WAIT_S`.
+- **The userID cache expires (P5.2).** `resolve_user_id`'s cache doubles as
+  "this key authenticates" (`probe` returns True straight off a hit), so an
+  unbounded entry let a key **revoked at zotero.org** keep reporting the Zotero
+  target as available until the app restarted — the user found out when a write
+  failed. Entries now carry a 15-minute TTL (`_USER_ID_TTL_S`); a *rotated* key
+  needed no change (the sha256 fingerprint is part of the cache key).
+- **Batch restore streams (P5.3).** `POST /api/tagging/restore {batch_id}` was a
+  synchronous JSON request: N pre-lock Zotero GETs + N reverts on one Waitress
+  thread, silent for minutes on a 150-op undo. It now runs through
+  `run_sse_worker` with per-op `{"info"}` progress and a terminal `{"restore"}`
+  frame carrying the old payload; `audit.js`'s `[undo retire]` consumes it into
+  the existing status line. The lock choreography is unchanged (Zotero reads
+  pre-lock, one heartbeat-checked hold for the reverts + save, per-op
+  conservatism). **The same URL now answers SSE for a `batch_id` body and JSON
+  for an `op_id` body** — deliberate and safe: only the batch is long-running,
+  and the CLI/MCP driver only ever sends `op_id` (pinned by the driver contract
+  + replay suites). Validation failures are decided before streaming begins, so
+  they keep real status codes — pinned by two new tests so an SSE 200 can never
+  start masquerading as success.
+
+## 2026-07-30 (fix-plan Plan 4: doc hygiene — one true record of deferred work)
+
+Docs only, zero code. The 2026-07-29/30 verification sweep found real deferrals
+recorded *only* in subtree docs, the CHANGELOG or code comments — exactly the
+record loss the root Known Issues section exists to prevent — plus two pointers
+that claimed something lived there when it didn't.
+
+- **Eight orphaned deferrals promoted** into root `CLAUDE.md` (*Promoted
+  2026-07-30*), each re-verified against the code first: the audit's serial
+  mapped-PDF annotation reads (`inventory.py:332`, `audit/CLAUDE.md`-only); the
+  four CHANGELOG-only Tier-3 items (frame-slim, apply-recompute, **unbounded
+  `llm_usage.jsonl`**, deck-checkpoint `raw`); the tagging-propose
+  pre-first-token cancel gap; the vision truncated-description cache (keyed on
+  image bytes, so raising the cap never re-runs it); the three uncovered
+  image-link shapes; retire-tag's Zotero child-note/`.bib` blind spot; the eval
+  graded-qrels v2 seam; deckgen batch mode.
+- **Two broken pointers fixed.** The CHANGELOG and `PUBLISHING.md` both said
+  provider-native web-search v2 was "recorded in CLAUDE.md Known Issues" — it
+  was recorded in the *Agent Mode* section, so a Known Issues entry now makes
+  both true. And the "thread-leak-guard port deferred to 4.3" note is annotated
+  **closed**: item 4.3 shipped it (`api/sse.py::_SSEOpGuard` releases only once
+  the stream ended AND any spawned worker exited).
+- **Drifted facts refreshed.** `rag/CLAUDE.md`'s batched-embed parity caveat is
+  narrowed to *unvalidated* backends (Ollama/`nomic-embed-text` was validated
+  2026-07-05 — stored vectors bit-identical at batch 1 vs 16); `rag/vault.py`
+  re-measured at **6,176 lines / `index_vault` ~667** (recorded as 5.4k/~480 —
+  the deferral grows while deferred); the path-validator count corrected to six.
+  Bonus: `rag/CLAUDE.md` #33 said "Two link shapes"/"Both" while enumerating
+  three.
+- **Three open product questions recorded** (*Awaiting a maintainer decision*):
+  Settings tiering — which had **no trace anywhere** that it was ever deferred —
+  the A5 in-app `.env` key affordance, and deckgen batch mode.
+- **`PUBLISHING.md` corrected.** Its status note claimed "nothing left to
+  withhold: every `docs/*` plan doc has been deleted after shipping", which this
+  plan folder itself invalidated. Scanned clean (no vault paths, personal data,
+  keys or excerpts) but flagged as a *live* planning artefact naming unfixed
+  defects — publish/withhold is a maintainer decision, and the "no strip step"
+  claim must not be trusted while `docs/` is non-empty.
+- Known Issues gained a standing rule at the top: record a deferral **there**
+  and cross-reference from the detail doc, never the other way round; plus a
+  pointer to `docs/fix_plans_2026-07-30/OVERALL.md` as the live tracker.
+
+## 2026-07-30 (fix-plan Plan 3: nine correctness quick wins)
+
+Eight long-carried 2026-07-20 audit deferrals plus one trust-check asymmetry,
+each small, local and independently pinned. Known Issues shrank by eight entries.
+
+- **Google adapter: `Retry-After` honoured (P3.1).** `_http_error_to_llm_error`
+  now calls `parse_retry_after_s` on a 429 (header first, then the "try again in
+  Xs" body phrase) so a Gemini rate-limit gets the provider's own wait as the
+  backoff FLOOR — the fix that shipped for OpenAI/Anthropic 2026-07-03 and never
+  reached the sibling. Non-429s carry no hint (a schedule the provider never
+  asked for), and a response without `.headers` is tolerated.
+- **Gemini prompt-level block is no longer a malformed turn (P3.2).** A blocked
+  PROMPT returns zero candidates + `promptFeedback.blockReason` instead of a
+  candidate with `finishReason: SAFETY`; that read as an empty STOP and counted
+  toward the agent loop's malformed-tool-call streak, dragging the turn into the
+  RAG fallback + capability nag. `_prompt_block_reason` maps it to
+  CONTENT_FILTER; a candidate's own finish reason still wins.
+- **Cancelled streams are recorded as cancelled (P3.3).** A client disconnect
+  raises `GeneratorExit` through `for chunk in stream`, which `except Exception`
+  deliberately does not catch — so all four adapters recorded a clean
+  `success=True`. Each now has an explicit branch marking
+  `error_category=CANCELLED_ERROR_CATEGORY` (new shared constant carrying the
+  reasoning), and OpenAI — whose usage rides the never-delivered final chunk —
+  re-estimates output tokens from the text actually streamed. `success` stays
+  True on purpose: `record()` forces cost 0.0 for a failure, and the provider
+  bills what it generated, so flagging it as failed would hide real spend.
+  Input-token under-reporting on final-chunk-usage providers is a documented
+  residual (not fabricated — see Known Issues).
+- **`init_db` fails loudly (P3.4).** It logged one line and returned, letting the
+  app boot with no `uploads` table and surface as a distant 500 on the first
+  upload; it now re-raises after logging.
+- **NFC-insensitive tag comparison (P3.5).** macOS stores Finder tags (and Zotero
+  can hold) accented text in NFD while `_tags.md` and the browser send NFC, so
+  `.lower()`-only comparison treated « rétablissement » NFC/NFD as two tags —
+  unioning a visual duplicate and missing the tag a removal targeted. All ten
+  comparison sites in `tagging/writers.py` now route through one `_tag_key`
+  (NFC + lower). KEY only: Finder's raw colour-suffixed entries and Zotero's
+  full tag dicts still round-trip byte-identically for Restore, and `.lower()`
+  (not `casefold()`) keeps case semantics unchanged.
+- **Atomic writers preserve an existing file's mode (P3.6).** `mkstemp` creates
+  0600 and `os.replace` carried that to the destination, so a 0644 vault note
+  rewritten by refactor Apply / docgen silently became owner-only.
+  `_inherit_dest_mode` copies an EXISTING destination's bits before promotion; a
+  NEW file keeps 0600 (never invented as world-readable) and a chmod failure
+  still writes the content.
+- **`load_config_readonly` never returns an empty proxy (P3.7).** A concurrent
+  `save_config` between its cold-path `load_config()` and the locked re-read
+  yielded `MappingProxyType({})`; it now retries and, in the pathological case,
+  returns the fully-merged dict instead of an empty mapping.
+- **`ReaderWriterLock` docstring made truthful (P3.8).** The headline said
+  "reentrant" unqualified while a plain reader re-acquiring `read_lock` with a
+  writer pending self-deadlocks. Now states writer-only reentrancy and forbids
+  nested reads, with the deadlock mechanism spelled out.
+- **The pandoc Lua filter gets `maintain.sh`'s trust check (P3.9).**
+  `check_tex.py` handed a suite-resident, vault-editable Lua filter to pandoc
+  after only an `.exists()` check while `maintain_gui.py` ownership-checked its
+  script. `_check_file_trust` mirrors that check (a deliberate copy — the GUI
+  module imports tkinter and this is a headless CLI); an untrusted filter is
+  skipped with a note in that document's log and the conversion runs without it.
+
+Also fixed, found while running subsets of the suite: **`TestVisionCallBounds`
+was order-dependent** — the vision transport reuses the `(base_url, timeout)`-keyed
+LM Studio client cache, so a client cached by another test file meant
+`openai.OpenAI` was never constructed and the retry/token assertions saw nothing.
+It passed only because the documented quick-gate order runs `test_concurrency.py`
+before `test_llm.py`. Its `setUp` now clears that cache, the same discipline
+`test_llm.py::_fake_httpx_module` already applies to the anthropic/google caches.
+Pre-existing (reproduced on `5c22005`), not a Plan 3 regression.
+
+Tests: `TestGoogleErrorAndBlockHandling`, `TestStreamCancellationAccounting`
+(test_llm.py), `Plan3CorrectnessFixesTest` (smoke_test.py),
+`TestTagKeyNFCNormalisation` (test_tagging.py) — 1888 passed, 3 skipped across
+the quick-gate + CI superset (and now under reversed file order too); 339 JS
+tests green.
+
+## 2026-07-30 (fix-plan Plan 2: DeepSeek alias sunset cleanup + config migration 3→4)
+
+The 2026-07-24 alias sunset fired as designed (the date-gated curation stopped
+offering `deepseek-chat`/`deepseek-reasoner`), leaving three pieces of residue:
+
+- **Dead machinery deleted.** `_DEEPSEEK_ALIAS_SUNSET` / `_DEEPSEEK_LEGACY_ALIASES`
+  / `_deepseek_curated` were permanently-dead past the date;
+  `DEEPSEEK_CURATED_MODELS` is a plain list again. The pinning test became
+  `test_deepseek_legacy_aliases_stay_retired` (unconditional absence).
+- **Config migration 3→4** (`_migrate_3_to_4`, `CONFIG_VERSION = 4`): the
+  sunset stopped OFFERING the alias ids, not USING them — a `deepseek_model`
+  persisted before it kept sending an id the provider 404s on every call. The
+  migration resets exactly the two retired aliases to the current default
+  (read from `_DEFAULTS`, never an inline literal), preserving any other value
+  as user-chosen. The 2→3 remedy pattern; pinned in
+  `smoke_test.py::TestConfigVersionMigration`.
+- **Pricing rows dropped** for the two aliases (historical usage records store
+  cost at write time; post-migration no new call can carry them). Docs updated
+  (`core/llm/CLAUDE.md`, adapter comments) — the sunset now reads as history,
+  not as a pending event.
+
+## 2026-07-30 (fix-plan Plan 1: Ollama thinking suppression + eval-generator diagnosability)
+
+Closes all three 2026-07-27 OPEN findings (the deferred-work plan set lives in
+`docs/fix_plans_2026-07-30/`; its OVERALL.md is the cross-session tracker).
+
+- **Ollama `think=False` everywhere (the headline fix).** Ollama bills thinking
+  tokens against `num_predict` and the app never reads `message.thinking`, so a
+  reasoning model returned an empty reply after burning its whole cap. Every
+  Ollama chat call now suppresses thinking: `OllamaProvider.stream_chat` routes
+  through `stream_chat_with_think_off` (first chunk pulled inside the guard —
+  pre-first-token, the house retry boundary) and the agent tool path through
+  `chat_with_think_off`. A backend/SDK that rejects the parameter itself gets
+  one retry without it (`_think_param_rejected` deliberately does NOT match
+  genuine generation errors) and the model is memoised in
+  `_THINK_UNSUPPORTED_MODELS`. Per-call-site opt-in seam for a future
+  reasoning consumer: `request.metadata["ollama_think"] = True` (or an explicit
+  `think=` kwarg to `stream_chat`) forwards `think=True` verbatim, no fallback.
+  Out of scope, recorded: the LlamaIndex `Ollama` LLM used by query-expansion
+  rewrites. Pinned by `test_llm.py::TestOllamaThinkSuppression` (9 tests).
+- **`scripts/gen_golden_retrieval.py` fails fast and says why.** (a) The reply
+  budget is a real knob: `--max-tokens` (default 512 via `DEFAULT_MAX_TOKENS`),
+  content-determining so it joins the resume job key. (b) The 0-query failure
+  line now quotes the raw reply's length + a 200-char preview (`ChunkResult`
+  gained `raw_len`/`raw_preview` — the reply was previously discarded before
+  the carrier, making the failure structurally undiagnosable; the
+  `tagging/propose.py` remedy pattern). (c) Systematic-failure early abort: if
+  the first `EARLY_ABORT_AFTER` (5) completions of a run ALL produce nothing,
+  the run cancels the queued tail and exits 1 with the likely causes (thinking
+  model, starved budget) instead of absorbing ~40 identical failures over ~40
+  minutes; one success re-enables the per-chunk tolerance. Covered by
+  `tests/eval/test_golden_gen.py::TestDiagnosticsAndEarlyAbort`.
+- **Point-of-use wording.** `tests/eval/README.md` no longer calls "any local
+  model" safe (privacy vs quality axes split; the thinking-model caveat is
+  rewritten as fixed-with-residual for pre-`think` servers) and the script's
+  docstring/`--help` carry the caveat at the point of use.
+
+## 2026-07-29 (four-pillar audit remediation: refusal surfacing · lock-shadowed heartbeat · settings race · toolchain hardening)
+
+A fresh four-pillar audit of `HEAD~5..HEAD` confirmed 15 findings with one
+theme: backend safety mechanisms correct server-side and then discarded
+downstream. Fixed in five batch commits; two items became documented deferrals
+(protected-archive byte cap; vault-resident-code sandboxing) in CLAUDE.md
+Known Issues.
+
+- **The erased refusal (P0).** The embed-backend gate's refusal — whose whole
+  value is its recovery instructions — travelled only on the destructively
+  drained `messages` channel, and `vault.js`'s `state === 'error'` branch then
+  blanked the status line and rendered a generic "Indexing failed." + a Retry
+  that re-ran the refusing gate forever. Every `index_vault` error exit now
+  records persistent `error_code`/`error_detail` (`_record_index_error`, on the
+  status payload additively); the client renders the real reason and keys
+  actions on the code: `embed_backend_mismatch` offers a **confirm-gated
+  "Rebuild from scratch"** (→ the newly exposed `force_fresh` body field on
+  `POST /api/obsidian/index`, strict `coerce_bool`) instead of Retry, and the
+  record survives a tab reload via `refreshIndexState`. The LanceDB preflight
+  gained the same code (`lancedb_unavailable`) + its missing phase stamp.
+- **Reranker heartbeat out from under the lock (P1).** The 2026-07-27 ticker
+  started inside `_reranker_load_lock`, covering only the loading thread —
+  launch prewarm (stage_cb=None) holds that lock for an entire multi-GB
+  download, so the documented upgrade flow ("relaunch, ask one question")
+  walked the first chat into a silent 330 s SSE stall kill. The ticker now
+  starts before the acquisition and stops in a `finally` after it, so waiters
+  beat too; the sticky-failure early return also emits a per-query
+  "reranking is disabled for this session" notice through `stage_cb` (never
+  the status ring). Client side, repeated heartbeat frames now UPDATE one
+  bubble in place (`vault.js::progressKey`, digit-blind) instead of appending
+  ~40 bubbles + ~40 SR announcements over a 20-minute download.
+- **Settings modal races (P1).** `refreshSettings` re-checks its
+  `_saveTimer || _savesPending` guard AFTER its awaits (a keystroke during the
+  GET used to be reverted by the stale response, then persisted by the pending
+  debounce); `_savesPending` increments after the payload build (leak window);
+  and a server-dropped key's error note is now in the control's
+  `aria-describedby` (WCAG 3.3.1 — additively, control-hint ids survive).
+- **Eval-harness restore integrity (P1).** `_PENDING_LOCK` is an `RLock`
+  (SIGTERM re-enters on the main thread mid-`_arm_pending`; a plain Lock
+  self-deadlocked and the config was never restored) and a failed unlink in
+  `restore_config`'s no-config branch raises `ConfigUnsafeError` keeping the
+  sidecar, instead of claiming a restore that didn't happen.
+- **vault_maintain toolchain.** `maintain_gui.py`: Stop's TERM→KILL escalation
+  captures its process (it could SIGKILL a subsequently started run), `_drain`
+  re-arms in a `finally` (one render error used to kill the poll loop
+  permanently), only exact `::step::/::start::/::end::` prefixes are protocol,
+  "Stopped" is `returncode < 0` only, and `maintain.sh` is refused unless
+  owned-by-user and not group/world-writable (`_check_script_trust`; residual
+  iCloud-sync risk documented). `check_tex.py`: latexmk/pandoc run in their own
+  process group with TERM→KILL on timeout (mirrors `deckgen/compile.py` — a
+  timeout used to orphan pdflatex/biber children into the TemporaryDirectory
+  cleanup), one read per `.tex` (`classify_document` replaces the
+  `is_root_document` + `is_beamer` double read), dead `_PRINT_LOCK` removed.
+- **Privacy/docs/CSS.** The personal vault-path literal is gone from
+  `vault_paths.py` (rule 5 is now subfolder names only — the tree publishes to
+  a public mirror); `~/venvs/...` paths genericized in guide.md /
+  tests/eval/README.md / install_mcp.py; `.help-tip` lost its unreachable
+  scrollbar (the tip-length ratchet is the real bound); `.help-badge` gained
+  the `margin-left: 4px` that makes its 24px hit-area overlay provably
+  non-overlapping; `.gitignore`'s `*cells*.json` is root-anchored.
+- Tests: `TestEmbedProviderStamping` (+persistent payload, supersession),
+  `TestRerankerLoadVisibility` (+beat-while-blocked, sticky notice),
+  `test_30c` route force_fresh coercion, `TestConfigBackupRestore` (+RLock
+  ratchet, unlink-failure), and three JS suites (`vaultErrorDetail`,
+  `vaultInfoDedupe`, extended `settingsFeedback`).
+
+## 2026-07-27 (retrieval eval harness · reranker upgrade path · embed-backend gate · four-pillar audit remediation)
+
+Retrieval quality was unmeasurable: every knob (RRF leg weights, cutoff, rerank
+pool sizing, reranker model) was tuned by feel, and answer-level pass rates are
+far too noisy to attribute a change to the retriever — Track 5.6 hit that wall
+and fell back to eyeballing raw embedding vectors. Shipped in two passes: the
+harness itself, then a four-pillar audit (principal-engineer / performance /
+a11y / AppSec) whose findings are folded in below rather than deferred. No
+default retrieval behaviour changed.
+
+### Retrieval eval harness (`tests/eval/` + `scripts/`)
+
+- **`tests/eval/retrieval_metrics.py`** — pure stdlib (**zero project imports**,
+  so it imports before `CHATEKLD_BASE_DIR` is fixed) computing **document-level**
+  recall@k / MRR / nDCG@k: the ranked list is collapsed to one entry per
+  document at its best rank, so three chunks of one note count once instead of
+  inflating recall. Every path comparison runs through `norm_source` (NFC +
+  casefold) on both sides — the target vault is bilingual FR/EN on an
+  NFD-filename APFS volume, where a byte comparison scores a perfect hit as a
+  miss. A **sourceless** retrieved chunk now consumes a rank slot instead of
+  being dropped (it used to silently promote everything below it: `["", "b.md"]`
+  scored `rr = 1.0` where the honest answer is `0.5`); fully-stamped indexes are
+  byte-identical, older results files are not comparable. `load_golden` raises
+  `ValueError` naming the offending row on any malformed entry — including a
+  `relevant_sources` given as a JSON *string*, which used to be exploded into
+  one-character "documents" and score 0.0 forever, reading as a retrieval
+  regression.
+- **`scripts/gen_golden_retrieval.py`** — builds a per-vault golden set by
+  *query inversion*: sample documents, hand each one's longest chunk to the chat
+  model, ask for the queries a user would type to find it; the chunk's own
+  document is the ground truth. Reads `docstore.json` directly, so it is
+  backend-agnostic and builds no index or embedding model. **Read-only on the
+  index dir**, hence no app-closed gate.
+- **`scripts/eval_retrieval.py`** — replays the golden set through the LLM-free
+  `retrieve()` against the REAL index with `top_k_explicit=True`, sweeps knob
+  "cells", prints a Δ-vs-baseline table and writes a results record. Config-only
+  knobs (RRF weights, pool multiplier/floor, reranker device, wikilink caps,
+  thesaurus variants, `context_window`) are swept by rewriting `config.json`.
+
+### Audit remediation — data safety
+
+- **Vault excerpts no longer leave the machine unasked.** The generator defaulted
+  to the *configured* chat provider, which may be online: on the maintainer's
+  setup the documented one-liner would have shipped ~72 000 characters of
+  clinical notes (40 × 1800, deliberately each note's longest chunk) to a
+  third-party API with no prompt, no banner and no mention in any doc. An online
+  provider is now **refused by default** and needs both `--allow-online` and an
+  interactive confirmation naming the destination and payload size; `.env` is
+  loaded only *after* the gate, so a refused run does not even materialise
+  credentials. Every printed exception goes through `core.llm.redact.redact`
+  (an `LLMError` can carry a provider URL with the key inline — the documented
+  Gemini/httpx leak shape).
+- **Clinical excerpts can no longer reach git.** `.gitignore` covers
+  `golden_retrieval*.json`, `retrieval_eval_*.json`, `/eval/`, `*cells*.json`
+  and `config.json.evalbak`; the generator additionally refuses an `--out`
+  resolving inside the repo. Three layers because this repo has a
+  private→public mirror workflow (`PUBLISHING.md`) where one `git add -A` would
+  publish patient-note excerpts. (The `/eval/` pattern is **root-anchored**: a
+  bare `eval/` matches at any depth and silently excluded the harness's own
+  tracked source under `tests/eval/` — caught doing exactly that.)
+- **Prompt fencing hardened** from a literal delimiter to a per-call `uuid4`
+  nonce (`wrap_untrusted`'s convention), since vault content includes
+  downloaded-PDF text and web clippings that can contain a fixed marker.
+  Output dirs are created `0o700` (files were already 0600 via `mkstemp`).
+
+### Audit remediation — the index gate now REFUSES instead of rebuilding
+
+`obsidian_meta.json` gained **`embed_provider`** — which LOCAL backend produced
+the vectors (`ollama` vs `lm_studio`), since one model name can be a differently
+quantized/pooled build across runners. The first cut *forced a full rebuild* on
+a mismatch, which was the most dangerous line in the change set:
+`resolve_embed_provider` returns the *chat* provider unchanged when it is local,
+so `ollama ↔ lm_studio` — or `lm_studio →` any online provider, falling back to
+the untouched `embed_provider` default — would have silently archived and
+re-embedded a 5.4 GB index (hours) from a chat-dropdown change that looks
+unrelated to embeddings, with `keep=2` pruning meaning three toggles destroyed
+the original.
+
+- The gate now **stops the run** with an actionable error naming both backends,
+  the chunk count, and both exits (switch back, or move the index aside).
+  Nothing is archived, deleted, re-embedded or backend-migrated.
+- `index_vault(..., force_fresh=True)` is the explicit opt-in (manager-level
+  hook; not yet on `POST /api/obsidian/index`).
+- **Grandfathering keeps the evidence** (`_prev_embed_provider`): recorded
+  `embed_provider` → else the recorded `provider` **when local** (it predates
+  the new field and, when local, is by definition what `resolve_embed_provider`
+  would have returned) → else adopt silently. Without the fallback the first
+  post-upgrade run — the one most likely to *be* a provider switch — would mix
+  vector spaces and stamp over the evidence. An online recorded `provider` is
+  deliberately not a usable proxy. **No existing index is forced to reindex.**
+- **Backup retention split**: identity-driven archives (vault switch,
+  `force_fresh`) are marked protected with their own window
+  (`_INDEX_BAK_PROTECTED_KEEP = 5`), so routine version-bump churn (`keep=2`)
+  can never evict the archive a user needs.
+
+### Audit remediation — the sweep can no longer corrupt settings
+
+- **Durable config restore.** The backup used to live only in RAM while the
+  restore used a truncating, non-fsynced `write_bytes` — the guarantees were
+  inverted (the disposable write was atomic, the corrective one was not). The
+  original bytes now land in `config.json.evalbak` (atomic + fsync'd) before the
+  first override, restored via `write_bytes_atomic` from the per-cell `finally`,
+  the outer `finally`, `atexit` **and** a `SIGTERM` handler, verified by
+  read-back before the sidecar is removed. A surviving sidecar makes the next
+  run refuse to start, printing both paths — deliberately not auto-restoring.
+- **Cell values are validated, not just key names.** An out-of-range or
+  malformed value aborts with exit 2 naming the key and its range, mirroring
+  `api/routes/config.py`'s map (with a parity ratchet) and *rejecting* rather
+  than clamping, since a clamped cell would report a Δ for a setting that never
+  existed. `reranker_model` gets the app's HF-repo-id shape check — that value
+  reaches an arbitrary model download, which the app forbids as a body override.
+  An unparseable config now aborts instead of being replaced by a file
+  containing only the override keys.
+- **Refusals replacing silent nonsense:** a live app (detected via
+  `core/server_info.py` + `/api/health`, the definition `papermind server`
+  already uses — `--yes` does not bypass it); a `cfg["embed"]` that differs from
+  the index's recorded model (every query would search a foreign vector space
+  and the banner printed the *index's* model, concealing the cause — the README
+  had promised this check for a week without it existing); a reranker preset
+  with no model configured.
+- **Two of five presets were dead.** `cutoff-sweep` was a 100% no-op —
+  `SimilarityPostprocessor` attaches only with no reranker *and* no fusion,
+  while the defaults enable both, so four cells printed Δ = 0.000 for ~20
+  minutes and read as "the cutoff doesn't matter" (false). It now switches the
+  blockers off and is documented as measuring the dense-only path.
+  `pool-sweep`'s 100/200 ceilings both clamped to 40; it now co-varies the
+  multiplier, and the 200 cell (which provably cannot bind) is gone. A general
+  **inert-override detector** flags any cell whose override cannot reach an
+  active code path, loudly, next to its row.
+- **Reranker state is a positively-derived tri-state** (`none|loaded|failed|
+  unknown`), replacing a sticky flag that lied in both directions — a
+  `reranker_enabled:false` cell inherited the previous cell's failure, and a
+  cell whose model resolved empty ran rerank-free while being scored *as* the
+  reranked baseline, making every Δ a comparison against a mislabelled
+  reference. **Results schema v2**; the old boolean is removed, not aliased.
+- **Leakage guard**: a generated query sharing >5 consecutive tokens with its
+  source chunk is dropped and counted. Verbatim copying scores near-perfectly on
+  BM25 and not on dense retrieval, so without this the RRF sweeps rewarded
+  upweighting BM25 on a generator artifact — biasing the exact comparison the
+  harness exists to run. The prompt had *asked* for this; nothing verified it.
+- **Per-query failures exclude that query** rather than scoring it as a miss (a
+  miss is a retrieval outcome; a failure is the absence of one); five
+  consecutive failures abort the cell, not the run.
+
+### Audit remediation — performance
+
+- **`docstore_sources()` no longer parses 1.456 GB to build a 9 664-string set**
+  (~7.2 GB peak, 11–20 s). Fallback chain: `indexed_materials.json` (~1 MB) →
+  ijson-streamed `ref_doc_info` → full load. Every tier *raises* rather than
+  returning empty, so a truthy-but-empty read can never be mistaken for "the
+  index is empty" and drop the whole golden set.
+- **Results are checkpointed after every cell** (`partial: true`, cleared on the
+  final write) — a 24-minute sweep killed at cell 4 used to lose everything.
+- **Progress and diagnostics**: `stage_cb` threaded into `retrieve()`, a
+  per-query counter with rolling ETA, `drain_status_messages()` echoed per cell
+  (the manager's warnings previously went to a 200-line ring nothing reads), a
+  pre-flight cost estimate with the ±1/√N noise floor, and a `--no-warmup`
+  warning that cell 1's latency then includes the model load.
+- **Generation parallelised** (bounded pool of 4) with ids assigned after the
+  join so they stay deterministic under out-of-order completion, plus a
+  per-chunk wall-clock bound and a resume sidecar.
+
+### Audit remediation — UX / accessibility
+
+- **The reranker hint contradicted the new docs.** `templates/index.html` said a
+  change "may trigger a model download on the next chat" — impossible, since
+  `launch.py` sets `HF_HUB_OFFLINE=1` from the *configured* model at launch, so
+  a mid-session switch fails and silently disables reranking. It now states the
+  restart requirement and the ~2.3 GB one-time download.
+- **The reranker load had no heartbeat**, so a first-time 2.3 GB download
+  guaranteed an SSE stall timeout at 330 s (`SSE_SINGLE_SHOT_FLOOR_S` +
+  `SSE_STALL_MARGIN_S`) — the user saw "Thinking…" for 5½ minutes and then *"the
+  model may be overloaded"*, blaming the wrong thing, while the download
+  continued and a later retry mysteriously worked. `_get_reranker` now beats
+  through `stage_cb` (the BM25 P4b pattern), and the load-failure and MPS→CPU
+  warnings are routed to the chat's SSE `{info}` channel — they previously went
+  to a status ring the client polls **only while indexing** and renders only
+  `warnings` from, so a typo'd model disabled reranking for the whole session
+  with zero user-visible signal.
+- **Silently dropped config values are now named.** `POST /api/config` returns an
+  additive `dropped` list and `settings.js` marks the offending control
+  (`aria-invalid` + inline error) and announces it — a WCAG 3.3.1 failure where
+  the error was detected and never identified. Out-of-range numerics are
+  *clamped* and deliberately not reported; only genuine discards are.
+- **The settings filter counted matches it never revealed** — `set-reranker-model`
+  lives in a nested `<details>` the filter never opened, so searching
+  "reranker" (the documented discovery path) reported N matches, announced them
+  to screen readers, and showed nothing. It now opens every ancestor.
+- **Dynamic `role="status"`** on vault info notices removed in favour of the
+  static `#sr-status-announcer` — the exact defect class `liveRegions.test.js`
+  exists to prevent, and what makes the new reranker heartbeat audible.
+- The 364-char reranker tip became a **popover** (focusable, scrollable,
+  selectable — it carries a model id to copy) with a new ratchet capping tips at
+  220 chars; `wireControlHints()` wires `aria-describedby` for 60 of 71
+  previously AT-invisible `control-hint`s; the help badge gained a 24×24 hit
+  area (WCAG 2.2 SC 2.5.8) without moving the 16×16 dot; three contrast pairs
+  joined the token lint; and the in-app guide stopped telling packaged-app users
+  to run `scripts/` that `install_and_build.sh` does not bundle.
+
+### CI / docs
+
+- `scripts/gen_golden_retrieval.py` + `scripts/eval_retrieval.py` joined the
+  py_compile sweep (the `scripts/` tree is not globbed — harness entry points
+  are named individually, like `install_mcp.py`), and the new
+  `tests/eval/test_{retrieval_metrics,golden_gen,eval_runner}.py` joined both
+  the CI list and the CLAUDE.md quick-gate. Drive-by: `tests/eval/test_eval_pipeline.py`
+  had been running in **neither** list since it was written, despite a CHANGELOG
+  entry claiming it was CI-driven — added to both. README's copy of the
+  quick-gate had also drifted eight files behind CLAUDE.md's; the two now match.
+- Three documentation claims that described behaviour the code did not have were
+  corrected (the embed-model check, "nothing is written to the index", and the
+  gate's rebuild semantics). A doc that promises a safety property the code
+  lacks is worse than silence — a reader who trusts it stops checking.
+- **Tests:** 41 (`test_retrieval_metrics.py`) + 47 (`test_golden_gen.py`) + 83
+  (`test_eval_runner.py`) + 9 + 5 (`TestEmbedProviderStamping`,
+  `TestRerankerLoadVisibility`) + `test_03e` (`smoke_test.py`, the `dropped`
+  contract) + 4 JS files. All hermetic — fakes, tmp docstores, no models, no
+  network; the config backup/restore cycle is exercised against a tmp path
+  including a simulated mid-cell exception.
+
+## 2026-07-23 (four-pillar audit of batches B–H — four remediation batches)
+
+A four-agent audit (logic / security / performance / UX-a11y) of the
+2026-07-22 range surfaced ~30 findings; fixed in four batch commits, suites
+green after each (1420 Python + 307 JS):
+
+- **Batch 1 · retire-tag data safety:** `journal.prune` gained
+  `protect_batch_id` so a >200-note retire can no longer evict its OWN
+  batch's ops + snapshots in the same request that promised one-click undo;
+  `batch_id` is stamped inside the remove writers before each per-op save
+  (the after-the-fact stamp lost the last op's stamp on cancel); a failed
+  `_tags.md` write flips the `vocab_retire` op to `failed` and zeroes the
+  reported `vocab_rows`.
+- **Batch 2 · retire-tag lock choreography:** four phases — Zotero GETs
+  pre-lock, vault writes + journal appends under ONE hold (manifest
+  checkpointed every 25 ops via the writers' `defer_save`), Zotero PATCHes
+  **lock-free** (the `If-Unmodified-Since-Version` guard, not the op-lock,
+  prevents lost updates — previously N sequential PATCHes froze every vault
+  write), then a short second hold that RELOADS the manifest and records
+  each PATCH outcome (a failed/cancelled PATCH never stays an "applied"
+  claim). Heartbeat `False` now aborts (retire + batch restore). Deferred
+  items recorded in CLAUDE.md Known Issues: the piecewise N-turn
+  `LATEX_OP_LOCK` hold, the synchronous batch restore, the bounded phase-4
+  re-acquire.
+- **Batch 3 · a11y/UX:** guided tour (aria-modal lie removed, focus lands on
+  the labelled card so SR users hear the step content, document-level
+  Escape, focus restore, per-step `onEnter` hook that lazy-loads the Help
+  guide); ⌘K palette (full combobox pattern with `aria-activedescendant`,
+  Tab trap, Escape-after-Tab, focus restore); refactor piecewise
+  announcements made dual-channel; Help tab loads on arrow-key activation;
+  a second retire no longer destroys the first batch's Undo button (all
+  [retire] buttons disabled during a run; confirm states the `_tags.md`
+  edit + the stores retire does NOT touch); visible skip-caveats beside all
+  four piecewise offer buttons. New `tourA11y.test.js` + extended palette
+  tests.
+- **Batch 4 · hardening:** the Tavily client refuses redirects (the default
+  handler carried the Bearer key to the Location target) and caps the
+  response read at 2 MB before parsing; `web_search_enabled: true` in the
+  body now actually enables the tool (the gate re-read the config knob);
+  the deck/docgen size-cap refusal carries `code:"size_cap"` and the
+  clients key the piecewise offer on it (never on regexing the prose);
+  `repair-piecewise` requires `base_sha256` and no longer drops
+  issues-but-no-repair sections from the skip accounting; tagging Zotero
+  503 skips carry the actionable no-key detail; the Restore projection
+  shows `removed`/`batch_id`; `check_tex.py` compiles with
+  `-no-shell-escape` + treats unreadable `.tex` as failures;
+  `audit_pdf_names.py` is case-sensitive.
+
+Documentation pass the same day: `docs/feature_plan_2026-07-22.md` deleted
+(shipped in full; its one deferred item — provider-native web-search v2 —
+is recorded in CLAUDE.md Known Issues), PROMPTS.md re-reviewed, README /
+help guide / subtree CLAUDE.md files synced.
+
+## 2026-07-22 (five-axis feature plan — eight batches, A–H)
+
+The maintainer's five feature axes (web search, guidance, size-limit recovery,
+export provenance, tag deletion), planned in a since-removed
+`docs/feature_plan_2026-07-22.md` (deleted 2026-07-23 after shipping; deferred
+items live in CLAUDE.md Known Issues) and shipped one commit per batch:
+
+- **A · Export provenance:** `{"meta"}` (resolved provider/model/params,
+  pre-token) + best-effort `{"usage"}` (real tokens/cost via
+  `usage_tracker.records_since`) SSE frames on plainchat/summarise/vault-chat;
+  clients capture them — plus the full scored retrieval objects and the agent
+  tool-call trace — onto stored turns, and `buildConversationExport` renders a
+  provenance header, per-turn Model/usage lines and the tool trace into every
+  MD/TXT export. Deck/article `.tex` gets a provenance comment header (articles
+  add a commented-out ICMJE-style disclosure); docgen vault notes get
+  provenance frontmatter.
+- **B · Per-paper tag deletion:** `remove_tags_from_frontmatter` (per-shape
+  splices, `before − removed` round-trip guard), the three removal writers
+  (Finder survivors keep colours; Zotero version-guarded full-array PATCH),
+  `note_untag`/`finder_untag`/`zotero_untag` journal ops reverted by the
+  existing conservative restores, `POST /api/tagging/remove-tags` (apply-all's
+  twin, deliberately NOT vocabulary-gated), and removable current-tag chips
+  (×) in the tagging table and deck.
+- **C · Agent web search (online providers only):** `core/agent/web_tools.py`
+  — a Tavily-backed client-side `web_search` ToolSpec behind a triple gate
+  (`vault_web_search_enabled` off-by-default + online chat provider +
+  `TAVILY_API_KEY` env), results wrapped as untrusted content, timeout clipped
+  to the turn's wall clock; registered in vault chat (body override, info when
+  unavailable) and deckgen's in-process runner. `tvly-` added to redaction.
+- **D · Piecewise note edits (offer-on-422):** `refactor/piecewise.py` +
+  `POST /api/refactor/rewrite-piecewise` (SSE) — one bounded LLM pass per
+  heading section, back-to-front splice, ONE staged combined proposal through
+  the unchanged apply-staged guards; the whole-note 422 now offers "Edit
+  section by section".
+- **E · Piecewise deck/docgen augment (offer-on-refusal):**
+  `deckgen.augment.replace_sections` + per-section agent turns behind
+  `piecewise:true`; the size-cap refusal offers "Revise section by section";
+  combined proposal rides the unchanged screen/staging/apply-augment pipeline.
+- **F · Piecewise deck auto-repair:** section-scoped review prompts/parse in
+  `deckgen/review.py` (whole-document replies refused) +
+  `POST /api/deck/repair-piecewise`, surfaced as an `{"augment"}` frame so the
+  existing apply-augment writes it; offered when the whole-deck repair is
+  withheld (`truncated`/`repair_truncated`).
+- **G · Retire a tag everywhere:** Tag Hygiene rows gain `[retire]` — one
+  confirm removes a tag from every note/PDF/Zotero item (Zotero reads
+  pre-lock; one lock hold with heartbeats), optionally prunes the `_tags.md`
+  row (`vocab_retire` snapshot op), stamps a shared `batch_id`, and
+  `POST /restore {batch_id}` (one Undo button) reverts the whole batch.
+- **H · Help & discoverability:** in-app Help tab rendering
+  `static/help/guide.md`, "?" badges over the vault-chat/agent knobs, a
+  dependency-free guided tour and ⌘K command palette (`ui.js` primitives,
+  `app.js` registry), README/CLAUDE.md sync, and the How-to modal's egress
+  claim updated for the opt-in web search.
+
+## 2026-07-22 (full audit remediation — eight batches, A–H)
+
+Fixes ~60 findings from a six-agent end-to-end audit (backend, RAG, LLM layer,
+feature subsystems, CLI/MCP/build, frontend UX/a11y), one commit per batch:
+
+- **A · Data safety:** refactor journal refuses to overwrite an unreadable
+  manifest (`JournalUnreadableError` backport; the old fresh-empty fallback
+  destroyed the restore history incl. archive_image mappings); deck compile-fix
+  backup routes through `_backup_deck` (the inline copy destroyed hand-written
+  originals on the second run); Finder-revert read failures tally `failed`
+  (prune-safe); the stale sweep protects empty-vision-description images and
+  images referenced by unreadable notes; a failed changed-chunk delete skips
+  the re-insert (no permanent duplicate vector rows); dangerous-macro screens
+  gate on occurrence COUNTS; deck/docgen figure copies moved past the cancel gate.
+- **B · Config/LLM:** pricing-override crash fixed (coercion + a never-break-
+  the-caller guard in `record()`); `llm_pricing_overrides` shape/size-validated;
+  `online_timeout_s` joined the SSE timeout chain; `/api/config` array-body 400,
+  `{}` no-op, deferred vault switch, provider-case normalization; vault-chat
+  `message` validated; `/api/health` redacted; `stream_with_fallback` cfg-load +
+  coerce net; cancel-aware jittered backoff; Gemini cached-input pricing.
+- **C · CLI/MCP full repair:** `BASE_DIR/server.json` discovery (GUI's random
+  port reachable; second server refused), generate tools actually work
+  (server-side template load + `template_tex`/`out_dir`), no-op params removed
+  or wired, MCP response guarantee/-32602/busy-bounded write semaphore/markdown-
+  write classification, unified status shape, `--unsafe-bind` removed,
+  `python -m cli` + `scripts/install_cli.py` shim, contract ratchet v2
+  (path+method + a request replay harness that catches body drift).
+- **D · RAG/concurrency:** broad generator guard on the primary md parse; the
+  status poll's lancedb probe moved off `_status_lock`; post-index background
+  BM25 rebuild + build heartbeat frames; half-open SSE consumers abandoned at a
+  ceiling; budget-bounded PDF-cache reads; NFC/NFD image dedup; audit search
+  corpus drops superseded builds; query-expansion-under-lock documented.
+- **E · UI feedback/ceremony:** Single-Paper renders map-reduce info frames
+  (persistent coverage notices); backend death is visible; tagging-deck failure
+  retry; confirm ceremony unified (ambig table, Compile & Auto-Fix, refactor
+  staged-apply/Archive, Cancel-first pull modal); UI chrome standardized to
+  English (example chips stay French by design).
+- **F · A11y:** keyboard chip removal, full ARIA combobox, roving-tabindex
+  repair in the refactor sidebar, deck `role=group`/Space-safe/Escape-closes-PDF,
+  live-region hygiene (single announcer channel), labels, visible-only focus
+  trap, full-title aria-labels, accent-token dropzone.
+- **G · Responsive/settings:** Single Paper stacks ≤900px; measured tab-strip
+  overflow fade; LLM Settings live filter (~84 controls).
+- **H · Docs/build:** stale comments repaired, load-bearing "why" comments
+  added, CLAUDE.md/README/CI synced (CLI/MCP story, ratchet v2, honest CI
+  superset note), build gaps closed (`tagging`/`docgen`/`cli`/`mcp_server` in
+  `--add-data`, dead `pydantic_settings` flags dropped, non-interactive guard,
+  eval-quoting normalized, DMG READ-ME lists all key env vars).
+
+## 2026-07-21 (multi-disciplinary audit remediation — six workstreams)
+
+Fixes the findings of an end-to-end audit (code/perf/UX-a11y/security) across the
+last 10 commits, in six workstreams:
+
+- **Data integrity (B):** `ObsidianVaultManager.heartbeat()` now RETURNS the
+  lost-lock bool and the refactor batch writers (apply/normalize/restore) act on
+  it — a lapsed-then-stolen op-lock aborts cleanly instead of writing as a second
+  concurrent writer; docgen's `compute_job_key` gained `images_enabled` (stale
+  checkpoint-resume parity with deck); an unreadable *sub*-directory is recorded
+  as a failed prefix so its subtree is withheld from the stale sweep (no durable
+  partial purge); corrected the Anthropic `_build_payload` docstring.
+- **Triage-deck logic + a11y (C):** fixed the double-advance race (navigating
+  during an in-flight write no longer skips a card), the undo stack surviving a
+  view toggle (keyed on scan identity), stale PDF-panel writes; added focus
+  retention + card announcements + `aria-label`/role, moved live regions off
+  render-time minting, fixed dark-theme candidate-row contrast (M2, lint pairs
+  added), search jump-to-row, a Close-vs-Clear affordance, and busy feedback.
+- **Performance (D):** the cross-report search corpus builds OFF the request
+  thread (202 + retry) so a slow build can't convoy the WSGI pool; the mapping
+  POST no longer re-hashes every curated PDF (moved to scan time); a manager
+  result-listener drops the search memo promptly; the Zotero restore path's read
+  + backoff sleep runs BEFORE the obsidian op-lock.
+- **Security (E):** Zotero requests refuse redirects (no API-key forwarding) and
+  the web base is https-validated at call time; the redact patterns cover
+  quoted/colon/dict-repr key shapes; the LaTeX macro denylist gained
+  `\VerbatimInput`/`\import`/`\subimport`/`\includepdf`/`\inputminted`; the
+  `style` `url()` strip de-escapes CSS escapes + catches `image-set`; the audit
+  reveal-`open` check is a fail-closed document-type allowlist.
+- **CLI/MCP (A):** `core/driver.py` rewritten HTTP-first — it dispatches to the
+  running app with the `X-Requested-With` header (the first cut 403'd every
+  request into a broken in-process branch that called phantom APIs), writes
+  require the running server, MCP write tools use the same confirm-gated
+  reversible endpoints as the GUI, and `tests/test_driver_contracts.py` is a
+  ratchet asserting every targeted endpoint/symbol actually exists.
+- **CI/docs (F):** the CLI/MCP tests are now in CI + the documented suite, and
+  the compile sweep covers `cli/`, `mcp_server/`.
+
+## 2026-07-20b (Zotero tag writes unblocked: web-API transport)
+
+Resolves the standing Known Issue that the Zotero write target "cannot work
+today". The Zotero 9 blocker is real and unchanged — the local API answers GET
+but returns **501** on PATCH — so `tagging/zotero_write.py` gained a second
+transport rather than a workaround. Verified live end-to-end against the real
+library (create → PATCH 204 → `type: 1` metadata preserved → stale version 412
+→ synced down to desktop Zotero 9.0.6 → deleted). `test_tagging.py` 91 → 105,
+`test_llm.py` +2, `smoke_test.py` +2; full suite 1298 green, `tests/js/` 273.
+
+- **Two transports, one wire format.** `resolve_transport(cfg)` selects the
+  loopback API or `https://api.zotero.org` per the new
+  `tagging_zotero_transport` (`auto`｜`local`｜`web`, default `auto` = web when
+  a key is present, else local). Every existing helper — the version guard,
+  the raw-dict passthrough, the `ZoteroVersionConflict` → 409 mapping — works
+  unchanged on both; only the base URL, library path and auth header differ.
+  Nothing regresses when Zotero 10 ships PATCH: flip to `local`.
+- **Real userID resolution.** api.zotero.org rejects the local API's magic
+  `users/0`, so `resolve_user_id` looks up `GET /keys/current` (cached under
+  the key's sha256 fingerprint, write-permission checked). `groups/<id>` is
+  identical on both transports.
+- **Key hygiene.** `ZOTERO_API_KEY` is read from the environment at call time,
+  never persisted to `config.json`, never returned by `/api/config`, and
+  **never journalled** — the restore manifest records only the transport, and
+  the revert re-reads the key (pinned by a test asserting the key is absent
+  from the manifest JSON). Two contextual patterns added to
+  `core/llm/redact.py` (a bare 24-char alnum key can only be matched in
+  context — a naive pattern would redact item keys and sha fragments).
+- **Sharper failure vocabulary.** `ZoteroWriteUnsupported` (501, with an
+  actionable "configure a key" message instead of an opaque 502),
+  `ZoteroAuthError` (401/403), `ZoteroRateLimited` (429/503 with
+  `retry_after_s`) — all subclassing `ZoteroError`, so existing handlers are
+  untouched. The web API's `Backoff` header is honoured, bounded, on **read**
+  paths only: the write path holds the obsidian op-lock, where sleeping would
+  stall indexing.
+- **Honest availability.** `zotero-available` now probes the *resolved*
+  transport and reports `{transport, writable, note}`; a reachable but
+  unauthenticated web endpoint counts as unavailable rather than offering a
+  button guaranteed to 503.
+- **Documented gotcha.** A create/write response reports the *library*
+  version, not the item's — observed live (POST returned 77060 while the item
+  was 77061, so a PATCH reusing it 412'd). Always re-read before writing.
+
+**Caveat:** a web write lands on zotero.org and reaches the desktop only on its
+next sync, so "applied" is not "visible in Zotero now".
+
+## 2026-07-19b (Audit remediation: Finder colours, keyboard confirm, apply-all truth, a11y/responsive)
+
+Fourteen commits resolving the full 2026-07-19 audit (the `AUDIT_19_07_2026.md`
+findings plus the deeper same-day review: data loss, keyboard trap, contract
+breaks, concurrency, a11y/responsive, layering). `test_tagging.py` 76 → 85,
+`tests/audit/` +3, `test_thesaurus.py` +1, `tests/js/` 212 → 228.
+
+- **P0 data loss — Finder tag colours.** The union writer read NAMES and
+  rewrote the whole `_kMDItemUserTags` array, flattening every colour the user
+  assigned in Finder; a failed xattr read looked like "no tags" and clobbered
+  the set. Now the Zotero `before_raw` pattern: raw entries round-trip
+  verbatim (journal stores `before_raw`/`after_raw`; Restore returns colours;
+  legacy name-only ops still revert), a failed READ raises and refuses that
+  PDF, and `xattr` is invoked by absolute path.
+- **P0 keyboard trap.** The deck's container-level verb handler cancelled the
+  confirm strip's native button activation (Enter re-fired Accept and
+  re-opened the strip forever — confirm was mouse-only). `confirmInline` now
+  owns its keys (Enter/Space stop propagating; Escape dismisses + refocuses)
+  for every consumer; the deck also ignores keys from inside a strip / on a
+  focused button (Space on Skip no longer Defers).
+- **P0 apply-all truth + undo integrity.** A late-target crash after the note
+  write had committed + journalled returned HTTP 500 — the deck reported total
+  failure and never learned the note op's id. Per-target exception isolation
+  (HTTP 200 with per-target truth) + the client processes `results` whenever
+  present, so op_ids always reach ⌫.
+- **P0 security-gate gap.** `parse_tags` skipped description-less rows, so a
+  gloss-less `_tags.md` tag could neither be proposed nor applied (the vocab
+  IS the write gate). `parse_tags(include_empty_desc=True)` for
+  `build_vocab` only (thesaurus byte-identical); space-containing tag ids are
+  rejected at the gate (they tear apart in the whitespace-splitting parsers).
+- **P1 concurrency.** Propose cancel reaches the embed phase (polled between
+  stages); client abort timeouts on propose/apply-all fetches (a hung fetch
+  pinned `_deck.busy` forever — also reset on deck re-entry); fresh PDF
+  extraction single-flights on a server lock + client promise-dedup (rapid
+  skipping stacked concurrent PyMuPDF scans of the same file); Zotero's GET
+  runs BEFORE the op-lock (`_zotero_prepare`/`_zotero_commit_locked` — the
+  version-guarded PATCH makes the early read safe; unreachable = 503 with no
+  lock touch); apply-all shares one manifest load + one prune (was 3× full
+  rewrite cycles per Accept); `gloss_embeddings` gets real double-checked
+  locking; Finder reverts count `failed` separately (a partial revert no
+  longer spends the op and its before-lists); audit.js re-checks its
+  latest-wins gate after the tagging await (cross-report handler double-bind).
+- **P2 a11y/responsive.** AA contrast (suggest gloss on hover, chip numbers,
+  badge-muted, managed `::placeholder`, disabled-toggle colour tier — all
+  pinned as contrast-test pairs); `:focus-visible` rings on chips/suggest
+  items/note entries; deck PDF grid stacks <980px, `.input-bar` wraps,
+  `.control-grid` collapses <700px, deck/docgen pane-views scroll instead of
+  clipping stacked cards; the type-ahead dropdown un-clipped (tagging opts the
+  report body out of its coerced overflow clip, own table wrappers);
+  `window.taggingTeardown` revokes the PDF blob on report switch; each new
+  card announced to the SR region; vocab+Zotero probes load in parallel with
+  staged text; inventory failures get a Retry error boundary; disabled targets
+  carry their reason as `aria-label`.
+- **P3 hygiene.** Frontmatter merge: empty `---\n---` recognised (no more
+  double block), singular `tag:` refused (no parallel key), round-trip guard
+  extended to sibling keys; `_MIN_USEFUL_CHARS` deduped (route imports it) and
+  the empirical constants (`0.85` neighbour cutoff, snippet/deadline sizes)
+  documented; broad excepts narrowed/log-raised. **Extraction:** the domain
+  writers moved to `tagging/writers.py` (route: ~1,360 → ~850 lines, HTTP-only;
+  private names re-exported for test-patch compat).
+
+## 2026-07-19 (Tagging: extraction fix + deck UX + Tag Hygiene + PDF panel + propose upgrades)
+
+Five independent commits fixing the triage deck's "Loading excerpt…" stall and
+landing the four planned tagging improvements. `test_tagging.py` 49 → 76,
+`tests/audit/` +8, `tests/js/` 203 → 212.
+
+- **Extraction fix (the stall).** `text_source`'s 20 s "budget" was a no-op
+  (equal to `_read_pdf_text`'s start-refusal floor, which never bounds a
+  started extraction): a cache-miss scanned PDF cost a synchronous ≤1000-page
+  PyMuPDF sweep + a whole-file MarkItDown/pdfminer pass per card, never
+  cached, re-paid by Propose (→ 504). Now: `extract_structured_from_pdf`
+  gains `use_markitdown` (all three fallback tiers gated, source-ratcheted),
+  `_read_pdf_text` gains keyword-only `fresh_max_pages`/`use_markitdown`
+  (`truncated` derived from `page_count`), snippet extracts ≤3 pages /
+  propose ≤8 with MarkItDown off, and a no-text fresh extract writes a
+  `<sha256>.notext` negative-cache marker beside the PDF text cache (real
+  caches — whole-file, legacy, per-range OCR — always win).
+- **Deck perceived latency.** Module-scoped snippet cache (survives re-renders
+  and the Deck↔Table toggle) + sequential prefetch of the next card's
+  snippet; Accept advances immediately after the confirm and reconciles the
+  apply-all outcome (failures included) into a deck-level status line that
+  survives the card change; Undo stays busy-gated (the undo stack fills
+  post-response).
+- **Tag Hygiene report** (9th audit tab, read-only, on-demand at GET):
+  cross-store tag frequencies (Finder / note YAML / Zotero parent / Zotero
+  notes / bib keywords) grouped by an OpenRefine-style fingerprint, vocabulary
+  flags via tagging's `_read_vocab` (same `_tags.md` resolution), near-miss
+  neighbours (`difflib` ≥ 0.85), surface-variant clusters, top co-occurrence
+  pairs. Fingerprint helper deliberately local to the vendored report module.
+- **Deck PDF side panel (V).** `GET /api/tagging/pdf?citation_key=` serves the
+  key's biblio PDF (inventory-derived, realpath re-checked under the resolved
+  biblio dir) + `POST open-pdf` macOS fallback; client fetches with the
+  header and renders via a blob: URL (never an `/api` iframe src —
+  source-ratcheted like the deck preview), on demand only, closed + blob
+  revoked on card change.
+- **Propose upgrades** (both optional, both degrade to the historical prompt
+  on any embed failure): `tagging_candidate_tags` (default 20, 0 = off) —
+  label-space reduction via gloss/paper embeddings, disk-cached per
+  `_tags.md` mtime + embed model; `tagging_fewshot_k` (default 3, 0 = off) —
+  the k most similar already-accepted papers from the tagging journal
+  injected as `title → accepted tags` few-shot lines. `tagging/candidates.py`
+  is the first embedding caller outside `rag/` (query-path template: 30 s
+  construction bound, `resolve_embed_provider`).
+
+## 2026-07-18b (Propose truncation root-cause + audit-fix batch)
+
+Root-caused the field-reported "the model returned no tags" (live evidence:
+`llm_usage.jsonl` showed Gemini propose replies of 7–12 output tokens — the
+whole `maxOutputTokens` budget went to *thinking*) and fixed the 18-finding
+audit of the last 10 commits. `test_tagging.py` 42 → 49, `test_llm.py` +2,
+`tests/js/tagging.test.js` 15 → 18.
+
+- **Propose truncation (the actual bug).** `tagging_propose_max_tokens` default
+  → **1536** with a **CONFIG_VERSION 2→3 migration** resetting a persisted 300
+  (the old materialised default — a raised code default alone never reaches an
+  existing install, which is why the earlier 640 bump changed nothing on the
+  reporting machine); route fallbacks now read `core.config._DEFAULTS` (the
+  stale inline `or 300` contradicted the config layer); Settings gained
+  max-tokens/temperature fields (the knob was un-fixable from the UI). A
+  `thinkingConfig` hard budget was deliberately rejected: Gemini pro 400s on
+  budget-0 and 3.x uses a different knob — headroom is model-agnostic.
+- **Diagnosability.** A 0-tag propose parse now logs the raw reply length +
+  preview (`tagging/propose.py`); usage records persist the **`workflow`** tag
+  (all rows previously read workflow-less, making per-feature attribution
+  impossible); `record_local_usage` takes `workflow=` too.
+- **Security.** `RedactingFilter` on every log handler: `httpx` logs Gemini
+  URLs *with the API key in the query string* — the raw key sat in
+  `chatekld.log` on disk (read-time redaction only covered `/api/log/tail`).
+- **Zotero metadata preservation.** The tag writer now reads full tag dicts
+  (`get_item_tags_full`) and PATCHes existing tags verbatim (+ journals
+  `before_raw` for Restore) — the name-only round-trip was silently converting
+  every *automatic* tag (`type: 1`) to manual on each write and each revert.
+- **Finder writer/revert.** `after` unions `added` not `valid` (no `dep`/`Dep`
+  case-duplicate xattr); an all-skipped/all-failed revert keeps the op
+  `applied` (retryable, prune-safe — flipping it destroyed the only restore
+  mapping without restoring); per-PDF revert failures are logged.
+- **Deck (JS).** Per-card `proposed` reset (1–9 keys could inject the PREVIOUS
+  paper's tags); auto-advance timer is stored/cancelled on any explicit
+  navigation + current-key-guarded (no more silent double-skip); undo is
+  confirm-gated (Track 6e — it rewrites vault data), peeks-not-pops (a fully
+  failed undo stays retryable), un-patches the cached row per reverted target,
+  and works from the done screen; snippet fetch checks `r.ok` and never caches
+  errors (a transport failure no longer renders — stickily — as "no extractable
+  text"); keyboard verbs survive checkbox focus; the Restore panel's outcome
+  line is visible (was SR-only).
+- **Misc.** Propose single-flight gate released if `Thread.start()` raises
+  (was a permanent-429 leak); `apply-note-tags` single `get_json`; apply-all's
+  note-409-continues-to-other-targets behavior + `/snippet`'s no-gate choice
+  documented as deliberate; stale-sweep docstore-read invariant + named
+  `_STALE_PROGRESS_EMIT_S` cadence in `rag/vault.py`.
+
+## 2026-07-18 (Biblio Tagging — Triage deck + visible Propose + fan-out apply)
+
+Reworks the Biblio Tagging UI around a fast, keyboard-first triage flow and fixes the
+long-standing "Propose gives no answer" report (the result was only ever announced to a
+screen-reader-only region, so a sighted user saw nothing). +7 Python tests
+(`test_tagging.py` 35 → 42), +4 JS tests (`tests/js/tagging.test.js` 11 → 15; full JS
+suite 191 → 195).
+
+- **Visible Propose/Apply feedback (the "no answers" fix).** Every Propose and Apply
+  outcome now writes to a **visible status line** (in both views) as well as the SR
+  announcer — including `no_text` (scanned/unreadable PDF), `empty` (model returned no
+  tags), `low_confidence`, and provider 502/504/429 errors. Previously all of these were
+  silent to a sighted user; a working provider looked broken.
+- **Triage deck** (new default view, toggle persisted in `localStorage.tagging_view`;
+  the original **Table** stays as the overview). One card at a time, **untagged-first**,
+  with a PDF-text excerpt (`POST /api/tagging/snippet`, cache-first). Keyboard-first:
+  `P` propose · `A`/`Enter` accept · `S`/`→` skip · `M` defer (to a review queue) · `⌫`
+  undo (via `/restore`) · `←` back · `1`–`9` toggle proposed chips.
+- **`POST /api/tagging/apply-all`** — Accept fans one confirmed decision out to **all
+  enabled+available targets at once** (note + Finder + Zotero) under a single lock hold.
+  Each target still journals its **own reversible op** (Restore stays per-target
+  granular) and re-validates against `_tags.md`; an absent (no note / no Zotero item /
+  no biblio PDF), off-platform (Finder off macOS) or unreachable (Zotero) target is
+  *skipped with a reason* rather than failing the whole write — the primary note write
+  still lands. The three standalone `apply-*` handlers were thinned to wrappers over
+  shared `_prepare_tag_write` + per-target `_*_write_locked` helpers that `apply-all`
+  reuses (standalone behavior byte-identical, pinned by `test_tagging.py`).
+- **`tagging_propose_max_tokens` default 300 → 640** so a reasoning model (e.g. a Gemini
+  "thinking" model) does not exhaust its budget on thoughts and emit empty JSON.
+- **`POST /api/tagging/snippet`** — a bounded, read-only, cache-first PDF-text excerpt
+  for the deck card (`{citation_key}` → `{snippet, truncated, chars}`).
+
+## 2026-07-15 (Biblio Tagging — new Library Audit sub-view)
+
+A new **Biblio Tagging** feature on `feat/biblio-tagging`: a Library Audit sub-view
+(the "Tagging" report tab) that turns the audit's per-citation-key `Record` join into
+a *write* surface for tags, scoped strictly to `biblio_articles/`. Six slices, each
+committed with hermetic tests (35 new Python tests in `test_tagging.py`, 11 JS in
+`tests/js/tagging.test.js`; the full JS suite went 180 → 191).
+
+- **New package `tagging/`** (core/route split like `refactor`/`deckgen`): `vocab.py`
+  (pure `_tags.md` → `{tag: gloss}`, reuses `rag.thesaurus.parse_tags`), `text_source.py`
+  (cache-first PDF text via the indexer's `_read_pdf_text` — OCR text for scanned PDFs),
+  `propose.py` (the only chat-LLM caller — one vocabulary-constrained classification,
+  paper text wrapped untrusted, reply re-constrained to real tag ids), `journal.py`
+  (self-contained restore manifest outside the vault, modelled on `refactor/journal.py`),
+  `zotero_write.py` (stdlib-urllib local-API client, version-guarded PATCH).
+- **Three write targets, all confirm-gated / vocab-gated / op-locked / journalled /
+  reversible:** the Obsidian note frontmatter (reuses `_audit_tagwrite`), the PDF's macOS
+  Finder tags (`api/routes/_finder_tagwrite.py`, xattr; 501 off-macOS), and the parent
+  Zotero item (via Zotero's **local API**, never SQLite — mediated + sync-safe; personal
+  vs group libraries routed from a new additive read of `library_id`/`type`/`group_id`).
+  The controlled-vocabulary intersection (`_canonicalise_tags`) is the security gate —
+  the client, even the LLM's own proposal, can never inject an arbitrary tag.
+- **`/api/tagging/*` blueprint** + `tagging_*` config keys (propose model/params,
+  `tagging_archive_dir`, `tagging_zotero_api_base`). UI: per-row Propose + vocabulary
+  type-ahead + `[→note]`/`[→finder]`/`[→zotero]` apply buttons (Zotero disabled when its
+  local API is unreachable) + an inline Restore panel. `tagging.js` follows the
+  `ui.js`+`api.js`-only hierarchy (delegated from `audit.js` via a `window` global).
+
+## 2026-07-13 (full-project review fixes — integrity / logic / UX / layout, 5 batches)
+
+A 54-finding 3-axis review (app integrity, code logic, UX + layout — the latter two
+axes' first deep pass) implemented in five batches on `fix/full-review-2026-07-13`
+(plan: `docs/fix_plan_2026-07-13_full_review.md`). Baseline before + after: ruff clean;
+pytest 1259 → 1276; JS 177 → 180.
+
+- **Integrity criticals.** (A1) A vault switch now drops the loaded index + every
+  retrieval cache (`cleanup()`/`reset_prewarm` on a real `obsidian_vault_path` change),
+  and `obsidian_meta.json` records `vault_path` so a reindex refuses a cross-vault
+  incremental — previously chat answered from the previous vault and a reindex ran
+  incrementally against it (mixed-vault retrieval). Pre-fix indexes are grandfathered.
+  (A2) `revert_archive_image` can no longer delete the only copy of an image: the
+  original-path preflight is flag-independent (decides from disk, not the crash-stale
+  `original_deleted` flag), the archive-copy deletion is gated on a digest-verified
+  restore, and the flag persists immediately after the unlink. (A3) apply-tag-drift
+  splits scalar `tags:` on whitespace AND commas (matching the scan reader) — no more
+  fusing `tags: anxiety depression` into one invalid tag.
+- **Logic (B1–B10).** LM Studio query-path LLM forces `max_retries=0`; NFC/NFD
+  normalization on image/wikilink/archive name lookups (accented-French vaults); audit
+  rel-path validator is a denylist (accepts accented paths) + case-insensitive skip
+  prefix; GLM-OCR overflow→empty-downscale records a failure + cooldown (was a silent
+  success); `_truncate_at_references` cuts the LAST reference heading past 50% and
+  reports the drop; config-migration cache re-key moved inside the write lock; the
+  `/api/config` validator map now covers provider/model-id/`vault_chat_system_prompt`;
+  `/api/refactor/restore` is confirm-gated + heartbeats per op; the SSE runner releases
+  the op lock if `Thread.start()` raises; plus server.py TERM→KILL escalation, launch
+  join matching the 30 s poll, `_write.py` write-failure logging, `generate-md` cache
+  invalidation, frontmatter fence accepted at EOF (reader+writer), audit worker polls
+  its own stop event, corrupt `mapping.json` preserved before overwrite, and
+  case-insensitive deny-prefix matching on darwin.
+- **UX (C1–C5).** Silent-failure basket surfaced (pickVaultFolder / onProviderChange /
+  cancelVaultIndex / resetAppData / removeExclusion / OCR-vision onchange / cancelAuditScan);
+  deck Generate/Augment get Cancel buttons + a unified busy set incl. preview/compile-fix;
+  docgen confirm-strip re-checks the busy gate; `isOnlineProvider` + labels include
+  deepseek/zai; Single-Paper summary gets a Stop button that keeps the upload, uploads
+  are abortable, plain-chat export flashes its outcome, vault Send disables mid-stream,
+  per-image archive has a reentry guard, and the Ollama pull gets an honest "Stop watching".
+- **Layout (D1–D7).** `#docgen-tab .deck-body` joins the scroll-region rule and
+  `.vault-info` gets `flex-shrink:0` (the two High findings — the Report/Article tab's
+  clipped controls + description-overlap, both verified by headless render); chat bubbles
+  break long tokens and contain wide `<pre>`/`<img>`; card headers wrap; the help popover
+  is height-bounded + dismisses on scroll; long paths break in the retrieval trace / deck
+  summaries / note-path headers; the nonexistent `--text-muted` token is replaced; the
+  prompt badge ellipsizes; the tab strip fades its right edge as a scroll cue.
+
+## 2026-07-13 (audit + fixes — map-reduce bounds/cancel, DeepSeek cost accounting, preview-binding, docgen UI hardening)
+
+A 25-finding principal-engineer audit of the docgen/help-UI series and the prior
+DeepSeek + context-budget work, fully resolved in seven commits (`027e972`…`fdf10ba`);
+three findings were disproven and pinned as by-design comments rather than "fixed".
+
+- **Map-reduce hardening (rag/summarizer.py).** The map phase is now cancel-aware
+  (`should_stop` from the paper worker's cancel event, polled per part + per streamed
+  token — it yields nothing, so the SSE consumer's per-token cancel check could never
+  stop it); parts are capped at `_MAP_MAX_PARTS` (64) with an explicit coverage notice;
+  the keep-alive heartbeat runs on its own daemon thread (the token-driven beat could
+  never fire during the pre-first-token stall it existed to cover); part sizes are
+  equalised (no stub tail paying a full LLM call); the online document bound is the new
+  `online_doc_window_tokens` config key (default 100k, validated 4000–2M); the
+  "Nothing is dropped" banner no longer contradicts the reduce-clip notice. Six new
+  `TestProviderRegressions` pins, including the previously-untested Ollama `num_ctx` branch.
+- **DeepSeek cost accounting + degradation.** `_cached_tokens_from_usage` reads
+  DeepSeek's TOP-LEVEL `usage.prompt_cache_hit_tokens` (the cached_input rates were dead
+  code — every cached token billed at full input rate, ~50× over at DeepSeek's ~2%
+  cache-hit pricing, which was RE-verified correct against the official docs and pinned
+  with a do-not-"fix" comment); `tools`/`tool_choice` joined `_HEALABLE_PARAMS` (the only
+  degradation path since lot 6bis emptied `MODELS_WITHOUT_TOOLS` — a tools 400 now strips
+  tools and degrades to a plain answer instead of killing every agent/deck/docgen turn);
+  the `deepseek-chat`/`deepseek-reasoner` alias retirement (2026-07-24) self-enforces via
+  `_deepseek_curated(today)`; the five online `*_model` config keys get shape validation.
+- **Preview-binding guard (deck + docgen apply-augment).** Staging is one slot per
+  document path, so a second window's preview silently replaced the first and Apply
+  could write a proposal the user never reviewed (the stale-diff sha cannot see the swap).
+  `apply-augment` now REQUIRES `proposed_sha256` (carried on the augment frame) to match
+  the staged digest, else 409; the stage is not cleared so the newer preview's own Apply
+  stays valid.
+- **Docgen UI hardening.** Compile-fix/preview join a shared `_docOpBusy()` predicate
+  (deck item-3.8 parity — they previously left Generate clickable into a 409); the three
+  SSE ops get a Cancel button (AbortController → consumer disconnect → the worker's
+  cancel gates) and generation failures render a retry-able error boundary (the Markdown
+  retry re-enters the confirm ceremony); help popovers dismiss on tab-out (non-modal,
+  selection-safe) and hovered tooltips dismiss on Escape (WCAG 1.4.13).
+- **Docgen worker dedupe.** The LaTeX and Markdown generate workers shared ~120
+  duplicated lines of knob-resolution + outline→sections checkpoint/resume loop —
+  extracted to `_resolve_gen_params` / `_run_sections_with_resume` (the routes differ
+  only in their engine bindings and a per-section kwargs hook). New pins for the augment
+  truncation guard, section-index bounds, and the turn-level error→info relabel.
+- **Dispositioned, not changed:** the "dangerous macro in a comment" rejection
+  (false positive — `find_dangerous_macros` strips comments internally); the
+  warn-and-write on a failed apply-time figure copy (by design: a visible compile
+  failure beats a silently omitted figure, `.tex.bak` recovers — rationale comment
+  restored in docgen); the synchronous compile-preview thread pinning (bounded by the
+  32-thread pool + per-subsystem op locks to ≤2/32 — documented instead of converting
+  the mature contract to SSE); `create_note` additionally logs a `create_note_failed`
+  companion line so the intent-first audit trail never asserts a create that never
+  reached disk.
+
+## 2026-07-13 (Report / Article Generator — docgen, + contextual help)
+
+The prose sibling of the Deck Generator, built by parametrizing the deckgen engine
+(commits `516af63`…`2128cb9`):
+
+- **Substrate extraction (step 0).** `deckgen/latex.py` — the document-class-agnostic
+  LaTeX substrate (metadata/title/dangerous-macro/cite/graphics/comment/template-assembly,
+  `validate_common`, the `DocClassStrategy` seam) extracted from `assemble.py`, which
+  keeps the Beamer pieces and re-exports the substrate (move+re-export, zero consumer
+  churn). `deckgen/sections.py`/`outline.py` gained document-class hooks
+  (sanitize / prompts / placeholder / unit label) defaulting to Beamer, so the deck path
+  is byte-identical.
+- **Article core (`docgen/`).** `article.py` (the `ARTICLE` strategy: prose
+  `sanitize_article_section` — a `\section` gate, not a frame gate — assemble/validate),
+  `prompts.py`, `generate.py` (engine bindings), `review.py`
+  (`screen_article_repair` — structural floor ≥1 `\section`), `markdown.py` (the
+  heading-gated Markdown long-form kind), plus `docgen/tests/`.
+- **Routes (`api/routes/docgen.py` + shared `api/routes/_latexdoc.py`).** `load-template`,
+  `generate` (SSE, emit-only scaffold with retry/salvage/checkpoint-resume),
+  `generate-md` (SSE — a Markdown note WRITTEN INTO THE VAULT via the new
+  `refactor/create_note.py` journal op, confirm-gated, refuses overwrite, reversible
+  from Note Refactor → Restore: revert DELETES the created note, skipped if hand-edited),
+  the augment trio, the compile/preview set, and `compile-fix` — full parity with the
+  deck's emit-only exceptions. One doc op at a time (`_DOCGEN_OP_LOCK` → 409).
+- **UI.** The Report / Article tab (`static/js/docgen.js`, ui.js+api.js-only), the
+  `docgen_*` LLM-Settings knobs, and axis ii **contextual help**: `ui.js::helpTip` /
+  `helpPopover` primitives + the declarative `help.js` table ("?" badges; every
+  vault-write button must carry a `writes: true` popover — ratcheted by
+  `tests/js/helpTable.test.js`).
+
+Six user-requested axes implemented, then hardened by a principal-engineer review pass
+(fix lots 1–6bis):
+
+- **DeepSeek + Z.AI providers (axis iii).** `core/llm/adapters/openai_compat.py` —
+  `OpenAIProvider` subclasses (streaming/tools/retry/heal/usage inherited); registered
+  across factory/config/UI; every curated id priced (`test_all_curated_models_are_priced`
+  still pins the guard). Keys via `DEEPSEEK_API_KEY` / `ZAI_API_KEY` env only.
+- **Usage visibility (axis vi).** The three local paths that bypassed the adapter seam —
+  local vault RAG, local single-paper summarise, vision/OCR — now record into
+  `/api/usage` via `usage.record_local_usage` (estimated tokens, $0 cost, client aborts
+  recorded as failures, not successes).
+- **Audit curation + first vault write (axis ii wave 1).** mapping.json entries are
+  hash-anchored (sha256 per curated PDF; a renamed/moved file re-links at the next scan —
+  size-prefiltered + capped recovery); new read-only reports `ambiguous_pdfs` (with an
+  in-UI key picker) and `skipped_pdfs`; `POST /api/audit/apply-tag-drift` writes missing
+  Zotero tags into a note's frontmatter — the audit's ONLY vault write: confirm-gated
+  (confirmInline ceremony), drift-validated server-side, op-locked, non-clobbering
+  `.bak`, `log_vault_write`, YAML-quoted merge with a post-merge round-trip guard that
+  refuses rather than corrupts.
+- **Input drafts persist across quits (axis v).** `ui.js::installDraftPersistence`
+  (localStorage) on deck topic/title/subtitle/instructions/audience, plain-chat input,
+  focus question.
+- **Conversation export (axis iv).** Export MD/TXT buttons on vault chat (new
+  client-side `_vaultHistory` transcript incl. retrieval sources) and plain chat, through
+  `/api/export-summary` (new `raw` flag: no `Summary_` prefix / injected heading).
+- **In-app deck PDF preview (axis i).** `POST /api/deck/compile-preview` (single latexmk
+  pass under the deck-op lock — never rewrites the `.tex`) + `GET /api/deck/preview-pdf`
+  + macOS `open-pdf` fallback. The PDF is fetched header-authenticated and rendered via a
+  blob: URL — a direct `<iframe src="/api/...">` would be 403'd by the origin guard
+  (pinned by `tests/js/deckPreview.test.js` incl. a source ratchet).
+
+## 2026-07-10 (UX & context-budget lots 1-5 — compile-fix env, deck title, dead links, num_ctx, map-reduce, salvage, reformat)
+
+Five user-approved work lots from the 2026-07-10 audit (agent wrap-up / context limits /
+deck generator / dead links), all landed together:
+
+- **Compile & Auto-Fix repaired (WP-D1).** The compile env didn't match the suite's
+  `common/latex-build.mk`: `BIBINPUTS` lacked the suite ROOT (where `_master.bib`
+  lives — biber failed on every run), `TEXINPUTS` lacked `common/fig` (`\commonlogo`
+  figures unresolvable), and the Finder-launched app's `PATH` lacked the TeX bin dir so
+  latexmk couldn't spawn `pdflatex`/`biber`. New `deckgen.compile.build_compile_env`
+  mirrors the `.mk` exactly; validated by compiling the maintainer's real
+  `presentation-boadilla-ai.tex` through the app code (PDF produced). Missing-suite-file
+  failures now explain what to check instead of a bare "compile failed". Pinned by
+  `TestBuildCompileEnv` + opt-in `RUN_LIVE_LATEX=1` live compiles (the all-mocked suite
+  was exactly how this class of bug shipped).
+- **Deck title substitution (WP-D2).** Templated decks kept the template's placeholder
+  `\title{…}` forever (`assemble_with_template` reuses the preamble verbatim and nothing
+  substituted the topic). New `deckgen.assemble.substitute_title` (balanced-brace scan,
+  word-bounded so `\titlepage` never matches, LaTeX-escaped, auto short-form for
+  footlines) + `deck_title`/`deck_subtitle` body fields + UI fields (title defaults to
+  the topic; empty subtitle leaves the template untouched).
+- **Dead links fixed app-wide (WP-L1/L2).** A markdown link in a rendered answer
+  navigated the whole PyWebView window to a Flask 404 ("dead page"). New global click
+  delegate `ui.js::installLinkInterceptor` preventDefaults every anchor and routes it to
+  the new `POST /api/open` (vault path → Finder reveal via `resolve_under_root`;
+  http/https → default browser; every other scheme swallowed — never `file:`/custom
+  schemes). Retrieval Context sources are now clickable. `test_open.py` +
+  `tests/js/linkInterceptor.test.js`.
+- **Context budgeting (WP-C1/C2/C5).** New `core/llm/budget.py` (token estimate ×
+  safety margin, doubling `NUM_CTX_LADDER`, input-fitting helpers). The local adapter
+  now auto-sizes Ollama's `num_ctx` per request on BOTH paths (tools + stream) —
+  Ollama silently truncates past `num_ctx` (~4k default; ollama/ollama #8099/#4967), so
+  agent turns / plain chat / refactor edits / compile repairs were losing their oldest
+  context invisibly. The single-paper summarizer's hardcoded, silent LM Studio
+  2800-token clip is replaced by a window-derived budget with a user-visible notice;
+  the deck integrity review's input clip and the online RAG context-budget drop are
+  also surfaced as info frames (engine gained a `stage_cb`).
+- **Map-reduce Single Paper (WP-C3).** A document over the window budget is split into
+  overlapping parts, each condensed into notes (progress + heartbeat via info frames so
+  the SSE stall guard stays fed), and the user's template synthesises the final summary
+  from the combined notes. More calls, nothing dropped.
+- **Agent wrap-up (WP-A1/A2).** The loop now warns at the PENULTIMATE iteration
+  ("one iteration left, it won't allow tools — answer now or make one targeted call",
+  tools still enabled) ahead of the existing forced tool-less final. Deck sections that
+  still fail every agent attempt get ONE tool-free single-shot salvage pass
+  (`InProcessChatRunner` now honours `agent=False`, parity with the HTTP client) before
+  the placeholder frame — the gathered tokens are no longer discarded outright.
+- **Augment `reformat` op (WP-D3).** Content-preserving .tex formatting/layout pass over
+  a section or the whole section region; a replace-type op sharing deepen/table's
+  zero-section + truncation guards (`_AUGMENT_REPLACE_OPS`), same screen/stage flow.
+- Docs: root/agent/llm `CLAUDE.md` + README (API table gained the previously-missing
+  deck augment/compile rows and `/api/open`). Suite: 1038 py + 150 JS + 125
+  deckgen/launch green; ruff clean.
+
 ## 2026-07-05 (Track 5.6 live-eval validation + run_eval wiring fix; Phase 6 / B3)
 
 - **Batched embedding validated numerically safe on a real backend.** Track 5.6's
@@ -370,7 +2489,7 @@ Implements Track 2 of `docs/improvement_plan_2026-07-04.md` in full (nine items;
 - **2.2 — deck zombie-writer + lock leak.** `_DeckOpGuard` owns `_DECK_OP_LOCK` release: exactly once, when the stream ended (incl. never-iterated generator, via `call_on_close`) AND the worker exited — a stall/disconnect can no longer release the lock under a still-writing worker, and an unconsumed Response can no longer leak it forever. Cancel gates added before generate's assemble/figure-copy/scaffold and augment's staging write.
 - **2.3 — LLM daemon pile-up.** The five bounded refactor LLM actions now propagate the 504's cancel into the daemon (polled before/after `LOCAL_MODEL_LOCK` and per token — an abandoned queued worker evaporates when the lock frees) and are per-action single-flight (second request while one is wedged → 429, not another queued thread).
 - **2.4 — tool-dispatch deadline.** The agent wall clock now gates each tool dispatch (the docstring had always promised it), and `read_note(..., time_budget_s=…)` refuses to START an uncached-PDF fresh extraction on a sub-floor budget (20 s); cache hits always served; non-agent callers unchanged.
-- **2.5 — `_DONE` sentinel survives a full queue** (`core.utils.put_done_resilient`, adopted at all five SSE worker sites) — the one-shot 5 s put dropped the sentinel and reported "timed out" on a completed answer. The thread-leak-guard port half is deferred to 4.3 by the plan's own note.
+- **2.5 — `_DONE` sentinel survives a full queue** (`core.utils.put_done_resilient`, adopted at all five SSE worker sites) — the one-shot 5 s put dropped the sentinel and reported "timed out" on a completed answer. The thread-leak-guard port half is deferred to 4.3 by the plan's own note. *(**Closed** by item 4.3 shipping: `api/sse.py::_SSEOpGuard` tracks `worker_spawned`/`worker_finished` and releases only once the stream has ended AND any spawned worker has exited — verified 2026-07-30, no longer an open deferral.)*
 - **2.6 — client caches bounded.** Both `(host, timeout)` local-client caches are 8-entry LRUs (evicted pools GC-closed, never closed in place) and the agent path quantises its per-call timeout to a coarse ceiling ladder — the "handful of entries" comment was wrong (one key per remaining-second); worst case was hundreds of idle httpx pools.
 - **2.7 — retune race.** The engine's locked pipeline build is now the ONLY writer of the shared BM25 `similarity_top_k` / reranker `top_n` (tune+use atomic within one mutation-lock hold); the manager fetch paths are read-only by contract — a deck `vault_search` (k=12) could previously retrim a concurrent chat's in-flight pass (k=8).
 - **2.8 — durability gaps.** (a) checkpoint promotion bracketed by `promotion_state.json` — a torn multi-file promotion is refused at load instead of silently serving a mixed-generation store; legacy checkpoints grandfathered. (b) the stale-doc sweep spares sources whose READ failed this run (iCloud dataless miss ≠ deletion). (c) the final persist's cache invalidation moved OUTSIDE the rw write lock, matching the mid-run path (inside, a concurrent BM25 rebuild froze every chat). (d) refactor batch writers checkpoint the journal every 25 notes — a mid-batch crash left applied notes invisible to Restore.

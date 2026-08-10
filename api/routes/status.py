@@ -17,6 +17,7 @@ import threading
 import time
 
 from flask import Blueprint, jsonify, request
+from api.security import sanitise_error_msg
 from core.providers import get_provider
 from api.validators import coerce_enum
 from core.providers.server import get_provider_warnings
@@ -156,9 +157,13 @@ def _compute_health() -> dict:
                 "error": "No vault folder configured.",
             }
         elif not os.path.isdir(vault_path):
+            # No raw path in the payload — parity with the app-wide
+            # sanitise-before-UI discipline (2026-07-22 audit: /api/health was
+            # the one surface emitting raw paths/exception text).
             details["vector_store"] = {
                 "status": "error",
-                "error": f"Configured vault path is not a directory: {vault_path}",
+                "error": "Configured vault path is not a directory — re-pick "
+                         "the vault folder in Settings.",
             }
         else:
             lancedb_rows = lancedb_table_count(OBSIDIAN_INDEX_DIR)
@@ -191,7 +196,7 @@ def _compute_health() -> dict:
     except Exception as exc:
         details["vector_store"] = {
             "status": "error",
-            "error": f"Unexpected health check failure: {exc}",
+            "error": f"Unexpected health check failure: {sanitise_error_msg(exc)}",
         }
 
     # 2) Local model backends: every distinct LOCAL provider any role is
@@ -208,7 +213,9 @@ def _compute_health() -> dict:
             prov = get_provider(prov_name)
             ok, err = prov.check_running()
             if not ok:
-                local_errors.append(f"{prov_name} is not running: {err or 'connection refused'}")
+                local_errors.append(
+                    f"{prov_name} is not running: "
+                    f"{sanitise_error_msg(err) if err else 'connection refused'}")
                 continue
             # A4 first-run UX: a runner that is UP but has ZERO models installed
             # cannot index or chat — the first index/chat would otherwise fail at
@@ -227,7 +234,7 @@ def _compute_health() -> dict:
                     "embedding model (e.g. nomic-embed-text) and a chat model to index and chat."
                 )
         except Exception as exc:
-            local_errors.append(f"Failed to check {prov_name}: {exc}")
+            local_errors.append(f"Failed to check {prov_name}: {sanitise_error_msg(exc)}")
 
     if local_errors:
         details["local_model"] = {

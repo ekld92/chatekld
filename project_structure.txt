@@ -38,6 +38,8 @@
 │       ├── prompts.py             (/api/prompts — read-only Prompt Hub snapshot)
 │       ├── refactor.py            (/api/refactor/* blueprint; Note Refactor analyzer + hub + writers)
 │       ├── status.py              (/api/status, /api/models, /api/health, /api/pull, …)
+│       ├── tagging.py             (/api/tagging/* blueprint; Biblio Tagging propose + note/finder/zotero writes)
+│       ├── _finder_tagwrite.py    (route-layer macOS Finder-tag reader/writer; keeps audit/ read-only)
 │       ├── usage.py               (/api/usage, /api/pricing)
 │       └── vault.py               (/api/obsidian/* incl. chat SSE)
 │
@@ -132,6 +134,13 @@
 │   ├── archive.py                 (per-image move-out + thumbnail + restore)
 │   └── result.py                  (third-party-free result dataclasses + serializers)
 │
+├── tagging/                       (Biblio Tagging: Library Audit sub-view; confirm-gated, reversible tag writes)
+│   ├── vocab.py                   (pure _tags.md -> {tag: gloss} vocabulary parser)
+│   ├── text_source.py             (cache-first PDF text via the indexer's _read_pdf_text)
+│   ├── propose.py                 (the ONLY chat-LLM caller: vocabulary-constrained tag proposal)
+│   ├── journal.py                 (self-contained restore manifest, outside the vault; note/finder/zotero ops)
+│   └── zotero_write.py            (stdlib-urllib Zotero LOCAL-API client; version-guarded PATCH, never SQLite)
+│
 ├── scripts/                       (maintenance-only; run with the app closed, back up app data first)
 │   ├── compact_lancedb.py         (one-off offline LanceDB version-bloat reclaim)
 │   ├── migrate_vector_store.py    (SimpleVectorStore -> LanceDB, no re-embedding)
@@ -147,7 +156,7 @@
 │   └── js/                        (ui.js + api.js are leaves; app.js is the root)
 │       ├── api.js · app.js · ui.js
 │       ├── audit.js · config.js · deck.js · settings.js · prompts.js
-│       ├── plainchat.js · refactor.js · summarizer.js · vault.js
+│       ├── plainchat.js · refactor.js · summarizer.js · tagging.js · vault.js
 │       └── vendor/marked.min.js   (v15.0.12, MIT — never loaded from a CDN)
 │
 ├── templates/
@@ -160,9 +169,10 @@
     ├── test_agent.py · test_audit.py · test_compile.py · test_concurrency.py
     ├── test_deck.py · test_health.py · test_lancedb_migration.py · test_launch.py
     ├── test_llm.py · test_plainchat.py · test_prompts.py · test_prompts_hub.py
-    ├── test_refactor.py · test_thesaurus.py · test_validators.py · test_vault_regressions.py
+    ├── test_refactor.py · test_tagging.py · test_thesaurus.py · test_validators.py · test_vault_regressions.py
     │                                  (test_prompts.py: model-free prompt invariants)
     │                                  (test_refactor.py: hermetic Note Refactor analyzer + hub + writers)
+    │                                  (test_tagging.py: hermetic Biblio Tagging vocab/propose/note/finder/zotero + restore)
     ├── tests/audit/               (ported kb_harmonizer unit tests)
     │   ├── conftest.py
     │   ├── test_bib.py · test_bridge_filename.py · test_bridge_mapping.py

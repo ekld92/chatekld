@@ -52,6 +52,13 @@ import tempfile
 
 from _pytest.python import Module
 
+# Re-export for interactive/root-context use. Test FILES must import this
+# from ``suite_helpers`` directly — ``from conftest import ...`` resolves
+# against whichever of the two conftest.py files (root vs tests/audit/) won
+# ``sys.modules["conftest"]`` during collection, and under the full suite
+# that is NOT this one. See suite_helpers.py's module docstring.
+from suite_helpers import join_post_index_daemons  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # Hermetic app-data sandbox.
 #

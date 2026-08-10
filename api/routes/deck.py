@@ -16,11 +16,12 @@ import json
 import logging
 import os
 import shutil
-import threading
+import subprocess
+import sys
 import time
 from pathlib import Path
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 
 from api.security import sanitise_error_msg
 from api.sse import run_sse_worker
@@ -57,6 +58,7 @@ from deckgen import checkpoint
 from deckgen.assemble import (
     assemble_with_template,
     sanitize_section,
+    substitute_title,
     validate,
     comment_out_missing_graphics,
     extract_graphics_keys,
@@ -68,16 +70,21 @@ from deckgen.augment import (
     insert_section,
     replace_region,
     replace_section,
+    replace_sections,
     split_deck,
 )
 from deckgen.inprocess import InProcessChatRunner
 from deckgen.outline import OutlineError, request_outline
 from deckgen.prompts import augment_system_prompt, build_augment_message
 from deckgen.review import (
+    REVIEW_MAX_CHARS,
     REVIEW_SYSTEM_PROMPT,
     REVIEW_TEMPERATURE,
+    SECTION_REVIEW_SYSTEM_PROMPT,
     build_review_messages,
+    build_section_review_messages,
     parse_review,
+    parse_section_review,
     screen_repair,
 )
 from deckgen.scaffold import (
@@ -128,7 +135,11 @@ _TEMP_MIN, _TEMP_MAX = 0.0, 2.0
 
 # Augment (deepen / extend an existing deck) input bounds.
 _INSTRUCTION_MAX = 4_000
-_AUGMENT_OPS = ("deepen", "table", "new_section")
+_AUGMENT_OPS = ("deepen", "table", "new_section", "reformat")
+# Operations that REPLACE the targeted span (vs. new_section, which inserts):
+# they share the zero-section and truncation guards — a clipped view must
+# never overwrite the full span it was clipped from.
+_AUGMENT_REPLACE_OPS = ("deepen", "table", "reformat")
 _AUGMENT_SCOPES = ("whole", "section")
 _SECTION_INDEX_MAX = 199  # a deck with more sections than this is pathological
 
@@ -139,6 +150,18 @@ _SECTION_INDEX_MAX = 199  # a deck with more sections than this is pathological
 _DENY_PREFIXES = (
     "/System", "/usr", "/bin", "/sbin", "/etc", "/private/etc",
 )
+
+
+def _under_deny_prefix(expanded: str) -> bool:
+    """True iff *expanded* (an absolute realpath) is or is under a denied prefix.
+
+    B10/#27 (2026-07-13): case-insensitive on darwin — APFS is case-insensitive
+    and ``realpath`` does not canonicalise case, so ``/SYSTEM/x`` slipped past a
+    case-sensitive ``startswith``. Defence in depth; mirrors _latexdoc.py.
+    """
+    hay = expanded.lower() if sys.platform == "darwin" else expanded
+    prefixes = [p.lower() for p in _DENY_PREFIXES] if sys.platform == "darwin" else _DENY_PREFIXES
+    return any(hay == p or hay.startswith(p + os.sep) for p in prefixes)
 
 _CHAT_TOKEN_TIMEOUT_S = 300  # default per-turn wall-clock cap (config: agent_wall_clock_s)
 # _STALL_MARGIN_S / _SINGLE_SHOT_FLOOR_S are imported from core/constants.py so
@@ -156,7 +179,16 @@ def _resolve_template_path(raw) -> str | None:
     if any(ch in s for ch in ("\x00", "\n", "\r")):
         return None
     try:
-        expanded = os.path.realpath(os.path.expanduser(s))
+        # The INPUT must already be absolute (``~`` expansion aside):
+        # ``realpath`` anchors a relative path to the SERVER's process
+        # CWD, so the caller would get a location it never named. Same
+        # guard as deck.py::_resolve_out_dir (P8.2, 2026-07-30) — this
+        # twin was missed because the parity ratchet only asserted the
+        # relative-input rule for that one validator.
+        user_expanded = os.path.expanduser(s)
+        if not os.path.isabs(user_expanded):
+            return None
+        expanded = os.path.realpath(user_expanded)
     except (OSError, ValueError):
         return None
     if not os.path.isabs(expanded) or not os.path.isfile(expanded):
@@ -167,21 +199,33 @@ def _resolve_template_path(raw) -> str | None:
 
 
 def _resolve_out_dir(raw) -> str | None:
-    """Coerce/validate an output dir: absolute, existing, not a system location."""
+    """Coerce/validate an output dir: absolute, existing, not a system location.
+
+    The INPUT must already be absolute (``~`` expansion aside). ``realpath``
+    turns a relative path into an absolute one by anchoring it to the process
+    CWD, so ``".."`` used to pass every check below and the deck was scaffolded
+    somewhere the caller never named — the same CWD-anchoring hazard
+    ``audit.py::_normalise_abs_path`` documents. It is a footgun over HTTP
+    *and* over the CLI, since the CLI is a client and the path resolves in the
+    SERVER's process, not the user's shell (2026-07-30, found by the
+    test_path_validators.py parity ratchet: this was the one validator of the
+    six that accepted relative input).
+    """
     s = coerce_string_max_len(raw, _PATH_MAX)
     if not s:
         return None
     if any(ch in s for ch in ("\x00", "\n", "\r")):
         return None
     try:
-        expanded = os.path.realpath(os.path.expanduser(s))
+        user_expanded = os.path.expanduser(s)
+        if not os.path.isabs(user_expanded):
+            return None
+        expanded = os.path.realpath(user_expanded)
     except (OSError, ValueError):
         return None
     if not os.path.isabs(expanded) or not os.path.isdir(expanded):
         return None
-    if expanded == os.sep or any(
-        expanded == p or expanded.startswith(p + os.sep) for p in _DENY_PREFIXES
-    ):
+    if expanded == os.sep or _under_deny_prefix(expanded):
         return None
     return expanded
 
@@ -201,16 +245,23 @@ def _resolve_existing_deck(raw) -> str | None:
     if any(ch in s for ch in ("\x00", "\n", "\r")):
         return None
     try:
-        expanded = os.path.realpath(os.path.expanduser(s))
+        # The INPUT must already be absolute (``~`` expansion aside):
+        # ``realpath`` anchors a relative path to the SERVER's process
+        # CWD, so the caller would get a location it never named. Same
+        # guard as deck.py::_resolve_out_dir (P8.2, 2026-07-30) — this
+        # twin was missed because the parity ratchet only asserted the
+        # relative-input rule for that one validator.
+        user_expanded = os.path.expanduser(s)
+        if not os.path.isabs(user_expanded):
+            return None
+        expanded = os.path.realpath(user_expanded)
     except (OSError, ValueError):
         return None
     if not os.path.isabs(expanded) or not os.path.isfile(expanded):
         return None
     if os.path.splitext(expanded)[1].lower() != ".tex":
         return None
-    if expanded == os.sep or any(
-        expanded == p or expanded.startswith(p + os.sep) for p in _DENY_PREFIXES
-    ):
+    if expanded == os.sep or _under_deny_prefix(expanded):
         return None
     return expanded
 
@@ -459,6 +510,13 @@ def _staging_dir() -> str:
 
 
 def _staging_path(deck_path: str) -> str:
+    # CROSS-PANEL NOTE (2026-07-22 comment repair): deck and docgen key their
+    # staging files on the same .tex realpath but into DISJOINT dirs, so two
+    # staged proposals for one file can legitimately coexist across panels.
+    # The cross-panel safety rests entirely on apply-time: both applies check
+    # the on-disk base sha under the SHARED LATEX_OP_LOCK, so whichever apply
+    # lands second 409s on the stale base — staging isolation is deliberate,
+    # not an oversight.
     key = hashlib.sha256(os.path.realpath(deck_path).encode("utf-8")).hexdigest()
     return os.path.join(_staging_dir(), f"{key}.json")
 
@@ -537,8 +595,13 @@ def _backup_deck(deck_path: str) -> str:
     overwrite rather than destroying the user's original without a backup — augment
     can target a hand-written deck, so the overwrite must always be recoverable.
     ``copyfile`` is byte-exact (works even for the rare non-UTF-8 deck, though
-    augment refuses those upstream).
+    augment refuses those upstream). A one-time non-clobbering ``.tex.orig``
+    is secured first (the rolling ``.bak`` alone destroyed a hand-written
+    original on the SECOND apply — 2026-07-20 audit M1).
     """
+    from api.routes._latexdoc import preserve_original_once
+
+    preserve_original_once(deck_path)
     bak = deck_path + ".bak"
     shutil.copyfile(deck_path, bak)
     return bak
@@ -551,7 +614,12 @@ def _backup_deck(deck_path: str) -> str:
 # augment while a generate streams) would contend on the model and double the load
 # for no benefit. A non-blocking try-acquire here lets exactly one run at a time;
 # the loser gets a clean 409 instead of silently competing.
-_DECK_OP_LOCK = threading.Lock()
+#
+# 2026-07-20 audit H1: this is now an ALIAS of the shared LATEX_OP_LOCK in
+# _latexdoc.py — docgen accepts the same absolute .tex paths, so a per-panel
+# lock let a docgen write interleave with a deck write on the same file. The
+# name is kept for existing test patch targets.
+from api.routes._latexdoc import LATEX_OP_LOCK as _DECK_OP_LOCK  # noqa: E402
 
 
 def _index_preflight_msgs(in_progress_msg: str, no_index_msg: str) -> list[str]:
@@ -653,6 +721,213 @@ def _run_integrity_review(tex, *, provider, model, max_tokens, cfg, cancel, dead
     return payload
 
 
+def _run_section_review(section_tex, *, title, provider, model, max_tokens,
+                        cfg, cancel, deadline_s=None):
+    """One RAG-free review call over ONE section span (piecewise repair).
+
+    The section twin of :func:`_run_integrity_review` — same never-raises
+    contract, same per-token deadline poll — but parsed with
+    :func:`deckgen.review.parse_section_review` (a repaired EXCERPT, never a
+    whole document). Returns ``{issues, repaired, repair_truncated, error}``.
+    """
+    out = {"issues": [], "repaired": None, "repair_truncated": False, "error": ""}
+    deadline = (time.monotonic() + deadline_s) if deadline_s else None
+    try:
+        messages, truncated = build_section_review_messages(section_tex, title=title)
+        chunks = []
+        for tok in stream_chat_messages(
+            messages=messages,
+            system_prompt=SECTION_REVIEW_SYSTEM_PROMPT,
+            provider_name=provider,
+            model=model,
+            temperature=REVIEW_TEMPERATURE,
+            max_tokens=max_tokens,
+            cfg=cfg,
+            workflow="deck_review",
+        ):
+            if cancel.is_set():
+                return out
+            if deadline is not None and time.monotonic() > deadline:
+                out["error"] = "section review timed out"
+                return out
+            chunks.append(tok)
+        parsed = parse_section_review("".join(chunks))
+        out["issues"] = parsed.issues
+        out["repair_truncated"] = parsed.repair_truncated
+        # A repair from a truncated INPUT would drop the unseen tail — refuse
+        # (the caller only sends ≤-cap sections, so this is belt-and-braces).
+        out["repaired"] = None if truncated else parsed.repaired_tex
+        return out
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = sanitise_error_msg(exc)
+        return out
+
+
+@deck_bp.route("/api/deck/repair-piecewise", methods=["POST"])
+def api_deck_repair_piecewise():
+    """Section-by-section integrity review + repair for an over-budget deck (SSE).
+
+    Batch F (2026-07-22, offer-on-withheld-repair): when the whole-deck
+    integrity pass reports issues but withholds its auto-repair (input over
+    ``REVIEW_MAX_CHARS`` or output over ``deck_review_max_tokens``), the UI
+    offers this route. Body ``{deck_path, base_sha256}``. Each ``\\section``
+    span ≤ the review cap gets its own RAG-free review call; repaired spans
+    are spliced back-to-front (``deckgen.augment.replace_sections``) and the
+    combined document goes through the UNCHANGED whole-doc ``screen_repair``
+    gate, is **staged**, and surfaces as a terminal ``{"augment"}`` frame —
+    so the existing preview-bound, re-screened, ``.bak``-backed
+    ``apply-augment`` applies it with no new write path. Writes nothing
+    itself. Model/token knobs are the config-only ``deck_review_*`` set
+    (never body overrides). 409 when the deck changed on disk or another
+    deck op is running.
+    """
+    data = request.get_json(silent=True) or {}
+    deck_path = _resolve_existing_deck(data.get("deck_path"))
+    if not deck_path:
+        return jsonify({"error": "Invalid or unreadable deck path (an absolute .tex)."}), 400
+    base_sha = coerce_string_max_len(data.get("base_sha256"), 64) or ""
+    # base_sha256 is REQUIRED (2026-07-23 audit): this route only makes sense
+    # launched from a generate frame that carried tex_sha256, and an empty
+    # token silently skipped the documented 409 stale-diff refusal.
+    if not base_sha:
+        return jsonify({"error": "base_sha256 required (from the generate frame)."}), 400
+    try:
+        deck_tex, deck_sha = _read_deck_strict(deck_path)
+    except _DeckReadError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if base_sha != deck_sha:
+        return jsonify({"error": "The deck changed on disk since it was generated; reload and retry.",
+                        "expected_sha256": deck_sha}), 409
+
+    cfg = load_config()
+    # Config-only model/token knobs (a page must not steer provider/spend) —
+    # the same resolution the integrity review and compile-fix use.
+    provider = cfg.get("provider", "ollama")
+    model = (cfg.get("deck_review_model") or "").strip() or resolve_chat_model(cfg, provider)
+    max_tokens = coerce_int_in_range(cfg.get("deck_review_max_tokens"), 256, 16384) or 4096
+    wall_clock_s = coerce_int_in_range(cfg.get("agent_wall_clock_s"), 30, 1800) or _CHAT_TOKEN_TIMEOUT_S
+    consumer_timeout_s = max(wall_clock_s, _SINGLE_SHOT_FLOOR_S) + _STALL_MARGIN_S
+
+    def _worker(put, cancel):
+        def _info(text):
+            put({"info": text})
+
+        try:
+            parts = split_deck(deck_tex)
+        except AugmentError as exc:
+            put({"error": str(exc)})
+            return
+        if not parts.sections:
+            put({"error": "This deck has no \\section spans to review piecewise."})
+            return
+
+        edits = []
+        issues: list[str] = []
+        skipped: list[str] = []
+        n = len(parts.sections)
+        for i, sec in enumerate(parts.sections):
+            if cancel.is_set():
+                return
+            if len(sec.body) > REVIEW_MAX_CHARS:
+                skipped.append(sec.title)
+                _info(f"Section {i + 1}/{n} ('{sec.title}') exceeds the review "
+                      "cap on its own — skipped.")
+                continue
+            _info(f"Reviewing section {i + 1}/{n}: {sec.title}…")
+            res = _run_section_review(
+                sec.body, title=sec.title, provider=provider, model=model,
+                max_tokens=max_tokens, cfg=cfg, cancel=cancel,
+                deadline_s=wall_clock_s,
+            )
+            if cancel.is_set():
+                return
+            if res["error"]:
+                skipped.append(sec.title)
+                _info(f"Section '{sec.title}': review failed ({res['error']}) — skipped.")
+                continue
+            issues.extend(f"{sec.title}: {iss}" for iss in res["issues"])
+            if res["repair_truncated"]:
+                skipped.append(sec.title)
+                _info(f"Section '{sec.title}': the corrected excerpt exceeded "
+                      "deck_review_max_tokens — issues stand, repair skipped.")
+                continue
+            repaired = res["repaired"]
+            if repaired and repaired.strip() != sec.body.strip():
+                edits.append((sec, repaired))
+            elif res["issues"]:
+                # The review reported issues but produced no usable SPAN
+                # repair (e.g. a whole-document reply, which
+                # parse_section_review refuses to splice) — count it as
+                # skipped, or the terminal frame reads "N edited, 0 skipped"
+                # while this section's issues stand (2026-07-23 audit).
+                skipped.append(sec.title)
+                _info(f"Section '{sec.title}': issues noted but no usable "
+                      "span repair — skipped.")
+
+        counts_before = deck_counts(deck_tex)
+        if not edits:
+            put({"augment": {
+                "proposed_tex": "", "changed": False,
+                "warnings": issues,
+                "rejected_reason": ("No section produced an applicable repair"
+                                    + (f" ({len(skipped)} skipped)" if skipped else "")
+                                    + "."),
+                "deck_path": deck_path, "deck_sha256": deck_sha,
+                "proposed_sha256": "",
+                "counts": {"sections_before": counts_before["sections"],
+                           "sections_after": counts_before["sections"],
+                           "frames_before": counts_before["frames"],
+                           "frames_after": counts_before["frames"]},
+                "operation": "repair", "scope": "whole", "section_index": 0,
+                "piecewise": True, "edited_sections": 0,
+                "skipped_sections": skipped,
+            }})
+            return
+
+        proposed_full = replace_sections(parts.tex, edits)
+        accepted, screen_warnings = screen_repair(deck_tex, proposed_full)
+        changed = accepted is not None
+        display_warnings = list(dict.fromkeys(
+            issues
+            + ([f"{len(skipped)} section(s) not repaired: {', '.join(skipped)}."]
+               if skipped else [])
+            + (list(screen_warnings) if changed else [])
+        ))
+        rejected_reason = "" if changed else (screen_warnings[0] if screen_warnings else "")
+        counts_after = deck_counts(proposed_full) if changed else counts_before
+
+        if cancel.is_set():
+            return
+        if changed:
+            _stage_augment(deck_path, deck_sha, accepted)
+        put({"augment": {
+            "proposed_tex": accepted or "",
+            "changed": changed,
+            "warnings": display_warnings,
+            "rejected_reason": rejected_reason,
+            "deck_path": deck_path,
+            "deck_sha256": deck_sha,
+            "proposed_sha256": _proposed_digest(accepted) if changed else "",
+            "counts": {
+                "sections_before": counts_before["sections"],
+                "sections_after": counts_after["sections"],
+                "frames_before": counts_before["frames"],
+                "frames_after": counts_after["frames"],
+            },
+            "operation": "repair", "scope": "whole", "section_index": 0,
+            "piecewise": True, "edited_sections": len(edits),
+            "skipped_sections": skipped,
+        }})
+
+    if not _DECK_OP_LOCK.acquire(blocking=False):
+        return jsonify({"error": "Another deck operation is already running. Please wait for it to finish."}), 409
+    return run_sse_worker(
+        _worker,
+        consumer_timeout_s=consumer_timeout_s,
+        release=_DECK_OP_LOCK.release,
+    )
+
+
 @deck_bp.route("/api/deck/load-template", methods=["POST"])
 def api_deck_load_template():
     """Read a template file and report its preamble-derived macros + bib."""
@@ -717,6 +992,10 @@ def api_deck_generate():
     deck_name = coerce_string_max_len(data.get("deck_name"), _DECK_NAME_MAX) or topic
     slug = slugify(deck_name)
     overwrite = bool(coerce_bool(data.get("overwrite")) or False)
+    # Presentation title/subtitle substituted into the template's \title{...}
+    # placeholder at assemble time (empty ⇒ leave the template untouched).
+    deck_title = coerce_string_max_len(data.get("deck_title"), _TOPIC_MAX) or ""
+    deck_subtitle = coerce_string_max_len(data.get("deck_subtitle"), _TOPIC_MAX) or ""
 
     cfg = load_config()
     # Generation knobs: request body wins, then the persisted ``deck_*``
@@ -786,6 +1065,10 @@ def api_deck_generate():
         provider=provider, model=model, max_sections=max_sections,
         audience=audience, citations_enabled=citations_enabled,
         slug=slug, out_dir=out_dir,
+        # Image policy shapes the section prompt, so it's content-determining
+        # (2026-07-20 audit L1) — a resume must not reuse sections generated
+        # under the opposite \includegraphics policy.
+        images_enabled=bool(cfg.get("vault_image_exts")),
     )
 
     def _worker(put, cancel):
@@ -964,12 +1247,33 @@ def api_deck_generate():
         # 4) Assemble + validate.
         tex = assemble_with_template(
             section_outputs,
-            preamble=parts.preamble,
+            preamble=substitute_title(parts.preamble, deck_title, deck_subtitle),
             opening=parts.opening,
             closing=parts.closing,
         )
-        tex, resolved_figs, fig_warnings, _pending = _resolve_and_copy_deck_figures(
-            tex, os.path.join(out_dir, slug),
+        # Provenance stamp BEFORE validate/review/scaffold so tex_sha256 and
+        # any offered repair are computed over the final text (2026-07-22).
+        from api.routes._latexdoc import provenance_comment
+        tex = provenance_comment("deck", provider, model) + tex
+        # Existing-deck refusal must run BEFORE the figure copy below writes
+        # into <slug>/figures/ (2026-07-20 audit M5): scaffold_deck's own
+        # overwrite gate still runs, but by then fresh vault images had
+        # already landed inside the project the run then claimed not to touch.
+        planned_tex = os.path.join(out_dir, slug, f"{slug}.tex")
+        if not overwrite and os.path.exists(planned_tex):
+            put({"error": (
+                f"A deck already exists at {planned_tex!r}. Choose another "
+                "name or enable overwrite. (Nothing was written; the "
+                "generated sections are checkpointed.)"
+            )})
+            return
+        # copy=False (2026-07-22 audit L1): resolution + tex rewrite here, but
+        # the actual vault→figures/ copies are deferred past the second cancel
+        # gate below — they used to run BETWEEN the gates, so a cancelled run
+        # still wrote into the user's project while both gates' comments
+        # promised write-freedom.
+        tex, resolved_figs, fig_warnings, pending_figs = _resolve_and_copy_deck_figures(
+            tex, os.path.join(out_dir, slug), copy=False,
         )
         generated_span = "\n\n".join(
             s.body.strip() for s in section_outputs if s.body.strip()
@@ -997,6 +1301,20 @@ def api_deck_generate():
         # <slug>/ — never perform it for a run whose consumer is gone.
         if cancel.is_set():
             return
+
+        # Perform the figure copies deferred by copy=False above. The pairs
+        # come straight from the in-memory resolver (same trust as the old
+        # copy=True path); never-clobber + warn-on-failure semantics match it.
+        for _src, _dst in pending_figs:
+            try:
+                os.makedirs(os.path.dirname(_dst), exist_ok=True)
+                if not os.path.exists(_dst):
+                    shutil.copy2(_src, _dst)
+            except OSError as exc:
+                warnings = list(warnings) + [
+                    f"Figure {os.path.basename(_dst)}: copy from the vault "
+                    f"failed ({exc})."
+                ]
 
         scaffold_error = None
         paths = {}
@@ -1038,6 +1356,14 @@ def api_deck_generate():
                 cancel=cancel,
                 deadline_s=wall_clock_s,
             )
+            # WP-C4: the review clips its input at REVIEW_MAX_CHARS — say so
+            # (the payload's `truncated` flag was previously UI-invisible).
+            if review_payload and review_payload.get("truncated"):
+                _info(
+                    "Integrity review saw a TRUNCATED copy of the deck (over "
+                    "the review size cap) — issues were reported but no "
+                    "auto-repair is offered from a clipped view."
+                )
 
         put({"deck": {
             "tex": tex,
@@ -1215,6 +1541,133 @@ def api_deck_sections():
     })
 
 
+def _run_piecewise_augment(*, put, cancel, parts, deck_tex, deck_path, deck_sha,
+                           operation, instruction, topic, audience,
+                           outline_titles, macros_block, bib_index, use_bib,
+                           cite_mode, tparts, cfg, provider, model, embed,
+                           agent_iters, temperature, wall_clock_s, on_event,
+                           info):
+    """One agent turn PER ``\\section`` for an over-cap whole-deck replace op.
+
+    Batch E (2026-07-22, offer-on-refusal): the single-pass truncation guard
+    refuses a whole-region deepen/table/reformat over
+    ``AUGMENT_MAX_SOURCE_CHARS``; this runs the SAME per-section turn the
+    scope=section path uses over every section in sequence, splices the
+    sanitized results **back-to-front over the original spans**
+    (``deckgen.augment.replace_sections``) and hands ONE combined proposal to
+    the unchanged validate → ``screen_repair`` → staging → terminal
+    ``{"augment"}`` pipeline — so apply-augment needs no changes. A section
+    that is individually over the cap, yields nothing usable, or hits a
+    provider blip is left UNCHANGED with an ``{"info"}`` notice (per-section
+    resilience, never a discarded run). Emits an info before every turn so
+    the SSE consumer's stall guard only ever has to outlast one turn.
+    """
+    runner = InProcessChatRunner(
+        cfg=cfg, cancel_event=cancel, turn_timeout_s=wall_clock_s,
+        workflow="deck_augment",
+    )
+    edits = []
+    skipped: list[str] = []
+    all_figs: set = set()
+    all_fig_warnings: list = []
+    all_pending: list = []
+    project_dir = os.path.dirname(deck_path)
+    n = len(parts.sections)
+    for i, sec in enumerate(parts.sections):
+        if cancel.is_set():
+            return
+        if len(sec.body) > AUGMENT_MAX_SOURCE_CHARS:
+            skipped.append(sec.title)
+            info(f"Section {i + 1}/{n} ('{sec.title}') is itself over the "
+                 "single-pass cap — left unchanged.")
+            continue
+        info(f"Revising section {i + 1}/{n}: {sec.title}…")
+        candidate_block = ""
+        if use_bib:
+            seed = instruction + " " + sec.body[:2000]
+            candidate_block = bib_candidates_block(
+                bib_index, relevant_bib_keys(bib_index, seed))
+        result = runner.chat(
+            build_augment_message(
+                topic=topic or sec.title,
+                operation=operation,
+                instruction=instruction,
+                existing_excerpt=sec.body,
+                outline_titles=outline_titles,
+                candidate_bib_block=candidate_block,
+            ),
+            system_prompt=augment_system_prompt(
+                audience, operation=operation,
+                macros_block=macros_block, cite_mode=cite_mode,
+                images_enabled=bool(cfg.get("vault_image_exts")),
+            ),
+            provider=provider, model=model, embed=embed,
+            agent=True, max_iters=agent_iters, temperature=temperature,
+            on_event=on_event,
+        )
+        if cancel.is_set():
+            return
+        body = sanitize_section(result.text)
+        if not body:
+            skipped.append(sec.title)
+            info(f"Section '{sec.title}' produced no usable content — left unchanged.")
+            continue
+        body, figs, fig_warnings, pending = _resolve_and_copy_deck_figures(
+            body, project_dir, copy=False)
+        all_figs.update(figs)
+        all_fig_warnings.extend(fig_warnings)
+        all_pending.extend(pending)
+        edits.append((sec, body))
+
+    if not edits:
+        put({"error": "No section produced usable revised content — nothing to apply."})
+        return
+    proposed_full = replace_sections(parts.tex, edits)
+    generated_span = "\n\n".join(body for _sec, body in edits)
+
+    structural = validate(
+        proposed_full,
+        generated_tex=generated_span,
+        known_bib_keys=tparts.bib_keys if (tparts and use_bib) else None,
+        copied_figures=all_figs,
+    )
+    accepted, screen_warnings = screen_repair(deck_tex, proposed_full)
+    changed = accepted is not None
+    display_warnings = list(dict.fromkeys(
+        all_fig_warnings + list(structural)
+        + ([f"{len(skipped)} section(s) left unchanged: {', '.join(skipped)}."]
+           if skipped else [])
+        + (list(screen_warnings) if changed else [])
+    ))
+    rejected_reason = "" if changed else (screen_warnings[0] if screen_warnings else "")
+    before = deck_counts(deck_tex)
+    after = deck_counts(proposed_full) if changed else before
+
+    if cancel.is_set():
+        return
+    if changed:
+        _stage_augment(deck_path, deck_sha, accepted, pending_figures=all_pending)
+    put({"augment": {
+        "proposed_tex": accepted or "",
+        "changed": changed,
+        "warnings": display_warnings,
+        "rejected_reason": rejected_reason,
+        "deck_path": deck_path,
+        "deck_sha256": deck_sha,
+        "proposed_sha256": _proposed_digest(accepted) if changed else "",
+        "counts": {
+            "sections_before": before["sections"], "sections_after": after["sections"],
+            "frames_before": before["frames"], "frames_after": after["frames"],
+        },
+        "operation": operation,
+        "scope": "whole",
+        "section_index": 0,
+        "piecewise": True,
+        "edited_sections": len(edits),
+        "skipped_sections": skipped,
+    }})
+
+
 @deck_bp.route("/api/deck/augment", methods=["POST"])
 def api_deck_augment():
     """Preview a free-text augmentation of an existing deck and stream progress (SSE).
@@ -1273,6 +1726,10 @@ def api_deck_augment():
     citations_enabled = bool(coerce_bool(data.get("citations_enabled")))
     if data.get("citations_enabled") is None:
         citations_enabled = True
+    # Batch E (2026-07-22): the offer-on-refusal piecewise mode — one agent
+    # turn PER \section instead of one over-cap whole-region pass. Only
+    # meaningful for replace ops at whole scope; ignored otherwise.
+    piecewise = coerce_bool(data.get("piecewise")) is True
 
     provider = coerce_string_max_len(data.get("provider"), 40) or cfg.get("provider", "ollama")
     model = coerce_string_max_len(data.get("model"), 120) or resolve_chat_model(cfg, provider)
@@ -1318,7 +1775,7 @@ def api_deck_augment():
             if not (0 <= section_index < n_sections):
                 put({"error": f"Section index out of range (the deck has {n_sections} section(s))."})
                 return
-        if operation in ("deepen", "table") and n_sections == 0:
+        if operation in _AUGMENT_REPLACE_OPS and n_sections == 0:
             put({"error": "This deck has no \\section to revise. Use 'Add a new section' instead."})
             return
 
@@ -1346,12 +1803,32 @@ def api_deck_augment():
         # (we INSERT, never replace), so a clipped view loses no content — proceed,
         # just note it.
         truncated = len(source) > AUGMENT_MAX_SOURCE_CHARS
-        if truncated and operation in ("deepen", "table"):
+        if truncated and operation in _AUGMENT_REPLACE_OPS:
+            # Batch E: at whole scope the user can re-POST with piecewise:true
+            # (the UI offers it on this refusal) — one turn per \section.
+            if piecewise and scope == "whole" and n_sections > 0:
+                _run_piecewise_augment(
+                    put=put, cancel=cancel, parts=parts, deck_tex=deck_tex,
+                    deck_path=deck_path, deck_sha=deck_sha,
+                    operation=operation, instruction=instruction, topic=topic,
+                    audience=audience, outline_titles=outline_titles,
+                    macros_block=macros_block, bib_index=bib_index,
+                    use_bib=use_bib, cite_mode=cite_mode, tparts=tparts,
+                    cfg=cfg, provider=provider, model=model, embed=embed,
+                    agent_iters=agent_iters, temperature=temperature,
+                    wall_clock_s=wall_clock_s, on_event=_on_event, info=_info,
+                )
+                return
             put({"error": (
                 f"The selected content is too large to revise in one pass "
                 f"({len(source):,} chars > {AUGMENT_MAX_SOURCE_CHARS:,}). Switch Scope to "
-                f"'One section' and revise it section by section."
-            )})
+                f"'One section' and revise it section by section — or use "
+                f"'Revise section by section' to run every section in turn."
+                # `code` is the machine identity of this refusal (2026-07-23):
+                # the client keys the piecewise offer on it — a copy edit to
+                # the prose above must not silently kill the offer (the old
+                # trigger regexed the message).
+            ), "code": "size_cap"})
             return
         excerpt = source[:AUGMENT_MAX_SOURCE_CHARS]
         if truncated:
@@ -1482,6 +1959,11 @@ def api_deck_augment():
             "rejected_reason": rejected_reason,
             "deck_path": deck_path,
             "deck_sha256": deck_sha,           # raw-byte stale-diff token
+            # Preview-binding token (audit #5): staging is one slot per deck
+            # path, so a second window's preview would silently replace this
+            # one — apply must present THIS digest so it can only ever write
+            # the exact proposal this preview showed.
+            "proposed_sha256": _proposed_digest(accepted) if changed else "",
             "counts": {
                 "sections_before": before["sections"], "sections_after": after["sections"],
                 "frames_before": before["frames"], "frames_after": after["frames"],
@@ -1508,14 +1990,20 @@ def api_deck_augment():
 def api_deck_apply_augment():
     """Write a confirmed augmentation over the on-disk deck.
 
-    Body: ``{deck_path, base_sha256, confirm: true}`` — the proposed ``.tex`` is
-    **never** taken from the client; it is read from the server-side staging cache
-    written by the preview, so a page cannot apply arbitrary content. The safety
-    model (stronger than apply-repair's, matching Note Refactor's vault writers):
+    Body: ``{deck_path, base_sha256, proposed_sha256, confirm: true}`` — the
+    proposed ``.tex`` is **never** taken from the client; it is read from the
+    server-side staging cache written by the preview, so a page cannot apply
+    arbitrary content. The safety model (stronger than apply-repair's, matching
+    Note Refactor's vault writers):
 
     * **confirm gate** — requires ``confirm: true``;
     * **staged proposal** — read the screened proposal from staging (404-style 400
       if the user never previewed); verify its own integrity digest;
+    * **preview-binding guard** (audit #5) — the client's ``proposed_sha256``
+      (carried on the augment frame) must match the staged digest, else 409:
+      staging is ONE slot per deck path, so without this a second window's
+      preview silently replaces the first and Apply would write a proposal the
+      user never saw;
     * **stale-diff guard** — the on-disk deck's raw-byte sha must equal BOTH the
       client's ``base_sha256`` and the staged base, else 409 (the deck changed since
       the preview);
@@ -1539,6 +2027,9 @@ def api_deck_apply_augment():
     base_sha256 = coerce_string_max_len(data.get("base_sha256"), 128)
     if not base_sha256:
         return jsonify({"error": "base_sha256 is required (stale-diff guard)."}), 400
+    proposed_sha256 = coerce_string_max_len(data.get("proposed_sha256"), 128)
+    if not proposed_sha256:
+        return jsonify({"error": "proposed_sha256 is required (preview-binding guard)."}), 400
 
     # One deck operation at a time: hold the process-wide lock across the whole
     # read→screen→backup→write so this writer can't race a streaming generate/
@@ -1560,6 +2051,17 @@ def api_deck_apply_augment():
             # it so the user re-previews rather than applying a damaged proposal.
             _clear_stage(deck_path)
             return jsonify({"error": "The staged augmentation is invalid; re-run the preview."}), 400
+        if stage.get("proposed_sha256") != proposed_sha256.strip():
+            # Preview-binding (audit #5): a NEWER preview (another window/tab)
+            # replaced this deck's single staging slot after the client's
+            # preview — the base sha can't see that swap (the deck on disk is
+            # unchanged), so without this check Apply would write a proposal
+            # the user never reviewed. The stage is NOT cleared: the newer
+            # preview's own Apply (carrying the newer digest) remains valid.
+            return jsonify({
+                "error": "A newer preview replaced this proposal; review and apply "
+                         "from the latest preview."
+            }), 409
 
         try:
             current_tex, current_sha = _read_deck_strict(deck_path)
@@ -1678,6 +2180,126 @@ def api_deck_native_pick_folder():
 def api_compile_available():
     """Report whether a TeX toolchain (latexmk) is installed on this machine."""
     return jsonify({"available": bool(find_latexmk())})
+
+
+@deck_bp.route("/api/deck/compile-preview", methods=["POST"])
+def api_deck_compile_preview():
+    """Compile a deck to PDF for in-app PREVIEW — never rewrites the ``.tex``.
+
+    Unlike ``compile-fix`` (LLM repair loop, writes the ``.tex``), this is a
+    single ``latexmk`` pass over the deck as-is. It writes only regenerable
+    build artifacts (``.pdf``/``.aux``/``.log``) beside the source — exactly
+    what ``make`` produces — so it needs no ``confirm`` and no stale-diff token.
+    Runs under ``_DECK_OP_LOCK`` (409 if another deck op is active) so it can't
+    race a generate/augment/compile-fix that IS writing the ``.tex``. The PDF is
+    then fetched via ``GET /api/deck/preview-pdf``. Body: ``{deck_path, engine?}``.
+    """
+    if not find_latexmk():
+        return jsonify({"error": "latexmk is not available on this system. Make sure a LaTeX suite is installed."}), 400
+
+    data = request.get_json(silent=True) or {}
+    deck_path = _resolve_existing_deck(data.get("deck_path"))
+    if not deck_path:
+        return jsonify({"error": "Invalid or unreadable deck path (an absolute .tex)."}), 400
+
+    cfg = load_config()
+    # Preview is a SYNCHRONOUS route (no SSE): the Waitress request thread is
+    # pinned for the whole compile and the frontend shows only a spinner, so
+    # the per-pass budget is capped at 300 s regardless of the (up to 600 s)
+    # compile-fix knob — a deck that needs longer should go through
+    # compile-fix, which streams progress and has a stall-guarded consumer.
+    timeout_s = min(coerce_int_in_range(cfg.get("deck_compile_timeout_s"), 30, 600) or 180, 300)
+    engine = coerce_enum(data.get("engine"), _COMPILE_ENGINES)
+    if engine is None:
+        engine = coerce_enum(cfg.get("deck_compile_engine"), _COMPILE_ENGINES) or "pdflatex"
+
+    if not _DECK_OP_LOCK.acquire(blocking=False):
+        return jsonify({"error": "Another deck operation is already running. Please wait for it to finish."}), 409
+    try:
+        success, log_contents = compile_latex(deck_path, engine=engine, timeout=timeout_s)
+        pdf_path = os.path.splitext(deck_path)[0] + ".pdf"
+        has_pdf = os.path.isfile(pdf_path)
+        # Tail of the log is where TeX prints the error blocks a user needs.
+        log_excerpt = (log_contents or "")[-4000:]
+        return jsonify({
+            "success": bool(success),
+            "has_pdf": bool(has_pdf),
+            "log_excerpt": log_excerpt,
+            "engine": engine,
+        })
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": sanitise_error_msg(exc)}), 500
+    finally:
+        _DECK_OP_LOCK.release()
+
+
+def _resolve_deck_pdf(raw) -> str | None:
+    """Validate *raw* as a deck ``.tex`` and return its compiled sibling PDF.
+
+    Returns the realpath'd ``<base>.pdf`` only when it exists AND itself stays
+    outside ``_DENY_PREFIXES`` — the ``.tex`` is realpath'd by
+    :func:`_resolve_existing_deck`, but its *sibling* could still be a symlink
+    pointing into a system location, so the derived path is re-checked before
+    it reaches ``send_file``/``open``. Note this endpoint family widens the
+    local READ surface to any compiled PDF sitting next to a readable ``.tex``
+    (header-gated, loopback-only, like every /api route); acceptable for a
+    local single-user app, documented here on purpose.
+    """
+    deck_path = _resolve_existing_deck(raw)
+    if not deck_path:
+        return None
+    pdf_path = os.path.realpath(os.path.splitext(deck_path)[0] + ".pdf")
+    if not os.path.isfile(pdf_path):
+        return ""  # valid deck, no PDF yet — caller distinguishes 404 from 400
+    if pdf_path == os.sep or _under_deny_prefix(pdf_path):
+        return None
+    return pdf_path
+
+
+@deck_bp.route("/api/deck/preview-pdf", methods=["GET"])
+def api_deck_preview_pdf():
+    """Serve a compiled deck's ``.pdf`` for the in-app viewer (read-only).
+
+    ``deck_path`` (query param) is validated as an existing absolute ``.tex``
+    not under a system root (same guard as compile-preview); the served file is
+    its realpath'd sibling ``<base>.pdf`` (404 if never compiled, 400 if the
+    sibling resolves into a denied root — see :func:`_resolve_deck_pdf`).
+    ``send_file`` with ``conditional=True`` supports range requests. The client
+    fetches this with the ``X-Requested-With`` header and renders via a blob:
+    URL — an <iframe src> pointing here directly would be 403'd by the
+    app-level origin guard (no custom headers on navigation requests).
+    """
+    pdf_path = _resolve_deck_pdf(request.args.get("deck_path"))
+    if pdf_path is None:
+        return jsonify({"error": "Invalid deck path."}), 400
+    if not pdf_path:
+        return jsonify({"error": "No compiled PDF yet. Run Preview first."}), 404
+    return send_file(pdf_path, mimetype="application/pdf", conditional=True)
+
+
+@deck_bp.route("/api/deck/open-pdf", methods=["POST"])
+def api_deck_open_pdf():
+    """Open a compiled deck PDF in the system viewer (macOS ``open``).
+
+    The blob-iframe fallback: some WKWebView builds refuse to render a PDF
+    inline, so the preview panel offers a one-click open of the SAME validated
+    file (``_resolve_deck_pdf`` — no new path surface vs preview-pdf). macOS
+    only (501 elsewhere), mirroring ``/api/audit/reveal``'s platform posture;
+    ``subprocess.Popen`` with an argv list, never a shell.
+    """
+    if sys.platform != "darwin":
+        return jsonify({"error": "Opening files is only supported on macOS."}), 501
+    data = request.get_json(silent=True) or {}
+    pdf_path = _resolve_deck_pdf(data.get("deck_path"))
+    if pdf_path is None:
+        return jsonify({"error": "Invalid deck path."}), 400
+    if not pdf_path:
+        return jsonify({"error": "No compiled PDF yet. Run Preview first."}), 404
+    try:
+        subprocess.Popen(["open", pdf_path])
+    except OSError as exc:
+        return jsonify({"error": sanitise_error_msg(exc)}), 500
+    return jsonify({"ok": True})
 
 
 # The only engines latexmk may be invoked with. Re-validated at CALL time (not
@@ -1853,9 +2475,22 @@ def api_deck_compile_fix():
             for entry in missing_files:
                 _info(f"Missing suite file (not repairable by the model): {entry}")
             if not errors:
-                last_log_excerpt = "\n".join(missing_files) or (
-                    "No error pattern found in log, but latexmk exited with an error."
-                )
+                if missing_files:
+                    # Environment problem, not a source problem: the files
+                    # either exist in the suite (TEXINPUTS/BIBINPUTS resolve
+                    # them) or the deck is outside its suite. Tell the user
+                    # what to check instead of a bare "failed".
+                    last_log_excerpt = (
+                        "Environment problem — TeX could not find suite file(s). "
+                        "The model cannot repair a missing file. Check that the deck "
+                        "lives inside its Beamer suite (an ancestor folder containing "
+                        "common/) and that the files below exist there:\n"
+                        + "\n".join(missing_files)
+                    )
+                else:
+                    last_log_excerpt = (
+                        "No error pattern found in log, but latexmk exited with an error."
+                    )
                 _info("Compilation failed with no model-repairable errors in the log.")
                 break
 
@@ -1900,12 +2535,17 @@ def api_deck_compile_fix():
                 break
 
             if not backup_made:
-                # One .bak of the ORIGINAL before the first write (augment-
-                # apply discipline); it is the user's recovery path, so a
-                # failed backup aborts before anything is touched.
-                backup_path = deck_path + ".bak"
+                # Full augment-apply backup discipline via _backup_deck: the
+                # rolling .bak PLUS the one-time non-clobbering .tex.orig.
+                # The previous inline copy2 skipped preserve_original_once, so
+                # a SECOND compile-fix run overwrote .bak with the first run's
+                # repaired state (the hand-written original was gone), and a
+                # later apply-augment then seeded .tex.orig from post-repair
+                # content — permanently breaking "first backup = true
+                # original" (2026-07-22 audit H2). A failed backup still
+                # aborts before anything is touched.
                 try:
-                    shutil.copy2(deck_path, backup_path)
+                    _backup_deck(deck_path)
                     backup_made = True
                     _info(f"Created backup of the original deck at {deck_base}.bak")
                 except OSError as exc:

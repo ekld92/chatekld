@@ -22,14 +22,39 @@ import json
 import logging
 import math
 import os
+import stat
 import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _inherit_dest_mode(dest: str, tmp: str) -> None:
+    """Copy an EXISTING *dest*'s permission bits onto *tmp* before promotion.
+
+    ``tempfile.mkstemp`` creates 0600 and ``os.replace`` carries the temp file's
+    mode to the destination, so rewriting a user's 0644 vault note through these
+    writers silently made it owner-only (2026-07-20 audit; fixed 2026-07-30).
+    Desirable for the files we own (``config.json`` and friends are already
+    0600); an undocumented side effect for user-owned vault notes and archived
+    attachments, which a second account or a sync agent may legitimately need to
+    read.
+
+    A missing destination keeps mkstemp's restrictive 0600 — a NEW file should
+    not be invented as world-readable. Best-effort by design: a stat/chmod
+    failure (exotic filesystem, ACL-only permissions) must not fail the write
+    the caller actually asked for, so the writer proceeds with 0600 rather than
+    losing the content.
+    """
+    try:
+        os.chmod(tmp, stat.S_IMODE(os.stat(dest).st_mode))
+    except OSError:
+        pass  # destination absent (normal for a create) or mode unreadable
 
 
 def write_text_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
@@ -75,6 +100,7 @@ def write_text_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
             # caches use their own non-fsync writers by design.)
             f.flush()
             os.fsync(f.fileno())
+        _inherit_dest_mode(path, tmp)
         os.replace(tmp, path)
     except Exception:
         try:
@@ -109,6 +135,7 @@ def write_bytes_atomic(path: str, data: bytes) -> None:
             # crash between the rename and the data hitting disk could lose it.
             f.flush()
             os.fsync(f.fileno())
+        _inherit_dest_mode(path, tmp)
         os.replace(tmp, path)
     except Exception:
         try:
@@ -173,6 +200,24 @@ def cap(value: str, limit: int = 8_000) -> str:
         return ""
     return value[:limit]
 
+
+def nfc(value: str) -> str:
+    """Return the NFC (canonical-composition) form of a string.
+
+    B2 (2026-07-13): macOS filesystems commonly store accented filenames in NFD
+    (decomposed) form while Obsidian note text carries the same names in NFC (as
+    typed). Pure-string dict/set lookups (image name_index, wikilink graphs,
+    archive reference sweeps) then miss across the normalization boundary — the
+    file exists but ``name_index.get("réunion.png")`` returns None. Normalize
+    BOTH the keys and the lookup targets through this helper so they compare
+    equal. APFS filesystem lookups are already normalization-insensitive, which
+    is why only the in-memory string comparisons need this. ``str.lower()`` does
+    NOT normalize, so callers still lower() separately where they case-fold.
+    """
+    if not isinstance(value, str):
+        return value
+    return unicodedata.normalize("NFC", value)
+
 def parse_temperature(raw, default: float = 0.3) -> float:
     """Safely parse and clamp temperature to [0.0, 2.0]."""
     try:
@@ -227,7 +272,8 @@ def parse_repeat_penalty(raw, default: float = 1.1) -> float:
     return max(0.5, min(2.0, val))
 
 class ReaderWriterLock:
-    """A writer-preferring, reentrant multiple-reader / single-writer lock.
+    """A writer-preferring multiple-reader / single-writer lock, reentrant for
+    the WRITER ONLY.
 
     Semantics:
 
@@ -238,10 +284,18 @@ class ReaderWriterLock:
       write is *pending* (``_write_requests > 0``) blocks instead of barging in.
       Without this, a steady stream of readers could keep ``_readers > 0`` forever
       and a writer would never acquire — fatal for an index rebuild that must run.
-    * **Reentrancy.** The thread currently holding the write lock may re-acquire it
-      (counted by ``_writer_reentry``) and may also take the read lock as a no-op —
-      it already has exclusive access, so nesting a read inside a write must not
-      deadlock against itself.
+    * **Writer reentrancy only.** The thread currently holding the WRITE lock may
+      re-acquire it (counted by ``_writer_reentry``) and may also take the read
+      lock as a no-op — it already has exclusive access, so nesting a read inside
+      a write must not deadlock against itself.
+    * **Nested read acquisition is FORBIDDEN** (2026-07-20 audit; the headline
+      said "reentrant" unqualified, which invited exactly this). A plain reader
+      that re-acquires ``read_lock`` while a writer is pending **self-deadlocks**:
+      the outer hold keeps ``_readers > 0`` so the writer cannot proceed, while
+      the inner acquire blocks on ``_write_requests > 0`` waiting for that same
+      writer. There is no reader owner-tracking to make it safe. No current call
+      path nests reads; if one is ever needed, add per-thread reader counts
+      rather than relaxing the writer-preference test.
 
     All state is guarded by a single :class:`threading.Condition` built over an
     ``RLock`` (re-entrant so the condition's own lock can be re-taken on the
@@ -343,6 +397,15 @@ class RagOperationLock:
     Long operations must call ``heartbeat(epoch)`` periodically to push the deadline
     out; ``is_held`` reflects this TTL, not merely "acquired".
 
+    TTL expiry is only safe against SLOW holders when the holder acts on the
+    ``False`` that ``heartbeat``/``release`` return after a steal: the epoch
+    mechanism neutralises the loser's bookkeeping, but nothing else stops its
+    actual work, so a wedged-then-resumed holder would otherwise run
+    concurrently with the new acquisition. The indexer does this via
+    ``ObsidianVaultManager._heartbeat_or_stop`` (a ``False`` heartbeat sets the
+    run's stop event); any new long-running holder must check the return the
+    same way, not discard it.
+
     A single ``threading.Lock`` (``_meta_lock``) serialises every state read/write,
     so all the methods are short critical sections — this lock guards the *metadata*,
     it is not itself held for the duration of the long operation.
@@ -439,7 +502,7 @@ class RagOperationLock:
                 return False
             return (time.monotonic() - self._holder_since) < self._ttl
 
-def put_done_resilient(event_q, done_sentinel, cancel) -> bool:
+def put_done_resilient(event_q, done_sentinel, cancel, max_wait_s=None) -> bool:
     """Deliver an SSE worker's terminal sentinel, surviving a full queue.
 
     Defect this replaces (improvement plan 2026-07-04, item 2.5): every SSE
@@ -457,12 +520,25 @@ def put_done_resilient(event_q, done_sentinel, cancel) -> bool:
     ``test_concurrency.py::TestPutDoneResilient``): a finished worker's
     sentinel reaches a live consumer whatever the queue depth; a dead
     consumer never traps the worker thread.
+
+    ``max_wait_s`` (2026-07-22 audit P6) bounds the retry for the HALF-OPEN
+    consumer the "provably gone" contract missed: a peer that stops reading
+    without closing parks the consumer in a socket-blocked yield where it can
+    never set *cancel*, so "retry until cancel" became "retry until the kernel
+    kills the TCP connection" — a worker thread pinned for hours. Past the
+    ceiling the sentinel is abandoned AND *cancel* is set on the consumer's
+    behalf. ``None`` keeps the legacy unbounded behaviour.
     """
     import queue as _queue
+    import time as _time
+    started = _time.monotonic()
     while True:
         try:
             event_q.put(done_sentinel, timeout=1)
             return True
         except _queue.Full:
             if cancel.is_set():
+                return False
+            if max_wait_s is not None and _time.monotonic() - started >= max_wait_s:
+                cancel.set()
                 return False

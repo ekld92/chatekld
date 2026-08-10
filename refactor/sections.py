@@ -27,7 +27,6 @@ Definitions (1-based line numbers, matching the rest of the package):
 """
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 
 from refactor.hygiene import _FENCE_RE, _HEADING_LINE_RE, _frontmatter_end_line
@@ -154,11 +153,6 @@ def slice_section(text: str, section: Section) -> str:
     """Return the exact text of *section* (heading line included, no trailing \\n)."""
     lines = text.split("\n")
     return "\n".join(lines[section.start_line - 1:section.end_line])
-
-
-def section_sha256(text: str, section: Section) -> str:
-    """sha256 of the section's current slice — a drift tripwire for the UI."""
-    return hashlib.sha256(slice_section(text, section).encode("utf-8")).hexdigest()
 
 
 def replace_section(text: str, section: Section, new_section_text: str) -> str:

@@ -28,7 +28,7 @@ from typing import Callable, Optional
 from PIL import Image
 
 from core.constants import VAULT_IMAGE_EXTS
-from core.utils import write_bytes_atomic, write_text_atomic
+from core.utils import nfc, write_bytes_atomic, write_text_atomic
 
 from refactor import extract, journal
 from refactor.resolver import (
@@ -161,7 +161,9 @@ def other_referencing_notes(
     resolve correctly here even though those notes are not indexed.
     """
     basename = os.path.basename(image_rel)
-    bn_lower = basename.lower()
+    # B2 (2026-07-13): NFC-normalize so the basename compares equal to the
+    # candidate index (link_target_basenames) regardless of NFC/NFD form.
+    bn_lower = nfc(basename).lower()
     root_key = str(vault_root)
 
     # Sweep: stat-walk the tree, reuse signature-matched index entries, re-read
@@ -205,7 +207,9 @@ def other_referencing_notes(
         except OSError:
             continue
         for occ in scan_embeds(text, p, vault_root, name_index):
-            if occ["rel_path"] == image_rel:
+            # B2 (2026-07-13): compare NFC-normalized so a resolved rel in NFD
+            # (from an on-disk name) matches an NFC image_rel and vice-versa.
+            if nfc(occ["rel_path"]) == nfc(image_rel):
                 out.append(rel)
                 break
 
@@ -469,8 +473,9 @@ def archive_image(vault_root: Path, cfg: dict, scope: str, note_rel: str,
     write_bytes_atomic(str(arch_abs), data)
     if sha256_bytes(Path(arch_abs).read_bytes()) != digest:
         res["message"] = "archive copy failed verification; original left in place"
-        # Nothing was journalled and the original is untouched; tidy the failed
-        # copy AND the now-orphan thumbnail so a retry starts clean.
+        # The op record is built at step 3 (below), so at THIS point nothing has
+        # been journalled yet and the original is untouched; tidy the failed copy
+        # AND the now-orphan thumbnail so a retry starts clean.
         for stray in (arch_abs, thumb_abs):
             _unlink_and_audit(stray, vault_root, "archive verify-fail cleanup")
         return res
@@ -554,6 +559,12 @@ def archive_image(vault_root: Path, cfg: dict, scope: str, note_rel: str,
         else:
             os.unlink(orig_abs)
             op["original_deleted"] = True
+            # A2 (2026-07-13): persist the flag IMMEDIATELY after the unlink,
+            # before prune, so a crash in the unlink→final-save window can't
+            # leave a stale `original_deleted=False` on a genuinely-deleted
+            # original. (revert_archive_image is now flag-independent too, so
+            # this is defence-in-depth, but it keeps the manifest honest.)
+            journal.save(vault_root, cfg, manifest)
             journal.log_vault_write("move_out", image_rel, f"→ {archive_rel}")
     except (OSError, journal.ScopeError) as exc:
         # Archive copy is durable + the note no longer embeds the original, so a
@@ -654,28 +665,46 @@ def revert_archive_image(vault_root: Path, cfg: dict, op: dict) -> dict:
                     "message": "Note changed since archiving; not reverting (would break the "
                                "thumbnail embed or clobber later edits). Resolve it by hand first."}
 
-    # (b) Original-path conflict. If we deleted the original and something now
-    #     occupies that path which is NOT our archived bytes, refuse rather than
-    #     overwrite a file the user may have created there meanwhile.
+    # (b) Original-path check — FLAG-INDEPENDENT (A2, 2026-07-13). The
+    #     `original_deleted` flag is persisted after the unlink, so a crash in
+    #     that window can leave it stale-False while the original is already
+    #     gone; keying this block on the flag (the old code) then skipped the
+    #     move-back and let step 4 delete the only surviving copy. Decide from
+    #     what is actually on disk at image_rel instead.
     move_original = False
-    if op.get("original_deleted"):
-        dest = vault_root / image_rel
-        if not dest.exists():
+    dest = vault_root / image_rel
+    if not dest.exists():
+        # The original is absent (deleted at archive time, or a crash-stale
+        # flag). Move the archived copy back if we still hold it.
+        if Path(arch_src).exists():
             move_original = True
-            if not Path(arch_src).exists():       # nothing to move back
-                return {"ok": False, "status": "failed",
-                        "message": "Archived original is missing; cannot restore."}
-        else:
-            try:
-                already = sha256_bytes(dest.read_bytes()) == op.get("digest")
-            except OSError as exc:
-                return {"ok": False, "status": "failed",
-                        "message": f"cannot inspect the original path ({type(exc).__name__})"}
-            if not already:
-                return {"ok": False, "status": "skipped",
-                        "message": "A different file now occupies the original path; not "
-                                   "overwriting it. Move it aside, then restore."}
+        elif op.get("original_deleted"):
+            # We recorded the delete AND the archive copy is gone → nothing to
+            # restore from. (Flag False + no copy + no original means we never
+            # deleted it; the note-body restore below is still valid work.)
+            return {"ok": False, "status": "failed",
+                    "message": "Archived original is missing; cannot restore."}
+    else:
+        try:
+            already = sha256_bytes(dest.read_bytes()) == op.get("digest")
+        except OSError as exc:
+            return {"ok": False, "status": "failed",
+                    "message": f"cannot inspect the original path ({type(exc).__name__})"}
+        if already:
             move_original = False                 # identical bytes already there → idempotent skip
+        elif op.get("original_deleted"):
+            # We deleted the original, yet a DIFFERENT file now occupies the
+            # path (user created one meanwhile) — refuse rather than clobber it.
+            return {"ok": False, "status": "skipped",
+                    "message": "A different file now occupies the original path; not "
+                               "overwriting it. Move it aside, then restore."}
+        else:
+            # `original_deleted` False and the on-disk bytes differ from the
+            # archived copy: the original was left in place but changed during
+            # archiving (scenario B). Leave the user's bytes; the note-body
+            # restore re-embeds them and step 4 KEEPS the pre-change archive
+            # copy (its digest guard sees the mismatch).
+            move_original = False
 
     # --- MUTATE (all checks passed; safe order) -----------------------------
     warnings: list[str] = []
@@ -734,10 +763,29 @@ def revert_archive_image(vault_root: Path, cfg: dict, op: dict) -> dict:
         except (OSError, journal.ScopeError):
             warnings.append("thumbnail not removed")
 
-    # 4) remove the now-redundant archive copy (best-effort).
+    # 4) remove the now-redundant archive copy — ONLY when the archived bytes
+    #    are provably back in the vault (A2, 2026-07-13). Deleting it
+    #    unconditionally could destroy the only copy: after a crash-stale flag
+    #    step 1 may not have run, or the file at image_rel may hold DIFFERENT
+    #    bytes (scenario B — changed original left in place). Guard on: image_rel
+    #    exists AND its sha256 == the archived digest; otherwise keep + warn.
     try:
         if Path(arch_src).exists():
-            os.unlink(arch_src)
+            dest_now = vault_root / image_rel
+            restored_ok = False
+            try:
+                restored_ok = (
+                    dest_now.is_file()
+                    and sha256_bytes(dest_now.read_bytes()) == op.get("digest")
+                )
+            except OSError:
+                restored_ok = False
+            if restored_ok:
+                os.unlink(arch_src)
+            else:
+                warnings.append(
+                    "archive copy kept: the vault original differs from the archived bytes"
+                )
     except OSError:
         pass
 

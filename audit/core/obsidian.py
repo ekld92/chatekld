@@ -73,7 +73,12 @@ def drain_parse_warnings() -> list[str]:
 WIKI_PDF_RE = re.compile(r"\[\[([^\]|#]*\.pdf)(?:\||#)?.*?\]\]", re.IGNORECASE)
 MD_PDF_RE = re.compile(r"\[.*?\]\((.*?\.pdf)\)", re.IGNORECASE)
 # Allow optional BOM or whitespace before ---
-YAML_RE = re.compile(r"^\s*(?:﻿)?---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+# B10/#37 (2026-07-13): accept a closing fence at EOF with no trailing newline
+# (``(?:\n|$)``). A frontmatter-only note saved without a final newline was
+# otherwise read as "no frontmatter", so its tags were invisible to the scan and
+# apply-tag-drift prepended a SECOND ``---`` block. The writer's _FM_RE mirrors
+# this exactly so reader and writer stay consistent.
+YAML_RE = re.compile(r"^\s*(?:﻿)?---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
 
 _yaml = YAML(typ="rt")
 _yaml.preserve_quotes = True

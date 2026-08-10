@@ -78,4 +78,68 @@ describe('sanitiseHtml — control-character scheme smuggling (Track 1.2)', () =
         const out = sanitiseHtml('<p>use javascript: carefully</p>');
         expect(out).toContain('use javascript: carefully');
     });
+
+    // 2026-07-20 audit A1: these carry plain http: values, so the scheme gate
+    // never touched them — they must be removed as ELEMENTS / attributes.
+    it('strips <link>, <meta>, and <base> elements', () => {
+        const out = sanitiseHtml(
+            '<link rel="stylesheet" href="http://attacker/x.css">'
+            + '<meta http-equiv="refresh" content="0;url=http://attacker">'
+            + '<base href="http://attacker/">'
+            + '<p>kept</p>');
+        expect(out).not.toContain('<link');
+        expect(out).not.toContain('<meta');
+        expect(out).not.toContain('<base');
+        expect(out).toContain('<p>kept</p>');
+    });
+
+    it('drops a style attribute that carries a url() beacon', () => {
+        const out = sanitiseHtml('<p style="background:url(http://attacker/b.png)">t</p>');
+        expect(out).not.toContain('url(');
+        expect(out).not.toContain('attacker');
+        expect(out).toContain('<p');
+        expect(out).toContain('t</p>');
+    });
+
+    it('keeps a benign style attribute without url()', () => {
+        const out = sanitiseHtml('<p style="color:red">t</p>');
+        expect(out).toContain('color:red');
+    });
+
+    // E5 (2026-07-20 audit): the bare `url(` substring test was evadable.
+    it('drops a style with a CSS-escaped url() (u\\72 l form)', () => {
+        // `\72 ` is the CSS hex escape for 'r', so `u\72 l(` decodes to `url(`.
+        const out = sanitiseHtml('<p style="background:u\\72 l(http://attacker/b.png)">t</p>');
+        expect(out).not.toContain('attacker');
+        expect(out).not.toMatch(/style=/);
+    });
+
+    it('drops a style using image-set() to beacon', () => {
+        const out = sanitiseHtml('<p style="background:image-set(&quot;http://attacker/x&quot; 1x)">t</p>');
+        expect(out).not.toContain('attacker');
+        expect(out).not.toMatch(/style=/);
+    });
+});
+
+describe('_styleHasExternalRef', () => {
+    it('flags url(), image-set, escaped url, and embedded http(s)', async () => {
+        const { _styleHasExternalRef } = await import('../../static/js/ui.js');
+        for (const v of [
+            'background:url(http://x/y)',
+            'background:image-set("http://x" 1x)',
+            'background:u\\72 l(http://x)',
+            'x:\\75 rl(http://x)',
+            'content:"https://x/y"',
+        ]) {
+            expect(_styleHasExternalRef(v), v).toBe(true);
+        }
+    });
+    it('does not flag benign inline styles', () => {
+        // imported lazily above; re-import is cached.
+        return import('../../static/js/ui.js').then(({ _styleHasExternalRef }) => {
+            for (const v of ['color:red', 'margin:0 auto', 'font-weight:600']) {
+                expect(_styleHasExternalRef(v), v).toBe(false);
+            }
+        });
+    });
 });

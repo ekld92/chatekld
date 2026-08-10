@@ -25,6 +25,10 @@ DEFAULT_ZOTERO_SQLITE = "~/Zotero/zotero.sqlite"
 DEFAULT_ZOTERO_STORAGE = "~/Zotero/storage"
 DEFAULT_ANNOTATIONS_READ_THRESHOLD = 5
 DEFAULT_BIBLIO_SKIP_PREFIX = "z_item"
+# Near-duplicate content-similarity cutoff (plan 2026-08-05/6): rapidfuzz
+# ratio %, calibrated on paperless-ngx's shipped 88/92/97 ladder. Lower =
+# more candidates, more noise.
+DEFAULT_NEAR_DUP_RATIO = 88
 DEFAULT_IGNORED_DIRS = frozenset({".git", ".obsidian", ".pandoc", ".trash"})
 
 
@@ -70,6 +74,7 @@ class Settings:
     ignored_dirs: frozenset[str] = DEFAULT_IGNORED_DIRS
     biblio_skip_prefix: str = DEFAULT_BIBLIO_SKIP_PREFIX
     annotations_read_threshold: int = DEFAULT_ANNOTATIONS_READ_THRESHOLD
+    near_dup_ratio: int = DEFAULT_NEAR_DUP_RATIO
     # Optional override (mainly for tests). When None, the property
     # resolves to ``BASE_DIR/audit/mapping.json``.
     mapping_file_override: Path | None = None
@@ -155,6 +160,14 @@ def load_settings() -> Settings:
     else:
         skip_prefix_value = str(skip_prefix_raw)
 
+    ratio_raw = cfg.get("audit_near_dup_ratio")
+    try:
+        ratio = int(ratio_raw) if ratio_raw is not None else DEFAULT_NEAR_DUP_RATIO
+    except (TypeError, ValueError):
+        ratio = DEFAULT_NEAR_DUP_RATIO
+    if not 60 <= ratio <= 100:
+        ratio = DEFAULT_NEAR_DUP_RATIO
+
     return Settings(
         vault_root=vault_root,
         attachments_subdir=str(
@@ -174,4 +187,5 @@ def load_settings() -> Settings:
         ignored_dirs=DEFAULT_IGNORED_DIRS,
         biblio_skip_prefix=skip_prefix_value,
         annotations_read_threshold=threshold,
+        near_dup_ratio=ratio,
     )

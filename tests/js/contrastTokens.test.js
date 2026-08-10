@@ -97,7 +97,7 @@ const PAIRS = [
     ['white on --user-msg-to', () => '#ffffff', (t) => t['--user-msg-to'], 4.5],
     // Accent-as-TEXT tokens on the surfaces they actually sit on.
     ['--accent-soft-fg on card (.audit-link-btn)', (t) => t['--accent-soft-fg'], (t) => t['--bg-card'], 4.5],
-    ['--accent-hover text on card (.refactor-diff .diff-hunk)', (t) => t['--accent-hover'], (t) => t['--bg-card'], 4.5],
+    ['--accent-hover text on card (.refactor-diff .diff-hunk, .btn-link)', (t) => t['--accent-hover'], (t) => t['--bg-card'], 4.5],
     ['--accent-hover on glow tint (.refactor-badge.badge-changed)',
         (t) => t['--accent-hover'], (t) => over(t['--accent-glow'], t['--bg-card']), 4.5],
     ['--accent-soft-fg on soft tint (.doc-type-badge)',
@@ -108,9 +108,74 @@ const PAIRS = [
     // .refactor-badge rest states — the old opacity:0.5 fade was ~2.7:1).
     ['--text-secondary on elevated (copy buttons, badges)',
         (t) => t['--text-secondary'], (t) => t['--bg-elevated'], 4.5],
+    // Help popover body text on the card surface (ui.js::helpPopover).
+    ['--text-secondary on card (help popover body)',
+        (t) => t['--text-secondary'], (t) => t['--bg-card'], 4.5],
+    // 2026-07-26 UX audit — two surfaces that passed but were pinned by
+    // NOTHING, so a token tweak could have degraded them silently:
+    //  (a) the hover/focus TOOLTIP body (ui.js::helpTip → .help-tip), the only
+    //      place --text-primary sits on --bg-elevated as sustained reading
+    //      text;
+    //  (b) the 71 `.control-hint` rows. These reuse --text-secondary/--bg-card,
+    //      the SAME pair as "help popover body" above — listed separately and
+    //      by name on purpose: per CLAUDE.md ("when reusing a token on a new
+    //      surface, add the pair there"), retargeting that one label at some
+    //      future popover redesign would otherwise drop all 71 hints out of the
+    //      ratchet without anyone noticing.
+    ['--text-primary on elevated (.help-tip body)',
+        (t) => t['--text-primary'], (t) => t['--bg-elevated'], 4.5],
+    ['--text-secondary on card (.control-hint)',
+        (t) => t['--text-secondary'], (t) => t['--bg-card'], 4.5],
+    // Inline "not saved" marker under a refused settings field
+    // (settings.js::_flagDropped → .settings-field-error).
+    ['--danger on card (.settings-field-error)',
+        (t) => t['--danger'], (t) => t['--bg-card'], 4.5],
     // Focus outlines / active borders: non-text 3:1 on the major surfaces.
     ['--accent outline on app bg', (t) => t['--accent'], (t) => t['--bg-app'], 3.0],
     ['--accent outline on card', (t) => t['--accent'], (t) => t['--bg-card'], 3.0],
+    // 2026-07-19 tagging/a11y batch: placeholders carry instructional content
+    // and now use a managed token (tertiary was 4.4:1 dark on --input-bg —
+    // just under); the suggest gloss / chip-num / badge-muted moved from
+    // tertiary to secondary on their elevated/subtle fills; the disabled
+    // target toggle swapped opacity-fade for the tertiary tier on the card.
+    ['--text-secondary as ::placeholder on --input-bg',
+        (t) => t['--text-secondary'], (t) => t['--input-bg'], 4.5],
+    ['--text-secondary on elevated (suggest gloss, hovered row)',
+        (t) => t['--text-secondary'], (t) => t['--bg-elevated'], 4.5],
+    ['--text-tertiary on card (disabled target-toggle label)',
+        (t) => t['--text-tertiary'], (t) => t['--card-bg'], 4.5],
+    // 2026-07-20 Card Catalog batch — previously-unverified pairs surfaced by
+    // the design audit, now pinned:
+    // .warning-banner is the shared class behind EVERY module's status/error
+    // text (deck/docgen/refactor/vault/audit) — one regression here degrades
+    // legibility everywhere at once.
+    ['--warn-fg on warn tint over card (.warning-banner)',
+        (t) => t['--warn-fg'], (t) => over(t['--warn-bg'], t['--bg-card']), 4.5],
+    ['--ok-fg on card (.refactor-diff .diff-add, milestone strip)',
+        (t) => t['--ok-fg'], (t) => t['--bg-card'], 4.5],
+    ['--danger on card (.audit-error-tag, .btn-danger text)',
+        (t) => t['--danger'], (t) => t['--bg-card'], 4.5],
+    // N/F/Z legend badges: --on-cat letter on each category fill.
+    ...['note', 'finder', 'zotero'].map((c) => [
+        `--on-cat letter on --cat-${c} (legend badge)`,
+        (t) => t['--on-cat'], (t) => t[`--cat-${c}`], 4.5,
+    ]),
+    // Disabled buttons moved from opacity-fade to the tertiary tier — the
+    // label must stay readable on every button surface it can sit on.
+    ['--text-tertiary as disabled .btn label on card',
+        (t) => t['--text-tertiary'], (t) => t['--bg-card'], 4.5],
+    // 2026-07-20 audit finding (M2): ambiguous-PDF triage deck. The pick-number
+    // (.audit-ambig-num) is the deck's primary affordance and sits on hovered /
+    // selected candidate rows — the old --text-tertiary composited to ~3.9:1
+    // there. Now --text-secondary on the hover fill, --accent-soft-fg on the
+    // selected fill (already pinned via .doc-type-badge), and the selection is
+    // carried by a solid accent-soft-fg left bar (non-text, >= 3:1).
+    ['--text-secondary as .audit-ambig-num on hovered candidate (surface-hover over card)',
+        (t) => t['--text-secondary'], (t) => over(t['--surface-hover'], t['--bg-card']), 4.5],
+    ['--accent-soft-fg selection bar/border on card (.audit-ambig-cand.is-sel)',
+        (t) => t['--accent-soft-fg'], (t) => t['--bg-card'], 3.0],
+    ['--text-primary as .audit-ambig-keys kbd on subtle over card',
+        (t) => t['--text-primary'], (t) => over(t['--surface-subtle'], t['--bg-card']), 4.5],
 ];
 
 describe.each([

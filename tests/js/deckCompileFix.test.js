@@ -89,3 +89,51 @@ describe('runCompileFix (Track 1.1)', () => {
         expect(btn.disabled).toBe(false);
     });
 });
+
+// ---------------------------------------------------------------------------
+// P6.2 (2026-07-30): client-side abort for the two LONGEST LaTeX operations.
+// Generate/Augment had Cancel since their SSE wiring landed; compile-fix and
+// preview did not, so a user watching a doomed repair loop could only wait or
+// reload. Source ratchets (the functions are DOM+SSE heavy; the invariant is
+// "the request carries an abort signal and the finally tears the button down").
+// ---------------------------------------------------------------------------
+describe('compile-fix / preview abort wiring (P6.2)', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const read = (f) => fs.readFileSync(
+        path.join(__dirname, '..', '..', 'static', 'js', f), 'utf8');
+
+    for (const [file, api] of [['deck.js', 'deck'], ['docgen.js', 'docgen']]) {
+        it(`${file}: compile-fix POSTs with an abort signal`, () => {
+            const src = read(file);
+            // Anchor on the URL LITERAL, not the bare word — the surrounding
+            // comments mention the endpoint names too.
+            const call = src.slice(src.indexOf(`'/api/${api}/compile-fix'`));
+            // The signal must be inside the SAME fetch options object as the body.
+            const opts = call.slice(0, call.indexOf('}, {'));
+            expect(opts).toContain('signal: _abortCtrl.signal');
+        });
+
+        it(`${file}: compile-preview POSTs with an abort signal`, () => {
+            const src = read(file);
+            const call = src.slice(src.indexOf(`'/api/${api}/compile-preview'`));
+            expect(call.slice(0, 400)).toContain('signal: _abortCtrl.signal');
+        });
+
+        it(`${file}: both paths mint a controller and a Cancel button`, () => {
+            const src = read(file);
+            // 5 ops each now: generate(+md for docgen)/augment/compile-fix/preview.
+            const ctrls = src.match(/_abortCtrl = new AbortController\(\)/g) || [];
+            expect(ctrls.length).toBeGreaterThanOrEqual(4);
+            const cancels = src.match(/_mkCancelButton\(/g) || [];
+            // one definition + one per op
+            expect(cancels.length).toBeGreaterThanOrEqual(5);
+        });
+
+        it(`${file}: a cancelled run reports cancellation, not a crash`, () => {
+            const src = read(file);
+            expect(src).toContain('Compile & auto-fix cancelled.');
+            expect(src).toContain('the server compile finishes on its own');
+        });
+    }
+});

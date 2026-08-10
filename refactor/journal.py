@@ -49,6 +49,21 @@ class ScopeError(Exception):
     """A write/move target escaped its allowed root (scope / vault / archive)."""
 
 
+class JournalUnreadableError(RuntimeError):
+    """The manifest EXISTS but could not be read/parsed — refuse to write.
+
+    Absent-vs-unreadable matters (2026-07-22 audit, backport of the tagging
+    journal's 2026-07-20 fix): treating a transient ``OSError`` (archive dir on
+    an unmounted external volume — the user-configurable ``refactor_archive_dir``
+    points at exactly such places) or corrupt JSON as "fresh empty manifest"
+    meant the very next Apply/Fix-formatting/Archive appended one op and
+    atomically OVERWROTE the real file — destroying every prior op, including
+    applied ``archive_image`` ops, whose record is the ONLY mapping from a
+    moved-out original back to its vault location (the reason :func:`prune`
+    never evicts them). Callers surface this as 503 and perform no write.
+    """
+
+
 # --- path roots ------------------------------------------------------------
 
 def _vault_key(vault_root: Path) -> str:
@@ -113,14 +128,51 @@ def thumb_dir(vault_root: Path, scope: str) -> Path:
 # --- manifest io -----------------------------------------------------------
 
 def load(vault_root: Path, cfg: dict) -> dict:
-    """Load the manifest (a fresh empty one if absent / unreadable / corrupt)."""
+    """Load the manifest (a fresh empty one only when genuinely ABSENT).
+
+    Raises :class:`JournalUnreadableError` when the file exists but cannot be
+    read, parsed, or has the wrong shape — never silently replaces it (see the
+    exception's docstring for why the old fresh-empty fallback was a data-loss
+    bug).
+    """
     p = manifest_path(vault_root, cfg)
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        data = None
-    if not isinstance(data, dict) or not isinstance(data.get("ops"), list):
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # Absent manifest is only "fresh" when the archive dir holds no prior
+        # snapshots. A missing manifest BESIDE existing notes/attachments means
+        # the journal was lost (or the configured archive volume is unmounted
+        # and we're looking at a stub path) — writing a fresh manifest there
+        # would orphan every snapshot's restore mapping.
+        arch = p.parent
+        try:
+            has_prior = any((arch / d).is_dir() and any((arch / d).iterdir())
+                            for d in ("notes", "attachments"))
+        except OSError:
+            has_prior = False
+        if has_prior:
+            raise JournalUnreadableError(
+                "refactor journal manifest is missing but prior snapshots exist "
+                f"under {arch}; refusing to write so the snapshots are not orphaned"
+            )
         return {"version": _MANIFEST_VERSION, "vault_key": _vault_key(vault_root), "ops": []}
+    except OSError as exc:
+        raise JournalUnreadableError(
+            f"refactor journal could not be read ({exc}); refusing to write "
+            "so the existing restore history is not overwritten"
+        ) from exc
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise JournalUnreadableError(
+            "refactor journal is corrupt; refusing to write so the existing "
+            f"restore history is not overwritten ({p})"
+        ) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("ops"), list):
+        raise JournalUnreadableError(
+            "refactor journal has an unexpected shape; refusing to write so "
+            f"the existing restore history is not overwritten ({p})"
+        )
     data.setdefault("version", _MANIFEST_VERSION)
     data.setdefault("vault_key", _vault_key(vault_root))
     return data
@@ -190,8 +242,8 @@ def prune(vault_root: Path, cfg: dict, manifest: dict) -> int:
         over = len(kept) - _MAX_OPS
         survivors: list[dict] = []
         for op in kept:
-            if over > 0 and op.get("kind") in ("apply_note", "normalize_note", "llm_note"):
-                _del_snapshot(op)
+            if over > 0 and op.get("kind") in ("apply_note", "normalize_note", "llm_note", "create_note"):
+                _del_snapshot(op)   # create_note has no snapshot (no-op); drops its undo
                 dropped += 1
                 over -= 1
                 continue
@@ -203,7 +255,14 @@ def prune(vault_root: Path, cfg: dict, manifest: dict) -> int:
 
 
 def new_op_id(manifest: dict) -> str:
-    """A unique, ordered op id (ms timestamp + position in the ops list)."""
+    """A unique, ordered op id (ms timestamp + position in the ops list).
+
+    Uniqueness scope (2026-07-22 comment repair): within ONE manifest, under
+    the single-writer op-lock the callers hold. ``prune`` can shrink
+    ``len(ops)``, so the positional suffix can repeat across time — cross-time
+    uniqueness rests on the millisecond timestamp (two ops in the same ms with
+    the same position would need a prune between them inside that ms).
+    """
     return f"{int(time.time() * 1000)}-{len(manifest.get('ops', []))}"
 
 
@@ -271,11 +330,16 @@ def revert_op(vault_root: Path, cfg: dict, op: dict) -> dict:
     if kind == "archive_image":
         from refactor.archive import revert_archive_image
         return revert_archive_image(vault_root, cfg, op)
+    if kind == "create_note":
+        # A newly-created note (docgen Markdown) has no prior snapshot; its
+        # inverse is deletion, not a snapshot-restore.
+        from refactor.create_note import revert_create_note
+        return revert_create_note(vault_root, cfg, op)
     return {"ok": False, "status": "unknown", "message": f"Unknown op kind: {kind!r}"}
 
 
 __all__ = [
-    "ScopeError", "archive_dir", "manifest_path", "assert_under", "thumb_dir",
+    "ScopeError", "JournalUnreadableError", "archive_dir", "manifest_path", "assert_under", "thumb_dir",
     "load", "save", "prune", "new_op_id", "now_iso", "find_op",
     "write_note_snapshot", "read_snapshot", "revert_op",
     "log_vault_write",

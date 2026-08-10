@@ -220,6 +220,21 @@ def replace_section(tex: str, section: DeckSection, new_body: str) -> str:
     return _splice(tex, section.start, section.end, new_body)
 
 
+def replace_sections(tex: str, edits: list) -> str:
+    """Splice several ``(DeckSection, new_body)`` edits, back-to-front.
+
+    All spans index the ORIGINAL *tex* (from one :func:`split_deck`); applying
+    them in descending ``start`` order keeps every remaining span's offsets
+    valid, so each individual splice stays byte-identical outside its own
+    span — the piecewise augment's core invariant (Batch E, 2026-07-22).
+    Sections must not overlap (``split_deck`` guarantees disjoint spans).
+    """
+    out = tex
+    for sec, new_body in sorted(edits, key=lambda e: e[0].start, reverse=True):
+        out = _splice(out, sec.start, sec.end, new_body)
+    return out
+
+
 def replace_region(parts: DeckParts, new_region: str) -> str:
     """Replace the whole section region (all ``\\section``s) with *new_region*.
 

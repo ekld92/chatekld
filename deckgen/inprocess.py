@@ -158,6 +158,51 @@ class InProcessChatRunner:
 
         result = ChatResult()
 
+        # WP-A2: honour agent=False (the HTTP client always did — it maps to
+        # agent_enabled=false). One single-shot RAG pass, no tools, no
+        # iterations: the deck section salvage uses this as its last resort
+        # before the placeholder frame, so a turn's worth of gathered-but-
+        # unformatted work isn't discarded outright.
+        if not agent:
+            # WP-A2 salvage bound (2026-07-20 audit M6): the agent path threads
+            # ``turn_timeout_s`` into ``run_agent_loop``, but this single-shot
+            # drain historically had NO deadline and NO cancel poll — a wedged
+            # local model mid-stream blocked up to the transport default
+            # (~600 s) while the process-wide _DECK_OP_LOCK stayed held, 409ing
+            # every other deck op. Bound it exactly like an agent turn: a
+            # per-token deadline check and a cancel-event poll drain, returning
+            # a timeout ChatResult so the caller degrades to its placeholder.
+            # (Residual: the pre-first-token wait is still bounded only by the
+            # transport timeout — the stream call itself is a blocking HTTP
+            # read we cannot interrupt from here, same limit the agent path has.)
+            deadline = time.monotonic() + self._turn_timeout_s
+            try:
+                response = obsidian_manager.stream_chat(
+                    message, model, embed,
+                    provider_name=provider,
+                    similarity_cutoff=sim_cutoff,
+                    hybrid_enabled=hybrid,
+                    reranker_enabled=rerank,
+                    reranker_model=rerank_model,
+                    custom_system_prompt=system_prompt,
+                    temperature=temperature,
+                )
+                if hasattr(response, "response_gen"):
+                    parts = []
+                    for tok in response.response_gen:
+                        if self._cancel_event is not None and self._cancel_event.is_set():
+                            break
+                        if time.monotonic() > deadline:
+                            result.error = "salvage pass timed out"
+                            break
+                        parts.append(tok)
+                    result.text = "".join(parts)
+                else:
+                    result.text = str(response)
+            except Exception as exc:
+                result.error = redact(str(exc)) or exc.__class__.__name__
+            return result
+
         def _on_agent_event(ev) -> None:
             item = _event_to_dict(ev)
             if item is None:
@@ -202,8 +247,23 @@ class InProcessChatRunner:
             reranker_enabled=rerank,
             reranker_model=rerank_model,
         )
-        tools = ToolRegistry(build_vault_tools(obsidian_manager, ctx))
+        specs = build_vault_tools(obsidian_manager, ctx)
         deadline = time.monotonic() + self._turn_timeout_s
+        # Optional web_search tool (2026-07-22, Batch C) — config-only here
+        # (no per-request body on this path); same triple gate as vault chat.
+        try:
+            from core.agent.web_tools import (
+                WebToolContext, build_web_tools, web_search_available,
+            )
+            ok, _why = web_search_available(cfg, provider)
+            if ok:
+                specs = specs + build_web_tools(WebToolContext(
+                    max_results=int(cfg.get("vault_web_search_max_results") or 5),
+                    deadline_monotonic_s=deadline,
+                ))
+        except Exception:  # pragma: no cover — the tool is optional
+            pass
+        tools = ToolRegistry(specs)
 
         try:
             run_agent_loop(

@@ -147,6 +147,13 @@ def wrap_untrusted(tool_name: str, content: str, *, truncated: bool = False) -> 
     """
     trunc_attr = "true" if truncated else "false"
     tag = f"tool_output-{uuid.uuid4().hex[:8]}"
+    # The unknown-tool / arg-error paths reach here with a MODEL-SUPPLIED name
+    # that never passed the registry's VALID_TOOL_NAME_RE — a name containing
+    # `">` would distort the wrapper markup around the error observation
+    # (2026-07-22 audit #8). Registry-validated names pass through unchanged;
+    # anything else collapses to a safe token (the name is informational only).
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", tool_name or ""):
+        tool_name = "<unknown>"
     return (
         f"{_UNTRUSTED_PREAMBLE}"
         f"<{tag} tool=\"{tool_name}\" truncated=\"{trunc_attr}\">\n"

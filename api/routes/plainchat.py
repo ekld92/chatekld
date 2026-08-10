@@ -12,22 +12,27 @@ of every agent / iteration / tool branch: only ``{info}`` / ``{token}`` /
 ``{error}`` frames plus the ``[DONE]`` sentinel.
 """
 
+import logging
+from datetime import datetime, timezone
+
 from flask import Blueprint, jsonify, request
 
 from api.security import sanitise_error_msg
 from api.validators import coerce_float_in_range, coerce_string_max_len
 from core.config import load_config, resolve_chat_model
-from api.sse import run_sse_worker
+from core.llm.usage import usage_frame_payload, usage_tracker
+from api.sse import online_aware_floor_s, run_sse_worker
 from core.constants import (
     SYSTEM_PROMPT_LIMIT,
     # Shared SSE stall-guard timing. Plain chat has no agent wall-clock — the
     # consumer get is its ONLY time guard (exactly like the single-shot RAG
     # path), so it uses the floored base + margin directly. One definition, no
     # cross-route private import. Rationale at the definition site.
-    SSE_SINGLE_SHOT_FLOOR_S,
     SSE_STALL_MARGIN_S,
 )
 from core.llm.chat import stream_chat_messages
+
+logger = logging.getLogger("chatekld")
 
 plainchat_bp = Blueprint("plainchat", __name__)
 
@@ -138,13 +143,25 @@ def api_plainchat():
     # emits a clean error; the thread exits when the blocking call finally
     # returns. This matches vault.py's single-shot path (the architecture cannot
     # interrupt a blocking read from outside the call).
-    consumer_timeout_s = SSE_SINGLE_SHOT_FLOOR_S + SSE_STALL_MARGIN_S
+    # online_aware_floor_s widens the floor to online_timeout_s so a legal
+    # slow online first token isn't killed by the app (timeout-chain repair,
+    # 2026-07-22 audit M2).
+    consumer_timeout_s = online_aware_floor_s(cfg) + SSE_STALL_MARGIN_S
 
     def _plainchat_worker(put, cancel):
         def _stage(text: str) -> None:
             if text:
                 put({"info": text})
 
+        # Export provenance (2026-07-22): the client resolves neither provider
+        # nor model (both server-side from config), so announce them up front —
+        # the panel stores the frame on the assistant turn for MD/TXT exports.
+        put({"meta": {
+            "provider": provider,
+            "model": model,
+            "temperature": temperature,
+        }})
+        start_iso = datetime.now(timezone.utc).isoformat()
         try:
             for tok in stream_chat_messages(
                 messages=messages,
@@ -162,6 +179,20 @@ def api_plainchat():
         except Exception as exc:
             if not cancel.is_set():
                 put({"error": sanitise_error_msg(exc)})
+            return
+        if cancel.is_set():
+            return
+        # Best-effort real token/cost figures for this answer: the adapters
+        # recorded the call(s) into the tracker ring tagged workflow=plain_chat;
+        # sum everything since our start stamp. Never fails the stream.
+        try:
+            payload = usage_frame_payload(
+                usage_tracker.records_since(start_iso, workflow="plain_chat")
+            )
+            if payload:
+                put({"usage": payload})
+        except Exception:
+            logger.debug("plainchat usage frame failed", exc_info=True)
     return run_sse_worker(
         _plainchat_worker,
         consumer_timeout_s=consumer_timeout_s,

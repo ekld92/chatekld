@@ -79,13 +79,24 @@ def parse_policy_from_config(cfg: dict, *, primary_override: Optional[str] = Non
         fallback = None
 
     fallback_on_raw = cfg.get("fallback_on")
-    if isinstance(fallback_on_raw, list) and fallback_on_raw:
+    if isinstance(fallback_on_raw, list):
         categories = set()
         for entry in fallback_on_raw:
             cat = _CATEGORY_BY_NAME.get(str(entry).strip().lower())
             if cat is not None:
                 categories.add(cat)
-        fallback_on = frozenset(categories) if categories else _DEFAULT_FALLBACK_ON
+        # An explicitly EMPTY list is the user's "never fall back", and the two
+        # layers must agree on that: the Settings window sends `[]` when every
+        # category checkbox is cleared, and `api/routes/config.py::
+        # _coerce_fallback_on` deliberately KEEPS it ("a valid 'fall back on
+        # nothing'"). Reading it back through a truthiness test turned that
+        # into the full default set, silently re-enabling the provider fallback
+        # the user had just switched off. A NON-empty list that filters to
+        # nothing is garbage — the route refuses to persist that shape, so
+        # defaults stay the safe read for it.
+        fallback_on = (_DEFAULT_FALLBACK_ON
+                       if fallback_on_raw and not categories
+                       else frozenset(categories))
     else:
         fallback_on = _DEFAULT_FALLBACK_ON
 

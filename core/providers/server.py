@@ -172,8 +172,17 @@ def start_ollama_server() -> Tuple[bool, str]:
     with _ollama_process_lock:
         proc, _ollama_process = _ollama_process, None
     if proc is not None:
+        # B10/#29 (2026-07-13): escalate terminate → wait → kill (mirroring
+        # shutdown_ollama). A bare terminate() with no wait/kill left a
+        # SIGTERM-ignoring or wedged child lingering for the session, and an
+        # unreaped zombie until the next Popen/interpreter exit.
         try:
             proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
         except Exception:
             pass
     return False, "Ollama did not respond in time."

@@ -144,18 +144,31 @@ export function logError(msg, error) {
  * @returns {Promise<void>} Resolves when the stream fully completes.
  */
 export async function consumeSSE(url, options, handlers) {
+    // Contract (2026-07-20 audit A2/A3): onError fires AT MOST ONCE, and it is
+    // terminal. Two prior bugs lived here — (1) a caller whose onError THROWS
+    // (vault/plainchat do, to reach their own catch) had onError called again
+    // from the catch with exc.message, i.e. twice; (2) an aborted fetch throws
+    // a DOMException named 'AbortError', but routing it through
+    // onError(exc.message) flattened it into a plain Error, so the callers'
+    // `e.name === 'AbortError'` friendly-timeout branch was DEAD code.
+    let onErrorCalled = false;
     try {
         const resp = await secureFetch(url, options);
         if (!resp.ok) {
             const result = await safeJson(resp);
             const err = result.error || `HTTP ${resp.status} - failed to start stream`;
-            handlers.onError?.(err);
+            onErrorCalled = true;
+            // Second arg = the full error payload (additive, 2026-07-23):
+            // structured fields like `code` let callers branch on machine
+            // identity instead of regexing the human message.
+            handlers.onError?.(err, result);   // may throw; propagates as the caller intends
             return;
         }
 
         for await (const frame of readSSE(resp)) {
             if (frame.error) {
-                handlers.onError?.(frame.error);
+                onErrorCalled = true;
+                handlers.onError?.(frame.error, frame);
                 return; // Server {error} is terminal
             }
             if (frame.info) {
@@ -168,6 +181,14 @@ export async function consumeSSE(url, options, handlers) {
         }
         handlers.onDone?.();
     } catch (exc) {
+        // If onError already ran, THIS exception is its own throw (or a
+        // downstream effect) — propagate it to the caller's catch untouched;
+        // never invoke onError a second time.
+        if (onErrorCalled) throw exc;
+        // Preserve abort identity so the caller's `e.name === 'AbortError'`
+        // branch is reachable — re-throw the original DOMException rather than
+        // flatten it through onError.
+        if (exc && exc.name === 'AbortError') throw exc;
         handlers.onError?.(exc.message || String(exc));
     }
 }

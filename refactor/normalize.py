@@ -8,7 +8,8 @@ whitespace fixes — and nothing opinionated:
 * a blank line before a heading / list that has content directly above it;
 * blank lines around a fenced code block;
 * trailing whitespace stripped (outside code fences);
-* runs of 3+ blank lines collapsed to one;
+* runs of 2+ blank lines collapsed to one (the code collapses any run ≥ 2 —
+  the previous "3+" wording was wrong);
 * exactly one trailing newline at EOF;
 * CRLF (Windows) line endings normalized to LF. This falls out of splitting on
   ``\n`` and ``rstrip()``-ing body lines (the stray ``\r`` is trailing

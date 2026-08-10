@@ -9,6 +9,7 @@ import { secureFetch, consumeSSE, logError, safeJson } from './api.js';
 import { setStatusA11y, taskBegin, taskEnd, copyToClipboard, confirmInline } from './ui.js';
 
 let _generating = false;
+let _previewing = false;
 let _compileAvailable = false;
 let _compileFixing = false;
 
@@ -40,6 +41,32 @@ function _status(msg, isError = false) {
 }
 
 function _clear(el) { while (el && el.firstChild) el.removeChild(el.firstChild); }
+
+// C2/#14 (2026-07-13): cancel affordance for the multi-minute deck SSE ops,
+// mirroring docgen.js. Cancel aborts the fetch; the server sees the consumer
+// disconnect and its cancel-gated worker stops at the next section (the
+// per-section checkpoint makes the run resumable). One controller per op.
+let _abortCtrl = null;
+
+function _mkCancelButton(logEl) {
+    if (!logEl || !logEl.parentElement) return null;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-outline btn-sm';
+    btn.textContent = 'Cancel';
+    btn.setAttribute('aria-label', 'Cancel the running deck operation');
+    btn.addEventListener('click', () => {
+        if (_abortCtrl) _abortCtrl.abort();
+        btn.disabled = true;
+        btn.textContent = 'Cancelling…';
+    });
+    logEl.parentElement.insertBefore(btn, logEl);
+    return btn;
+}
+
+function _wasCancelled() {
+    return !!(_abortCtrl && _abortCtrl.signal.aborted);
+}
 
 function _addActivity(text, muted = false) {
     const log = $('deck-activity');
@@ -150,12 +177,15 @@ function _renderTemplateHint(d) {
  * suppressed as noise; a non-200 (pre-stream reject) is surfaced and aborted so
  * the UI never hangs on "Generating…".
  */
-// Item 3.8: ONE busy predicate for all three deck operations. The guards were
+// Item 3.8: ONE busy predicate for all deck operations. The guards were
 // asymmetric — generate/augment ignored an in-flight compile-fix and
 // compile-fix ignored an in-flight augment — so two deck operations could
 // race client-side and the loser burned a round-trip on the server's 409.
+// _previewing joins the set (review lot 5.1): a preview holds the server's
+// _DECK_OP_LOCK for the whole latexmk pass, so a Generate click during it
+// would 409 confusingly without this client-side gate.
 function _deckOpBusy() {
-    return _generating || _augmenting || _compileFixing;
+    return _generating || _augmenting || _compileFixing || _previewing;
 }
 
 export async function generate() {
@@ -172,6 +202,10 @@ export async function generate() {
         template_path: ($('deck-template-path').value || '').trim(),
         out_dir: ($('deck-out-dir').value || '').trim(),
         deck_name: ($('deck-name').value || '').trim(),
+        // The generated deck should carry the user's title, not the template's
+        // placeholder — default to the topic when the field is left empty.
+        deck_title: (($('deck-title') && $('deck-title').value) || '').trim() || topic,
+        deck_subtitle: (($('deck-subtitle') && $('deck-subtitle').value) || '').trim(),
         instructions: $('deck-instructions').value || '',
         audience: ($('deck-audience').value || '').trim(),
         citations_enabled: $('deck-citations').checked,
@@ -189,11 +223,14 @@ export async function generate() {
     _clear($('deck-activity'));
     _clear($('deck-result'));
     _status('Generating — this can take a few minutes for a multi-section deck…');
+    _abortCtrl = new AbortController();
+    const cancelBtn = _mkCancelButton($('deck-activity'));
 
     try {
         await consumeSSE('/api/deck/generate', {
             method: 'POST',
             body: JSON.stringify(payload),
+            signal: _abortCtrl.signal,
         }, {
             onInfo: (info) => _addActivity(info),
             onOther: (evt) => {
@@ -209,21 +246,33 @@ export async function generate() {
         });
 
     } catch (e) {
-        logError('Deck generation failed', e);
-        _status('Deck generation failed (see console).', true);
+        // C2/#14: distinguish the user's own Cancel from a real failure. The
+        // per-section checkpoint means a cancelled run resumes on the next click.
+        if (_wasCancelled()) {
+            _status('Generation cancelled. Re-run to resume from the last section.', false);
+            _addActivity('Cancelled by user.', true);
+        } else {
+            logError('Deck generation failed', e);
+            _status('Deck generation failed (see console).', true);
+        }
     } finally {
         _generating = false;
+        _abortCtrl = null;
+        if (cancelBtn) cancelBtn.remove();
         _setDeckBusy(false);
         taskEnd('deck-generate');
     }
 }
 
-/** Enable/disable both deck-operation buttons together (one op at a time). */
+/** Enable/disable the deck-operation buttons together (one op at a time).
+ * C2/#13 (2026-07-13): also covers the augment card's Preview-PDF button, and
+ * preview/compile-fix now route through this (was: they disabled only their own
+ * button, so Generate/Augment looked live but silently early-returned). */
 function _setDeckBusy(busy) {
-    const a = $('deck-generate-btn');
-    const b = $('deck-aug-preview-btn');
-    if (a) a.disabled = busy;
-    if (b) b.disabled = busy;
+    for (const id of ['deck-generate-btn', 'deck-aug-preview-btn', 'deck-aug-pdf-btn']) {
+        const el = $(id);
+        if (el) el.disabled = busy;
+    }
 }
 
 function _renderDeck(deck) {
@@ -280,8 +329,29 @@ function _renderDeck(deck) {
                 get sha() { return deck.tex_sha256; },
                 set sha(v) { deck.tex_sha256 = v; },
             };
-            compileBtn.addEventListener('click', () => runCompileFix(deck.tex_path, shaRef, compileBtn));
+            // E10 (2026-07-22 audit): this loop WRITES LLM-authored repairs
+            // into the user's .tex (with .bak/.orig) — identical risk to
+            // apply-repair/apply-augment, which carry a strip. Route it
+            // through the same Track-6e ceremony so the confirm strip never
+            // reads as noise.
+            compileBtn.addEventListener('click', () => confirmInline(compileBtn, {
+                message: 'Compile and auto-repair may rewrite the deck .tex '
+                    + '(a .bak backup is kept). Continue?',
+                confirmLabel: 'Compile & fix',
+                onConfirm: () => runCompileFix(deck.tex_path, shaRef, compileBtn),
+            }));
             root.appendChild(compileBtn);
+
+            const previewBtn = document.createElement('button');
+            previewBtn.className = 'btn btn-outline btn-sm';
+            previewBtn.style.marginTop = '8px';
+            previewBtn.style.marginLeft = '8px';
+            previewBtn.textContent = 'Preview PDF';
+            const previewHost = document.createElement('div');
+            previewHost.className = 'deck-preview-host';
+            previewBtn.addEventListener('click', () => runDeckPreview(deck.tex_path, previewBtn, previewHost));
+            root.appendChild(previewBtn);
+            root.appendChild(previewHost);
         }
         _status(`Deck written (${n} section(s)). ` +
             (ph ? `${ph} section(s) had no content — review those.` : 'Done.'),
@@ -406,6 +476,26 @@ function _renderReview(root, deck) {
         wrap.appendChild(note);
     }
 
+    // Batch F (2026-07-22, offer-on-withheld-repair): the deck was too big for
+    // a one-pass repair (input over the review cap OR output over the token
+    // budget) but issues WERE found — offer the section-by-section repair.
+    if (!review.changed && issues.length
+            && (review.truncated || review.repair_truncated)
+            && deck.tex_path) {
+        const pw = document.createElement('button');
+        pw.className = 'btn btn-outline';
+        pw.textContent = 'Try section-by-section repair';
+        pw.title = 'Reviews each \\section on its own (each fits the review budget), then previews one combined repaired deck — applied via the usual confirmed Apply.';
+        pw.addEventListener('click', () => _runPiecewiseRepair(deck, pw));
+        wrap.appendChild(pw);
+        // Visible caveat (title tooltips are invisible to keyboard/touch/SR
+        // users, and the skip behaviour matters before clicking).
+        const pwNote = document.createElement('div');
+        pwNote.className = 'muted';
+        pwNote.textContent = 'Over-cap or failed sections are skipped and left unchanged.';
+        wrap.appendChild(pwNote);
+    }
+
     if (review.changed && review.repaired_tex) {
         wrap.appendChild(_texOutput('Proposed repaired .tex', '', review.repaired_tex, 14));
 
@@ -424,6 +514,47 @@ function _renderReview(root, deck) {
     }
 
     root.appendChild(wrap);
+}
+
+/**
+ * Run the section-by-section repair (Batch F) and pipe its terminal
+ * `{augment}` frame into the standard augment renderer — the proposal is
+ * staged server-side and applied through the usual confirmed apply-augment.
+ */
+async function _runPiecewiseRepair(deck, btn) {
+    if (_deckOpBusy()) { _status('Another deck operation is running — wait for it.', true); return; }
+    btn.disabled = true;
+    _setDeckBusy(true);
+    taskBegin('deck-repair-pw', 'Piecewise repair');
+    _clear($('deck-aug-activity'));
+    _clear($('deck-aug-result'));
+    _augStatus('Section-by-section repair — one review pass per section…');
+    let sawAugment = false;
+    try {
+        await consumeSSE('/api/deck/repair-piecewise', {
+            method: 'POST',
+            body: JSON.stringify({ deck_path: deck.tex_path, base_sha256: deck.tex_sha256 || '' }),
+        }, {
+            onInfo: (info) => _augActivity(info),
+            onOther: (evt) => {
+                if (evt.augment) { sawAugment = true; _renderAugment(evt.augment); }
+            },
+            onError: (err) => {
+                _augStatus(err, true);
+                _augActivity('ERROR: ' + err);
+            },
+        });
+        if (sawAugment) {
+            _augStatus('Piecewise repair preview ready below (Augment panel) — nothing written yet.');
+        }
+    } catch (e) {
+        logError('Piecewise repair failed', e);
+        _augStatus('Piecewise repair failed (see console).', true);
+    } finally {
+        btn.disabled = false;
+        _setDeckBusy(false);
+        taskEnd('deck-repair-pw');
+    }
 }
 
 /** Confirm + write a screened repair over the on-disk deck. */
@@ -486,6 +617,23 @@ function _augActivity(text, muted = false) {
     line.textContent = text;
     log.appendChild(line);
     log.scrollTop = log.scrollHeight;
+}
+
+/**
+ * Preview the AUGMENT panel's deck as a PDF (review lot 5.1). This is the
+ * common case the generate-panel button misses: previewing an existing —
+ * possibly hand-written — deck the user just picked, before or after an
+ * augment. Same write-free compile+blob pipeline as runDeckPreview; the path
+ * comes from the panel's input and is validated server-side.
+ */
+export async function augPreviewPdf() {
+    const path = ($('deck-aug-path').value || '').trim();
+    if (!path) { _augStatus('Choose a deck .tex first.', true); return; }
+    const btn = $('deck-aug-pdf-btn');
+    const host = $('deck-aug-pdf-host');
+    if (!btn || !host) return;
+    // C2/#44: route status into the augment card's own banner, not the generate card.
+    await runDeckPreview(path, btn, host, _augStatus);
 }
 
 /** Native-pick an existing deck .tex and load its sections. */
@@ -559,7 +707,7 @@ export function augScopeChanged() {
  * trace as generate; the terminal `{augment}` frame is rendered by _renderAugment.
  * Writes nothing — the user confirms via Apply.
  */
-export async function augmentPreview() {
+export async function augmentPreview(piecewise) {
     if (_deckOpBusy()) return;   // one deck op at a time (all three ops)
     if (!_augment) { _augStatus('Load a deck first.', true); return; }
     const instruction = ($('deck-aug-instruction').value || '').trim();
@@ -575,6 +723,9 @@ export async function augmentPreview() {
         audience: ($('deck-audience').value || '').trim(),
         citations_enabled: $('deck-citations').checked,
     };
+    // Batch E (2026-07-22): the offer-on-refusal re-run — one agent turn per
+    // \section when the whole-deck pass refused on the size cap.
+    if (piecewise === true) payload.piecewise = true;
 
     _augmenting = true;
     taskBegin('deck-augment', 'Augmenting deck');
@@ -582,11 +733,14 @@ export async function augmentPreview() {
     _clear($('deck-aug-activity'));
     _clear($('deck-aug-result'));
     _augStatus('Augmenting — one vault-grounded pass; this can take a moment…');
+    _abortCtrl = new AbortController();
+    const cancelBtn = _mkCancelButton($('deck-aug-activity'));
 
     try {
         await consumeSSE('/api/deck/augment', {
             method: 'POST',
             body: JSON.stringify(payload),
+            signal: _abortCtrl.signal,
         }, {
             onInfo: (info) => _augActivity(info),
             onOther: (evt) => {
@@ -595,20 +749,62 @@ export async function augmentPreview() {
                 else if (evt.tool_result) _augActivity(`· tool result${evt.tool_result.is_error ? ' [error]' : ''}`, true);
                 else if (evt.augment) _renderAugment(evt.augment);
             },
-            onError: (err) => {
+            onError: (err, frame) => {
                 _augStatus(err, true);
                 _augActivity('ERROR: ' + err);
+                // Offer the piecewise run when the refusal is the size cap
+                // (whole scope only — a single over-cap section has no
+                // smaller unit to fall back to). Keyed on the structured
+                // `code` (2026-07-23 — a copy edit to the server prose used
+                // to silently kill the offer); the regex stays as a fallback
+                // for an older server without the field.
+                const sizeCap = (frame && frame.code === 'size_cap')
+                    || /too large to revise in one pass/i.test(err);
+                if (sizeCap && scope === 'whole') {
+                    _offerPiecewiseAugment();
+                }
             }
         });
 
     } catch (e) {
-        logError('Deck augmentation failed', e);
-        _augStatus('Augmentation failed (see console).', true);
+        if (_wasCancelled()) {
+            _augStatus('Augmentation cancelled — nothing was written.', false);
+            _augActivity('Cancelled by user.', true);
+        } else {
+            logError('Deck augmentation failed', e);
+            _augStatus('Augmentation failed (see console).', true);
+        }
     } finally {
         _augmenting = false;
+        _abortCtrl = null;
+        if (cancelBtn) cancelBtn.remove();
         _setDeckBusy(false);
         taskEnd('deck-augment');
     }
+}
+
+/** Render the 'Revise section by section' offer after a size-cap refusal. */
+function _offerPiecewiseAugment() {
+    const root = $('deck-aug-result');
+    if (!root || root.querySelector('.deck-piecewise-offer')) return;
+    // Button + caveat share one wrapper (carrying the dedupe class) so the
+    // click removes them together — a click on the bare button used to leave
+    // an orphaned note behind.
+    const wrap = document.createElement('div');
+    wrap.className = 'deck-piecewise-offer';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-outline';
+    btn.textContent = 'Revise section by section';
+    btn.title = 'Runs one vault-grounded pass per \\section (over-cap sections are left unchanged), then previews one combined proposal.';
+    btn.addEventListener('click', () => { wrap.remove(); augmentPreview(true); });
+    wrap.appendChild(btn);
+    // Visible caveat (title tooltips are invisible to keyboard/touch/SR users).
+    const note = document.createElement('div');
+    note.className = 'muted';
+    note.textContent = 'Over-cap or failed sections are skipped and left unchanged.';
+    wrap.appendChild(note);
+    root.appendChild(wrap);
 }
 
 function _renderAugment(aug) {
@@ -691,8 +887,11 @@ async function _applyAugment(aug, btn) {
                 deck_path: aug.deck_path || '',
                 // The proposed .tex is read from server-side staging, never sent
                 // from here; we pass only the stale-diff token (the server 409s if
-                // the on-disk deck changed since the preview).
+                // the on-disk deck changed since the preview) and the
+                // preview-binding token (409 if a newer preview replaced the
+                // single staging slot after this one was shown).
                 base_sha256: aug.deck_sha256 || '',
+                proposed_sha256: aug.proposed_sha256 || '',
                 confirm: true,
             }),
         });
@@ -726,6 +925,7 @@ async function _applyAugment(aug, btn) {
 export async function runCompileFix(deckPath, shaRef, btn) {
     if (_deckOpBusy()) return;
     _compileFixing = true;
+    _setDeckBusy(true);   // C2/#13: block Generate/Augment during compile-fix
     btn.disabled = true;
 
     const act = $('deck-activity');
@@ -737,6 +937,16 @@ export async function runCompileFix(deckPath, shaRef, btn) {
     _addActivity('Initializing latexmk subprocess...');
 
     taskBegin('deck-compile-fix', 'Compiling deck');
+    // Client-side abort (P6.2, 2026-07-30). Generate and Augment have had a
+    // Cancel button since their SSE wiring landed; compile-fix — the LONGEST
+    // deck operation (up to (2*iters+1) compile passes plus LLM repair turns)
+    // — had none, so a user watching a doomed repair loop could only wait or
+    // reload. Aborting the fetch closes the SSE stream, which the server's
+    // consumer-disconnect path already handles: the worker's cancel event is
+    // set, latexmk's process group is TERM->KILLed on its own timeout, and
+    // _SSEOpGuard releases the op lock once the worker exits.
+    _abortCtrl = new AbortController();
+    const cancelBtn = _mkCancelButton($('deck-activity'));
     try {
         // Dead-button fix (improvement plan 2026-07-04, item 1.1). This used to
         // call readSSE('/api/deck/compile-fix', {…}, callback) — but readSSE is
@@ -758,7 +968,8 @@ export async function runCompileFix(deckPath, shaRef, btn) {
                 deck_path: deckPath,
                 base_sha256: shaRef.sha,
                 confirm: true
-            })
+            }),
+            signal: _abortCtrl.signal,
         }, {
             onInfo: (info) => _addActivity(info),
             onOther: (evt) => {
@@ -789,11 +1000,149 @@ export async function runCompileFix(deckPath, shaRef, btn) {
         });
 
     } catch (e) {
-        logError('Compile-fix failed', e);
-        _status('Compile-fix request failed (see console).', true);
+        if (_wasCancelled()) {
+            _status('Compile & auto-fix cancelled.');
+            _addActivity('Cancelled by user.', true);
+        } else {
+            logError('Compile-fix failed', e);
+            _status('Compile-fix request failed (see console).', true);
+        }
     } finally {
         _compileFixing = false;
+        _setDeckBusy(false);
         btn.disabled = false;
+        _abortCtrl = null;
+        if (cancelBtn) cancelBtn.remove();
         taskEnd('deck-compile-fix');
+    }
+}
+
+// The one live preview object URL. Revoked before each new preview so repeated
+// compiles don't leak a blob per click (same discipline as refactor.js's
+// _objectUrls, but a single slot: only one preview frame exists at a time).
+let _previewObjectUrl = null;
+
+/**
+ * Compile the deck as-is and render the resulting PDF inline (axis i preview).
+ * Write-free w.r.t. the .tex — the server runs one latexmk pass (build
+ * artifacts only) and serves <base>.pdf. On a compile failure the log excerpt
+ * is shown instead so the user can see why.
+ *
+ * The PDF bytes are fetched with secureFetch and handed to the <iframe> as a
+ * blob: URL — NEVER as a direct `/api/...` src. Every /api route requires the
+ * X-Requested-With header (app-level origin guard), which an iframe navigation
+ * request cannot send — a direct src would 403. Same constraint and same fix
+ * as refactor.js::_loadThumb; keeping the fetch header-authenticated preserves
+ * the server's origin check instead of weakening the endpoint.
+ */
+export async function runDeckPreview(deckPath, btn, host, statusFn = _status) {
+    // C2/#44 (2026-07-13): statusFn lets the augment card route compile
+    // progress/errors into ITS OWN status banner instead of the generate card's.
+    if (_deckOpBusy()) return;
+    _previewing = true;
+    _setDeckBusy(true);   // C2/#13: block Generate/Augment while a preview runs
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = 'Compiling…';
+    statusFn('Compiling deck for preview…');
+    taskBegin('deck-preview', 'Compiling deck');
+    // Client-side abort (P6.2, 2026-07-30). compile-preview is a SYNCHRONOUS
+    // route, so aborting frees the UI (and this fetch) — it does NOT stop the
+    // server's latexmk pass, which runs out its own min(deck_compile_timeout_s,
+    // 300) cap and then releases the op lock. Honest affordance: the button
+    // says as much, and the preview is write-free w.r.t. the .tex, so an
+    // abandoned pass can only leave regenerable build artifacts.
+    _abortCtrl = new AbortController();
+    const cancelBtn = _mkCancelButton(host);
+    if (cancelBtn) {
+        cancelBtn.title = 'Stop waiting for this preview. The compile already '
+            + 'running on the server finishes on its own (build artifacts only).';
+        // The default aria-label claims a server-side cancel this synchronous
+        // route can't deliver, and title is hover-only — AT users must hear
+        // the same honest scope (2026-08-04 audit).
+        cancelBtn.setAttribute('aria-label', cancelBtn.title);
+    }
+    try {
+        const r = await secureFetch('/api/deck/compile-preview', {
+            method: 'POST',
+            body: JSON.stringify({ deck_path: deckPath }),
+            signal: _abortCtrl.signal,
+        });
+        const d = await safeJson(r);
+        if (!r.ok) {
+            statusFn(d.error || `Preview failed (${r.status})`, true);
+            return;
+        }
+        _clear(host);
+        if (d.success && d.has_pdf) {
+            // Same signal as the compile call: without it, Cancel during the
+            // (potentially large) PDF download was inert — the blob completed
+            // and the iframe rendered anyway (2026-08-04 audit).
+            const pdfResp = await secureFetch(
+                `/api/deck/preview-pdf?deck_path=${encodeURIComponent(deckPath)}`,
+                { signal: _abortCtrl.signal });
+            if (!pdfResp.ok) {
+                const pd = await safeJson(pdfResp);
+                statusFn(pd.error || `PDF fetch failed (${pdfResp.status})`, true);
+                return;
+            }
+            const blob = await pdfResp.blob();
+            if (_previewObjectUrl) URL.revokeObjectURL(_previewObjectUrl);
+            _previewObjectUrl = URL.createObjectURL(blob);
+            statusFn('Preview compiled.', false);
+            const frame = document.createElement('iframe');
+            frame.className = 'deck-preview-frame';
+            frame.title = 'Deck PDF preview';
+            frame.style.width = '100%';
+            frame.style.height = '70vh';
+            frame.style.border = '1px solid var(--border, #ccc)';
+            frame.style.marginTop = '8px';
+            frame.src = _previewObjectUrl;
+            host.appendChild(frame);
+            // Fallback affordance: WKWebView builds that refuse to render a
+            // blob: PDF inline still get a one-click path to the compiled file
+            // (server-side `open`, same validated deck path — no new surface).
+            const openBtn = document.createElement('button');
+            openBtn.className = 'btn btn-outline btn-sm';
+            openBtn.style.marginTop = '4px';
+            openBtn.textContent = 'Open in PDF viewer';
+            openBtn.addEventListener('click', async () => {
+                try {
+                    const or = await secureFetch('/api/deck/open-pdf', {
+                        method: 'POST',
+                        body: JSON.stringify({ deck_path: deckPath }),
+                    });
+                    if (!or.ok) {
+                        const od = await safeJson(or);
+                        statusFn(od.error || `Open failed (${or.status})`, true);
+                    }
+                } catch (e) { logError('Open PDF failed', e); }
+            });
+            host.appendChild(openBtn);
+        } else {
+            statusFn('Compilation failed — see the log below.', true);
+            const pre = document.createElement('pre');
+            pre.className = 'deck-preview-log';
+            pre.style.marginTop = '8px';
+            pre.style.maxHeight = '40vh';
+            pre.style.overflow = 'auto';
+            pre.textContent = d.log_excerpt || 'No log produced.';
+            host.appendChild(pre);
+        }
+    } catch (e) {
+        if (_wasCancelled()) {
+            statusFn('Stopped waiting for the preview (the server compile finishes on its own).');
+        } else {
+            logError('Deck preview failed', e);
+            statusFn('Preview request failed (see console).', true);
+        }
+    } finally {
+        _previewing = false;
+        _setDeckBusy(false);
+        btn.disabled = false;
+        btn.textContent = original;
+        _abortCtrl = null;
+        if (cancelBtn) cancelBtn.remove();
+        taskEnd('deck-preview');
     }
 }

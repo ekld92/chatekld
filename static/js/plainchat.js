@@ -8,9 +8,9 @@
  * does — never imported.
  */
 import { secureFetch, consumeSSE } from './api.js';
-import { sanitiseHtml, copyToClipboard, enhanceCodeBlocks, showTaskError, clearTaskError, makeAnswerRenderer, announceStatus } from './ui.js';
+import { sanitiseHtml, copyToClipboard, enhanceCodeBlocks, showTaskError, clearTaskError, makeAnswerRenderer, announceStatus, announceError, buildConversationExport } from './ui.js';
 
-let history = [];          // {role: 'user'|'assistant', content: string}[]
+let _history = [];          // {role: 'user'|'assistant', content: string}[]
 let _isQuerying = false;
 
 const _MAX_TURNS = 20;     // mirrors the backend cap
@@ -20,7 +20,7 @@ const _MAX_TURNS = 20;     // mirrors the backend cap
 const _CHAT_STALL_FLOOR_S = 300;
 const _CHAT_TIMEOUT_MARGIN_S = 60;
 // Muted text shown when the model returns nothing. Display-only — it is NEVER
-// pushed into `history`, so it cannot be re-sent to the model as a fake
+// pushed into `_history`, so it cannot be re-sent to the model as a fake
 // assistant turn on the next request (the backend deliberately sends no
 // placeholder token for the same reason).
 const _NO_RESPONSE_MSG = '(No response from the model.)';
@@ -76,8 +76,8 @@ function _showError(message, retry) {
 
 /**
  * Send the input as a new user turn and stream the assistant reply. Pushes the
- * user turn into `history` before the request (so it is part of the sent
- * context), sends only `history.slice(-20)`, and consumes the SSE `{info}` /
+ * user turn into `_history` before the request (so it is part of the sent
+ * context), sends only `_history.slice(-20)`, and consumes the SSE `{info}` /
  * `{token}` / `{error}` stream. On success the assistant turn is recorded; on
  * error the un-answered user turn is rolled back so a retry re-sends it exactly
  * once; an empty-but-clean stream shows a muted placeholder that is NOT recorded.
@@ -111,7 +111,7 @@ export async function chatPlain(retryText) {
 
     // Push the user turn before the request so it is part of the sent history;
     // it is rolled back on failure so a retry does not duplicate it.
-    history.push({ role: 'user', content: text });
+    _history.push({ role: 'user', content: text });
 
     const botMsg = document.createElement('div');
     botMsg.className = 'message message-bot';
@@ -134,8 +134,15 @@ export async function chatPlain(retryText) {
     announceStatus('Generating response…');
 
     let fullAnswer = '';
+    // Export provenance (2026-07-22): the server announces the resolved
+    // provider/model ({"meta"}) and, post-stream, the real token/cost figures
+    // ({"usage"}); both are stored on the assistant turn for MD/TXT exports.
+    let turnMeta = null;
+    let turnUsage = null;
     try {
-        const body = { messages: history.slice(-_MAX_TURNS) };
+        // The server reads only role/content; the provenance fields riding on
+        // stored turns are ignored by _validate_messages.
+        const body = { messages: _history.slice(-_MAX_TURNS) };
 
         await consumeSSE('/api/plainchat', {
             method: 'POST',
@@ -145,15 +152,22 @@ export async function chatPlain(retryText) {
             onInfo: (info) => {
                 const note = document.createElement('div');
                 note.className = 'message message-info';
-                note.setAttribute('role', 'status');
                 note.textContent = info;
                 chat.insertBefore(note, botMsg);
                 chat.scrollTop = chat.scrollHeight;
+                // Announced via the STATIC live region — a role minted in the
+                // same tick as the textContent write is unreliable in WebKit
+                // (the liveRegions ratchet class; parity with vault.js onInfo).
+                announceStatus(info);
             },
             onToken: (token) => {
                 if (fullAnswer === '') botMsg.innerHTML = '';
                 fullAnswer += token;
                 answerRenderer.update(fullAnswer);
+            },
+            onOther: (frame) => {
+                if (frame && frame.meta) turnMeta = frame.meta;
+                if (frame && frame.usage) turnUsage = frame.usage;
             },
             onError: (errMsg) => { throw new Error(errMsg); }
         });
@@ -161,7 +175,10 @@ export async function chatPlain(retryText) {
         answerRenderer.flush();
 
         if (fullAnswer) {
-            history.push({ role: 'assistant', content: fullAnswer });
+            const turn = { role: 'assistant', content: fullAnswer };
+            if (turnMeta) turn.meta = turnMeta;
+            if (turnUsage) turn.usage = turnUsage;
+            _history.push(turn);
             _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
             enhanceCodeBlocks(botMsg);
         } else {
@@ -173,16 +190,18 @@ export async function chatPlain(retryText) {
             answerRenderer.flush();
             const note = document.createElement('div');
             note.className = 'muted';
-            note.lang = 'fr';
-            note.textContent = '⚠ Réponse interrompue — le texte ci-dessus est partiel.';
+            note.textContent = '⚠ Response interrupted — the text above is partial.';
             botMsg.appendChild(note);
             _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
         } else {
             answerRenderer.cancel();
             botMsg.remove();
         }
-        if (history.length && history[history.length - 1].role === 'user') history.pop();
-        const msg = e.message === 'AbortError'
+        if (_history.length && _history[_history.length - 1].role === 'user') _history.pop();
+        // 2026-07-20 audit A2: test the DOMException NAME (consumeSSE now
+        // re-throws the abort untouched), not e.message — which was never
+        // 'AbortError' even before, so the friendly branch was dead.
+        const msg = e.name === 'AbortError'
             ? 'Response timed out. The model may be overloaded — please try again.'
             : ('Error: ' + e.message);
         _showError(msg, () => {
@@ -198,15 +217,71 @@ export async function chatPlain(retryText) {
 }
 
 /**
- * Start a fresh conversation: clear the history array and the rendered transcript
+ * Start a fresh conversation: clear the _history array and the rendered transcript
  * (the conversation is ephemeral — nothing is persisted). Refuses mid-stream.
  */
 export function newChat() {
     // Refuse while a query is in flight so the in-progress bot message is not
     // orphaned mid-stream.
-    if (_isQuerying) return;
-    history = [];
+    if (_isQuerying) {
+        // C5/#43 (2026-07-13): announce instead of silently doing nothing
+        // (parity with vault chat's "wait for the current response" hint).
+        announceStatus('Wait for the current response before starting a new chat.');
+        return;
+    }
+    _history = [];
     const chat = document.getElementById('plainchat-history');
     if (chat) chat.innerHTML = '';
     clearTaskError(document.getElementById('plainchat-error-boundary'));
+}
+
+/**
+ * Export the current plain-chat conversation to Downloads as md or txt
+ * (axis iv). The browser-owned ``_history`` array is already a full transcript;
+ * this serialises it and reuses the /api/export-summary writer.
+ */
+export async function exportPlainConversation(format, btn) {
+    // C5/#17 (2026-07-13): flash the outcome ON the clicked button so a sighted
+    // user sees success/failure — the SR-only announcements alone were invisible.
+    const flash = (label) => {
+        if (!btn) return;
+        const orig = btn.dataset.origLabel || btn.textContent;
+        btn.dataset.origLabel = orig;
+        btn.textContent = label;
+        setTimeout(() => { btn.textContent = btn.dataset.origLabel || orig; }, 2500);
+    };
+    if (!_history.length) {
+        announceStatus('No conversation to export yet.');
+        flash('Nothing to export');
+        return;
+    }
+    // Header: export date + the last answered turn's provider/model (the
+    // conversation may span a provider switch; per-turn lines carry the rest).
+    const lastMeta = [..._history].reverse().find((t) => t.meta)?.meta || null;
+    const header = { 'Exported': new Date().toISOString() };
+    if (lastMeta) header['Model'] = [lastMeta.provider, lastMeta.model].filter(Boolean).join(' / ');
+    const { format: fmt, content } = buildConversationExport(
+        _history, format, 'Plain Chat Conversation', { header });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    try {
+        // raw: true — see vault.js's exporter: no Summary_ prefix, no second
+        // injected heading; the transcript already carries its own title.
+        const r = await secureFetch('/api/export-summary', {
+            method: 'POST',
+            body: JSON.stringify({ format: fmt, filename: `PlainChat_${stamp}`, content, raw: true }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok) {
+            announceStatus(`Exported to ${d.path || 'Downloads'}`);
+            flash('Exported ✓');
+        } else {
+            // Failures go through the assertive error region, not the polite
+            // status one — parity with the rest of the app's error surfacing.
+            announceError(d.error || `Export failed (${r.status})`);
+            flash('Export failed');
+        }
+    } catch (err) {
+        announceError(String(err));
+        flash('Export failed');
+    }
 }

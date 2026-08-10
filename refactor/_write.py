@@ -68,6 +68,11 @@ def journalled_write_note(
         write_text_atomic(str(note_path), proposed_text)
     except OSError as exc:
         op["state"] = "failed"
+        # B10/#35 (2026-07-13): log the failure counterpart, mirroring
+        # create_note's ``create_note_failed`` — the intent-first log line above
+        # asserts a write that never reached disk, so record that it failed. The
+        # human-readable trail is the recovery record when the manifest is lost.
+        journal.log_vault_write(f"{category}_failed", rel, type(exc).__name__)
         if post_write_persist_on_failure or pre_write_persist:
             journal.save(vault_root, cfg, manifest)
         return op_id, "failed", f"write failed ({type(exc).__name__})"

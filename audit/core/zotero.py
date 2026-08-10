@@ -109,6 +109,12 @@ class ZoteroItem:
     tags: list[str] = field(default_factory=list)  # parent-item tags
     attachments: list[ZoteroAttachment] = field(default_factory=list)
     child_notes: list[ZoteroChildNote] = field(default_factory=list)
+    # Local-API routing (Tagging write path): which library the item lives in.
+    # ``library_type`` is ``"user"`` or ``"group"``; ``group_id`` is set only for
+    # group libraries. Read-only metadata — the audit itself never writes Zotero.
+    library_id: int | None = None
+    library_type: str | None = None
+    group_id: int | None = None
 
 
 # Ceiling for the copy-based snapshot (sqlite + -wal + -shm combined). A
@@ -229,12 +235,27 @@ def read_items(sqlite_path: Path, storage_root: Path) -> list[ZoteroItem]:
         items_rows = conn.execute(
             """
             SELECT items.itemID AS id, items.key AS key, itemTypes.typeName AS type,
-                   items.dateModified AS dt
+                   items.dateModified AS dt, items.libraryID AS library_id
             FROM items
             JOIN itemTypes ON itemTypes.itemTypeID = items.itemTypeID
             WHERE items.itemID NOT IN (SELECT itemID FROM deletedItems)
             """
         ).fetchall()
+
+        # Library routing for the Tagging local-API writer: map each libraryID to
+        # its type ('user'/'group') and, for groups, the groupID the local API
+        # addresses (``groups/<groupID>``). Best-effort — a missing table (older
+        # schema) just leaves the routing fields None and the writer treats the
+        # item as the personal library.
+        lib_index: dict[int, dict] = {}
+        try:
+            for r in conn.execute("SELECT libraryID, type FROM libraries").fetchall():
+                lib_index[r["libraryID"]] = {"type": r["type"], "group_id": None}
+            for r in conn.execute("SELECT libraryID, groupID FROM groups").fetchall():
+                entry = lib_index.setdefault(r["libraryID"], {"type": "group", "group_id": None})
+                entry["group_id"] = r["groupID"]
+        except sqlite3.Error:
+            lib_index = {}
 
         title_rows = conn.execute(
             """
@@ -290,11 +311,16 @@ def read_items(sqlite_path: Path, storage_root: Path) -> list[ZoteroItem]:
             # Only build "parent" ZoteroItems for non-note, non-attachment types.
             # Standalone notes/attachments at top level get their own entries below.
             if r["type"] not in ("note", "attachment"):
+                lib_id = r["library_id"]
+                lib = lib_index.get(lib_id, {})
                 items_by_id[r["id"]] = ZoteroItem(
                     item_key=r["key"],
                     item_type=r["type"],
                     title=titles.get(r["id"]),
                     tags=tags_by_item.get(r["id"], []),
+                    library_id=lib_id,
+                    library_type=lib.get("type"),
+                    group_id=lib.get("group_id"),
                 )
 
         id_to_key = {r["id"]: r["key"] for r in items_rows}

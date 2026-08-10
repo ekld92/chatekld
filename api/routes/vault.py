@@ -9,7 +9,7 @@ reuses the same stall model). The shape, repeated in every SSE route:
 * A **daemon worker** (``_run_chat`` for single-shot RAG, ``_run_agent`` for the
   ReAct loop) runs the slow generation off the request thread and ``_put``s
   ``{token}`` / ``{info}`` / ``{error}`` / agent-trace dicts onto a **bounded**
-  ``queue.Queue`` (``maxsize=512`` → back-pressure) plus a ``_DONE`` sentinel in
+  ``queue.Queue`` (``maxsize=1024`` in api/sse.py → back-pressure) plus a ``_DONE`` sentinel in
   its ``finally``.
 * The **consumer** (the ``generate`` generator) ``get``s with a stall timeout and
   re-emits each item as an SSE ``data:`` frame, ending with ``[DONE]``.
@@ -23,13 +23,14 @@ Indexing is guarded separately by the manager's ``RagOperationLock`` (TTL 3600 s
 thread. ``_resolve_chat_params`` resolves every live retrieval/generation knob
 body→config→default so a Settings change applies on the next Send with no reload.
 """
+import logging
 import threading
 import time
 import os
 from pathlib import Path
 from flask import Blueprint, jsonify, request
 from api.security import sanitise_error_msg
-from api.sse import run_sse_worker
+from api.sse import online_aware_floor_s, run_sse_worker
 from core.config import load_config
 from core.constants import (
     DEFAULT_EMBED,
@@ -38,7 +39,6 @@ from core.constants import (
     # aliased to the historical private names so the usage + comments below are
     # undisturbed). The full rationale lives at the definition site.
     SSE_STALL_MARGIN_S as _STALL_MARGIN_S,
-    SSE_SINGLE_SHOT_FLOOR_S as _SINGLE_SHOT_FLOOR_S,
 )
 from api.validators import (
     MISSING,
@@ -313,6 +313,7 @@ def _resolve_chat_params(data: dict, cfg: dict) -> dict:
     return out
 
 vault_bp = Blueprint('vault', __name__)
+logger = logging.getLogger("chatekld")
 
 @vault_bp.route("/api/obsidian/status")
 def api_obsidian_status():
@@ -360,10 +361,19 @@ def api_obsidian_index():
     op_epoch = obsidian_manager.try_acquire_lock(ttl=3600)
     if not op_epoch:
         return jsonify({"error": "An indexing operation is already in progress"}), 503
+    # Explicit rebuild opt-in (2026-07-29 audit 0.1). The manager-level
+    # `force_fresh` hook existed but no route exposed it, so the embed-backend
+    # gate's refusal had no in-app "yes, rebuild" — the error boundary's only
+    # affordance was a Retry that re-failed identically. The client sends this
+    # ONLY from the confirm-gated "Rebuild from scratch" action; coerce_bool
+    # (never a raw truthiness test) so a garbage body value cannot trigger an
+    # hours-long re-embed.
+    force_fresh = coerce_bool(data.get("force_fresh")) or False
     def run_index():
         try:
             obsidian_manager.index_vault(
-                llm, embed, provider_name=provider, op_epoch=op_epoch
+                llm, embed, provider_name=provider, op_epoch=op_epoch,
+                force_fresh=force_fresh,
             )
         finally:
             obsidian_manager.release_lock(op_epoch)
@@ -387,6 +397,15 @@ def api_obsidian_chat():
     if not data or "message" not in data:
         return jsonify({"error": "Missing message"}), 400
     message = data["message"]
+    # Type + length gate (2026-07-22 audit M8): this was the one uncoerced
+    # field in the module — a non-string only failed deep inside the worker
+    # (SSE error frame instead of a 400), and an arbitrarily large string rode
+    # into the query embed under _index_mutation_lock, whose timing budget
+    # assumes a query-sized input. Cap mirrors plain chat's per-message bound.
+    if not isinstance(message, str) or not message.strip():
+        return jsonify({"error": "message must be a non-empty string"}), 400
+    if len(message) > 24000:
+        return jsonify({"error": "message too long (max 24000 characters)"}), 400
     cfg = load_config()
     from core.config import resolve_chat_model
     provider = data.get("provider") or cfg.get("provider", "ollama")
@@ -406,7 +425,9 @@ def api_obsidian_chat():
     # Consumer stall guard floored so lowering the agent cap can't starve the
     # single-shot path (see _SINGLE_SHOT_FLOOR_S). The agent deadline stays the
     # exact user cap; only this backstop is floored.
-    consumer_timeout_s = max(wall_clock_s, _SINGLE_SHOT_FLOOR_S) + _STALL_MARGIN_S
+    # The floor itself is widened to online_timeout_s (timeout-chain repair,
+    # 2026-07-22 audit M2 — see api.sse.online_aware_floor_s).
+    consumer_timeout_s = max(wall_clock_s, online_aware_floor_s(cfg)) + _STALL_MARGIN_S
 
     def _vault_worker(put, cancel):
         found_any = False
@@ -419,6 +440,15 @@ def api_obsidian_chat():
                 if item.get("error"):
                     errored = True
             put(item)
+
+        # Export provenance (2026-07-22): confirm the resolved provider/model
+        # server-side (the client sends its own selections, but body-absent
+        # fields resolve from config here) so exports stamp what actually ran.
+        _put({"meta": {
+            "provider": provider,
+            "model": llm,
+            "agent_enabled": agent_enabled,
+        }})
             
         def _stage(text: str) -> None:
             if text:
@@ -480,7 +510,39 @@ def api_obsidian_chat():
                     reranker_model=chat_params.get("reranker_model", ""),
                     deadline_monotonic_s=deadline,
                 )
-                tools = ToolRegistry(build_vault_tools(obsidian_manager, ctx))
+                specs = build_vault_tools(obsidian_manager, ctx)
+                # Optional web_search tool (2026-07-22, Batch C): body override
+                # → config knob; registered only when the triple gate passes
+                # (knob on + ONLINE provider + TAVILY_API_KEY set). A knob-on
+                # but unavailable state surfaces as an info notice so the user
+                # learns WHY the agent isn't searching the web.
+                from core.agent.web_tools import (
+                    WebToolContext, build_web_tools, web_search_available,
+                )
+                web_enabled = coerce_bool(data.get("web_search_enabled"))
+                if web_enabled is None:
+                    web_enabled = bool(cfg.get("vault_web_search_enabled", False))
+                if web_enabled:
+                    # enabled_override: the gate must honour THIS request's
+                    # resolved body→config value, not re-read the config knob
+                    # (a body true sent before the debounced Settings save
+                    # landed was silently ignored — 2026-07-23 audit).
+                    ok, why = web_search_available(
+                        cfg, provider, enabled_override=True)
+                    if ok:
+                        web_ctx = WebToolContext(
+                            max_results=coerce_int_in_range(
+                                cfg.get("vault_web_search_max_results"), 1, 8) or 5,
+                            deadline_monotonic_s=deadline,
+                        )
+                        specs = specs + build_web_tools(web_ctx)
+                    elif why == "no_key":
+                        _stage("Web search is enabled but TAVILY_API_KEY is "
+                               "not set — continuing without it.")
+                    elif why == "local_provider":
+                        _stage("Web search is only available with an online "
+                               "chat provider — continuing without it.")
+                tools = ToolRegistry(specs)
 
                 def _rag_fallback():
                     fallback_params = {
@@ -523,15 +585,42 @@ def api_obsidian_chat():
                 )
                 if not cancel.is_set() and budget.iteration_count > 0:
                     _put({"info": _format_agent_usage(budget)})
+                    # Structured twin of the info footer, for export stamping
+                    # (the info line is display-only and discarded by the UI).
+                    usage_payload = budget.as_dict()
+                    usage_payload["cost_usd"] = round(
+                        usage_payload.pop("estimated_cost_usd", 0.0) or 0.0, 6
+                    )
+                    _put({"usage": usage_payload})
             except Exception as exc:
                 if not cancel.is_set():
                     _put({"error": sanitise_error_msg(exc)})
 
+        from datetime import datetime, timezone
+
+        from core.llm.usage import usage_frame_payload, usage_tracker
+        start_iso = datetime.now(timezone.utc).isoformat()
         try:
             if agent_enabled:
                 _run_agent()
             else:
                 _run_chat()
+                if not cancel.is_set() and not errored:
+                    # Best-effort real token/cost figures for the single-shot
+                    # answer (the agent path emits its own budget-based frame).
+                    # Filtered by (provider, model) — the single-shot request
+                    # carries no workflow tag on the online path. Never fails
+                    # the stream.
+                    try:
+                        payload = usage_frame_payload(
+                            usage_tracker.records_since(
+                                start_iso, provider=provider, model=llm
+                            )
+                        )
+                        if payload:
+                            _put({"usage": payload})
+                    except Exception:
+                        logger.debug("vault usage frame failed", exc_info=True)
         except Exception:
             errored = True
             raise
@@ -542,6 +631,10 @@ def api_obsidian_chat():
 
     preflight_msgs = []
     index_state = obsidian_manager.get_status()
+    # COUPLING (2026-07-22 comment repair): this tuple mirrors the manager's
+    # in-flight status vocabulary (rag/vault.py _index_state values). A new
+    # indexer state that is not added here silently loses the "indexing in
+    # progress" preflight warning for chats started during it.
     if index_state in ("running", "scanning", "embedding", "paused", "paused_scan", "paused_partial"):
         preflight_msgs.append(
             "Indexing is still in progress — answers may miss "

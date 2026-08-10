@@ -22,6 +22,25 @@ def test_job_key_is_stable_and_input_sensitive():
     assert _key(max_sections=5) != _key()
     assert _key(citations_enabled=True) != _key()
     assert _key(out_dir="/elsewhere") != _key()
+    # 2026-07-20 audit L1: image policy is content-determining.
+    assert _key(images_enabled=True) != _key()
+
+
+def test_job_key_length_prefixing_prevents_field_boundary_collision():
+    # 2026-07-20 audit L1: the old \x00 separator let a NUL inside a field
+    # forge a boundary — ("a\x00","b") and ("a","\x00b") hashed identically.
+    # Length-prefixing makes distinct field splits distinct keys.
+    a = checkpoint.compute_job_key(
+        topic="a\x00", instructions="b", template_tex="", provider="p",
+        model="m", max_sections=1, audience="", citations_enabled=False,
+        slug="s", out_dir="/o",
+    )
+    b = checkpoint.compute_job_key(
+        topic="a", instructions="\x00b", template_tex="", provider="p",
+        model="m", max_sections=1, audience="", citations_enabled=False,
+        slug="s", out_dir="/o",
+    )
+    assert a != b
 
 
 def test_manifest_roundtrip(tmp_path):

@@ -174,6 +174,14 @@ class LMStudioProvider(Provider):
         timeout = local_request_timeout()
         if timeout is not None and "timeout" not in kwargs:
             kwargs["timeout"] = timeout
+        # B1 (2026-07-13): force max_retries=0 so one wedged call is bounded by
+        # exactly one `timeout`, matching get_lmstudio_client / get_embedding.
+        # LlamaIndex's OpenAI LLM defaults to max_retries=3 — both the SDK's own
+        # internal retries AND a tenacity wrapper — so on the vault-chat
+        # single-shot RAG path (rag/engine.py builds this LLM) a stuck backend
+        # could burn ~4× the timeout and blow past the SSE consumer stall window.
+        # Never override an explicit caller kwarg (same posture as `timeout`).
+        kwargs.setdefault("max_retries", 0)
         # Raw model string from config is used directly
         llm = _LMStudioOpenAI(
             model=model_name,

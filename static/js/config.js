@@ -37,6 +37,9 @@ const _ONLINE_MODEL_KEYS = {
     openai: 'openai_model',
     anthropic: 'anthropic_model',
     google: 'google_model',
+    deepseek: 'deepseek_model',
+    zai: 'zai_model',
+    openrouter: 'openrouter_model',
 };
 
 /**
@@ -124,8 +127,18 @@ export async function onProviderChange() {
             if (pullBtn) pullBtn.style.display = newProvider === 'ollama' ? '' : 'none';
             window.dispatchEvent(new CustomEvent('providerChanged', { detail: { provider: newProvider } }));
             await loadModels();
+        } else {
+            // C1/#12 (2026-07-13): the save failed — roll the select back to the
+            // still-active provider so the UI can't claim a provider the server
+            // never accepted, and tell the user.
+            providerSelect.value = _activeProvider;
+            announceError('Could not switch provider — the previous one is still active.');
         }
     } catch (e) {
+        if (gen === _providerSwitchGen) {
+            providerSelect.value = _activeProvider;
+            announceError('Could not switch provider (see console).');
+        }
         console.error('Provider change failed:', e);
     }
 }
@@ -286,6 +299,15 @@ async function _populateEmbeddingsFromLocal(embedSelect) {
         });
     } catch (e) {
         console.error('Failed to load local embedding models:', e);
+        // E6 (2026-07-22 audit): a silent catch left the select EMPTY —
+        // indistinguishable from "no models installed", which the health
+        // system treats as first-run guidance. Name the actual problem.
+        embedSelect.innerHTML = '';
+        const opt = document.createElement('option');
+        opt.textContent = 'Model list unavailable — is the provider running?';
+        opt.disabled = true;
+        embedSelect.appendChild(opt);
+        embedSelect.disabled = true;
     }
 }
 
@@ -326,10 +348,18 @@ async function loadVisionModelSelect(kind) {
     }
 
     providerSelect.onchange = async () => {
-        if (kind === 'ocr') _configOcrProvider = providerSelect.value;
-        else _configVisionProvider = providerSelect.value;
-        await loadVisionModelSelect(kind);
-        await saveVisionModels();
+        // C1/#46 (2026-07-13): wrap the chained fetches so a transient failure
+        // surfaces instead of becoming an unhandled rejection with the provider
+        // select and the model list left silently desynced.
+        try {
+            if (kind === 'ocr') _configOcrProvider = providerSelect.value;
+            else _configVisionProvider = providerSelect.value;
+            await loadVisionModelSelect(kind);
+            await saveVisionModels();
+        } catch (e) {
+            console.error('Vision/OCR provider change failed:', e);
+            announceError('Could not update the ' + kind.toUpperCase() + ' provider (see console).');
+        }
     };
     modelSelect.onchange = saveVisionModels;
 }
@@ -424,12 +454,24 @@ export async function saveVisionModels() {
  * driving a determinate progress bar from the `completed`/`total` byte counts,
  * then reloads the model list so the new model is selectable.
  */
+// C5/#45 (2026-07-13): the pull's client abort controller. Ollama offers no
+// server-side cancel through our proxy, so aborting only stops the client from
+// watching — the label says so honestly.
+let _pullAbortController = null;
+
+export function cancelPull() {
+    if (_pullAbortController) { try { _pullAbortController.abort(); } catch (_) {} }
+}
+
 export async function pullModel() {
     const model = document.getElementById('pull-model-input').value.trim();
     if (!model) return;
-    
+
     const btn = document.getElementById('pull-btn');
     btn.disabled = true;
+    const cancelBtn = document.getElementById('pull-cancel-btn');
+    _pullAbortController = new AbortController();
+    if (cancelBtn) { cancelBtn.style.display = ''; cancelBtn.disabled = false; }
     const statusEl = document.getElementById('pull-status');
     const progressFill = document.getElementById('pull-progress-fill');
     const progressWrap = document.getElementById('pull-progress-wrap');
@@ -444,7 +486,8 @@ export async function pullModel() {
     try {
         await consumeSSE('/api/pull', {
             method: 'POST',
-            body: JSON.stringify({model})
+            body: JSON.stringify({model}),
+            signal: _pullAbortController.signal
         }, {
             onInfo: () => {},
             onToken: () => {},
@@ -466,10 +509,19 @@ export async function pullModel() {
         announceStatus('Model download complete.');
         await loadModels();
     } catch (e) {
-        statusEl.textContent = 'Error: ' + e.message;
-        announceError('Model download failed: ' + e.message);
+        if (e.name === 'AbortError') {
+            // C5/#45: the client stopped watching; the server may still finish
+            // the pull in the background (no Ollama cancel through our proxy).
+            statusEl.textContent = 'Stopped watching — the download may continue in the background.';
+            announceStatus('Stopped watching the model download.');
+        } else {
+            statusEl.textContent = 'Error: ' + e.message;
+            announceError('Model download failed: ' + e.message);
+        }
     } finally {
         btn.disabled = false;
+        _pullAbortController = null;
+        if (cancelBtn) { cancelBtn.style.display = 'none'; }
         taskEnd('pull-model');
         // Hide the bar so a stale full/partial fill isn't shown next open.
         if (progressWrap) progressWrap.style.display = 'none';

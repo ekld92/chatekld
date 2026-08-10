@@ -31,7 +31,7 @@ from core.llm.types import (
     LLMResponse,
     LLMUsage,
 )
-from core.llm.usage import usage_tracker
+from core.llm.usage import CANCELLED_ERROR_CATEGORY, usage_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -168,8 +168,11 @@ class AnthropicProvider(LLMProvider):
     * **Temperature is clamped to ≤ 1.0** — Anthropic rejects the (1.0, 2.0]
       range the app's vault-chat knob permits (see :meth:`_build_payload`).
     * Tools use ``input_schema`` (not ``parameters``) and ``tool_choice`` is an
-      object union with no ``"none"`` variant — "none" is honoured by omitting
-      the tools payload entirely.
+      object union. ``"none"`` maps to ``{"type": "none"}`` **with the tools
+      kept in the payload** — once the history holds ``tool_use`` blocks (the
+      agent loop's forced final turn), OMITTING tools 400s. (The old "omit the
+      tools payload" note described a workaround ``_build_payload`` no longer
+      uses — see its inline comment; 2026-07-20 audit B13.)
     * The streaming response is a typed SSE event stream (``message_start`` /
       ``content_block_delta`` / ``message_delta``), parsed line-by-line in
       :meth:`stream`, with usage split across ``message_start`` (input) and
@@ -318,9 +321,13 @@ class AnthropicProvider(LLMProvider):
 
         Encodes the Anthropic-specific contract: ``max_tokens`` is mandatory
         (defaulted), the system prompt is a top-level field, ``temperature`` is
-        clamped to ≤ 1.0, and tools use ``input_schema`` with an object-shaped
-        ``tool_choice`` (``"none"`` is realised by omitting the tools entirely,
-        since the union has no none variant).
+        clamped to ≤ 1.0 (and dropped entirely for the newest families), and
+        tools use ``input_schema`` with an object-shaped ``tool_choice``.
+        ``tool_choice="none"`` is realised as ``{"type": "none"}`` with the
+        tools KEPT in the payload — once the history holds tool_use/tool_result
+        blocks (the agent loop's forced final turn) Anthropic 400s if the tools
+        param is absent, so the old "omit tools entirely" workaround was wrong
+        (see the inline comment on the tools branch below).
         """
         max_tokens = request.max_tokens if request.max_tokens is not None else 4096
         payload: dict = {
@@ -470,6 +477,7 @@ class AnthropicProvider(LLMProvider):
             usage_tracker.record(
                 provider=self.name,
                 model=request.model,
+                workflow=request.workflow,
                 usage=usage,
                 latency_ms=latency_ms,
                 stream=False,
@@ -489,6 +497,9 @@ class AnthropicProvider(LLMProvider):
         return retry_with_backoff(
             _do_call, max_attempts=self.max_retries,
             deadline_monotonic_s=deadline,
+            # Interruptible backoff (2026-07-22 audit B8): the agent loop puts
+            # its cancel probe in request.metadata; absent for other callers.
+            should_cancel=(request.metadata or {}).get("should_cancel"),
         )
 
     def stream(self, request: LLMRequest) -> StreamingResponse:
@@ -521,6 +532,7 @@ class AnthropicProvider(LLMProvider):
             creation_in = 0
             finish_reason = FinishReason.STOP
             stream_error: LLMError | None = None
+            cancelled = False
             try:
                 # nullcontext wraps the CACHED client so the streaming block's
                 # structure/indentation is unchanged, but the shared client is NOT
@@ -590,11 +602,29 @@ class AnthropicProvider(LLMProvider):
                                 elif ev_type == "message_delta":
                                     delta_usage = data.get("usage") or {}
                                     if delta_usage:
-                                        usage_out = int(delta_usage.get("output_tokens", 0) or usage_out)
+                                        usage_out = int(delta_usage.get("output_tokens", 0) or usage_out)  # or-latch: a later 0/absent count must NOT clobber the running total (reads like a typo; it isn't)
                                     stop_reason = (data.get("delta") or {}).get("stop_reason")
                                     if stop_reason:
                                         finish_reason = _STOP_REASON_MAP.get(stop_reason, FinishReason.STOP)
+                                elif ev_type == "error":
+                                    # Anthropic can emit an in-stream error event
+                                    # (e.g. overloaded_error) and then close the
+                                    # connection normally. Ignoring it turned a
+                                    # provider failure into silent truncation
+                                    # recorded as a clean success — raise so the
+                                    # route emits a structured SSE error and the
+                                    # finally records the failure.
+                                    raise _stream_error_event_to_llm_error(
+                                        data, self.name, request.model,
+                                    )
                         break  # normal completion — the while exists only for the heal retry
+            except GeneratorExit:
+                # Consumer abandoned the stream (client disconnect) — marked,
+                # not failed. See CANCELLED_ERROR_CATEGORY. Anthropic reports
+                # input tokens on message_start and output on message_delta, so
+                # the counts gathered so far are the provider's own.
+                cancelled = True
+                raise
             except LLMError as exc:
                 stream_error = exc
                 raise
@@ -624,14 +654,65 @@ class AnthropicProvider(LLMProvider):
                 usage_tracker.record(
                     provider=self.name,
                     model=request.model,
+                    workflow=request.workflow,
                     usage=final.usage,
                     latency_ms=final.latency_ms,
                     stream=True,
                     success=stream_error is None,
-                    error_category=stream_error.category.value if stream_error else "",
+                    error_category=(
+                        stream_error.category.value if stream_error
+                        else CANCELLED_ERROR_CATEGORY if cancelled
+                        else ""
+                    ),
                 )
 
         return StreamingResponse(response_gen=_iter(), final=final)
+
+
+# Anthropic SSE `error` event types → normalised categories. Mirrors the
+# status-code mapping in _http_error_to_llm_error, but in-stream errors carry
+# no HTTP status — only the error.type discriminator (docs: overloaded_error
+# is the 529 equivalent, api_error the 500 equivalent).
+_STREAM_ERROR_TYPE_MAP = {
+    "invalid_request_error": ErrorCategory.INVALID_REQUEST,
+    "request_too_large": ErrorCategory.INVALID_REQUEST,
+    "authentication_error": ErrorCategory.AUTH,
+    "permission_error": ErrorCategory.AUTH,
+    "not_found_error": ErrorCategory.NOT_FOUND,
+    "rate_limit_error": ErrorCategory.RATE_LIMIT,
+    "timeout_error": ErrorCategory.TIMEOUT,
+    "api_error": ErrorCategory.SERVER_ERROR,
+    "overloaded_error": ErrorCategory.SERVER_ERROR,
+}
+
+
+def _stream_error_event_to_llm_error(data: dict, provider: str, model: str) -> LLMError:
+    """Map an in-stream ``{"type": "error"}`` SSE event onto an :class:`LLMError`.
+
+    Same quota re-mapping and Retry-After capture as the HTTP-status path, so
+    the retry/fallback layers treat both shapes identically.
+    """
+    err = data.get("error") or {}
+    err_type = str(err.get("type") or "")
+    message = str(err.get("message") or "") or f"anthropic stream error: {err_type or 'unknown'}"
+    category = _STREAM_ERROR_TYPE_MAP.get(err_type, ErrorCategory.SERVER_ERROR)
+    if category in (ErrorCategory.RATE_LIMIT, ErrorCategory.INVALID_REQUEST) and looks_like_quota(message):
+        category = ErrorCategory.QUOTA
+    retry_after = None
+    if category == ErrorCategory.RATE_LIMIT:
+        retry_after = parse_retry_after_s(message, None)
+    return LLMError(
+        category=category,
+        message=message,
+        provider=provider,
+        model=model,
+        retryable=category in {
+            ErrorCategory.TIMEOUT,
+            ErrorCategory.RATE_LIMIT,
+            ErrorCategory.SERVER_ERROR,
+        },
+        retry_after_s=retry_after,
+    )
 
 
 def _http_error_to_llm_error(

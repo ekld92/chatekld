@@ -48,12 +48,24 @@ def compute_job_key(
     citations_enabled: bool,
     slug: str,
     out_dir: str,
+    images_enabled: bool = False,
 ) -> str:
     """Stable hex digest naming this generation's checkpoint file.
 
     Any change to a content-determining input yields a different key (so a new
     request never resumes a stale checkpoint); the file *is* the guard, so no
     separate inputs-hash is stored.
+
+    ``images_enabled`` (derived from ``cfg["vault_image_exts"]``) shapes the
+    section system prompt's ``\\includegraphics`` policy, so it IS
+    content-determining — omitting it (pre-2026-07-20) let a run resume
+    sections generated under the opposite image policy. It defaults False so a
+    caller that doesn't pass it is unaffected.
+
+    Fields are LENGTH-PREFIXED, not `\\x00`-separated: a field can itself
+    contain a NUL (JSON ``\\u0000`` survives coercion), so the old separator
+    let ``("a\\x00","b")`` and ``("a","\\x00b")`` collide onto one key. The
+    explicit byte length before each field makes the boundary unforgeable.
     """
     h = hashlib.sha256()
     for part in (
@@ -68,9 +80,13 @@ def compute_job_key(
         "1" if citations_enabled else "0",
         slug or "",
         out_dir or "",
+        "1" if images_enabled else "0",
     ):
-        h.update(part.encode("utf-8", "replace"))
-        h.update(b"\x00")  # length-prefix-free field separator
+        data = part.encode("utf-8", "replace")
+        # Length prefix (decimal + NUL delimiter): the length is derived from
+        # the field itself, so no field content can forge a boundary.
+        h.update(f"{len(data)}\x00".encode("ascii"))
+        h.update(data)
     return h.hexdigest()
 
 

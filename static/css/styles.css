@@ -1,7 +1,10 @@
 :root {
-    /* ── Geometry (theme-independent) ── */
-    --radius:    8px;
-    --radius-sm: 7px;
+    /* ── Geometry (theme-independent) ──
+       "Card Catalog" (2026-07-20): flat institutional look — radius is
+       reserved for small controls (buttons, chips); cards/panels square off
+       via their own border-radius:0 rules below. */
+    --radius:    4px;
+    --radius-sm: 3px;
 
     /* ── Motion (theme-independent) ── */
     --ease:          cubic-bezier(0.22, 0, 0.08, 1);
@@ -20,41 +23,43 @@
    a literal sweep. ────────────────────────────────────────────────────────── */
 :root,
 [data-theme="dark"] {
-    /* Surfaces */
-    --bg-app:      #101114;
-    --bg-sidebar:  #18191d;
-    --bg-card:     #202126;
-    --bg-elevated: #2a2b31;
-    --card-bg:     #17181c;   /* opaque card / input-bar / upload-overlay */
-    --input-bg:    #25262b;
-    --header-bg:   rgba(14,14,16,0.88);
-    --tab-active-bg: #33343a;
+    /* Surfaces — Card Catalog (2026-07-20): true-neutral grays (the old set
+       carried a blue cast), flat panels separated by hairlines, not shadows. */
+    --bg-app:      #131313;
+    --bg-sidebar:  #1a1a1a;
+    --bg-card:     #1e1e1e;
+    --bg-elevated: #262626;
+    --card-bg:     #171717;   /* opaque card / input-bar / upload-overlay */
+    --input-bg:    #202020;
+    --header-bg:   rgba(19,19,19,0.90);
+    --tab-active-bg: #2a2a2a;
 
     /* Surface overlays (hover / subtle fills) — alpha-on-light in light mode */
     --surface-subtle:       rgba(255,255,255,0.03);
     --surface-hover:        rgba(255,255,255,0.05);
     --surface-hover-strong: rgba(255,255,255,0.08);
-    --scrollbar-thumb:       rgba(255,255,255,0.11);
-    --scrollbar-thumb-hover: rgba(255,255,255,0.20);
+    --scrollbar-thumb:       rgba(255,255,255,0.24);
+    --scrollbar-thumb-hover: rgba(255,255,255,0.38);
     --overlay-scrim:         rgba(0,0,0,0.55);
 
-    /* Accent (Track 6a, 2026-07-04 — values validated by the contrast lint,
-       tests/js/contrastTokens.test.js). #6f63ff put white button text at
-       4.28:1 (< AA 4.5); #675aff clears it while keeping >=3:1 as a border/
-       outline on every dark surface. --accent-hover is the TEXT-grade accent
-       (links/badges on dark + tinted fills — #8278ff sat at 3.62:1 on the
-       glow tint); the button hover BACKGROUND is the separate
-       --accent-hover-bg, because one value cannot be both light enough to
-       read as text on dark and dark enough to carry white text. */
-    --accent:        #675aff;
-    --accent-hover:  #a29aff;
-    --accent-hover-bg: #5b4de8;
-    --accent-glow:   rgba(111,99,255,0.22);
+    /* Accent — Card Catalog (2026-07-20): institutional blue replaces the
+       purple. Values validated by the contrast lint
+       (tests/js/contrastTokens.test.js): #3273cf carries white button text at
+       4.68:1 and stays >=3:1 as a border/outline on every dark surface
+       (elevated #262626 is the tightest at 3.23:1). --accent-hover stays the
+       TEXT-grade accent (light blue, 6.2:1 on card); the button hover
+       BACKGROUND is the separate --accent-hover-bg (darkens, like light
+       mode), because one value cannot be both light enough to read as text
+       on dark and dark enough to carry white text. */
+    --accent:        #3273cf;
+    --accent-hover:  #6fa0e6;
+    --accent-hover-bg: #2a62b8;
+    --accent-glow:   rgba(88,140,220,0.20);
     --on-accent:     #fff;
-    --user-msg-from: #675aff;
-    --user-msg-to:   #6b53e8;
-    --accent-soft-bg: rgba(124,99,255,0.12);
-    --accent-soft-fg: #a29aff;
+    --user-msg-from: #3273cf;
+    --user-msg-to:   #3273cf;
+    --accent-soft-bg: rgba(111,160,230,0.14);
+    --accent-soft-fg: #6fa0e6;
 
     /* Status — semantic bg/border/fg trios (invert per theme) */
     --danger:        #ff453a;
@@ -79,52 +84,64 @@
     --status-warn:          #ffd60a;
     --status-error:         #ff453a;
 
-    /* Typography */
-    --text-primary:   #eeeef3;
-    --text-secondary: #aeaeb2;
-    --text-tertiary:  #8a8a91;
+    /* Card Catalog category colors — grounded in each tagging target's real
+       identity (Zotero red, Finder blue, vault-note gold), used by the N/F/Z
+       legend badges and the audit report-group dots. --on-cat is the letter
+       color on the badge fill (dark text on light fills in dark mode). */
+    --cat-note:   #d9a441;
+    --cat-finder: #6fa0e6;
+    --cat-zotero: #e5626a;
+    --on-cat:     #131313;
 
-    /* Borders */
-    --border:        rgba(255,255,255,0.10);
-    --border-strong: rgba(255,255,255,0.16);
+    /* Typography (true-neutral tiers; secondary >=4.5:1 on every input/card
+       surface, tertiary >=4.5:1 on card — pinned by the contrast lint) */
+    --text-primary:   #f1f1ef;
+    --text-secondary: #adada8;
+    --text-tertiary:  #8b8b86;
 
-    /* Shadows */
-    --shadow-sm: 0 1px 4px rgba(0,0,0,0.35);
-    --shadow:    0 4px 16px rgba(0,0,0,0.50);
-    --shadow-lg: 0 16px 48px rgba(0,0,0,0.65);
+    /* Borders — slightly stronger than the old set: hairlines do the work
+       shadows used to. */
+    --border:        rgba(255,255,255,0.12);
+    --border-strong: rgba(255,255,255,0.22);
+
+    /* Shadows — near-flat; only overlays (modals, popovers) keep real lift. */
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.25);
+    --shadow:    0 1px 3px rgba(0,0,0,0.30);
+    --shadow-lg: 0 8px 24px rgba(0,0,0,0.45);
 
     color-scheme: dark;
 }
 
 [data-theme="light"] {
-    /* Surfaces */
-    --bg-app:      #f4f4f7;
-    --bg-sidebar:  #ececef;
+    /* Surfaces — Card Catalog: warm-neutral paper grays, no blue cast. */
+    --bg-app:      #f7f7f5;
+    --bg-sidebar:  #efefec;
     --bg-card:     #ffffff;
-    --bg-elevated: #e6e6ea;
+    --bg-elevated: #e9e9e6;
     --card-bg:     #ffffff;
     --input-bg:    #ffffff;
-    --header-bg:   rgba(248,248,250,0.85);
+    --header-bg:   rgba(247,247,245,0.88);
     --tab-active-bg: #ffffff;
 
     --surface-subtle:       rgba(0,0,0,0.025);
     --surface-hover:        rgba(0,0,0,0.05);
     --surface-hover-strong: rgba(0,0,0,0.08);
-    --scrollbar-thumb:       rgba(0,0,0,0.20);
-    --scrollbar-thumb-hover: rgba(0,0,0,0.32);
+    --scrollbar-thumb:       rgba(0,0,0,0.30);
+    --scrollbar-thumb-hover: rgba(0,0,0,0.46);
     --overlay-scrim:         rgba(0,0,0,0.32);
 
-    /* Accent darkened so white-on-accent AND accent-as-text both clear AA.
-       Light hover already darkens, so text-grade and bg-grade coincide. */
-    --accent:        #5446d6;
-    --accent-hover:  #4536c4;
-    --accent-hover-bg: #4536c4;
-    --accent-glow:   rgba(84,70,214,0.16);
+    /* Accent — institutional blue, dark enough that white-on-accent AND
+       accent-as-text both clear AA (7.8:1 on white). Light hover darkens, so
+       text-grade and bg-grade coincide. */
+    --accent:        #1e4fa3;
+    --accent-hover:  #163d82;
+    --accent-hover-bg: #163d82;
+    --accent-glow:   rgba(30,79,163,0.15);
     --on-accent:     #fff;
-    --user-msg-from: #5e51e0;
-    --user-msg-to:   #5446d6;
-    --accent-soft-bg: rgba(84,70,214,0.10);
-    --accent-soft-fg: #4536c4;
+    --user-msg-from: #1e4fa3;
+    --user-msg-to:   #1e4fa3;
+    --accent-soft-bg: rgba(30,79,163,0.10);
+    --accent-soft-fg: #1e4fa3;
 
     --danger:        #d70015;
     --danger-hover:  #b00010;
@@ -149,16 +166,23 @@
     --status-warn:          #9a6e00;
     --status-error:         #d70015;
 
-    --text-primary:   #1c1c1e;
-    --text-secondary: #54545a;
-    --text-tertiary:  #6a6a72;
+    /* Card Catalog category colors, light: darkened so white badge letters
+       clear 4.5:1 on each fill (note 4.9, finder 7.8, zotero 5.7). */
+    --cat-note:   #93690c;
+    --cat-finder: #1e4fa3;
+    --cat-zotero: #c8222b;
+    --on-cat:     #ffffff;
 
-    --border:        rgba(0,0,0,0.12);
-    --border-strong: rgba(0,0,0,0.20);
+    --text-primary:   #1b1b18;
+    --text-secondary: #53534e;
+    --text-tertiary:  #6b6b64;
 
-    --shadow-sm: 0 1px 3px rgba(0,0,0,0.10);
-    --shadow:    0 4px 16px rgba(0,0,0,0.14);
-    --shadow-lg: 0 16px 48px rgba(0,0,0,0.22);
+    --border:        rgba(0,0,0,0.14);
+    --border-strong: rgba(0,0,0,0.24);
+
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.08);
+    --shadow:    0 1px 3px rgba(0,0,0,0.10);
+    --shadow-lg: 0 8px 24px rgba(0,0,0,0.18);
 
     color-scheme: light;
 }
@@ -186,7 +210,9 @@ button {
 }
 
 body {
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    /* Card Catalog: one grotesk family, hierarchy from weight/size/tracked
+       uppercase — Helvetica Neue with the Arial fallback, no webfont. */
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
     margin: 0;
     display: flex;
     height: 100vh;
@@ -300,6 +326,12 @@ select, input[type="text"], input[type="number"], input[type="password"], textar
     font-family: inherit;
 }
 
+/* 2026-07-19: placeholders here carry real instructional content (examples,
+   formats), so they get a contrast-managed token instead of the WebKit
+   default (~54% of text colour, well under AA). Secondary clears 4.5:1 on
+   --input-bg in both themes (tertiary is 4.4:1 dark — just under). opacity:1
+   because WebKit otherwise multiplies its own alpha onto the colour. */
+::placeholder { color: var(--text-secondary); opacity: 1; }
 select:focus, input[type="text"]:focus, input[type="number"]:focus,
 input[type="password"]:focus, textarea:focus {
     border-color: var(--accent);
@@ -336,8 +368,8 @@ input[type="range"] {
     padding: 9px 16px;
     border-radius: var(--radius-sm);
     font-size: 0.8125rem;
-    font-weight: 500;
-    letter-spacing: -0.1px;
+    font-weight: 600;
+    letter-spacing: 0;
     cursor: pointer;
     transition: background-color var(--dur-fast) var(--ease),
                 border-color var(--dur-fast) var(--ease),
@@ -359,8 +391,14 @@ input[type="range"] {
     transform: translateY(1px);
 }
 
+/* Disabled state is a real color tier, not an opacity fade (the opacity-only
+   dim was the a11y smell the 2026-07-19 tagging fix removed for its toggles —
+   generalized here to every button; see contrast lint for the tier values). */
 .btn:disabled {
-    opacity: 0.45;
+    color: var(--text-tertiary);
+    background: var(--surface-subtle);
+    border-color: var(--border);
+    box-shadow: none;
     cursor: not-allowed;
 }
 
@@ -379,14 +417,14 @@ input[type="range"] {
 .btn-primary {
     background: var(--accent);
     color: #fff;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.12);
+    box-shadow: none;
 }
 
 .btn-primary:hover:not(:disabled) {
     /* 6a: --accent-hover is text-grade (too light under white text in dark
        mode); the hover surface is the bg-grade token. */
     background: var(--accent-hover-bg);
-    box-shadow: 0 3px 10px rgba(124,99,255,0.40), inset 0 1px 0 rgba(255,255,255,0.14);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
 }
 
 .btn-outline {
@@ -604,11 +642,15 @@ input[type="range"] {
     background: var(--surface-hover);
 }
 
+/* Card Catalog: the active tab is an accent underline (the reference-site
+   nav treatment), not a raised pill. */
 .tab.active {
-    background: var(--tab-active-bg);
+    background: transparent;
     color: var(--text-primary);
-    border-color: rgba(255,255,255,0.08);
-    box-shadow: 0 1px 5px rgba(0,0,0,0.45), 0 0 0 0.5px rgba(255,255,255,0.06);
+    font-weight: 700;
+    border-color: transparent;
+    border-radius: 0;
+    box-shadow: inset 0 -2px 0 0 var(--accent);
 }
 
 .content-area {
@@ -639,17 +681,99 @@ input[type="range"] {
     flex-direction: column;
     overflow: hidden;
 }
+/* Deck/Report tabs stack 2-3 cards (min-height:200px each) in one pane-view;
+   on a short window the overflow:hidden pane CLIPPED the bottom card with no
+   way to reach it. Scoped to these two tabs only — the chat layout's flex
+   heights depend on the hidden overflow and must not change. The cards'
+   min-height floor is what makes the scroll engage (flex items never shrink
+   below it). */
+#deck-tab .pane-view,
+#docgen-tab .pane-view,
+#audit-tab .pane-view,
+#refactor-tab .pane-view,
+#prompts-tab .pane-view {
+    overflow-y: auto;
+}
+/* When the pane itself scrolls, its card must be allowed to grow past the
+   viewport instead of clipping its tail behind overflow:hidden.
+   ONLY for tabs whose card sits inside a `.pane-view` scroll container — that
+   is what still constrains the card's WIDTH. `.content-area` is
+   `flex-direction: row`, so `flex: 0 0 auto` releases the card on the
+   HORIZONTAL (main) axis: a card that is a direct child of `.content-area`
+   then sizes to its content and spills past the panel, where
+   `.content-area { overflow: hidden }` clips it with no scrollbar to reach it.
+   `#prompts-tab` was listed here by mistake — its card has no `.pane-view`
+   (it scrolls internally via `.prompts-list`), so it lost 16px of every row
+   and the tail of its intro line. It now inherits the base `.card { flex: 1 }`
+   like `#help-tab`, which has the same markup shape. */
+#audit-tab .card,
+#refactor-tab .card {
+    flex: 0 0 auto;
+    overflow: visible;
+}
 
 .card {
     background: var(--card-bg);
     border: 1px solid var(--border);
-    border-radius: var(--radius);
-    box-shadow: var(--shadow);
+    /* Card Catalog signature: square corners + a colored top-rule instead of
+       a drop-shadow card — the guide-card tab of a library card catalog. */
+    border-top: 3px solid var(--accent);
+    border-radius: 0;
+    box-shadow: none;
     flex: 1;
     display: flex;
     flex-direction: column;
     overflow: hidden;
     min-height: 200px;
+}
+
+/* G4 (2026-07-22): settings-modal live filter */
+.settings-filter-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 4px 0 12px;
+}
+.settings-filter-row input[type="search"] {
+    flex: 1;
+    max-width: 340px;
+}
+
+/* E14 (2026-07-22): inline link-styled button (jump-to-field affordances) */
+.btn-link {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    /* TEXT, so it takes the text-grade accent (--accent-hover), not --accent —
+       which the token comment above reserves for fills/outlines and the
+       contrast lint only holds to 3:1. On dark, --accent as 12px text measured
+       3.57:1 against the card (AA wants 4.5). One value cannot be both. */
+    color: var(--accent-hover);
+    text-decoration: underline;
+    cursor: pointer;
+}
+.btn-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* E1 (2026-07-22): map-reduce stage progress + persistent coverage notices */
+.summarise-stage {
+    padding: 6px 24px 0;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-style: italic;
+}
+.summarise-notices {
+    margin: 8px 24px 0;
+    padding: 8px 12px;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--text-primary);
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
 }
 
 .chat-history, .summary-content {
@@ -669,6 +793,12 @@ input[type="range"] {
     flex: 0 0 auto;
     background: var(--card-bg);
     border-bottom: 1px solid var(--border);
+    /* D4/#21 (2026-07-13): let a title + several action buttons wrap at narrow
+       widths instead of clipping the trailing buttons under overflow:hidden. */
+    flex-wrap: wrap;
+    row-gap: 6px;
+    padding-top: 8px;
+    padding-bottom: 8px;
 }
 
 /* Track 6c: card titles are real <h2>s now (heading navigation); the reset
@@ -704,6 +834,12 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
     align-items: center;
     gap: 8px;
     min-height: 42px;
+    /* D2/#6 (2026-07-13): never let the flex parent compress this row below its
+       content. With min-height:42px and the default flex-shrink:1, a card under
+       height pressure squeezed the row to 42px while its wrapped description still
+       needed several lines — the overflow then painted over the next control's
+       label (the observed docgen overlap). flex-shrink:0 keeps it at content height. */
+    flex-shrink: 0;
     padding: 8px 16px;
     border-bottom: 1px solid var(--border);
     background: var(--surface-subtle);
@@ -711,7 +847,10 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
     font-size: 0.75rem;
 }
 
-#vault-path-display {
+/* D7/#52 (2026-07-13): the audit vault-path display gets the same ellipsis
+   treatment as its Obsidian sibling so a long path can't overflow its row. */
+#vault-path-display,
+#audit-vault-path-display {
     min-width: 0;
     flex: 1;
     overflow: hidden;
@@ -731,8 +870,8 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
     margin: 6px 16px 0;
     padding: 8px 12px;
     border-radius: 8px;
-    background: rgba(125, 110, 240, 0.12);
-    border: 1px solid rgba(125, 110, 240, 0.35);
+    background: var(--accent-soft-bg);
+    border: 1px solid var(--accent-glow);
     color: var(--text-secondary);
     font-size: 0.75rem;
     display: flex;
@@ -751,7 +890,7 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    border: 2px solid rgba(125, 110, 240, 0.35);
+    border: 2px solid var(--accent-glow);
     border-top-color: var(--accent);
     animation: prewarm-spin 0.9s linear infinite;
     flex-shrink: 0;
@@ -764,6 +903,20 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
     padding: 11px 15px;
     border-radius: 14px;
     white-space: pre-wrap;
+    /* D3/#20 (2026-07-13): break long URLs / unbreakable tokens inside the bubble
+       instead of painting outside it. */
+    overflow-wrap: anywhere;
+}
+
+/* D3/#20: keep wide rendered content (code blocks, images) inside the bubble so
+   it never forces the whole chat history to scroll horizontally. */
+.message pre {
+    max-width: 100%;
+    overflow-x: auto;
+}
+.message img {
+    max-width: 100%;
+    height: auto;
 }
 
 .message-user {
@@ -771,7 +924,7 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
     background: linear-gradient(160deg, var(--user-msg-from), var(--user-msg-to));
     color: #fff;
     border-bottom-right-radius: 3px;
-    box-shadow: 0 2px 8px rgba(124,99,255,0.30);
+    box-shadow: none;
     position: relative;
 }
 
@@ -818,6 +971,9 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
     border-radius: var(--radius-sm);
     font-size: 0.75rem;
     color: var(--text-secondary);
+    /* D6/#51 (2026-07-13): break long vault-relative paths (accented French
+       filenames, deep folders) so one source can't scroll the whole chat. */
+    overflow-wrap: anywhere;
 }
 
 .retrieval-trace summary {
@@ -884,6 +1040,11 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
     border: 1px solid var(--border);
     color: var(--text-secondary);
     white-space: nowrap;
+    /* D7/#53 (2026-07-13): a very long model / HF-repo id can't scroll the
+       Prompt Hub sideways — ellipsize an over-wide badge instead. */
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 .prompt-badge-model { font-family: var(--font-mono, monospace); }
 .prompt-badge-empty { font-style: italic; }
@@ -966,7 +1127,7 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
 
 .agent-tool-result-tag {
     display: inline-block;
-    background: rgba(124,99,255,0.18);
+    background: var(--accent-soft-bg);
     color: var(--text-primary);
     border-radius: 3px;
     padding: 0 6px;
@@ -995,6 +1156,19 @@ fieldset.checkbox-fieldset > legend { padding: 0; }
     color: var(--text-secondary);
     margin-top: 4px;
     line-height: 1.4;
+}
+
+/* Inline "the server refused this value" marker (settings.js::_flagDropped).
+   WCAG 3.3.1: a dropped key used to be entirely silent — 200 OK and the stale
+   value left sitting in the input. --danger on --bg-card is already pinned by
+   tests/js/contrastTokens.test.js. Colour is NOT the only channel: the text
+   itself states the failure, and the control carries aria-invalid. */
+.settings-field-error {
+    display: block;
+    margin-top: 4px;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--danger);
 }
 
 /* Click-to-insert example prompts (ui.js::renderExampleChips). */
@@ -1133,6 +1307,10 @@ pre.has-code-copy:hover .code-copy-btn,
     background: var(--card-bg);
     border-top: 1px solid var(--border);
     display: flex;
+    /* wrap like .card > .header does: the bar holds 5 controls and lives in
+       an overflow:hidden card, so without wrapping a narrow window CLIPPED
+       the trailing Export buttons with no scroll and no recourse. */
+    flex-wrap: wrap;
     gap: 12px;
 }
 
@@ -1217,6 +1395,11 @@ pre.has-code-copy:hover .code-copy-btn,
     gap: 10px;
     margin-top: 12px;
 }
+/* The Settings modal is max-width:95vw — on a narrow window two hard columns
+   crushed the number inputs into unusable slivers; collapse to one. */
+@media (max-width: 700px) {
+    .control-grid { grid-template-columns: 1fr; }
+}
 
 .materials-panel {
     border-bottom: 1px solid var(--border);
@@ -1289,7 +1472,7 @@ pre.has-code-copy:hover .code-copy-btn,
 
 #upload-overlay:hover,
 #upload-overlay.dragover {
-    border-color: rgba(130,120,255,0.72);
+    border-color: var(--accent);
     background: var(--bg-elevated);
 }
 
@@ -1300,7 +1483,7 @@ pre.has-code-copy:hover .code-copy-btn,
 #upload-overlay:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-    border-color: rgba(130,120,255,0.72);
+    border-color: var(--accent);
 }
 
 .upload-target {
@@ -1320,9 +1503,9 @@ pre.has-code-copy:hover .code-copy-btn,
     justify-content: center;
     width: 58px;
     height: 72px;
-    border: 1px solid rgba(130,120,255,0.55);
+    border: 1px solid var(--accent);
     border-radius: 8px;
-    background: rgba(111,99,255,0.10);
+    background: var(--accent-soft-bg);
     color: var(--accent-hover);
     font-size: 0.8125rem;
     font-weight: 800;
@@ -1450,7 +1633,7 @@ pre.has-code-copy:hover .code-copy-btn,
 
 .modal {
     background: var(--bg-card);
-    border-radius: 14px;
+    border-radius: 6px;
     border: 1px solid var(--border);
     padding: 28px;
     width: 480px;
@@ -1611,11 +1794,18 @@ pre.has-code-copy:hover .code-copy-btn,
 }
 
 /* ── Thin native-feeling scrollbars ── */
-::-webkit-scrollbar { width: 5px; height: 5px; }
+/* Card Catalog (2026-07-20): visible, grabbable scrollbars everywhere —
+   styling ::-webkit-scrollbar opts out of the macOS auto-hiding overlay, so
+   every scrollable panel shows a persistent bar you can drag. */
+::-webkit-scrollbar { width: 11px; height: 11px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
     background: var(--scrollbar-thumb);
-    border-radius: 3px;
+    border-radius: 6px;
+    /* Inset the thumb from the track edges so the wider bar stays light. */
+    border: 3px solid transparent;
+    background-clip: padding-box;
+    min-height: 32px;
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 ::-webkit-scrollbar-corner { background: transparent; }
@@ -1656,28 +1846,17 @@ pre.has-code-copy:hover .code-copy-btn,
     border-radius: var(--radius-sm);
     font-size: 0.8125rem;
 }
-.audit-report-tabs {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    padding: 8px 16px 0 16px;
-    border-bottom: 1px solid var(--border);
-}
+/* Base report-link styling; the grouped "On this report" layout (Card
+   Catalog, 2026-07-20) lives with the other redesign components at the end
+   of this sheet. */
 .audit-report-tab {
     background: transparent;
     border: 1px solid transparent;
     color: var(--text-secondary);
-    padding: 6px 10px;
-    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
     cursor: pointer;
     font-size: 0.8125rem;
 }
-.audit-report-tab.active {
-    background: var(--bg-elevated);
-    border-color: var(--border);
-    border-bottom-color: var(--bg-elevated);
-    color: var(--text-primary);
-}
+.audit-report-tab:hover:not(.active) { color: var(--text-primary); background: var(--surface-hover); }
 .audit-report-meta {
     padding: 8px 16px;
     color: var(--text-secondary);
@@ -1733,6 +1912,221 @@ pre.has-code-copy:hover .code-copy-btn,
     margin-left: 4px;
 }
 
+/* --- Cross-report search -------------------------------------------------
+   The bar sits between the grouped tablist and the report meta line; the
+   results panel replaces the report body while a query is active. Both share
+   the tablist's post-scan display gating (audit.js::_setTabsVisible). */
+.audit-search-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 16px 10px;
+}
+.audit-search-input {
+    flex: 1;
+    min-width: 0;
+    padding: 7px 10px;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+}
+.audit-search-input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+}
+.audit-search-clear { flex: 0 0 auto; }
+.audit-search-results { padding: 0 16px 12px; }
+.audit-search-count,
+.audit-search-empty {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin: 0 0 10px;
+}
+.audit-search-group { margin-bottom: 14px; }
+.audit-search-group h4 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+    margin: 0 0 4px;
+    padding-bottom: 3px;
+    border-bottom: 1px solid var(--border);
+}
+.audit-search-n { color: var(--accent-soft-fg); }
+.audit-search-more { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.audit-search-group ul { list-style: none; margin: 0; padding: 0; }
+.audit-search-hit {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 10px;
+    width: 100%;
+    min-height: 28px;
+    padding: 4px 6px;
+    text-align: left;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 0.82rem;
+    color: var(--text-primary);
+}
+.audit-search-hit:hover { background: var(--surface-subtle); }
+.audit-search-hit:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+.audit-search-detail { font-size: 0.75rem; color: var(--text-secondary); }
+
+/* --- Ambiguous-PDF triage deck ------------------------------------------
+   One card at a time over the ambiguous_pdfs report (the table view stays,
+   toggled from the meta line). `with-pdf` splits the deck when the on-demand
+   PDF panel is open. */
+.audit-view-toggle { margin-left: 8px; }
+.audit-view-toggle .is-active { text-decoration: underline; font-weight: 600; }
+.audit-ambig-deck { padding: 0 16px 16px; }
+.audit-ambig-deck:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.audit-ambig-deck.with-pdf {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas: "progress progress" "result result" "card pdf" "keys keys";
+    gap: 0 16px;
+}
+.audit-ambig-deck.with-pdf > #audit-ambig-progress { grid-area: progress; }
+.audit-ambig-deck.with-pdf > #audit-ambig-result   { grid-area: result; }
+.audit-ambig-deck.with-pdf > #audit-ambig-card     { grid-area: card; }
+.audit-ambig-deck.with-pdf > #audit-ambig-pdf      { grid-area: pdf; }
+.audit-ambig-deck.with-pdf > .audit-ambig-keys     { grid-area: keys; }
+.audit-ambig-progress,
+.audit-ambig-result {
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    margin: 0 0 6px;
+    min-height: 1.1em;
+}
+.audit-ambig-result.is-error { color: var(--danger); }
+.audit-ambig-card {
+    border: 1px solid var(--border);
+    border-top: 3px solid var(--accent);
+    background: var(--surface-subtle);
+    padding: 14px 16px;
+}
+.audit-ambig-name {
+    font-size: 0.95rem;
+    margin: 0 0 2px;
+    color: var(--text-primary);
+    word-break: break-word;
+}
+.audit-ambig-path {
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+    margin: 0 0 10px;
+    word-break: break-all;
+}
+.audit-ambig-prior {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin: 0 0 10px;
+}
+.audit-ambig-cands { list-style: none; margin: 0 0 12px; padding: 0; }
+.audit-ambig-cand {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    width: 100%;
+    min-height: 30px;
+    padding: 5px 8px;
+    text-align: left;
+    background: transparent;
+    border: 1px solid transparent;
+    cursor: pointer;
+    font-size: 0.82rem;
+    color: var(--text-primary);
+}
+.audit-ambig-cand:hover { background: var(--surface-hover); }
+.audit-ambig-cand:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* M2 (2026-07-20 audit): the selected row is where the user acts, so its cues
+   must clear WCAG on the composited fill — the old `--accent` 1px border on the
+   translucent hover surface measured ~2.8:1 (under the 3:1 non-text minimum).
+   The selection now reads via an accent-tinted fill (--accent-soft-bg, built
+   for exactly this) plus a solid 3px left bar in --accent-soft-fg (a graphic
+   object comfortably ≥3:1 on the card), so it no longer depends on a low-
+   contrast hairline border. */
+.audit-ambig-cand.is-sel {
+    border-color: var(--accent-soft-fg);
+    background: var(--accent-soft-bg);
+    box-shadow: inset 3px 0 0 var(--accent-soft-fg);
+}
+.audit-ambig-num {
+    flex: 0 0 auto;
+    font-size: 0.75rem;
+    /* Was --text-tertiary, which composited to ~3.9:1 on the selected/hover
+       fill (AA needs 4.5) — and these 1–9 numbers are the deck's primary
+       affordance. --text-secondary clears it on every surface. */
+    color: var(--text-secondary);
+    min-width: 1.2em;
+}
+/* On the selected row, the pick number takes the accent colour for a clear,
+   contrast-passing "this is chosen" signal. */
+.audit-ambig-cand.is-sel .audit-ambig-num { color: var(--accent-soft-fg); font-weight: 600; }
+.audit-ambig-key { font-weight: 600; }
+.audit-ambig-title { color: var(--text-secondary); font-size: 0.78rem; }
+.audit-ambig-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+/* L1: the primary decision (Assign) must read as primary among the bracketed
+   link-style verbs, mirroring the tagging deck's primary Accept button. */
+.audit-btn-primary {
+    padding: 5px 14px;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+.audit-btn-primary:hover { background: var(--accent-hover-bg); border-color: var(--accent-hover-bg); }
+.audit-btn-primary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.audit-ambig-done { font-size: 0.85rem; color: var(--text-primary); margin: 0 0 10px; }
+.audit-ambig-keys {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin: 10px 0 0;
+}
+/* L7: give the deck legend the same <kbd> chip styling the tagging deck uses,
+   so the two sibling decks' command legends read as one system. */
+.audit-ambig-keys kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface-subtle);
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--text-primary);
+}
+/* Transient "here it is" flash when a search hit jumps to its row (M3). */
+.audit-row-highlight {
+    animation: audit-row-flash 2.4s ease-out;
+}
+@keyframes audit-row-flash {
+    0%, 30% { background: var(--accent-soft-bg); }
+    100%    { background: transparent; }
+}
+.audit-ambig-pdf { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+.audit-ambig-frame {
+    width: 100%;
+    height: 65vh;
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+}
+@media (max-width: 900px) {
+    .audit-ambig-deck.with-pdf {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "progress" "result" "card" "pdf" "keys";
+    }
+    .audit-ambig-frame { height: 50vh; }
+}
+
 /* Honour the OS "Reduce Motion" setting: neutralise the spinners,
    pulse, and typing-bounce animations and snap transitions. */
 @media (prefers-reduced-motion: reduce) {
@@ -1773,8 +2167,12 @@ pre.has-code-copy:hover .code-copy-btn,
    overflowing the card. */
 /* Note Refactor reuses the .deck-body class but lives under #refactor-tab, so it
    needs the same scroll region — without it the analyzer's preview + image rows
-   clip off the bottom of the overflow:hidden card with no scrollbar. */
+   clip off the bottom of the overflow:hidden card with no scrollbar.
+   D1/#5 (2026-07-13): the Report/Article tab (#docgen-tab) reuses .deck-body too
+   across THREE stacked cards, and was missing here — its lower controls (out-dir,
+   activity log, result panel, augment preview iframe) clipped with no scrollbar. */
 #deck-tab .deck-body,
+#docgen-tab .deck-body,
 #refactor-tab .deck-body {
     flex: 1 1 auto;
     min-height: 0;
@@ -1832,6 +2230,16 @@ pre.has-code-copy:hover .code-copy-btn,
 .deck-result { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 .deck-result:empty { display: none; }
 .deck-summary { color: var(--text-primary); font-weight: 500; }
+
+/* D7/#52 (2026-07-13): break long absolute paths in the deck/docgen summaries,
+   template hints, refactor note-path headers, and warning banners so they wrap
+   inside their box instead of overflowing / adding a horizontal scrollbar. */
+.deck-summary,
+.deck-template-hint,
+.refactor-note-path,
+.warning-banner {
+    overflow-wrap: anywhere;
+}
 
 .deck-warnings {
     border: 1px solid var(--danger);
@@ -1964,6 +2372,146 @@ pre.has-code-copy:hover .code-copy-btn,
 .inline-confirm-msg { font-size: 0.8125rem; margin-bottom: 8px; }
 .inline-confirm-actions { display: flex; gap: 8px; }
 
+/* Axis ii: contextual help — "?" badge + hover tooltip + click popover
+   (ui.js::helpTip / helpPopover). Tokens only; badge fill + text reuse the
+   already-lint-pinned --text-secondary-on-elevated and accent-hover-on-glow
+   pairings (tests/js/contrastTokens.test.js), the popover body adds one pair. */
+.help-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    /* WCAG 2.2 SC 2.5.8 (target size, minimum 24x24). The visual dot stays
+       16x16 — 33 badges are already placed and any size change would reflow
+       every label row — so the HIT AREA is grown by a transparent ::after
+       overlay instead (see below). position:relative is the only property that
+       changes here and it is layout-neutral for an inline-flex box. The inline
+       exception in 2.5.8 is weak for these: the badge is a SIBLING of the
+       label, not a word inside a sentence. */
+    position: relative;
+    flex: 0 0 auto;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 50%;
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    font-weight: 700;
+    line-height: 1;
+    cursor: help;
+    vertical-align: middle;
+    transition: background var(--dur-fast) var(--ease),
+                color var(--dur-fast) var(--ease),
+                border-color var(--dur-fast) var(--ease);
+}
+/* 16px + 4px on every side = a 24x24 pointer/touch target, painted nowhere.
+   margin-left: 4px is the GUARANTEE on the one side the badge shares with
+   clickable content — the <label> text it is inserted after: inset -4px
+   reaches exactly to that 4px margin edge, so the overlay cannot steal the
+   label's clicks (2026-07-29 audit 14 — the pair of 4s must stay equal; the
+   old rule relied on "verified by eye"). The other three sides reach only
+   inter-row/trailing whitespace. Out-of-flow pseudo ⇒ no layout shift;
+   the left margin itself only widens the pre-existing label→badge gap. */
+.help-badge {
+    margin-left: 4px;
+}
+.help-badge::after {
+    content: '';
+    position: absolute;
+    inset: -4px;
+}
+.help-badge:hover,
+.help-badge:focus-visible {
+    background: var(--accent-glow);
+    color: var(--accent-hover);
+    border-color: var(--accent);
+    outline: none;
+}
+.help-badge:focus-visible { box-shadow: 0 0 0 3px var(--accent-glow); }
+
+.help-tip {
+    position: fixed;
+    z-index: 1200;
+    max-width: 260px;
+    /* No max-height/overflow here (2026-07-29 audit 14): the tip is
+       pointer-events:none, so a scrollbar on it is one NO USER CAN OPERATE —
+       a height bound would turn visible overflow into silently truncated
+       content, the worse failure. The real bound on tip length is the
+       MAX_TIP_CHARS ratchet in tests/js/helpTable.test.js; anything longer
+       must be promoted to a helpPopover (focusable, scrollable), as
+       `set-reranker-model` was. */
+    padding: 9px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    font-size: 0.75rem;
+    line-height: 1.45;
+    box-shadow: var(--shadow);
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(3px);
+    transition: opacity var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+.help-tip.show { opacity: 1; transform: translateY(0); }
+
+.help-popover {
+    position: fixed;
+    z-index: 1210;
+    width: 320px;
+    max-width: calc(100vw - 32px);
+    /* D5/#22 (2026-07-13): bound the height so a long body + writes banner stays
+       readable at small window heights instead of clipping (overflow:hidden). */
+    max-height: min(60vh, 480px);
+    overflow-y: auto;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    box-shadow: var(--shadow-lg);
+}
+.help-popover-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 11px 13px;
+    border-bottom: 1px solid var(--border);
+}
+.help-popover-title { font-size: 0.875rem; font-weight: 650; color: var(--text-primary); }
+.help-popover-close {
+    padding: 2px 5px;
+    border: none;
+    border-radius: 5px;
+    background: none;
+    color: var(--text-tertiary);
+    font-size: 1.05rem;
+    line-height: 1;
+    cursor: pointer;
+}
+.help-popover-close:hover { color: var(--text-primary); background: var(--surface-hover); }
+.help-popover-body {
+    padding: 12px 13px;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+}
+.help-popover-writes {
+    margin: 0 13px 12px;
+    padding: 7px 10px;
+    border: 1px solid var(--warn-border);
+    border-radius: var(--radius-sm);
+    background: var(--warn-bg);
+    color: var(--warn-fg);
+    font-size: 0.75rem;
+    line-height: 1.4;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .help-badge, .help-tip { transition: none; }
+}
+
 /* --- Note Refactor hub: master-detail layout (Phase 1.5) --- */
 .refactor-layout { display: flex; gap: 12px; margin-top: 10px; align-items: flex-start; }
 .refactor-note-list {
@@ -1992,6 +2540,10 @@ pre.has-code-copy:hover .code-copy-btn,
     gap: 3px;
 }
 .refactor-note-entry:hover { background: var(--bg-elevated); }
+.refactor-note-entry:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
 /* Selection signalled by an accent left-border + weight, not tint alone (the
    accent-glow fill is easy to miss, especially in light mode). */
 .refactor-note-entry.selected {
@@ -2057,7 +2609,9 @@ pre.has-code-copy:hover .code-copy-btn,
 @media (max-width: 900px) { .refactor-md-cols { flex-direction: column; } }
 
 /* Classification + ignore states */
-.refactor-badge.badge-muted { background: var(--bg-elevated); color: var(--text-tertiary); }
+/* 2026-07-19 contrast: tertiary on the elevated fill was 3.97:1 dark /
+   4.31:1 light — under AA. Secondary is 6.4:1 / 6.0:1 on the same fill. */
+.refactor-badge.badge-muted { background: var(--bg-elevated); color: var(--text-secondary); }
 .refactor-badge.badge-classify { background: var(--bg-elevated); color: var(--text-secondary); }
 .refactor-badge.badge-handwritten { background: var(--warn-bg); color: var(--warn-fg); }
 .refactor-image-ignored { opacity: 0.5; }
@@ -2096,6 +2650,16 @@ pre.has-code-copy:hover .code-copy-btn,
    click and by the existing arrow-key roving navigation). */
 .tabs { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
 .tabs::-webkit-scrollbar { height: 0; }
+/* D7/#54 (2026-07-13) + G3 (2026-07-22): the tab strip scrolls with a hidden
+   scrollbar, so there was zero cue that more tabs exist off-screen. The fade
+   used to be armed by a 1024px media query — but overflow depends on FONT
+   SIZE too (a large system font overflows the 8 tabs well above 1024px with
+   no cue). app.js now measures scrollWidth > clientWidth on load/resize and
+   toggles this class, so the cue tracks actual overflow at every width. */
+.tabs.tabs-overflowing {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent 100%);
+    mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent 100%);
+}
 
 @media (max-width: 1024px) {
     .sidebar { width: 240px; padding: 18px 14px; }
@@ -2109,5 +2673,565 @@ pre.has-code-copy:hover .code-copy-btn,
     .header { padding: 0 14px; }
     .pane-view { padding: 16px; }
     .pane-config { width: 230px; padding: 16px; }
-    #document-tab.active { grid-template-columns: 230px minmax(0, 1fr); }
+}
+
+/* G1 (2026-07-22 audit): Single Paper was the one panel that NEVER stacked —
+   at ~750px (210px sidebar floor) its two-column grid left ≈300px for the
+   SUMMARY, the panel's actual reading surface. Stack config above the summary
+   (refactor-layout's 900px pattern). Placed AFTER the 1024/820 blocks so the
+   cascade cannot re-impose their two-column templates at narrow widths. */
+@media (max-width: 900px) {
+    #document-tab.active { grid-template-columns: minmax(0, 1fr); }
+    #document-tab .pane-config {
+        width: 100%;
+        max-height: 40vh;
+        overflow-y: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   Biblio Tagging — triage deck + visible status (Library Audit → Tagging tab)
+   --------------------------------------------------------------------------- */
+.tagging-viewtoggle { display: inline-flex; gap: 4px; }
+.tagging-status,
+.tagging-card-status,
+.tagging-deck-lastresult,
+.tagging-deck-progress {
+    color: var(--text-secondary);
+    font-size: 0.85em;
+    margin-top: 6px;
+    min-height: 1.2em;
+}
+.tagging-status { padding-left: 2px; }
+
+.tagging-deck { outline: none; max-width: 760px; margin: 0 auto; }
+.tagging-deck:focus-visible { box-shadow: 0 0 0 2px var(--accent); border-radius: 2px; }
+.tagging-deck-progress {
+    text-align: center;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+}
+.tagging-deck-lastresult { text-align: center; }
+
+/* PDF side panel (V): the deck widens to a two-column grid, status lines and
+   the hint span both columns, card left / PDF right. */
+.tagging-deck.with-pdf {
+    max-width: 1280px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+}
+.tagging-deck.with-pdf .tagging-deck-progress,
+.tagging-deck.with-pdf .tagging-deck-lastresult,
+.tagging-deck.with-pdf .tagging-deck-hint { grid-column: 1 / -1; }
+.tagging-deck-pdf {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 8px;
+    min-height: 200px;
+}
+.tagging-pdf-frame { width: 100%; height: 72vh; border: 0; border-radius: 6px; }
+
+.tagging-deck-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    /* Card Catalog: square corners + accent top-rule, like .card. */
+    border-top: 3px solid var(--accent);
+    border-radius: 0;
+    padding: 18px 20px;
+    margin: 8px 0 10px;
+}
+.tagging-card-head {
+    display: flex; align-items: baseline; gap: 10px; justify-content: space-between;
+}
+.tagging-card-key { font-family: monospace; font-weight: 700; color: var(--text-primary); }
+.tagging-card-year { color: var(--text-tertiary); font-size: 0.9em; }
+.tagging-card-title {
+    font-size: 1.05em; font-weight: 600; color: var(--text-primary);
+    margin: 4px 0 12px; line-height: 1.35;
+}
+.tagging-card-current {
+    display: flex; flex-wrap: wrap; gap: 6px 18px;
+    padding: 8px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+    font-size: 0.88em;
+}
+.tagging-card-target-label {
+    color: var(--text-tertiary);
+    font-weight: 600;
+    margin-right: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+.tagging-card-target-tags { color: var(--text-secondary); }
+
+.tagging-card-snippet {
+    margin: 12px 0; padding: 10px 12px;
+    background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text-secondary); font-size: 0.85em; line-height: 1.45;
+    max-height: 8.5em; overflow: auto; white-space: pre-wrap;
+}
+
+.tagging-card-proposed { margin: 8px 0; min-height: 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.tagging-proposed-label { color: var(--text-tertiary); font-size: 0.82em; font-weight: 600; }
+.tagging-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 9px; border-radius: 999px;
+    background: var(--surface-hover); border: 1px solid var(--border);
+    color: var(--text-primary); font-size: 0.82em; cursor: pointer;
+}
+.tagging-chip:hover { background: var(--surface-hover-strong); border-color: var(--border-strong); }
+.tagging-chip.is-on { background: var(--accent-hover-bg); border-color: var(--accent); color: #fff; }
+.tagging-chip-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; border-radius: 3px;
+    /* secondary, not tertiary: 12px text on the subtle tint sat under AA */
+    background: var(--surface-subtle); color: var(--text-secondary);
+    font-size: 0.75em; font-weight: 700;
+}
+.tagging-chip-conf { color: var(--text-tertiary); font-size: 0.85em; }
+.tagging-chip:focus-visible,
+.tagging-entry-chip-x:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.tagging-card-entry { margin: 10px 0 6px; }
+.tagging-card-entry .tagging-tag-input { width: 100%; box-sizing: border-box; }
+
+/* Chips token-field: committed tags are removable chips, the input only ever
+   holds the tag being typed — no separators exist. One visual box. */
+.tagging-tokenfield {
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+    padding: 4px 6px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--card-bg);
+    cursor: text;
+}
+.tagging-tokenfield:focus-within { box-shadow: 0 0 0 2px var(--accent); }
+.tagging-tokenfield .tagging-tag-input {
+    flex: 1;
+    min-width: 110px;
+    width: auto;
+    border: 0;
+    outline: none;
+    background: transparent;
+    box-shadow: none;
+    padding: 4px 2px;
+}
+.tagging-entry-chips { display: contents; }
+.tagging-entry-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 0.85em;
+    color: var(--text-primary);
+}
+.tagging-entry-chip-x {
+    border: 0;
+    background: none;
+    cursor: pointer;
+    color: var(--text-tertiary);
+    padding: 0 2px;
+    font-size: 1em;
+    line-height: 1;
+}
+.tagging-entry-chip-x:hover { color: var(--text-primary); }
+
+/* Removable CURRENT-store tags (tag deletion, 2026-07-22): rendered inline in
+   the table cells and the deck card's Note/Finder/Zotero chips. The × stays
+   muted until hover/focus so dense tables don't read as a wall of buttons. */
+.tagging-cur-tag { white-space: nowrap; }
+.tagging-cur-x {
+    border: 0;
+    background: none;
+    cursor: pointer;
+    color: var(--text-tertiary);
+    padding: 0 2px;
+    font-size: 1em;
+    line-height: 1;
+}
+.tagging-cur-x:hover,
+.tagging-cur-x:focus-visible { color: var(--danger, #c0392b); }
+.tagging-cur-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Per-token tag type-ahead (replaces the whole-value-matching <datalist>). */
+.tagging-suggest {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 40;
+    margin-top: 2px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+    max-height: 240px;
+    overflow-y: auto;
+}
+.tagging-suggest-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 6px 10px;
+    background: none;
+    border: 0;
+    cursor: pointer;
+    font-size: 0.9em;
+    color: var(--text-primary);
+}
+.tagging-suggest-item.is-active,
+.tagging-suggest-item:hover { background: var(--bg-elevated); }
+.tagging-suggest-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px; /* inward — the list clips an outward ring */
+}
+/* secondary, not tertiary: the HOVERED row's elevated fill put the gloss at
+   3.97:1 dark — the row you're pointing at was the one under AA. */
+.tagging-suggest-gloss { color: var(--text-secondary); }
+
+.tagging-card-targets { display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 12px; font-size: 0.88em; }
+.tagging-target-toggle { display: inline-flex; align-items: center; gap: 5px; color: var(--text-secondary); cursor: pointer; }
+/* De-emphasis via a real colour tier, not opacity: label text under 0.45
+   opacity composited far below AA, and a disabled-looking CONTENT state is
+   not WCAG-exempt the way a :disabled form control is. Only the checkbox
+   glyph (non-text UI, 3:1 bar) keeps a mild opacity. */
+.tagging-target-toggle.is-disabled { color: var(--text-tertiary); cursor: not-allowed; }
+.tagging-target-toggle.is-disabled input { opacity: 0.7; }
+
+.tagging-card-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.tagging-deck-hint { text-align: center; color: var(--text-tertiary); font-size: 0.8em; margin-top: 4px; line-height: 1.7; }
+.tagging-deck-hint kbd {
+    display: inline-block; padding: 1px 5px; border-radius: 4px;
+    background: var(--surface-hover); border: 1px solid var(--border);
+    font-family: monospace; font-size: 0.9em; color: var(--text-secondary);
+}
+.tagging-deck-done { text-align: center; padding: 24px 12px; color: var(--text-secondary); }
+
+/* The report body's overflow-x:auto coerces overflow-y to auto (CSS spec),
+   making it a clip container that cut off the type-ahead dropdown near the
+   panel's bottom edge. While the Tagging sub-view is mounted the body opts
+   out (tagging.js toggles the class; window.taggingTeardown removes it) and
+   tagging's own tables get their own scroll wrapper instead. */
+.audit-report-body.tagging-active { overflow: visible; }
+.tagging-table-wrap { overflow-x: auto; }
+
+/* Below ~980px the side-by-side card+PDF grid crushed a full PDF page into a
+   half-width column; stack instead (the sibling .refactor-md-cols pattern). */
+@media (max-width: 980px) {
+    .tagging-deck.with-pdf { grid-template-columns: 1fr; }
+    .tagging-pdf-frame { height: 50vh; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Card Catalog components (2026-07-20 redesign batch)
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Tracked-uppercase eyebrow label — the running-head device used above card
+   titles (triage progress, retrieval "Sources", settings section meta). */
+.eyebrow-label {
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+}
+
+/* N/F/Z lettered legend badge — the reference's A/G/Q key applied to the
+   three tagging targets. Letter color is --on-cat (>=4.5:1 on each fill,
+   contrast-lint pinned); the accompanying text label carries the meaning,
+   the badge is aria-hidden decoration reinforcing it. */
+.legend-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 800;
+    color: var(--on-cat);
+    flex: 0 0 auto;
+}
+.legend-badge.legend-note   { background: var(--cat-note); }
+.legend-badge.legend-finder { background: var(--cat-finder); }
+.legend-badge.legend-zotero { background: var(--cat-zotero); }
+
+/* Retrieval Context — a numbered reference list (vault.js::_renderRetrievalTrace):
+   footnote number · source link + kind label · relevance bar + score. */
+.retrieval-trace { margin: 2px 0 6px; }
+.retrieval-trace > summary {
+    cursor: pointer;
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+    user-select: none;
+}
+.retrieval-trace > summary:hover { color: var(--text-primary); }
+.retrieval-list { display: flex; flex-direction: column; margin-top: 4px; }
+.retrieval-row {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: baseline;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8125rem;
+}
+.retrieval-row:last-child { border-bottom: 0; }
+.retrieval-num {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+}
+.retrieval-src { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.retrieval-src a {
+    color: var(--text-primary);
+    font-weight: 600;
+    text-decoration: none;
+    overflow-wrap: anywhere;
+}
+.retrieval-src a:hover { color: var(--accent-hover); text-decoration: underline; }
+.retrieval-kind {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+}
+.retrieval-rel { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.retrieval-rel-bar {
+    width: 46px;
+    height: 4px;
+    background: var(--border);
+    overflow: hidden;
+    border-radius: 2px;
+}
+.retrieval-rel-bar > span { display: block; height: 100%; background: var(--accent); }
+.retrieval-rel-val {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+    min-width: 28px;
+    text-align: right;
+}
+
+/* confirmInline tone: 'confirm' — an ordinary gated write (tagging Accept)
+   is an accent-toned decision strip, NOT the danger-red reserved for
+   destructive/hard-to-reverse actions (the default tone). */
+.inline-confirm-strip.tone-confirm {
+    border-color: var(--accent);
+    background: var(--accent-soft-bg);
+}
+
+/* One-shot milestone / trend strip (audit first-scan, hygiene delta):
+   flat left-rule annotation, ok tone. */
+.milestone-strip {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    border-left: 3px solid var(--ok-fg);
+    padding: 8px 12px;
+    margin: 8px 16px;
+    background: var(--surface-subtle);
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+}
+.milestone-strip strong { color: var(--text-primary); }
+.hygiene-trend {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 4px 0 8px;
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+.hygiene-trend .trend-n { font-weight: 800; font-size: 1rem; color: var(--text-primary); }
+.hygiene-trend .trend-better { color: var(--ok-fg); font-weight: 800; }
+.hygiene-trend .trend-worse { color: var(--warn-fg); font-weight: 800; }
+
+/* Audit report nav — "On this report" grouped index (the reference's
+   "On this page" block): three labeled columns of report links with a
+   category dot, replacing the flat 11-button strip. Buttons keep their
+   .audit-report-tab class/roles — this is layout + link styling only. */
+.audit-report-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 40px;
+    padding: 12px 16px;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    margin: 10px 16px;
+}
+.audit-tab-group { display: flex; flex-direction: column; gap: 1px; min-width: 150px; }
+.audit-tab-group-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+    margin-bottom: 4px;
+}
+.audit-tab-group-label .dot { width: 8px; height: 8px; }
+.audit-tab-group-label .dot.cat-note   { background: var(--cat-note); }
+.audit-tab-group-label .dot.cat-finder { background: var(--cat-finder); }
+.audit-tab-group-label .dot.cat-zotero { background: var(--cat-zotero); }
+.audit-report-tab {
+    text-align: left;
+    justify-content: flex-start;
+    padding: 3px 6px;
+    border-radius: var(--radius-sm);
+}
+.audit-report-tab.active {
+    background: transparent;
+    color: var(--text-primary);
+    font-weight: 700;
+    box-shadow: inset 2px 0 0 0 var(--accent);
+    border-radius: 0;
+}
+
+/* Settings sections — flat shared-border accordion rows with a control
+   count in the summary (settings.js stamps .settings-count at init). */
+.settings-count {
+    float: right;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+    font-weight: 400;
+}
+
+/* Note Refactor master-detail: stack list-over-detail on a narrow window —
+   the same collapse the 2026-07-19 batch gave the tagging PDF split; below
+   this width the fixed side-list starved the detail pane. */
+@media (max-width: 900px) {
+    .refactor-layout { flex-direction: column; }
+    .refactor-note-list { flex: 0 0 auto; width: 100%; max-height: 32vh; }
+}
+
+/* ── Command palette (⌘K) — Batch H, 2026-07-22 ─────────────────────────── */
+.cmdk-overlay {
+    position: fixed; inset: 0; z-index: 1200;
+    background: color-mix(in srgb, var(--bg, #000) 40%, transparent);
+    display: flex; align-items: flex-start; justify-content: center;
+    padding-top: 12vh;
+}
+.cmdk-panel {
+    width: min(560px, 92vw);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    overflow: hidden;
+}
+.cmdk-input {
+    width: 100%; box-sizing: border-box;
+    padding: 12px 14px; border: 0;
+    border-bottom: 1px solid var(--border);
+    background: transparent; color: var(--text-primary);
+    font-size: 1rem; outline: none;
+}
+.cmdk-list { max-height: 40vh; overflow-y: auto; }
+.cmdk-item {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 14px; cursor: pointer; color: var(--text-primary);
+}
+.cmdk-item.is-selected { background: var(--accent-hover-bg); color: #fff; }
+.cmdk-item.is-selected .cmdk-hint { color: #fff; opacity: 0.8; }
+.cmdk-hint { color: var(--text-tertiary); font-size: 0.85em; margin-left: 12px; }
+.cmdk-empty { padding: 12px 14px; color: var(--text-tertiary); }
+
+/* ── Guided tour — Batch H ──────────────────────────────────────────────── */
+.tour-overlay {
+    position: fixed; inset: 0; z-index: 1190;
+    pointer-events: none;
+}
+.tour-card {
+    pointer-events: auto;
+    position: fixed; right: 24px; bottom: 24px;
+    width: min(420px, 90vw);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    padding: 14px 16px;
+    color: var(--text-primary);
+}
+.tour-card p { margin: 8px 0 12px; color: var(--text-secondary); }
+.tour-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.tour-highlight {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 6px;
+}
+
+/* ── Help tab guide ─────────────────────────────────────────────────────── */
+/* The app shell is height:100vh/overflow:hidden and .card clips its overflow,
+   so the guide itself must be the scroll container (the .prompts-list /
+   .chat-history pattern): flex:1 fills the card's remaining height,
+   min-height:0 lets it shrink below its content so overflow-y engages and the
+   scrollbar appears. Full card width — the measure is kept readable by the
+   inner column, not by starving the viewport. */
+.help-guide {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 4px 24px 24px;
+    line-height: 1.6;
+}
+.help-guide-inner {
+    max-width: 1100px;
+    margin: 0 auto;
+}
+.help-guide h1 { font-size: 1.35rem; margin-top: 0; }
+.help-guide h2 {
+    font-size: 1.12rem;
+    margin-top: 1.6em;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+}
+.help-guide h1 + p, .help-guide h2 + p { margin-top: 0.6em; }
+.help-guide ul, .help-guide ol { padding-left: 1.4em; }
+.help-guide li { margin: 0.35em 0; }
+.help-guide code { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+/* 2026-07-26 UX audit — mirrors the .message pre rule (D3/#20). The guide has
+   NO pre rule of its own, and .help-guide sets overflow-y:auto, which makes the
+   computed overflow-x `auto` too: a long line inside a fenced block (e.g. the
+   venv-prefixed eval command) scrolled the WHOLE guide sideways, taking the
+   prose with it. Give the block its own scroll container instead. */
+.help-guide pre {
+    max-width: 100%;
+    overflow-x: auto;
+}
+/* …and stop the INLINE-code chrome (border + horizontal padding) applying to
+   every <code> inside a fenced block — marked wraps fenced content in
+   <pre><code>, so the rule above painted a box around the code and indented
+   its first line. */
+.help-guide pre code {
+    background: none;
+    border: 0;
+    padding: 0;
+}
+.help-guide-fallback { white-space: pre-wrap; }
+kbd {
+    background: var(--bg-elevated); border: 1px solid var(--border-strong);
+    border-bottom-width: 2px; border-radius: 4px; padding: 0 5px;
+    font-size: 0.85em;
 }

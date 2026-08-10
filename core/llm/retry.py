@@ -91,6 +91,7 @@ def retry_with_backoff(
     max_delay_s: float = 16.0,
     on_attempt: Callable[[int, LLMError], None] | None = None,
     deadline_monotonic_s: float | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> T:
     """Call *fn* and retry on transient :class:`LLMError` failures.
 
@@ -116,8 +117,11 @@ def retry_with_backoff(
         except LLMError as err:
             if attempt >= max_attempts or not is_transient(err):
                 raise
-            sleep_for = min(delay, max_delay_s)
-            sleep_for = sleep_for * (0.75 + random.random() * 0.5)
+            # Jitter (±25 %) BEFORE the cap, so max_delay_s is an honest
+            # ceiling — the previous clamp-then-jitter order let the "max"
+            # run 25 % over its own name (2026-07-22 audit B8). The
+            # retry-after hint below may still exceed the cap by design.
+            sleep_for = min(delay * (0.75 + random.random() * 0.5), max_delay_s)
             # Provider retry-after hint (429s): sleeping LESS than the hint
             # guarantees the retry burns on another 429 (the TPM window has
             # not drained), so the hint is a FLOOR over the exponential
@@ -152,5 +156,21 @@ def retry_with_backoff(
                 max_attempts,
                 sleep_for,
             )
-            time.sleep(sleep_for)
+            # Sliced, cancel-aware sleep (2026-07-22 audit B8): a rate-limit
+            # hint can legitimately floor this at tens of seconds, during
+            # which the caller's Cancel previously appeared inert — the
+            # between-attempt cancel check could only run after the full
+            # sleep. Slices keep the wait interruptible at ~1 s granularity;
+            # on cancel the CURRENT error is re-raised (nothing new started).
+            if should_cancel is None:
+                time.sleep(sleep_for)
+            else:
+                end_at = time.monotonic() + sleep_for
+                while True:
+                    if should_cancel():
+                        raise err
+                    remaining_sleep = end_at - time.monotonic()
+                    if remaining_sleep <= 0:
+                        break
+                    time.sleep(min(1.0, remaining_sleep))
             delay *= 2

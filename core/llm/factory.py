@@ -11,7 +11,9 @@ from core.llm.types import ErrorCategory, LLMError, LLMRequest, LLMResponse
 
 logger = logging.getLogger(__name__)
 
-ONLINE_PROVIDER_NAMES = frozenset({"openai", "anthropic", "google"})
+ONLINE_PROVIDER_NAMES = frozenset(
+    {"openai", "anthropic", "google", "deepseek", "zai", "openrouter"}
+)
 LOCAL_PROVIDER_NAMES = frozenset({"ollama", "lm_studio"})
 ALL_PROVIDER_NAMES = ONLINE_PROVIDER_NAMES | LOCAL_PROVIDER_NAMES
 
@@ -54,6 +56,15 @@ def get_llm_provider(name: str, cfg: Optional[dict] = None) -> LLMProvider:
     if key == "google":
         from core.llm.adapters.google import GoogleProvider
         return GoogleProvider(**online_kwargs)
+    if key == "deepseek":
+        from core.llm.adapters.openai_compat import DeepSeekProvider
+        return DeepSeekProvider(**online_kwargs)
+    if key == "zai":
+        from core.llm.adapters.openai_compat import ZAIProvider
+        return ZAIProvider(**online_kwargs)
+    if key == "openrouter":
+        from core.llm.adapters.openai_compat import OpenRouterProvider
+        return OpenRouterProvider(**online_kwargs)
     if key in LOCAL_PROVIDER_NAMES:
         from core.llm.adapters.local import LocalLLMProvider
         return LocalLLMProvider(key)
@@ -140,7 +151,32 @@ def resolve_chat_provider(
         )
         assert policy.fallback is not None
         fallback = get_llm_provider(policy.fallback, cfg=cfg)
-        response = fallback.stream(request) if stream else fallback.generate(request)
+        # The fallback provider almost never serves the primary's model id
+        # (e.g. falling back openai→ollama with model="gpt-5" would 404), so
+        # re-resolve the model for the fallback provider — the same re-model
+        # step stream_with_fallback performs. cfg is loaded when the caller
+        # passed none: resolve_chat_model({}) would otherwise silently pick
+        # the hard default instead of the user's persisted selection.
+        from core.config import load_config, resolve_chat_model
+
+        model_cfg = cfg if cfg is not None else load_config()
+        fallback_request = dataclasses.replace(
+            request, model=resolve_chat_model(model_cfg, policy.fallback)
+        )
+        try:
+            response = (
+                fallback.stream(fallback_request)
+                if stream
+                else fallback.generate(fallback_request)
+            )
+        except Exception as exc:
+            # An exception raised inside an except block is NOT caught by the
+            # sibling `except Exception` below (handlers don't re-enter their
+            # own try), so without this the fallback's failure would escape
+            # raw and misattributed. Coerce it against the fallback provider.
+            raise coerce_error(
+                exc, provider=policy.fallback, model=fallback_request.model
+            )
         return response, policy.fallback
     except Exception as exc:
         raise coerce_error(exc, provider=policy.primary, model=request.model)
@@ -174,6 +210,20 @@ def stream_with_fallback(
     # prompts, and the refactor review/edit prompts — every stream_chat_messages
     # and _stream_online caller — via their request.workflow tag.
     _capture_request(request, provider_name)
+    def _notify_fallback(err: LLMError) -> None:
+        if on_fallback is not None:
+            try:
+                on_fallback(err.category.value, policy.fallback)
+            except Exception:
+                logger.debug("on_fallback callback failed", exc_info=True)
+        logger.warning(
+            "%s %s -> %s: %s",
+            log_context,
+            provider_name,
+            policy.fallback,
+            redact(err.message),
+        )
+
     yielded_any = False
     try:
         for token in primary.stream(request).response_gen:
@@ -185,23 +235,31 @@ def stream_with_fallback(
             raise
         if not policy.should_fall_back(err) or policy.fallback is None:
             raise
-            
-        if on_fallback is not None:
-            try:
-                on_fallback(err.category.value, policy.fallback)
-            except Exception:
-                logger.debug("on_fallback callback failed", exc_info=True)
-                
-        logger.warning(
-            "%s %s -> %s: %s",
-            log_context,
-            provider_name,
-            policy.fallback,
-            redact(err.message),
-        )
+        _notify_fallback(err)
+    except (GeneratorExit, KeyboardInterrupt):
+        raise
+    except Exception as exc:
+        # Parity with resolve_chat_provider's coerce net (2026-07-22 audit M6b):
+        # an adapter can leak a raw non-LLMError exception (SDK types outside
+        # the captured tuples, plain bugs), which previously bypassed both
+        # fallback eligibility and provider attribution and surfaced raw to
+        # the route. Coerce it; the coerced error then goes through the same
+        # eligibility gate as a native LLMError.
+        err = coerce_error(exc, provider=provider_name, model=request.model)
+        if yielded_any:
+            raise err from exc
+        if not policy.should_fall_back(err) or policy.fallback is None:
+            raise err from exc
+        _notify_fallback(err)
 
     fallback = get_llm_provider(policy.fallback, cfg=cfg)
-    fallback_model = resolve_chat_model(cfg or {}, policy.fallback)
+    # cfg is LOADED when the caller passed none — the exact trap the sibling
+    # seam (resolve_chat_provider) documents and fixes: resolve_chat_model({})
+    # silently picks the hard-default model id instead of the user's persisted
+    # per-provider selection (2026-07-22 audit M6).
+    from core.config import load_config as _load_config
+    model_cfg = cfg if cfg is not None else _load_config()
+    fallback_model = resolve_chat_model(model_cfg, policy.fallback)
     fallback_request = dataclasses.replace(request, model=fallback_model)
     
     yield from fallback.stream(fallback_request).response_gen

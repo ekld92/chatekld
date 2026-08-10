@@ -183,6 +183,12 @@ if LanceDBVectorStore is not None:
             bit-for-bit identical to the legacy ``SimpleVectorStore``.
             """
             if getattr(query, "query_embedding", None) is not None:
+                # In-place mutation is deliberate and safe HERE (asymmetric
+                # with add(), which stresses copies): a VectorStoreQuery is
+                # built per retrieval and never reused after this call, so
+                # normalizing the caller's object costs nothing — while add()'s
+                # nodes ARE long-lived (docstore) and must never see their
+                # embeddings changed (2026-07-22 comment repair).
                 query.query_embedding = _unit(query.query_embedding)
             return super().query(query, **kwargs)
 

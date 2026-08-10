@@ -118,6 +118,26 @@ def _cfg_bounded_int(key: str, default: int, lo: int, hi: int) -> int:
         return default
     return max(lo, min(v, hi))
 
+def _record_vision_usage(provider, model, prompt, result, start_monotonic, *, success=True):
+    """Log a vision/OCR call to /api/usage (axis vi visibility; local ⇒ $0).
+
+    The image bytes are not tokenised (they are not text); the recorded input
+    is the text prompt only, so the input-token figure is a small floor — the
+    point is that the call is *visible*, with a real output-token estimate.
+    """
+    import time as _t
+    from core.llm.usage import record_local_usage
+    record_local_usage(
+        provider or "", model or "",
+        input_text=prompt or "",
+        output_text=result or "",
+        latency_ms=int((_t.monotonic() - start_monotonic) * 1000),
+        stream=False,
+        success=success,
+        error_category="" if success else "vision_error",
+    )
+
+
 def _model_matches(configured: str, installed: list[str]) -> bool:
     """Return True if *configured* is exactly listed in *installed*, or shares
     a base name (the part before the first colon) with one of them.
@@ -215,6 +235,7 @@ class VisionManager:
         if failure_at is not None and (time.monotonic() - failure_at) < _failure_cooldown_s():
             return ""
 
+        _vstart = time.monotonic()
         try:
             # Indexing-time description for vault images (figures, diagrams,
             # charts, photos, screenshots) — NOT the scanned-PDF OCR path
@@ -255,23 +276,52 @@ class VisionManager:
                 "vision_describe", prompt,
                 provider=current_provider, model=current_model,
             )
+            call_meta: dict = {}
             if current_provider == "lm_studio":
                 result = _chat_lm_studio_image(
                     current_model, prompt, payload,
-                    timeout=timeout, max_tokens=max_tokens,
+                    timeout=timeout, max_tokens=max_tokens, meta=call_meta,
                 )
             else:
                 result = _chat_ollama_image(
                     current_model, prompt, payload,
-                    timeout=timeout, max_tokens=max_tokens,
+                    timeout=timeout, max_tokens=max_tokens, meta=call_meta,
+                )
+            if call_meta.get("truncated"):
+                # A description cut off at vision_max_tokens is still cached and
+                # embedded (accepted: truncated text is useful for retrieval,
+                # and NOT caching would re-run an expensive vision call on every
+                # indexing run). But the cache keys on the IMAGE BYTES, so
+                # raising the cap never re-runs it — say so, loudly and once per
+                # call, naming the knob (2026-07-20 audit; surfaced 2026-07-30).
+                # Clearing obsidian_cache/.../image_cache/ is the remedy.
+                logger.warning(
+                    "Vision description hit the %s-token cap and is truncated; "
+                    "it is cached as-is (keyed on image bytes), so raising "
+                    "vision_max_tokens will NOT regenerate it — clear the image "
+                    "description cache to redo it.", max_tokens,
                 )
         except Exception as e:
             logger.warning("Vision error: %s", e)
             with self._lock:
-                self._call_failure_at = time.monotonic()
+                # Arm the cooldown only if the configuration still matches the
+                # snapshot this call ran with (the same compare-under-lock
+                # check_availability does): an in-flight model-A failure
+                # landing after a set_model(B) must not arm B's cooldown —
+                # set_model's "retries immediately" promise would be silently
+                # defeated and a window of images dropped.
+                if self.model == current_model and self.provider == current_provider:
+                    self._call_failure_at = time.monotonic()
+            _record_vision_usage(
+                current_provider, current_model, prompt, "",
+                _vstart, success=False,
+            )
             return ""
         with self._lock:
             self._call_failure_at = None
+        # Usage visibility (axis vi): image calls bypass the core.llm adapter
+        # seam, so record the call so it shows in /api/usage (local ⇒ $0).
+        _record_vision_usage(current_provider, current_model, prompt, result, _vstart)
         return result
 
     def set_model(self, model: str) -> None:
@@ -453,6 +503,8 @@ class GLMOCRManager:
             provider=current_provider, model=current_model,
         )
         result = ""
+        got_response = False
+        _ocr_start = time.monotonic()
         for attempt in range(2):
             image_payload = base64_png if attempt == 0 else _downscale_base64_png(base64_png, 0.8)
             if not image_payload:
@@ -468,6 +520,7 @@ class GLMOCRManager:
                         current_model, prompt, image_payload,
                         timeout=timeout, max_tokens=max_tokens,
                     )
+                got_response = True
                 break
             except Exception as e:
                 if attempt == 0 and _is_context_overflow_error(e):
@@ -475,17 +528,54 @@ class GLMOCRManager:
                     continue
                 logger.warning("GLM-OCR error on page: %s", e)
                 with self._lock:
-                    self._call_failure_at = time.monotonic()
+                    # Same snapshot compare as describe_image: never arm the
+                    # cooldown for a model/provider this call didn't run with.
+                    if self.model == current_model and self.provider == current_provider:
+                        self._call_failure_at = time.monotonic()
+                # Usage visibility (axis vi): record the failed OCR call too.
+                _record_vision_usage(
+                    current_provider, current_model, prompt, "",
+                    _ocr_start, success=False,
+                )
                 return ""
 
-        if result:
+        # B4 (2026-07-13): if NO attempt produced a response — e.g. attempt 0
+        # overflowed and the smaller re-render came back empty, so attempt 1 was
+        # skipped by the `if not image_payload: continue` guard — this is a
+        # FAILURE, not a silent empty success. The old code fell through to the
+        # success recorder below (mislabeling it a $0 success in /api/usage) and
+        # never armed the cooldown, so a corrupt/oversized page made a fresh
+        # failing round-trip on every re-encounter. Record the failure + arm the
+        # fast-fail cooldown instead.
+        if not got_response:
+            logger.warning("GLM-OCR page could not be rendered small enough to OCR; skipping.")
             with self._lock:
-                self._call_failure_at = None
-            with self._cache_lock:
-                if len(self._cache) >= self._OCR_CACHE_MAX_SIZE:
-                    oldest_key = next(iter(self._cache))
-                    del self._cache[oldest_key]
-                self._cache[img_hash] = result
+                if self.model == current_model and self.provider == current_provider:
+                    self._call_failure_at = time.monotonic()
+            _record_vision_usage(
+                current_provider, current_model, prompt, "",
+                _ocr_start, success=False,
+            )
+            return ""
+
+        # Usage visibility (axis vi): OCR bypasses the core.llm adapter seam.
+        _record_vision_usage(current_provider, current_model, prompt, result, _ocr_start)
+        # An EMPTY result from a call that answered is still a success: the
+        # model just found no text (a blank/graphic page). Gating the
+        # cooldown-clear and the cache insert on `if result:` (pre-2026-07-20)
+        # meant (a) a healthy backend never cleared a previously-armed cooldown
+        # with a blank page, so later pages kept fast-failing for the full
+        # window, and (b) blank pages were never cached, re-paying a full model
+        # round-trip on every re-encounter — the cache exists to prevent
+        # exactly that. The cache-hit check is a membership test, so a stored
+        # "" round-trips fine.
+        with self._lock:
+            self._call_failure_at = None
+        with self._cache_lock:
+            if len(self._cache) >= self._OCR_CACHE_MAX_SIZE:
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
+            self._cache[img_hash] = result
         return result
 
 def _is_context_overflow_error(exc: Exception) -> bool:
@@ -583,12 +673,17 @@ def _chat_ollama_image(
     *,
     timeout: float | None = None,
     max_tokens: int | None = None,
+    meta: dict | None = None,
 ) -> str:
     """Send one image+prompt to Ollama's vision chat and return the stripped text.
 
     Keyword-only ``timeout``/``max_tokens`` map to a timed client and ``num_predict``;
     they are the always-on call bounds. Raises on a backend/None-content failure
     (the managers catch it and treat it as an empty, cooldown-triggering result).
+
+    ``meta`` (optional, 2026-07-30) is an out-dict the caller may pass to learn
+    WHY generation stopped: ``meta["truncated"]`` is True when the model hit
+    ``max_tokens``. Additive — every existing caller omits it and is unaffected.
     """
     # Use a timed client (cached per host+timeout) instead of the module-level
     # ollama.chat so a stuck call is bounded; ``timeout=None`` leaves the SDK
@@ -610,6 +705,9 @@ def _chat_ollama_image(
         }],
         options=options,
     )
+    if meta is not None:
+        # Ollama reports the stop cause as done_reason ("length" == hit the cap).
+        meta["truncated"] = str(getattr(response, "done_reason", "") or "") == "length"
     # No `or ""` guard here (unlike the LM Studio path): a model that returns
     # content=None raises AttributeError, which the callers catch and treat as a
     # failed call (empty result + cooldown) — the same outcome as "".
@@ -622,8 +720,12 @@ def _chat_lm_studio_image(
     *,
     timeout: float | None = None,
     max_tokens: int | None = None,
+    meta: dict | None = None,
 ) -> str:
     """Send one image+prompt to LM Studio's OpenAI-compatible vision endpoint.
+
+    ``meta`` (optional, 2026-07-30) mirrors the Ollama transport: an out-dict
+    receiving ``truncated`` when the model stopped at ``max_tokens``.
 
     Builds the OpenAI ``image_url`` data-URI message shape. ``max_retries=0`` so a
     timed-out request is not silently retried into 3× the wall-clock; ``timeout`` is
@@ -660,7 +762,10 @@ def _chat_lm_studio_image(
         }],
         **create_kwargs,
     )
-    return (response.choices[0].message.content or "").strip()
+    choice = response.choices[0]
+    if meta is not None:
+        meta["truncated"] = str(getattr(choice, "finish_reason", "") or "") == "length"
+    return (choice.message.content or "").strip()
 
 # Singletons
 vision_manager = VisionManager()

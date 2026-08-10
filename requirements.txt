@@ -129,3 +129,8 @@ pikepdf>=8.15,<10.0
 ruamel.yaml>=0.18,<0.19
 bibtexparser>=1.4,<2.0
 beautifulsoup4>=4.12,<5.0
+# rapidfuzz scores the near-duplicate report's content-similarity tier
+# (plan 2026-08-05/6).  The audit engine imports it lazily and degrades to
+# the deterministic tiers with a disclosed meta note when it is absent, so
+# an env installed before this pin keeps working.
+rapidfuzz>=3.9,<4.0

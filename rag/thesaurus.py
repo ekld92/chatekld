@@ -216,9 +216,17 @@ class TagRow:
     tags: list[str] = field(default_factory=list)
 
 
-def parse_tags(text: str) -> list[TagRow]:
+def parse_tags(text: str, *, include_empty_desc: bool = False) -> list[TagRow]:
     """Parse ``_tags.md`` — the comma-separated Description column is the
-    bilingual concept-phrase source for synonym grouping."""
+    bilingual concept-phrase source for synonym grouping.
+
+    ``include_empty_desc=True`` also yields rows that carry tags but no
+    description phrases. The thesaurus consumers keep the default (an empty
+    row contributes no synonyms and would render an empty primer line), but
+    the tagging vocabulary (``tagging/vocab.py``) needs every tag id — the
+    vocabulary is the server-side security gate for tag writes, so a
+    legitimately-defined gloss-less tag must not silently become unusable.
+    """
     out: list[TagRow] = []
     for cells in _table_rows(text):
         if len(cells) < 2:
@@ -227,9 +235,9 @@ def parse_tags(text: str) -> list[TagRow]:
         if _norm(desc).startswith("description") or _norm(tags_cell) in ("tags", "tag"):
             continue
         phrases = [p.strip() for p in re.split(r"[,/]", desc) if p.strip()]
-        if not phrases:
-            continue
         tags = [t.strip().lstrip("#") for t in tags_cell.split(",") if t.strip()]
+        if not phrases and not (include_empty_desc and tags):
+            continue
         out.append(TagRow(phrases=phrases, tags=tags))
     return out
 
@@ -251,8 +259,9 @@ def _clean_meaning_for_display(s: str) -> str:
 
 
 _PRIMER_HEADER = (
-    "This knowledge base is a bilingual French/English psychiatry and "
-    "clinical-research corpus. Notes are terse and use heavy shorthand and "
+    "This knowledge base is a trilingual French/German/English psychiatry and "
+    "clinical-research corpus; passages in any of the three languages are "
+    "equally valid evidence. Notes are terse and use heavy shorthand and "
     "abbreviations. Reference glossary (abbreviation = meaning) for "
     "interpreting the retrieved notes:"
 )
@@ -440,7 +449,7 @@ class Thesaurus:
         *header* replaces the built-in :data:`_PRIMER_HEADER` intro sentence, and
         a non-empty *core_terms* replaces the :data:`_CORE_PRIMER_TERMS` priority
         list (both default to the built-ins, which are tuned for the maintainer's
-        FR/EN clinical corpus — see ``vault_primer_header`` /
+        FR/DE/EN clinical corpus — see ``vault_primer_header`` /
         ``vault_primer_core_terms``).
         """
         if max_chars <= 0 or not self.abbrev_rows:

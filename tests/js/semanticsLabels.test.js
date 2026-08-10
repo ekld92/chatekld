@@ -48,18 +48,29 @@ describe('markup semantics (Track 6c)', () => {
     });
 
     it('audit report tabs have ids and the panel names its initial tab', () => {
-        expect((html.match(/id="audit-rtab-/g) || []).length).toBe(7);
+        // Derive the expected count from the tabs' own data-report attributes
+        // instead of a hand-bumped literal (review lot 6): every tab button
+        // must carry a matching id, whatever the tab set grows to.
+        const dataReports = (html.match(/class="audit-report-tab[^"]*"[^>]*data-report="/g) || []).length;
+        expect(dataReports).toBeGreaterThan(0);
+        expect((html.match(/id="audit-rtab-/g) || []).length).toBe(dataReports);
         const panel = /<div id="audit-report-body"[^>]*>/.exec(html)[0];
         expect(panel).toContain('aria-labelledby="audit-rtab-inventory"');
     });
 
     it('decorative gear glyphs are hidden from AT', () => {
         // Every ⚙ ships inside an aria-hidden span; the adjacent text names
-        // the target, so the symbol is pure decoration.
+        // the target, so the symbol is pure decoration. Relative, not a fixed
+        // floor: the old ">= 10" counted glyphs inside the retired
+        // howto modal (plan 2026-08-05/1), so deleting content broke it while
+        // proving nothing — the invariant is "no bare gear", i.e. wrapped
+        // occurrences account for EVERY occurrence.
         expect(html).not.toMatch(/<strong>&#9881;/);
         expect(html).not.toMatch(/>&#9881; LLM Settings</);
-        expect((html.match(/<span aria-hidden="true">&#9881;<\/span>/g) || []).length)
-            .toBeGreaterThanOrEqual(10);
+        const total = (html.match(/&#9881;/g) || []).length;
+        const wrapped = (html.match(/<span aria-hidden="true">&#9881;<\/span>/g) || []).length;
+        expect(total).toBeGreaterThanOrEqual(1);
+        expect(wrapped).toBe(total);
     });
 });
 

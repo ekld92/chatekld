@@ -22,6 +22,7 @@ All routes are gated by the app-level before_request origin guard
 (api.security.register_origin_guard; 403 otherwise).
 """
 import json
+import math
 import os
 import re
 import shutil
@@ -29,6 +30,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request, Response
 from core.config import load_config, save_config, load_report_types
 from core.constants import (
@@ -67,7 +69,10 @@ config_bp = Blueprint('config', __name__)
 # cannot store a pathological timeout, token budget, or out-of-range knob.  A
 # value that fails coercion is DROPPED from the payload (not persisted), leaving
 # the previously-saved value intact rather than overwriting it with garbage.
-_PROVIDER_NAMES = ("ollama", "lm_studio", "openai", "anthropic", "google")
+_PROVIDER_NAMES = (
+    "ollama", "lm_studio", "openai", "anthropic", "google", "deepseek", "zai",
+    "openrouter",
+)
 _FALLBACK_ON_ALLOWED = ("timeout", "network", "rate_limit", "server_error")
 
 
@@ -164,6 +169,46 @@ def _coerce_local_host(value):
     return s if _LOCAL_HOST_RE.fullmatch(s) else None
 
 
+def _coerce_http_url(value):
+    """Allow "" (fall back to the built-in default) or an http(s) URL; else None.
+
+    For a stored dial target that legitimately carries a PATH (the Zotero
+    local-API base, ``http://127.0.0.1:23119/api``) — unlike ``ollama_host``,
+    which is host[:port] only. Shape gate (2026-07-20 audit M3): scheme must be
+    http/https, no whitespace/control chars, bounded length. Defence in depth
+    over the local-origin gate on ``/api/config``, since this becomes the base
+    URL a urllib client dials (an SSRF surface).
+    """
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s == "":
+        return ""
+    if len(s) > 200 or any(ch in s for ch in ("\x00", "\n", "\r", " ", "\t")):
+        return None
+    parsed = urlparse(s)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return s
+
+
+def _coerce_https_url(value):
+    """Like ``_coerce_http_url`` but **https only** (E2, 2026-07-20 audit).
+
+    Used for ``tagging_zotero_web_api_base``, which carries the ZOTERO_API_KEY in
+    a request header. Allowing plain ``http`` there is a cleartext-credential
+    dial target; the loopback local base keeps ``http`` (127.0.0.1) via
+    ``_coerce_http_url``. ``resolve_transport`` re-validates at call time too, so
+    a hand-edited config can't bypass this.
+    """
+    out = _coerce_http_url(value)
+    if out in (None, ""):
+        return out
+    if urlparse(out).scheme != "https":
+        return None
+    return out
+
+
 def _coerce_vault_rel_subdir(value):
     """Shape-validate a vault-relative sub-folder (no traversal/abs/NUL).
 
@@ -225,6 +270,19 @@ def _coerce_model_name(value):
     return s
 
 
+def _coerce_online_model(value):
+    """A bounded, control-char-free online model id; empty is DROPPED.
+
+    The per-provider ``*_model`` keys (the routing target of the UI's generic
+    ``llm`` field) previously persisted any string and only failed at call time
+    (audit finding #25). Unlike ``_coerce_model_name`` (where "" means "use the
+    chat model"), an empty online selection is meaningless — drop it so the
+    prior persisted value survives.
+    """
+    coerced = _coerce_model_name(value)
+    return coerced or None
+
+
 def _coerce_abs_dir_or_empty(value):
     """Allow "" (use the default archive dir) or an ABSOLUTE, control-char-free path.
 
@@ -248,12 +306,71 @@ def _coerce_abs_dir_or_empty(value):
     return s
 
 
+
+# Bounds for llm_pricing_overrides: enough for every provider's curated list
+# plus custom models, far below anything that could bloat config.json.
+_PRICING_OVERRIDES_MAX_MODELS = 64
+_PRICING_OVERRIDES_MAX_KEY_LEN = 200
+_PRICING_OVERRIDES_FIELDS = ("input", "output", "cached_input")
+
+
+def _coerce_pricing_overrides(value):
+    """Validated copy of an ``llm_pricing_overrides`` dict, or None to drop.
+
+    Numbers are float()ed at WRITE time (quoted numbers from hand-edited JSON
+    are the common mistake), matching what ``estimate_cost_usd`` expects, so a
+    malformed entry can never reach the costing hot path.
+    """
+    if not isinstance(value, dict) or len(value) > _PRICING_OVERRIDES_MAX_MODELS:
+        return None
+    out: dict = {}
+    for model, row in value.items():
+        if not isinstance(model, str) or not model.strip() \
+                or len(model) > _PRICING_OVERRIDES_MAX_KEY_LEN:
+            return None
+        if not isinstance(row, dict):
+            return None
+        entry: dict = {}
+        for field in _PRICING_OVERRIDES_FIELDS:
+            if field not in row:
+                continue
+            raw = row[field]
+            if field == "cached_input" and raw is None:
+                entry[field] = None
+                continue
+            try:
+                num = float(raw)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(num) or num < 0 or num > 1_000_000:
+                return None
+            entry[field] = num
+        # input+output are what estimate_cost_usd requires to apply a row.
+        if "input" not in entry or "output" not in entry:
+            return None
+        out[model.strip()] = entry
+    return out
+
+
 # key -> callable(raw) -> clamped value or None (None ⇒ drop the key).
 _CONFIG_VALIDATORS = {
     # Online / shared LLM plumbing (also reused by the agent loop for local).
     "online_timeout_s": lambda v: coerce_int_in_range(v, 5, 600),
     "online_max_retries": lambda v: coerce_int_in_range(v, 0, 10),
     "online_max_tokens": lambda v: coerce_int_in_range(v, 64, 32768),
+    # Online single-paper document bound (map-reduce trigger). Config-only, no
+    # Settings control; floor 4000 keeps a garbage value from forcing every
+    # paper through map-reduce.
+    "online_doc_window_tokens": lambda v: coerce_int_in_range(v, 4000, 2_000_000),
+    # Per-provider online model selections (the routing target of the UI's
+    # generic `llm` field). Shape-only; a garbage id previously persisted and
+    # failed only at call time.
+    "openai_model": _coerce_online_model,
+    "anthropic_model": _coerce_online_model,
+    "google_model": _coerce_online_model,
+    "deepseek_model": _coerce_online_model,
+    "zai_model": _coerce_online_model,
+    "openrouter_model": _coerce_online_model,
     # Assumed chat-model context window: sizes the local LLM context and the
     # retrieval-breadth autoscaler. No Settings control (advanced/internal), but
     # validated here so a hand-edited / generic-POST garbage value can't reach
@@ -272,6 +389,19 @@ _CONFIG_VALIDATORS = {
     # Failed-call fast-fail window; 0 legitimately disables (retry every image).
     "vision_failure_cooldown_s": lambda v: coerce_int_in_range(v, 0, 600),
     "fallback_provider": _coerce_fallback_provider,
+    # B7 (2026-07-13): the active provider selectors + free-string model ids were
+    # previously UNVALIDATED — a garbage `provider` persisted and surfaced only as
+    # a call-time error, and `llm`/`embed`/`ocr_model`/`vision_model` accepted any
+    # string. Enum-check the providers (invalid ⇒ dropped, prior survives) and
+    # bound the model ids (empty kept, control-char-free, ≤120 chars).
+    "provider": lambda v: coerce_enum(v, _PROVIDER_NAMES),
+    "ocr_provider": lambda v: coerce_enum(v, ("ollama", "lm_studio")),
+    "vision_provider": lambda v: coerce_enum(v, ("ollama", "lm_studio")),
+    "llm": _coerce_model_name,
+    "embed": _coerce_model_name,
+    "embed_provider": lambda v: coerce_enum(v, ("ollama", "lm_studio")),
+    "ocr_model": _coerce_model_name,
+    "vision_model": _coerce_model_name,
     # Vault chat generation / retrieval knobs.
     "vault_top_k": lambda v: coerce_int_in_range(v, 1, 32),
     "vault_similarity_cutoff": lambda v: coerce_float_in_range(v, 0.0, 1.0),
@@ -289,9 +419,27 @@ _CONFIG_VALIDATORS = {
     "vault_query_expansion": coerce_bool,
     "vault_num_queries": lambda v: coerce_int_in_range(v, 1, 5),
     "vault_rerank_pool_ceiling": lambda v: coerce_int_in_range(v, 10, 200),
+    # Config-only siblings of the ceiling (2026-07-22 audit: they were the
+    # only rerank-pool knobs without validators, contradicting the "every
+    # numeric knob is validated" contract; the engine reads them defensively
+    # but garbage should still never persist).
+    "vault_rerank_pool_multiplier": lambda v: coerce_int_in_range(v, 1, 16),
+    "vault_rerank_pool_floor": lambda v: coerce_int_in_range(v, 1, 200),
+    # llm_pricing_overrides: shape + size gate (2026-07-22 audit M2 — the
+    # exact config-bloat class fixed as B7 for vault_chat_system_prompt,
+    # reopened here: the key passed the KNOWN_KEYS whitelist un-checked, so
+    # one crafted POST could persist a ~100 MB blob that every load_config()
+    # then deep-copies ~75 call sites deep). Entries must be
+    # {model_id: {input/output/cached_input: number}}; anything else drops
+    # the whole key (the previously persisted value survives).
+    "llm_pricing_overrides": lambda v: _coerce_pricing_overrides(v),
     # Track 5.6: indexer embed-batch size; 1 = legacy per-chunk inserts.
     "vault_embed_batch_size": lambda v: coerce_int_in_range(v, 1, 256),
     "vault_wikilink_expansion": coerce_bool,
+    # Agent web_search tool (2026-07-22): the knob is a bool; the key stays
+    # env-only (TAVILY_API_KEY) and is never accepted or returned here.
+    "vault_web_search_enabled": coerce_bool,
+    "vault_web_search_max_results": lambda v: coerce_int_in_range(v, 1, 8),
     "vault_wikilink_neighbor_cap": lambda v: coerce_int_in_range(v, 1, 100),
     "vault_wikilink_node_cap": lambda v: coerce_int_in_range(v, 1, 200),
     "vault_wikilink_score_decay": lambda v: coerce_float_in_range(v, 0.0, 1.0),
@@ -308,6 +456,10 @@ _CONFIG_VALIDATORS = {
     "vault_thesaurus_tags_path": _coerce_vault_rel_file,
     "vault_primer_header": lambda v: coerce_string_max_len(v, 2000),
     "vault_primer_core_terms": lambda v: coerce_string_max_len(v, 4000),
+    # B7 (2026-07-13): the vault-chat system-prompt PREFIX (persisted by
+    # vault.js) had no write-time cap — only a read-time cap bounded what reached
+    # the LLM, so a crafted POST could bloat config.json (deep-copied ~75×).
+    "vault_chat_system_prompt": lambda v: coerce_string_max_len(v, SYSTEM_PROMPT_LIMIT),
     "vault_agent_enabled": coerce_bool,
     "vault_agent_max_iterations": lambda v: coerce_int_in_range(v, 1, 12),
     "vault_vector_backend": lambda v: coerce_enum(v, ("simple", "lancedb")),
@@ -326,6 +478,15 @@ _CONFIG_VALIDATORS = {
     "deck_retry_backoff_s": lambda v: coerce_int_in_range(v, 0, 30),
     "deck_section_max_tokens": lambda v: coerce_int_in_range(v, 256, 8192),
     "deck_resume_enabled": coerce_bool,
+    # Doc Generator (article/report) generation knobs — prose sibling of deck_*
+    # (ranges mirror the _*_MIN/_*_MAX constants in api/routes/docgen.py).
+    "docgen_temperature": lambda v: coerce_float_in_range(v, 0.0, 2.0),
+    "docgen_max_sections": lambda v: coerce_int_in_range(v, 1, 30),
+    "docgen_agent_max_iterations": lambda v: coerce_int_in_range(v, 1, 12),
+    "docgen_section_max_attempts": lambda v: coerce_int_in_range(v, 1, 5),
+    "docgen_retry_backoff_s": lambda v: coerce_int_in_range(v, 0, 30),
+    "docgen_section_max_tokens": lambda v: coerce_int_in_range(v, 256, 16384),
+    "docgen_resume_enabled": coerce_bool,
     # Opt-in final-stage .tex integrity review + auto-repair. review_enabled is
     # the persisted default for the off-by-default panel toggle; review_model is
     # the HF/provider-shaped stronger-model override (""⇒chat model); max_tokens
@@ -368,25 +529,58 @@ _CONFIG_VALIDATORS = {
     # the in-vault thumbnail's longest side.
     "refactor_archive_dir": _coerce_abs_dir_or_empty,
     "refactor_thumb_max_side": lambda v: coerce_int_in_range(v, 96, 1024),
+    # Biblio Tagging archive dir — shape-only (abs or ""); the not-inside-vault
+    # check is re-applied at apply time by tagging/journal.py::archive_dir.
+    "tagging_archive_dir": _coerce_abs_dir_or_empty,
+    # Biblio Tagging LLM tag-proposal knobs (empty model kept ⇒ chat model).
+    # Model id through _coerce_model_name (rejects control chars/newlines), not
+    # a bare length cap (2026-07-20 audit M3) — it becomes a provider model id.
+    "tagging_propose_model": _coerce_model_name,
+    "tagging_propose_max_tokens": lambda v: coerce_int_in_range(v, 64, 2048),
+    "tagging_propose_temperature": lambda v: coerce_float_in_range(v, 0.0, 2.0),
+    "tagging_max_tags": lambda v: coerce_int_in_range(v, 1, 12),
+    "tagging_min_conf": lambda v: coerce_float_in_range(v, 0.0, 1.0),
+    "tagging_text_max_chars": lambda v: coerce_int_in_range(v, 500, 40000),
+    "tagging_candidate_tags": lambda v: coerce_int_in_range(v, 0, 200),
+    "tagging_fewshot_k": lambda v: coerce_int_in_range(v, 0, 10),
+    # Zotero local-API base — validated as an http(s) URL (it carries a path,
+    # ``/api``), not a bare length cap (2026-07-20 audit M3): this is a stored
+    # dial target (SSRF surface). Empty is kept (built-in local-API default).
+    "tagging_zotero_api_base": _coerce_http_url,
+    "tagging_zotero_web_api_base": _coerce_https_url,
+    "tagging_zotero_transport": lambda v: coerce_enum(v, ("auto", "local", "web")),
     # fallback_on handled separately (list-valued).
 }
 
 
-def _validate_llm_config_keys(data: dict) -> None:
-    """Clamp/drop the LLM-parameter keys in-place before save_config."""
+def _validate_llm_config_keys(data: dict) -> list[str]:
+    """Clamp/drop the LLM-parameter keys in-place before save_config.
+
+    Returns the list of keys that were DROPPED (malformed / out of range, so the
+    prior persisted value survives). 2026-07-26 UX audit, WCAG 3.3.1 Error
+    Identification: a drop used to be completely silent — 200 OK, no field in
+    the body — while the Settings modal is populated once at boot and never
+    reloaded, so the rejected value sat in the input for the whole session while
+    the server held the old one. The caller surfaces this ADDITIVELY (the
+    response keeps ``ok`` and its 200 status; smoke_test.py asserts on those).
+    """
+    dropped: list[str] = []
     for key, validator in _CONFIG_VALIDATORS.items():
         if key in data:
             coerced = validator(data[key])
             if coerced is None:
                 data.pop(key)
+                dropped.append(key)
             else:
                 data[key] = coerced
     if "fallback_on" in data:
         fo = _coerce_fallback_on(data["fallback_on"])
         if fo is None:
             data.pop("fallback_on")
+            dropped.append("fallback_on")
         else:
             data["fallback_on"] = fo
+    return dropped
 
 @config_bp.route("/api/config")
 def api_get_config():
@@ -415,11 +609,27 @@ def api_save_config():
     6. ``audit_*`` key stripping (those go through ``/api/audit/config``).
     7. ``_validate_llm_config_keys`` — clamp/drop the numeric/enum/bool knobs.
 
+    Responds ``{"ok": true, "dropped": [key, …]}``. ``dropped`` names the keys
+    step 7 refused (prior value kept) so the Settings window can flag the exact
+    field instead of failing silently; it is additive and always present.
+
     Local-origin gated; 400 on non-JSON or an invalid vault path.
     """
     data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "Invalid JSON"}), 400
+    # isinstance, not truthiness (2026-07-22 audit M7): a JSON *array* body
+    # passed `if not data` and crashed on `.startswith`/`.pop` deeper in (500
+    # instead of a clean 400) — the class paper.py fixed with the same check.
+    # And `{}` is a legitimate no-op patch, not "Invalid JSON".
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON: expected an object"}), 400
+    # Normalise `provider` ONCE, up front: the llm-routing below used to
+    # .strip().lower() its own copy while the enum validator later required
+    # an exact match — so {"provider": "OPENAI", "llm": "x"} routed `llm`
+    # into openai_model (consuming the local selection) and then DROPPED the
+    # provider change. One normalisation ⇒ routing and validation agree.
+    if isinstance(data.get("provider"), str):
+        data["provider"] = data["provider"].strip().lower()
+    _vault_switch_to = None
     if "obsidian_vault_path" in data:
         try:
             data["obsidian_vault_path"] = _validate_vault_path(
@@ -427,7 +637,15 @@ def api_save_config():
             )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        obsidian_manager.restore_vault_path(data["obsidian_vault_path"])
+        # A1 (2026-07-13): a vault SWITCH must drop the loaded index and every
+        # retrieval cache (BM25/wikilink/thesaurus sidecars, prewarm state) —
+        # otherwise the next chat answers from the previous vault's in-memory
+        # index and a reindex runs incrementally against it (cross-vault mix).
+        # The switch itself is DEFERRED until after save_config succeeds
+        # (2026-07-22 audit M7b): mutating the live manager first meant a
+        # failed save (disk full) left memory on the new vault while
+        # config.json kept the old one — divergent until restart.
+        _vault_switch_to = data["obsidian_vault_path"]
     if "vault_exclude_dirs" in data:
         data["vault_exclude_dirs"] = _normalise_vault_exclude_dirs(
             data.get("vault_exclude_dirs"),
@@ -437,7 +655,8 @@ def api_save_config():
         data["vault_image_exts"] = _normalise_vault_image_exts(
             data.get("vault_image_exts")
         )
-    if any(key in data for key in ("provider", "llm", "embed", "openai_model", "anthropic_model", "google_model")):
+    from core.config import ONLINE_MODEL_KEYS
+    if any(key in data for key in ("provider", "llm", "embed", *ONLINE_MODEL_KEYS.values())):
         clear_provider_warnings()
     # When the active provider is online, route the generic "llm" field
     # into its per-provider companion so per-provider selections survive
@@ -448,13 +667,14 @@ def api_save_config():
     # provider="ollama" in a real config).
     if "llm" in data:
         from core.config import is_online_provider
-        active = (data.get("provider") or load_config().get("provider") or "ollama").strip().lower()
+        # str() first: a non-string truthy `provider` (a number, a dict — this
+        # is a JSON body) made `.strip()` raise AttributeError, i.e. a 500 on a
+        # malformed request where every other bad value in this handler is
+        # coerced or dropped.
+        active = str(data.get("provider") or load_config().get("provider")
+                     or "ollama").strip().lower()
         if is_online_provider(active):
-            key = {
-                "openai": "openai_model",
-                "anthropic": "anthropic_model",
-                "google": "google_model",
-            }[active]
+            key = ONLINE_MODEL_KEYS[active]
             data.setdefault(key, data["llm"])
             data.pop("llm")
     if any(key in data for key in ("ocr_provider", "ocr_model", "vision_provider", "vision_model")):
@@ -492,9 +712,27 @@ def api_save_config():
 
     # Clamp/validate the LLM-parameter keys the Settings window writes; an
     # out-of-range or malformed value is dropped so the prior value survives.
-    _validate_llm_config_keys(data)
+    # The dropped list rides the response (see below) so the client can tell the
+    # user WHICH field did not persist instead of leaving a rejected value
+    # sitting in the input all session.
+    dropped = _validate_llm_config_keys(data)
     save_config(data)
-    return jsonify({"ok": True})
+    # Vault switch AFTER the successful persist (see the deferral comment
+    # above): compare normalised forms and only clear on a real change so a
+    # no-op re-save stays cheap. cleanup() drops the in-memory index + caches
+    # and calls reset_prewarm(); it does NOT delete anything on disk (only
+    # /api/reset does), so a switch BACK to the prior vault still loads it.
+    if _vault_switch_to is not None:
+        _prev_vault = obsidian_manager.get_vault_path()
+        obsidian_manager.restore_vault_path(_vault_switch_to)
+        if obsidian_manager.get_vault_path() != _prev_vault:
+            obsidian_manager.cleanup()
+    # ADDITIVE field (2026-07-26 UX audit): status stays 200 and ``ok`` stays
+    # True — a drop is a partial success, not a request failure, and existing
+    # callers/tests that only read ``ok`` are unaffected. ``dropped`` is always
+    # present (empty on the happy path) so a client can branch on length rather
+    # than on presence.
+    return jsonify({"ok": True, "dropped": dropped})
 
 def _validate_vault_path(raw: str) -> str:
     """Resolve + safety-check the Obsidian vault path before persistence.
@@ -663,7 +901,11 @@ def api_pull():
                 chunk_data = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
                 yield f"data: {json.dumps(chunk_data)}\n\n"
         except Exception as exc:
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            # Through sanitise_error_msg like every other SSE/error path
+            # (2026-07-20 audit M4): the raw str(exc) leaked filesystem paths /
+            # topology into the UI, breaking the "redact before it reaches the
+            # UI" discipline the module otherwise follows.
+            yield f"data: {json.dumps({'error': sanitise_error_msg(exc)})}\n\n"
         yield "data: [DONE]\n\n"
 
     return Response(generate(), mimetype="text/event-stream")

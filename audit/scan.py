@@ -280,6 +280,9 @@ def check_note_tag_drift(settings: Settings) -> int:
         print(f"    zotero note tags : {sorted(row.zotero_note_tags)}")
         print(f"    obs YAML tags    : {sorted(row.obs_tags)}")
         print(f"    missing in obs   : {sorted(row.missing_in_obs)}")
+        if row.variants:
+            pairs = ", ".join(f"{z} ~ {n}" for z, n, _reason in row.variants)
+            print(f"    variants present : {pairs}")
     return 0
 
 
@@ -321,6 +324,13 @@ def check_read_unzoterod(settings: Settings) -> int:
     )
     above = sum(1 for r in rep.rows if r.annotations >= rep.suggested_read_cutoff)
     print(f"  rows at/above cutoff: {above}")
+    # Same exclusion disclosure the UI tab carries — the row count alone reads
+    # as "every PDF missing from Zotero", which it is not.
+    print(
+        f"  not listed: {rep.ambiguous_count} ambiguous, "
+        f"{rep.confirmed_no_match_count} confirmed-not-in-bib, "
+        f"{rep.skipped_count} skipped by prefix"
+    )
     for row in rep.rows[:30]:
         print(f"    {row.annotations:>4} annots   {_rel(row.pdf, settings)}")
     if len(rep.rows) > 30:

@@ -235,6 +235,48 @@ def test_plainchat_streams_tokens_and_done():
     assert "[DONE]" in frames
     # The validated conversation array reached the helper.
     assert captured["messages"] == [{"role": "user", "content": "hi"}]
+    # Export provenance (2026-07-22): the resolved provider/model announce
+    # themselves in a {"meta"} frame BEFORE the first token.
+    metas = [f["meta"] for f in frames if isinstance(f, dict) and "meta" in f]
+    assert len(metas) == 1
+    assert metas[0]["provider"] and metas[0]["model"] is not None
+    assert isinstance(metas[0]["temperature"], float)
+    first_token_i = next(i for i, f in enumerate(frames)
+                         if isinstance(f, dict) and "token" in f)
+    meta_i = next(i for i, f in enumerate(frames)
+                  if isinstance(f, dict) and "meta" in f)
+    assert meta_i < first_token_i
+
+
+def test_plainchat_usage_frame_from_tracker():
+    """A ring record tagged workflow=plain_chat since stream start surfaces
+    as a terminal {"usage"} frame (export provenance, 2026-07-22)."""
+    from app import app
+    import api.routes.plainchat as pc
+    from core.llm.types import LLMUsage
+    from core.llm.usage import usage_tracker
+
+    def fake_stream(**kwargs):
+        yield "Hi"
+        usage_tracker.record(
+            provider="openai", model="gpt-x",
+            usage=LLMUsage(input_tokens=11, output_tokens=7),
+            latency_ms=5, stream=True, workflow="plain_chat",
+        )
+
+    client = app.test_client()
+    h = {"X-Requested-With": "ChatEKLD"}
+    with mock.patch.object(pc, "stream_chat_messages", new=fake_stream):
+        r = client.post("/api/plainchat",
+                        json={"messages": [{"role": "user", "content": "hi"}]},
+                        headers=h)
+        frames = _sse_frames(r.get_data())
+
+    usages = [f["usage"] for f in frames if isinstance(f, dict) and "usage" in f]
+    assert len(usages) == 1
+    assert usages[0]["input_tokens"] == 11
+    assert usages[0]["output_tokens"] == 7
+    assert usages[0]["requests"] == 1
 
 
 def test_plainchat_caps_message_array_and_content():

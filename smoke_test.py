@@ -71,6 +71,77 @@ class ChatEKLDSmokeTest(unittest.TestCase):
                                 headers=self.headers)
         self.assertEqual(resp.status_code, 400)
 
+    def test_03a_config_body_shape_edges(self):
+        """2026-07-22 audit M7: a JSON ARRAY body must 400 cleanly (it used to
+        pass the truthiness check and 500 on .startswith deeper in), and `{}`
+        is a legitimate no-op patch, not "Invalid JSON"."""
+        resp = self.client.post('/api/config', json=[1, 2],
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.post('/api/config', json=["audit_x"],
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.post('/api/config', json={},
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_03c_provider_case_normalised_before_routing(self):
+        """2026-07-22 audit M7c: {"provider": "OPENAI", "llm": "x"} used to
+        route `llm` into openai_model (consuming the local selection) and then
+        DROP the provider change because the validator required exact case.
+        One up-front normalisation makes routing and validation agree."""
+        resp = self.client.post('/api/config',
+                                json={"provider": "ollama", "llm": "llama3.2"},
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.post('/api/config',
+                                json={"provider": "OPENAI", "llm": "gpt-4o"},
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertEqual(data.get('provider'), 'openai')
+        self.assertEqual(data.get('openai_model'), 'gpt-4o')
+        self.assertEqual(data.get('llm'), 'llama3.2')   # local selection intact
+
+    def test_03d_pricing_overrides_validated(self):
+        """2026-07-22 audit M2: llm_pricing_overrides gets a shape/size gate —
+        garbage or oversized values are DROPPED (prior value survives), valid
+        rows persist with numbers coerced at write time."""
+        ok = {"gpt-4o-mini": {"input": 1.0, "output": "2.5",
+                              "cached_input": "0.5"}}
+        resp = self.client.post('/api/config',
+                                json={"llm_pricing_overrides": ok},
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        row = data.get('llm_pricing_overrides', {}).get('gpt-4o-mini')
+        self.assertEqual(row, {"input": 1.0, "output": 2.5, "cached_input": 0.5})
+
+        # A malformed patch is dropped — the valid row above survives.
+        for bad in (
+            {"m": "not-a-dict"},
+            {"m": {"input": "x", "output": 1}},
+            {"m": {"input": 1}},                    # missing output
+            {"m" * 300: {"input": 1, "output": 1}},  # key too long
+            "not-a-dict",
+        ):
+            resp = self.client.post('/api/config',
+                                    json={"llm_pricing_overrides": bad},
+                                    headers=self.headers)
+            self.assertEqual(resp.status_code, 200, bad)
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertEqual(
+            data.get('llm_pricing_overrides', {}).get('gpt-4o-mini'),
+            {"input": 1.0, "output": 2.5, "cached_input": 0.5})
+
+        # Clean up: the CHATEKLD_BASE_DIR sandbox is per-SESSION, so a
+        # persisted override would leak into other files' cost tests
+        # (usage_tracker.record resolves persisted overrides itself).
+        resp = self.client.post('/api/config',
+                                json={"llm_pricing_overrides": {}},
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+
     def test_03b_online_llm_save_preserves_local_selection(self):
         """Saving a chat model while an ONLINE provider is active must land in
         the per-provider key (openai_model / ...) and must NOT overwrite the
@@ -184,8 +255,79 @@ class ChatEKLDSmokeTest(unittest.TestCase):
         data = json.loads(self.client.get('/api/config', headers=self.headers).data)
         self.assertEqual(data.get("fallback_on"), ["timeout", "rate_limit"])
 
+        # B7 (2026-07-13): the provider selectors are now enum-validated — a
+        # garbage `provider` is DROPPED, the prior value survives.
+        self.client.post('/api/config', json={"provider": "ollama"}, headers=self.headers)
+        self.client.post('/api/config', json={"provider": "not-a-provider"}, headers=self.headers)
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertEqual(data.get("provider"), "ollama")
+        # B7: an over-long system prompt is capped, not persisted whole.
+        self.client.post('/api/config',
+                         json={"vault_chat_system_prompt": "x" * 99999},
+                         headers=self.headers)
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertLessEqual(len(data.get("vault_chat_system_prompt", "")), 4000)
+        # B7: a control-char-laden model id is dropped (prior value survives).
+        self.client.post('/api/config', json={"vision_model": "qwen3-vl"}, headers=self.headers)
+        self.client.post('/api/config', json={"vision_model": "bad\x00id"}, headers=self.headers)
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertEqual(data.get("vision_model"), "qwen3-vl")
+
         # Restore the default timeout so later tests see a clean value.
         self.client.post('/api/config', json={"online_timeout_s": 60}, headers=self.headers)
+
+    def test_03e_dropped_keys_are_reported_to_the_client(self):
+        """2026-07-27 a11y audit: a rejected value must be NAMED in the response.
+
+        The validator drops an out-of-range key and keeps the prior persisted
+        value — correct, but until now the route answered a bare 200, so the
+        Settings window showed the rejected text sitting in the field all
+        session while the server held something else (a WCAG 3.3.1 Error
+        Identification failure: the error is detected and never identified).
+        `dropped` is what lets settings.js mark the offending control and
+        announce it.  Purely additive — `ok` and the status code are unchanged,
+        which is why every assertion in test_03* above still holds.
+        """
+        # An UNPARSEABLE value is dropped and named. Note the deliberate
+        # asymmetry in api/validators.py, which this test also pins: a numeric
+        # knob out of range is CLAMPED (see below), only garbage is dropped —
+        # so `dropped` reports the cases where the user's input was discarded
+        # entirely, which are exactly the ones a silent 200 made invisible.
+        resp = self.client.post('/api/config',
+                                json={"vault_top_k": "not-a-number"},
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        body = json.loads(resp.data)
+        self.assertTrue(body.get("ok"))
+        self.assertIn("vault_top_k", body.get("dropped", []))
+
+        # An unknown ENUM value is dropped too (coerce_enum has no clamp to
+        # fall back on) — this is the `vault_reranker_device: "cuda:0"` shape
+        # the eval-sweep audit flagged as persistable through a non-validating
+        # writer.
+        resp = self.client.post('/api/config',
+                                json={"vault_reranker_device": "cuda:0"},
+                                headers=self.headers)
+        self.assertIn("vault_reranker_device", json.loads(resp.data).get("dropped", []))
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertIn(data.get("vault_reranker_device"), ("auto", "cpu", "mps"))
+
+        # Out-of-range numerics are CLAMPED, not dropped — so they must NOT be
+        # reported, or the UI would flag an error for a value the server did
+        # accept (in clamped form). Pinning both halves keeps the client's
+        # error marking honest.
+        resp = self.client.post('/api/config',
+                                json={"vault_top_k": 9999},   # range is 1..32
+                                headers=self.headers)
+        self.assertNotIn("vault_top_k", json.loads(resp.data).get("dropped", []))
+        data = json.loads(self.client.get('/api/config', headers=self.headers).data)
+        self.assertEqual(int(data.get("vault_top_k", 0)), 32)
+
+        # A clean save reports an empty list rather than omitting the key, so
+        # the client can distinguish "nothing dropped" from "old server".
+        resp = self.client.post('/api/config',
+                                json={"vault_top_k": 8}, headers=self.headers)
+        self.assertEqual(json.loads(resp.data).get("dropped"), [])
 
     def test_04_report_types(self):
         """GET /api/report-types must return 200 with a ``report_types`` list."""
@@ -575,6 +717,45 @@ class ChatEKLDSmokeTest(unittest.TestCase):
         self.assertIn("error", json.loads(resp.data))
         acq.assert_not_called()  # bailed out before acquiring the lock
 
+    def test_30c_index_route_threads_force_fresh(self):
+        """(2026-07-29 audit 0.1) POST /api/obsidian/index accepts the
+        `force_fresh` body field — the in-app "yes, rebuild" the embed-backend
+        gate's refusal requires — and coerces it strictly: only a JSON `true`
+        reaches the manager as True (a garbage value must never trigger an
+        hours-long re-embed)."""
+        import unittest.mock as mock
+        from rag.vault import obsidian_manager
+
+        for body_value, expected in ((True, True), ("yes-ish", False), (None, False)):
+            with (
+                mock.patch.object(obsidian_manager, "get_vault_path",
+                                  return_value="/tmp/vault"),
+                mock.patch.object(obsidian_manager, "wait_for_indexing",
+                                  return_value=True),
+                mock.patch.object(obsidian_manager, "try_acquire_lock",
+                                  return_value=7),
+                mock.patch.object(obsidian_manager, "release_lock"),
+                mock.patch.object(obsidian_manager, "register_index_thread"),
+                mock.patch.object(obsidian_manager, "index_vault") as iv,
+                mock.patch("threading.Thread") as thread_cls,
+            ):
+                # Run the "background" thread synchronously so the mock call
+                # is recorded before the assertion.
+                thread_cls.side_effect = lambda target=None, daemon=None: mock.Mock(
+                    start=target, name="fake-thread")
+                body = {} if body_value is None else {"force_fresh": body_value}
+                resp = self.client.post(
+                    "/api/obsidian/index",
+                    json=body,
+                    content_type="application/json",
+                    headers=self.headers,
+                )
+                self.assertEqual(resp.status_code, 200, resp.data)
+                self.assertEqual(
+                    iv.call_args.kwargs.get("force_fresh"), expected,
+                    f"body {body_value!r} must thread as {expected}",
+                )
+
     def test_26_reset_wipe_feedback_and_config(self):
         """POST /api/reset with wipe_feedback=true and wipe_config=true deletes
         the corresponding files when they exist.
@@ -679,6 +860,28 @@ class ChatEKLDSmokeTest(unittest.TestCase):
         """``GET /api/status`` succeeds with the correct CSRF header."""
         resp = self.client.get("/api/status", headers=self.headers)
         self.assertEqual(resp.status_code, 200)
+
+    def test_dns_rebinding_foreign_host_is_forbidden(self):
+        """2026-07-20 audit H1: a DNS-rebound page is same-origin (custom
+        header allowed, no preflight), sends no Origin/Referer, and hits a
+        loopback remote_addr — but its Host header is the attacker's domain.
+        The Host allowlist must reject it (403) so config/log reads can't be
+        exfiltrated."""
+        resp = self.client.get(
+            "/api/config",
+            headers={"X-Requested-With": "ChatEKLD", "Host": "evil.example.com"},
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_localhost_host_variants_allowed(self):
+        """The PyWebView shapes (localhost / 127.0.0.1, with or without a
+        port) still pass the Host allowlist."""
+        for host in ("localhost", "127.0.0.1", "localhost:5000", "127.0.0.1:8080"):
+            resp = self.client.get(
+                "/api/status",
+                headers={"X-Requested-With": "ChatEKLD", "Host": host},
+            )
+            self.assertEqual(resp.status_code, 200, host)
 
 
 class ExtractAllPagesTest(unittest.TestCase):
@@ -933,6 +1136,54 @@ class TestConfigVersionMigration(unittest.TestCase):
         self.assertIn("obsidian_vault_path", KNOWN_KEYS)
         self.assertIn("config_version", KNOWN_KEYS)
 
+    def test_tagging_zotero_api_base_shape_validated(self):
+        # 2026-07-20 audit M3: the Zotero base is a stored dial target, so it
+        # gets the http(s) host shape gate, not a bare length cap.
+        from api.routes.config import _CONFIG_VALIDATORS
+        v = _CONFIG_VALIDATORS["tagging_zotero_api_base"]
+        self.assertEqual(v("http://127.0.0.1:23119/api"), "http://127.0.0.1:23119/api")
+        self.assertEqual(v(""), "")                      # empty kept ⇒ default
+        self.assertIsNone(v("not a url with spaces"))    # garbage dropped
+        self.assertIsNone(v("http://evil\ninternal"))    # control chars dropped
+
+    def test_tagging_zotero_web_api_base_is_https_only(self):
+        # E2 (2026-07-20 audit): the WEB base carries the API key, so plain http
+        # (a cleartext-credential dial target) and non-http schemes are dropped;
+        # the loopback LOCAL base keeps http (127.0.0.1).
+        from api.routes.config import _CONFIG_VALIDATORS
+        v = _CONFIG_VALIDATORS["tagging_zotero_web_api_base"]
+        self.assertEqual(v("https://api.zotero.org"), "https://api.zotero.org")
+        self.assertEqual(v(""), "")                        # empty kept ⇒ default
+        self.assertIsNone(v("http://api.zotero.org"))      # cleartext dropped
+        self.assertIsNone(v("file:///etc/passwd"))         # non-http dropped
+
+    def test_tagging_zotero_transport_enum_validated(self):
+        """The transport reaches network routing, so an unknown value must be
+        dropped (keeping the prior setting) rather than stored."""
+        from api.routes.config import _CONFIG_VALIDATORS
+        v = _CONFIG_VALIDATORS["tagging_zotero_transport"]
+        for good in ("auto", "local", "web"):
+            self.assertEqual(v(good), good)
+        self.assertIsNone(v("sqlite"))   # never a valid transport
+        self.assertIsNone(v("WEB "))     # not silently normalised
+
+    def test_zotero_api_key_is_never_persisted_to_config(self):
+        """Provider-key discipline: the Zotero key is env-only, like every
+        other API key — it must not become a config default or a stored key."""
+        from core.config import _DEFAULTS
+        self.assertNotIn("tagging_zotero_api_key", _DEFAULTS)
+        self.assertNotIn("zotero_api_key", _DEFAULTS)
+        for key, val in _DEFAULTS.items():
+            if "zotero" in key and isinstance(val, str):
+                self.assertNotIn("Zotero-API-Key", val)
+
+    def test_tagging_propose_model_rejects_control_chars(self):
+        from api.routes.config import _CONFIG_VALIDATORS
+        v = _CONFIG_VALIDATORS["tagging_propose_model"]
+        self.assertEqual(v("gemini-2.5-flash"), "gemini-2.5-flash")
+        self.assertEqual(v(""), "")                      # empty ⇒ chat model
+        self.assertIsNone(v("model\nwith\nnewlines"))
+
     def test_unversioned_file_is_migrated_pruned_and_stamped(self):
         from core.config import CONFIG_VERSION, load_config
         # A pre-version config: one real user key + one key retired long ago.
@@ -944,6 +1195,45 @@ class TestConfigVersionMigration(unittest.TestCase):
         self.assertEqual(on_disk.get("config_version"), CONFIG_VERSION)
         self.assertNotIn("some_retired_knob_2024", on_disk)  # pruned, persisted
         self.assertEqual(on_disk.get("llm"), "user-model")   # user value kept
+
+    def test_version_1_config_retires_library_root(self):
+        """2026-07-13: the 1→2 prune migration drops `library_root` (a declared
+        but unreferenced key) from an existing version-1 config."""
+        from core.config import CONFIG_VERSION, load_config
+        self._write_raw({"config_version": 1, "llm": "m", "library_root": "/x"})
+        cfg = load_config()
+        self.assertNotIn("library_root", cfg)
+        self.assertEqual(cfg.get("llm"), "m")
+        on_disk = self._read_raw()
+        self.assertEqual(on_disk.get("config_version"), CONFIG_VERSION)
+        self.assertNotIn("library_root", on_disk)
+
+    def test_version_3_config_resets_retired_deepseek_alias(self):
+        """2026-07-30 (fix-plan Plan 2): the 3→4 migration resets a persisted
+        legacy DeepSeek alias — the provider's 2026-07-24 sunset stopped the
+        curated list OFFERING deepseek-chat/reasoner, but a selection persisted
+        before it kept 404ing every call. Any other value is user-chosen and
+        must survive."""
+        from core.config import _DEFAULTS, CONFIG_VERSION, load_config
+        self._write_raw({"config_version": 3, "deepseek_model": "deepseek-chat",
+                         "llm": "m"})
+        cfg = load_config()
+        self.assertEqual(cfg.get("deepseek_model"), _DEFAULTS["deepseek_model"])
+        self.assertEqual(cfg.get("llm"), "m")  # unrelated user value kept
+        on_disk = self._read_raw()
+        self.assertEqual(on_disk.get("config_version"), CONFIG_VERSION)
+        self.assertEqual(on_disk.get("deepseek_model"), _DEFAULTS["deepseek_model"])
+
+    def test_version_3_config_keeps_a_real_deepseek_model(self):
+        from core.config import load_config
+        self._write_raw({"config_version": 3, "deepseek_model": "deepseek-v4-pro"})
+        self.assertEqual(load_config().get("deepseek_model"), "deepseek-v4-pro")
+
+    def test_migrate_3_to_4_resets_both_aliases(self):
+        from core.config import _DEFAULTS, _migrate_3_to_4
+        for alias in ("deepseek-chat", "deepseek-reasoner"):
+            out = _migrate_3_to_4({"deepseek_model": alias})
+            self.assertEqual(out["deepseek_model"], _DEFAULTS["deepseek_model"])
 
     def test_current_version_file_is_not_rewritten(self):
         from core.config import CONFIG_VERSION, load_config
@@ -974,6 +1264,126 @@ class TestConfigVersionMigration(unittest.TestCase):
         self.assertEqual(on_disk.get("llm"), "new-model")
         self.assertNotIn("zombie_key", on_disk)
         self.assertEqual(load_config().get("llm"), "new-model")
+
+
+class Plan3CorrectnessFixesTest(unittest.TestCase):
+    """2026-07-30 fix-plan Plan 3: four small correctness deferrals from the
+    2026-07-20 audit (init_db swallowing, atomic-writer mode clobber,
+    load_config_readonly's empty proxy, the Lua-filter trust gap)."""
+
+    # ---- P3.4: init_db fails loudly ---------------------------------------
+
+    def test_init_db_raises_instead_of_booting_without_a_table(self):
+        import sqlite3
+        from unittest import mock
+        from core.database import init_db
+        # A failed CREATE TABLE used to log one line and let the app boot with
+        # no uploads table, surfacing as a distant 500 on the first upload.
+        with mock.patch("core.database.sqlite3.connect",
+                        side_effect=sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaises(sqlite3.OperationalError):
+                init_db()
+
+    # ---- P3.6: atomic writers preserve an existing file's mode ------------
+
+    def test_write_text_atomic_preserves_destination_mode(self):
+        import tempfile as _tempfile
+        from core.utils import write_text_atomic
+        with _tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "note.md")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("original")
+            os.chmod(path, 0o644)
+            write_text_atomic(path, "rewritten")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "rewritten")
+
+    def test_write_bytes_atomic_preserves_destination_mode(self):
+        import tempfile as _tempfile
+        from core.utils import write_bytes_atomic
+        with _tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "img.png")
+            with open(path, "wb") as fh:
+                fh.write(b"old")
+            os.chmod(path, 0o664)
+            write_bytes_atomic(path, b"new")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o664)
+
+    def test_atomic_writers_keep_0600_for_a_new_file(self):
+        # A file we CREATE must not be invented as world-readable — only an
+        # existing destination's own mode is inherited.
+        import tempfile as _tempfile
+        from core.utils import write_bytes_atomic, write_text_atomic
+        with _tempfile.TemporaryDirectory() as d:
+            text_path = os.path.join(d, "fresh.json")
+            write_text_atomic(text_path, "{}")
+            self.assertEqual(os.stat(text_path).st_mode & 0o777, 0o600)
+            bytes_path = os.path.join(d, "fresh.bin")
+            write_bytes_atomic(bytes_path, b"x")
+            self.assertEqual(os.stat(bytes_path).st_mode & 0o777, 0o600)
+
+    def test_mode_inherit_failure_does_not_fail_the_write(self):
+        # Best-effort by design: an exotic FS that refuses chmod must still get
+        # the content the caller asked to persist.
+        import tempfile as _tempfile
+        from unittest import mock
+        from core.utils import write_text_atomic
+        with _tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "note.md")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("old")
+            with mock.patch("core.utils.os.chmod", side_effect=OSError("nope")):
+                write_text_atomic(path, "new")
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "new")
+
+    # ---- P3.7: load_config_readonly never returns an empty mapping --------
+
+    def test_load_config_readonly_survives_a_concurrent_invalidation(self):
+        from unittest import mock
+        import core.config as cfgmod
+        from core.config import load_config_readonly
+        # Simulate the race the audit found: every attempt to read the cache
+        # finds it nulled by a concurrent save_config. The old code fell
+        # through to MappingProxyType({}) — a reader that iterated saw no keys.
+        with mock.patch.object(cfgmod, "_config_cache", None), \
+                mock.patch.object(cfgmod, "_config_cache_key", None), \
+                mock.patch.object(cfgmod, "load_config",
+                                  side_effect=lambda: {"provider": "ollama"}):
+            proxy = load_config_readonly()
+        self.assertTrue(len(proxy) > 0)
+        self.assertEqual(proxy.get("provider"), "ollama")
+
+    def test_load_config_readonly_returns_a_populated_proxy_normally(self):
+        from core.config import load_config_readonly
+        proxy = load_config_readonly()
+        self.assertIn("provider", proxy)
+        with self.assertRaises(TypeError):   # still read-only
+            proxy["provider"] = "x"
+
+    # ---- P3.9: the pandoc Lua filter gets maintain.sh's trust check -------
+
+    def test_check_tex_file_trust_matches_the_gui_contract(self):
+        import importlib
+        import sys
+        import tempfile as _tempfile
+        from pathlib import Path
+        script_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "scripts", "vault_maintain")
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        check_tex = importlib.import_module("check_tex")
+        with _tempfile.TemporaryDirectory() as d:
+            lua = os.path.join(d, "beamer_frames.lua")
+            with open(lua, "w", encoding="utf-8") as fh:
+                fh.write("-- filter")
+            os.chmod(lua, 0o644)
+            self.assertEqual(check_tex._check_file_trust(Path(lua)), "")
+            os.chmod(lua, 0o666)               # group/world-writable
+            self.assertIn("writable", check_tex._check_file_trust(Path(lua)))
+            missing = check_tex._check_file_trust(Path(d) / "absent.lua")
+            self.assertIn("cannot stat", missing)
 
 
 class SaveFeedbackNoStallTest(unittest.TestCase):

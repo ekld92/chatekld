@@ -496,6 +496,20 @@ class TestVisionCallBounds(unittest.TestCase):
         for _key in list(sys.modules):
             if any(_key == p or _key.startswith(p + ".") for p in _prefixes):
                 sys.modules.pop(_key, None)
+        # Isolate the module-level LM Studio client cache (2026-07-30). The
+        # vision transport reuses get_lmstudio_client, keyed by
+        # (base_url, timeout) — so a client another test file cached under the
+        # same key means `openai.OpenAI` is never constructed here and the
+        # assertions below see no captured kwargs. This test only passed
+        # because the documented quick-gate order happens to run this file
+        # before test_llm.py; the same clear-the-cache discipline
+        # `test_llm.py::_fake_httpx_module` applies to the anthropic/google
+        # caches makes it order-independent.
+        try:
+            from core.providers import lms as _lms
+            _lms._client_cache.clear()
+        except Exception:  # noqa: BLE001 — isolation aid, never a test blocker
+            pass
 
     @staticmethod
     def _big_png_b64(w=4000, h=3000):
@@ -546,7 +560,10 @@ class TestVisionCallBounds(unittest.TestCase):
         from services.vision import VisionManager
         captured = {}
 
-        def fake(model, prompt, payload, *, timeout=None, max_tokens=None):
+        # `meta` is the additive out-dict the transports gained 2026-07-30
+        # (truncation reporting); a stub must accept it or describe_image's
+        # except-Exception guard turns the TypeError into an empty description.
+        def fake(model, prompt, payload, *, timeout=None, max_tokens=None, meta=None):
             captured["side"] = self._longest_side(payload)
             captured["timeout"] = timeout
             captured["max_tokens"] = max_tokens
@@ -580,6 +597,68 @@ class TestVisionCallBounds(unittest.TestCase):
         self.assertEqual(out, "page text")
         self.assertEqual(captured["timeout"], 90)
         self.assertEqual(captured["max_tokens"], 2048)      # ocr_max_tokens, not vision
+
+    def test_transports_report_truncation_via_the_meta_out_dict(self):
+        """P8.4 (2026-07-30): a description cut off at vision_max_tokens is
+        still cached and embedded (not caching would re-run an expensive
+        vision call every indexing run), but the cache keys on the IMAGE
+        BYTES so raising the cap never regenerates it. The transports now
+        report the stop cause so the manager can say so."""
+        import services.vision as v
+
+        class _FakeCompletions:
+            def __init__(self, reason):
+                self._reason = reason
+
+            def create(self, **kw):
+                msg = type("M", (), {"content": "half a sen"})()
+                choice = type("Ch", (), {"message": msg, "finish_reason": self._reason})()
+                return type("R", (), {"choices": [choice]})()
+
+        def _client_for(reason):
+            class _FakeClient:
+                def __init__(self, **kw):
+                    self.chat = type(
+                        "Chat", (), {"completions": _FakeCompletions(reason)})()
+            return _FakeClient
+
+        from core.providers import lms as _lms
+
+        for reason, expected in (("length", True), ("stop", False)):
+            # The transport reuses the (base_url, timeout)-keyed client cache,
+            # so a second call at the same timeout would answer from the FIRST
+            # fake and silently test nothing (the same pollution the class
+            # setUp clears between tests).
+            _lms._client_cache.clear()
+            meta = {}
+            with patch("openai.OpenAI", _client_for(reason)):
+                v._chat_lm_studio_image("m", "p", "b64", timeout=5,
+                                        max_tokens=16, meta=meta)
+            self.assertIs(meta["truncated"], expected, reason)
+
+        # Omitting meta stays byte-identical for every existing caller.
+        _lms._client_cache.clear()
+        with patch("openai.OpenAI", _client_for("length")):
+            self.assertEqual(
+                v._chat_lm_studio_image("m", "p", "b64", timeout=5, max_tokens=16),
+                "half a sen")
+
+    def test_ollama_transport_reports_truncation(self):
+        import services.vision as v
+        captured = {}
+
+        class _FakeClient:
+            def chat(self, **kw):
+                captured.update(kw)
+                msg = type("M", (), {"content": " text "})()
+                return type("R", (), {"message": msg, "done_reason": "length"})()
+
+        with patch("core.providers.ollama._ollama_client", lambda *a, **k: _FakeClient()):
+            meta = {}
+            out = v._chat_ollama_image("m", "p", "b64", timeout=5,
+                                       max_tokens=16, meta=meta)
+        self.assertEqual(out, "text")
+        self.assertIs(meta["truncated"], True)
 
     def test_lm_studio_transport_disables_retries_and_caps_tokens(self):
         import services.vision as v
@@ -641,6 +720,40 @@ class TestOpLockEpochToken(unittest.TestCase):
         self.assertIsNone(self.manager.try_acquire_lock(ttl=30))  # held ⇒ None
         self.manager.release_lock(epoch)
         self.assertTrue(self.manager.try_acquire_lock(ttl=30))    # released ⇒ re-acquirable
+
+    def test_cancel_indexing_does_not_steal_another_writers_lock(self):
+        """``POST /api/obsidian/cancel`` must not free a lock it does not own.
+
+        The route is ungated (no index-state check, no holder check) and the
+        Cancel button stays visible after a pause, when no indexer is running.
+        ``cancel_indexing`` used to call ``force_release()`` unconditionally,
+        so a Cancel pressed while a Note Refactor Apply / tagging write /
+        docgen note write held the op-lock handed it away and admitted a
+        SECOND concurrent vault writer — each with its own in-memory copy of
+        the restore manifest, so the last save erased the other's op records.
+        """
+        # A non-indexing vault writer holds the lock; no indexing run started,
+        # so the manager has registered no indexing epoch.
+        writer_epoch = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(writer_epoch)
+
+        was_held = self.manager.cancel_indexing()
+
+        self.assertFalse(was_held, "cancel reported freeing a lock it never owned")
+        self.assertIsNone(self.manager.try_acquire_lock(ttl=30),
+                          "cancel released another writer's op-lock")
+        self.assertTrue(self.manager.heartbeat(writer_epoch),
+                        "the real holder lost its acquisition to a cancel")
+
+    def test_cancel_indexing_releases_its_own_run(self):
+        """The flip side: cancel still frees the INDEXER's own acquisition."""
+        epoch = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(epoch)
+        self.manager._index_op_epoch = epoch      # what index_vault records
+
+        self.assertTrue(self.manager.cancel_indexing())
+        self.assertTrue(self.manager.try_acquire_lock(ttl=30),
+                        "cancel left the cancelled run's lock held")
 
     def test_stale_holder_cannot_release_newer_acquisition(self):
         # The exact failure scenario from the plan: worker A acquires, is
@@ -758,6 +871,26 @@ class TestPutDoneResilient(unittest.TestCase):
         self.assertFalse(delivered)
         self.assertLess(time.monotonic() - start, 3.0)   # bounded exit
 
+    def test_half_open_consumer_abandoned_at_the_ceiling(self):
+        """2026-07-22 audit P6: a HALF-OPEN consumer (socket-blocked in yield,
+        never sets cancel, never drains) must not trap the worker forever —
+        past max_wait_s the sentinel is abandoned and cancel is set on the
+        consumer's behalf."""
+        import queue
+        import threading
+        import time
+        from core.utils import put_done_resilient
+
+        q: queue.Queue = queue.Queue(maxsize=1)
+        q.put("blocker")                        # full forever
+        cancel = threading.Event()              # NEVER set by the consumer
+        start = time.monotonic()
+        delivered = put_done_resilient(q, object(), cancel, max_wait_s=2.0)
+        elapsed = time.monotonic() - start
+        self.assertFalse(delivered)
+        self.assertTrue(cancel.is_set())        # worker declared it dead
+        self.assertLess(elapsed, 10)            # bounded, not kernel-timeout-scale
+
 
 
 
@@ -815,6 +948,53 @@ class TestAgentTimeoutQuantisation(unittest.TestCase):
             self.assertIn(q, _TIMEOUT_BUCKETS)
             if remaining <= _TIMEOUT_BUCKETS[-1]:
                 self.assertGreaterEqual(q, min(remaining, _TIMEOUT_BUCKETS[-1]))
+
+
+class TestHeartbeatLostLockAborts(unittest.TestCase):
+    """2026-07-20 audit H1: the indexer must ACT on a failed heartbeat.
+
+    TTL expiry admits a new operation, but the epoch mechanism only
+    neutralises the loser's bookkeeping — nothing stopped its actual work, so
+    a wedged-then-resumed indexing run kept inserting/sweeping concurrently
+    with the new holder's vault writes. ``_heartbeat_or_stop`` closes that:
+    a ``False`` heartbeat (lock stolen) sets the run's stop event.
+    """
+
+    def setUp(self):
+        from rag.vault import ObsidianVaultManager
+        self.manager = ObsidianVaultManager()
+
+    def test_lost_lock_sets_stop_event_and_emits(self):
+        epoch = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(epoch)
+        # Simulate the steal: force-release + a new acquisition bumps the epoch.
+        self.manager.force_release()
+        newer = self.manager.try_acquire_lock(ttl=30)
+        self.assertTrue(newer)
+        msgs = []
+        with patch.object(self.manager, "_emit", side_effect=msgs.append):
+            self.manager._heartbeat_or_stop(epoch)
+        self.assertTrue(self.manager._stop_event.is_set())
+        self.assertTrue(any("operation lock expired" in m for m in msgs), msgs)
+        self.manager._stop_event.clear()
+        self.manager.release_lock(newer)
+
+    def test_live_lock_heartbeat_is_silent(self):
+        epoch = self.manager.try_acquire_lock(ttl=30)
+        msgs = []
+        with patch.object(self.manager, "_emit", side_effect=msgs.append):
+            self.manager._heartbeat_or_stop(epoch)
+        self.assertFalse(self.manager._stop_event.is_set())
+        self.assertEqual(msgs, [])
+        self.manager.release_lock(epoch)
+
+    def test_epoch_zero_stays_inert(self):
+        # Direct/test callers holding no lock must not abort anything.
+        msgs = []
+        with patch.object(self.manager, "_emit", side_effect=msgs.append):
+            self.manager._heartbeat_or_stop(0)
+        self.assertFalse(self.manager._stop_event.is_set())
+        self.assertEqual(msgs, [])
 
 
 if __name__ == "__main__":

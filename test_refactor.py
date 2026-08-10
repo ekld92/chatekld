@@ -30,6 +30,35 @@ def _png_bytes(color=(10, 20, 30)) -> bytes:
     return buf.getvalue()
 
 
+def test_nfc_nfd_resolution_and_reference_basenames(tmp_path):
+    """B2 (2026-07-13): an image referenced in a different Unicode normalization
+    form than its on-disk filename still resolves, and the archive candidate
+    basename index carries the NFC form regardless of the link's form."""
+    import unicodedata
+    from refactor import resolver
+    from refactor.resolver import link_target_basenames
+    from rag.vault import obsidian_manager
+
+    root = Path(tmp_path / "v").resolve()
+    (root / "Z_attachments").mkdir(parents=True)
+    nfd = unicodedata.normalize("NFD", "Réunion.png")
+    nfc_name = unicodedata.normalize("NFC", "Réunion.png")
+    assert nfd != nfc_name  # the two forms genuinely differ
+    (root / "Z_attachments" / nfd).write_bytes(_png_bytes((1, 2, 3)))
+    note_a = root / "note_a.md"
+    note_a.write_text(f"![[{nfc_name}]]\n", encoding="utf-8")
+
+    name_index, _link_index = resolver.build_file_index(root, set())
+    # The NFC link target resolves to the NFD on-disk file across the boundary.
+    rel = obsidian_manager._resolve_md_attachment(
+        nfc_name, note_a, root, name_index=name_index)
+    assert rel and (root / rel).is_file()
+
+    # The archive candidate index carries the NFC basename either way.
+    assert nfc_name.lower() in link_target_basenames(f"![[{nfc_name}]]\n")
+    assert nfc_name.lower() in link_target_basenames(f"![]({nfd})\n")
+
+
 @pytest.fixture
 def vault(tmp_path) -> Path:
     """A tiny vault: a scope sub-folder with a note + a central attachments dir."""
@@ -1100,6 +1129,87 @@ def test_restore_reverts_archive(vault):
     assert not thumb.exists()                                             # thumbnail gone
 
 
+def test_restore_archive_stale_flag_restores_original_before_deleting_copy(vault):
+    """A2 (2026-07-13) scenario A — crash-stale ``original_deleted=False``.
+
+    A crash between the unlink and the flag persist can leave the manifest saying
+    the original was NOT deleted while it actually is gone. The revert must decide
+    from what is on disk (original absent → move the archive copy back) and must
+    NOT delete the only surviving copy before the original is restored.
+    """
+    from core.config import load_config
+    from refactor import archive as archive_mod, journal
+    from refactor.result import sha256_bytes
+
+    note = vault / "study_notes/fluoxetine.md"
+    before = note.read_bytes()
+    img_before = (vault / "Z_attachments/7A27.png").read_bytes()
+    cfg = load_config()
+    res = archive_mod.archive_image(
+        vault, cfg, "study_notes",
+        "study_notes/fluoxetine.md", "Z_attachments/7A27.png",
+        sha256_bytes(before))
+    assert res["ok"]
+    # The original really is gone (archive deleted it) but simulate the crash
+    # window: the persisted op still claims it was not deleted.
+    assert not (vault / "Z_attachments/7A27.png").exists()
+    man = journal.load(vault, cfg)
+    op = [o for o in man["ops"] if o["kind"] == "archive_image"][0]
+    op["original_deleted"] = False   # stale flag
+
+    r = journal.revert_op(vault, cfg, op)
+    journal.save(vault, cfg, man)
+    assert r["status"] == "reverted", r
+    assert (vault / "Z_attachments/7A27.png").read_bytes() == img_before  # original restored
+    assert note.read_bytes() == before                                    # embed restored
+
+
+def test_restore_archive_keeps_copy_when_original_changed(vault):
+    """A2 (2026-07-13) scenario B — changed original left in place.
+
+    When the original changed during archiving it is left on disk with
+    ``original_deleted=False`` and the archive keeps the pre-change copy. A later
+    revert must re-embed the (changed) original and must KEEP the archive copy
+    rather than silently deleting the promised pre-change bytes.
+    """
+    from core.config import load_config
+    from refactor import archive as archive_mod, journal
+    from refactor.result import sha256_bytes
+
+    note = vault / "study_notes/fluoxetine.md"
+    before = note.read_bytes()
+    img = vault / "Z_attachments/7A27.png"
+    original_bytes = img.read_bytes()
+    changed_bytes = original_bytes + b"\x00external-edit"
+    real_thumb = archive_mod.make_thumbnail
+
+    def _thumb_and_swap(data, max_side):
+        out = real_thumb(data, max_side)
+        img.write_bytes(changed_bytes)
+        return out
+
+    cfg = load_config()
+    with mock.patch.object(archive_mod, "make_thumbnail", side_effect=_thumb_and_swap):
+        res = archive_mod.archive_image(
+            vault, cfg, "study_notes",
+            "study_notes/fluoxetine.md", "Z_attachments/7A27.png",
+            sha256_bytes(before))
+    assert res["ok"] and img.read_bytes() == changed_bytes
+    arch = journal.archive_dir(vault, cfg)
+    copy_path = arch / res["archive_rel"]
+    assert copy_path.read_bytes() == original_bytes
+
+    man = journal.load(vault, cfg)
+    op = [o for o in man["ops"] if o["kind"] == "archive_image"][0]
+    r = journal.revert_op(vault, cfg, op)
+    journal.save(vault, cfg, man)
+    assert r["status"] == "reverted", r
+    assert note.read_bytes() == before                     # note re-embeds the original
+    assert img.read_bytes() == changed_bytes               # user's bytes untouched
+    assert copy_path.read_bytes() == original_bytes        # pre-change copy PRESERVED
+    assert "archive copy kept" in r["message"]
+
+
 def test_restore_archive_aborts_without_orphaning_thumbnail_on_snapshot_failure(vault, monkeypatch):
     """If the note-snapshot restore fails, revert must NOT delete the thumbnail.
 
@@ -1181,6 +1291,85 @@ def test_journal_prune_caps_note_ops_but_keeps_applied_archive(vault, monkeypatc
     assert any(o["kind"] == "archive_image" for o in man["ops"])   # archive op survived
     assert not snaps[0].exists() and not snaps[1].exists() and not snaps[2].exists()
     assert snaps[3].exists() and snaps[4].exists()       # newest two kept
+
+
+# --- journal unreadable-manifest guard (2026-07-22 audit H1; backport of the
+# --- tagging journal's 2026-07-20 fix) --------------------------------------
+
+def test_journal_absent_manifest_loads_fresh(vault):
+    from core.config import load_config
+    from refactor import journal
+    man = journal.load(vault, load_config())
+    assert man["ops"] == []
+
+
+def test_journal_corrupt_manifest_raises_and_preserves_bytes(vault):
+    from core.config import load_config
+    from refactor import journal
+    cfg = load_config()
+    p = journal.manifest_path(vault, cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    corrupt = "{this is not json"
+    p.write_text(corrupt, encoding="utf-8")
+    with pytest.raises(journal.JournalUnreadableError):
+        journal.load(vault, cfg)
+    # Nothing rewrote the file while refusing.
+    assert p.read_text(encoding="utf-8") == corrupt
+
+
+def test_journal_wrong_shape_manifest_raises(vault):
+    from core.config import load_config
+    from refactor import journal
+    cfg = load_config()
+    p = journal.manifest_path(vault, cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('{"ops": "not-a-list"}', encoding="utf-8")
+    with pytest.raises(journal.JournalUnreadableError):
+        journal.load(vault, cfg)
+
+
+def test_journal_missing_manifest_beside_snapshots_raises(vault):
+    """A manifest that vanished while notes/ snapshots survive means the
+    journal was lost (or an unmounted archive volume is a stub path) — a
+    fresh manifest there would orphan every snapshot's restore mapping."""
+    from core.config import load_config
+    from refactor import journal
+    cfg = load_config()
+    srel = journal.write_note_snapshot(
+        vault, cfg, "study_notes/fluoxetine.md", "1-0", b"snap")
+    assert (journal.archive_dir(vault, cfg) / srel).exists()
+    assert not journal.manifest_path(vault, cfg).exists()
+    with pytest.raises(journal.JournalUnreadableError):
+        journal.load(vault, cfg)
+
+
+def test_apply_notes_refuses_write_on_corrupt_manifest(vault):
+    """apply_notes must propagate the journal error BEFORE any note write —
+    pre-fix it appended one op to a fresh manifest and atomically overwrote
+    the real restore history."""
+    import contextlib
+    from core.config import load_config
+    from refactor import apply as apply_mod, journal
+
+    _seed_description(vault, "Z_attachments/7A27.png", "A dopamine pathway diagram.")
+    frame = _plan_proposal(vault, "study_notes/fluoxetine.md")
+    cfg = load_config()
+    p = journal.manifest_path(vault, cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    corrupt = "{corrupt"
+    p.write_text(corrupt, encoding="utf-8")
+    note_before = (vault / "study_notes/fluoxetine.md").read_text(encoding="utf-8")
+    approved = [{"rel": "study_notes/fluoxetine.md",
+                 "content_sha256": frame["content_sha256"],
+                 "proposed_sha256": frame["proposed_sha256"]}]
+    with contextlib.ExitStack() as stack:
+        for cm in _no_vision():
+            stack.enter_context(cm)
+        with pytest.raises(journal.JournalUnreadableError):
+            apply_mod.apply_notes(vault, cfg, approved)
+    # Neither the manifest nor the note was touched.
+    assert p.read_text(encoding="utf-8") == corrupt
+    assert (vault / "study_notes/fluoxetine.md").read_text(encoding="utf-8") == note_before
 
 
 def test_apply_notes_persists_manifest_once_per_batch(vault):
@@ -1273,6 +1462,24 @@ def test_apply_route_requires_confirm_and_applies(vault):
     assert r1.status_code == 200
     assert r1.get_json()["applied"] == 1
     assert "[!extracted]" in (vault / "study_notes/fluoxetine.md").read_text(encoding="utf-8")
+
+
+def test_restore_route_requires_confirm(vault):
+    """B8 (2026-07-13): the restore route mutates the vault and must reject an
+    unconfirmed request (parity with apply/normalize/archive)."""
+    from app import app
+    from rag.vault import obsidian_manager
+
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    with mock.patch.object(obsidian_manager, "get_vault_path", return_value=str(vault)):
+        r0 = client.post("/api/refactor/restore", json={"all": True}, headers=headers)
+        assert r0.status_code == 400
+        r1 = client.post("/api/refactor/restore",
+                         json={"all": True, "confirm": True}, headers=headers)
+        # Confirmed: the empty manifest reverts nothing but the request is accepted.
+        assert r1.status_code == 200
+        assert r1.get_json()["reverted"] == 0
 
 
 def test_apply_route_503_when_indexing(vault):
@@ -2770,18 +2977,47 @@ def test_apply_notes_invokes_heartbeat_once_per_note(tmp_path):
     The heartbeat keeps the route's op-lock alive across a large batch so a
     concurrent indexing run cannot steal the expired lock and mutate the vault
     mid-write. Hermetic: bogus rels still trigger the per-note heartbeat before
-    the (failing) per-note apply.
+    the (failing) per-note apply. The callback returns True (lock still held) —
+    the new bool contract (2026-07-20 audit finding 1).
     """
     from refactor import apply as apply_mod
 
     calls = {"n": 0}
     approved = [{"rel": "a.md"}, {"rel": "b.md"}, {"rel": "c.md"}]
-    results = apply_mod.apply_notes(
-        tmp_path, {}, approved, heartbeat=lambda: calls.__setitem__("n", calls["n"] + 1))
+
+    def _hb():
+        calls["n"] += 1
+        return True
+
+    results = apply_mod.apply_notes(tmp_path, {}, approved, heartbeat=_hb)
     assert calls["n"] == len(approved)
     assert len(results) == len(approved)
     # Default (no heartbeat) must still work — the param is optional.
     assert apply_mod.apply_notes(tmp_path, {}, [{"rel": "a.md"}]) is not None
+
+
+def test_apply_notes_aborts_batch_when_heartbeat_reports_lost_lock(tmp_path):
+    """A False heartbeat (lock lapsed and stolen) must stop the batch cleanly.
+
+    Finding 1 (2026-07-20 audit): the manager's heartbeat now returns False once
+    another operation legitimately took the lock. Continuing to write would make
+    apply_notes a second concurrent vault writer. It must stop and mark the
+    remaining notes skipped rather than silently dropping them.
+    """
+    from refactor import apply as apply_mod
+
+    approved = [{"rel": "a.md"}, {"rel": "b.md"}, {"rel": "c.md"}]
+
+    # Return True for the first note, then False (lock lost) for the second.
+    seq = iter([True, False, True])
+    results = apply_mod.apply_notes(
+        tmp_path, {}, approved, heartbeat=lambda: next(seq))
+
+    # One processed note + two skipped-with-lock_lost remainder (b.md, c.md).
+    assert len(results) == len(approved)
+    lost = [r for r in results if r.get("error") == "lock_lost"]
+    assert {r["rel"] for r in lost} == {"b.md", "c.md"}
+    assert all(r["status"] == "skipped" for r in lost)
 
 
 def test_apply_normalize_invokes_heartbeat_once_per_note(tmp_path):
@@ -2789,9 +3025,25 @@ def test_apply_normalize_invokes_heartbeat_once_per_note(tmp_path):
 
     calls = {"n": 0}
     approved = [{"rel": "x.md"}, {"rel": "y.md"}]
-    format_fix_mod.apply_normalize(
-        tmp_path, {}, approved, heartbeat=lambda: calls.__setitem__("n", calls["n"] + 1))
+
+    def _hb():
+        calls["n"] += 1
+        return True
+
+    format_fix_mod.apply_normalize(tmp_path, {}, approved, heartbeat=_hb)
     assert calls["n"] == len(approved)
+
+
+def test_apply_normalize_aborts_batch_when_heartbeat_reports_lost_lock(tmp_path):
+    """apply_normalize honours the same lost-lock abort contract as apply_notes."""
+    from refactor import format_fix as format_fix_mod
+
+    approved = [{"rel": "x.md"}, {"rel": "y.md"}, {"rel": "z.md"}]
+    seq = iter([True, False, True])
+    results = format_fix_mod.apply_normalize(
+        tmp_path, {}, approved, heartbeat=lambda: next(seq))
+    lost = [r for r in results if r.get("error") == "lock_lost"]
+    assert {r["rel"] for r in lost} == {"y.md", "z.md"}
 
 
 def test_manager_heartbeat_keeps_oplock_alive_past_ttl():
@@ -2816,6 +3068,31 @@ def test_manager_heartbeat_keeps_oplock_alive_past_ttl():
         assert obsidian_manager._op_lock.try_acquire(1) is False
     finally:
         obsidian_manager.release_lock(epoch)
+
+
+def test_manager_heartbeat_returns_false_after_lock_is_stolen():
+    """heartbeat() must report False once another operation took the lock.
+
+    Finding 1 (2026-07-20 audit): the batch writers can only stop if this signal
+    reaches them. Force-release the acquisition (simulating a TTL lapse + steal),
+    let a new operation acquire, and assert the old holder's heartbeat is False
+    while the new holder's is True. epoch==0 (no lock) returns True.
+    """
+    from rag.vault import obsidian_manager
+
+    obsidian_manager.force_release()
+    old_epoch = obsidian_manager.try_acquire_lock(ttl=60)
+    assert old_epoch
+    # Simulate the lapse-and-steal: free the acquisition, a new op takes it.
+    obsidian_manager.force_release()
+    new_epoch = obsidian_manager.try_acquire_lock(ttl=60)
+    assert new_epoch
+    try:
+        assert obsidian_manager.heartbeat(old_epoch) is False  # stolen → stop
+        assert obsidian_manager.heartbeat(new_epoch) is True   # current holder
+        assert obsidian_manager.heartbeat(0) is True           # no lock held
+    finally:
+        obsidian_manager.release_lock(new_epoch)
 
 
 # --------------------------------------------------------------------------- #
@@ -3037,3 +3314,132 @@ def test_ensure_thumbs_excluded_saves_only_the_delta(vault):
         archive_mod._ensure_thumbs_excluded(vault, scope, {})
     assert set(saved.keys()) == {"vault_exclude_dirs"}
     assert any(v.endswith("_thumbs") for v in saved["vault_exclude_dirs"])
+
+
+# ---------------------------------------------------------------------------
+# Batch D (2026-07-22): piecewise section-by-section LLM edits
+# ---------------------------------------------------------------------------
+
+def _piecewise_frames(raw: bytes) -> list:
+    import json as _json
+    frames = []
+    for line in raw.decode("utf-8").splitlines():
+        if not line.startswith("data: "):
+            continue
+        body = line[len("data: "):]
+        if body == "[DONE]":
+            frames.append("[DONE]")
+        else:
+            frames.append(_json.loads(body))
+    return frames
+
+
+def test_piecewise_edit_splices_back_to_front_and_skips_over_cap():
+    from refactor import piecewise, sections
+
+    text = ("# A\naaa\n"
+            "# B\n" + ("x" * 50) + "\n"
+            "# C\nccc\n")
+    secs = sections.split_sections(text)
+    assert [s.title for s in secs] == ["A", "B", "C"]
+
+    def run_edit(body):
+        # Uppercase the body's content line, keep the heading.
+        lines = body.splitlines()
+        return {"text": lines[0] + "\n" + "\n".join(x.upper() for x in lines[1:]) + "\n",
+                "error": "", "model": "m", "provider": "p"}
+
+    res = piecewise.piecewise_edit(text, run_edit=run_edit, max_chars=30)
+    # B (over 30 chars) skipped with a reason; A and C edited.
+    by_title = {o.title: o for o in res.outcomes}
+    assert by_title["B"].status == "skipped_too_large"
+    assert by_title["A"].status == "edited" and by_title["C"].status == "edited"
+    assert res.edited_count == 2
+    assert "AAA" in res.proposed and "CCC" in res.proposed
+    assert ("x" * 50) in res.proposed            # untouched middle section
+    assert res.model == "m" and res.provider == "p"
+    # Identity edit returns the exact original (byte-identical splice).
+    ident = piecewise.piecewise_edit(
+        text, run_edit=lambda b: {"text": b, "error": ""}, max_chars=10_000)
+    assert ident.proposed == text and ident.edited_count == 0
+
+
+def test_piecewise_edit_failure_and_cancel_semantics():
+    from refactor import piecewise
+
+    text = "# A\naaa\n# B\nbbb\n"
+
+    def failing(body):
+        return {"text": "", "error": "provider down"}
+
+    res = piecewise.piecewise_edit(text, run_edit=failing, max_chars=10_000)
+    assert res.error == "Every section edit failed."
+    assert all(o.status == "failed" for o in res.outcomes)
+
+    calls = []
+    def cancel_after_first():
+        return len(calls) >= 1
+    def counting(body):
+        calls.append(body)
+        return {"text": body + "edited\n", "error": ""}
+    res2 = piecewise.piecewise_edit(
+        text, run_edit=counting, max_chars=10_000,
+        should_cancel=cancel_after_first)
+    assert res2.error == "cancelled"
+    assert len(calls) == 1                      # no further LLM calls after cancel
+
+
+def test_rewrite_piecewise_route_stages_combined_proposal(vault):
+    from app import app
+    from rag.vault import obsidian_manager
+    from refactor import llm_edit, staging
+
+    note_rel = "study_notes/pw.md"
+    text = "# Un\ncontenu un\n# Deux\ncontenu deux\n"
+    (vault / note_rel).write_text(text, encoding="utf-8")
+
+    def fake_rewrite(body, cfg, should_cancel=None):
+        return {"text": body.replace("contenu", "CONTENU"),
+                "error": "", "model": "m", "provider": "ollama",
+                "truncated": False}
+
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    with mock.patch.object(obsidian_manager, "get_vault_path", return_value=str(vault)), \
+         mock.patch.object(llm_edit, "rewrite_formatting", side_effect=fake_rewrite):
+        r = client.post("/api/refactor/rewrite-piecewise",
+                        json={"rel": note_rel, "scope_subdir": "study_notes",
+                              "action": "rewrite"},
+                        headers=headers)
+    assert r.status_code == 200
+    frames = _piecewise_frames(r.get_data())
+    terms = [f["piecewise"] for f in frames if isinstance(f, dict) and "piecewise" in f]
+    assert len(terms) == 1
+    t = terms[0]
+    assert t["changed"] is True and t["edited_count"] == 2
+    assert "CONTENU un" in t["proposed"] and "CONTENU deux" in t["proposed"]
+    # The staged record matches the previewed proposal (apply-staged ready).
+    staged = staging.load_staged(vault, note_rel, "rewrite")
+    assert staged is not None
+    assert staged["proposed_sha256"] == t["proposed_sha256"]
+    assert staged["content_sha256"] == t["content_sha256"]
+
+
+def test_rewrite_piecewise_route_validates_action_and_instruction(vault):
+    from app import app
+    from rag.vault import obsidian_manager
+
+    note_rel = "study_notes/pw2.md"
+    (vault / note_rel).write_text("# A\nx\n", encoding="utf-8")
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    with mock.patch.object(obsidian_manager, "get_vault_path", return_value=str(vault)):
+        bad = client.post("/api/refactor/rewrite-piecewise",
+                          json={"rel": note_rel, "scope_subdir": "study_notes",
+                                "action": "nope"}, headers=headers)
+        assert bad.status_code == 400
+        missing = client.post("/api/refactor/rewrite-piecewise",
+                              json={"rel": note_rel, "scope_subdir": "study_notes",
+                                    "action": "custom"}, headers=headers)
+        assert missing.status_code == 400
+        assert "instruction" in missing.get_json()["error"]

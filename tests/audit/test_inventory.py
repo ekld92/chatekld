@@ -56,6 +56,19 @@ def test_skip_prefix_filters_matching_pdfs(tmp_path: Path) -> None:
     assert "regular.pdf" in {p.name for p in inv.bridge.unmapped_pdfs}
 
 
+def test_skip_prefix_is_case_insensitive(tmp_path: Path) -> None:
+    """B3 (2026-07-13): a prefix saved with user case (``Z_item``) must still
+    match the lower()ed filenames — the compare lowercases both sides."""
+    biblio = _make_vault(tmp_path)
+    (biblio / "z_item_skip_me.pdf").write_bytes(b"%PDF-1.4 fake")
+    (biblio / "regular.pdf").write_bytes(b"%PDF-1.4 fake")
+
+    settings = Settings(vault_root=tmp_path.resolve(), biblio_skip_prefix="Z_item")
+    inv = inventory.build_inventory(settings, count_annotations=False)
+
+    assert [p.name for p in inv.pdfs_skipped] == ["z_item_skip_me.pdf"]
+
+
 def test_cancel_fn_short_circuits_inventory(tmp_path: Path) -> None:
     """``build_inventory`` checks the cancel callback between phases."""
     _make_vault(tmp_path)

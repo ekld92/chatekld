@@ -70,6 +70,11 @@ DEFAULT_VISION_MODEL = "qwen3-vl:4b"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5"
 DEFAULT_GOOGLE_MODEL = "gemini-2.5-flash"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEFAULT_ZAI_MODEL = "glm-4.7"
+# OpenRouter ids are namespaced vendor/model (":variant" suffixes allowed);
+# the default mirrors DEFAULT_ANTHROPIC_MODEL's tier through the aggregator.
+DEFAULT_OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 DEFAULT_ONLINE_TIMEOUT_S = 60
 DEFAULT_ONLINE_MAX_RETRIES = 3
 DEFAULT_ONLINE_MAX_TOKENS = 4096
@@ -96,12 +101,14 @@ VISION_MAX_RETRIES = 0             # fail fast; an empty image retries next run
 VISION_IMAGE_MAX_SIDE = 1568       # description path downscales above this px
 
 # --- Single-paper (/api/summarise) local-generation stall floor ---
-# That route streams synchronously in the request generator and has no
-# consumer-side stall guard (unlike the vault/plainchat/deck SSE routes), so a
-# connected-but-wedged local model could hang it until the browser aborts. When
-# ``local_request_timeout_s`` is unset (0 ⇒ SDK default = unbounded), the
-# summariser substitutes this per-read timeout (max gap between streamed
-# tokens) so the worker thread can't park forever. A user-set positive
+# A per-READ timeout (max gap between streamed tokens) the summariser
+# substitutes when ``local_request_timeout_s`` is unset (0 ⇒ SDK default =
+# unbounded), so a connected-but-wedged local model can't park the worker
+# thread inside a blocking read forever. Comment repaired 2026-07-22: the old
+# rationale claimed the route "has no consumer-side stall guard", which has
+# been false since paper.py moved onto api/sse.py::run_sse_worker — the
+# consumer guard now frees the CLIENT, but this per-read bound is still what
+# lets the WORKER thread itself escape the blocking call. A user-set positive
 # ``local_request_timeout_s`` still wins.
 PAPER_LOCAL_STALL_TIMEOUT_S = 120
 

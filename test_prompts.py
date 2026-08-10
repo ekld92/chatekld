@@ -208,5 +208,59 @@ class TestDeckPromptRendering(unittest.TestCase):
             self.assertIn("\\citefoot{key}", prompt)
 
 
+class TestMultilingualSourceRules(unittest.TestCase):
+    """2026-08-07: the vault holds French, GERMAN and English sources; every
+    default prompt that describes the vault must name all three languages so a
+    model never discards a German passage as 'foreign'. These pins are the
+    deliberate-update record for that change — soften them only on purpose."""
+
+    LANGS = ("French", "German", "English")
+
+    def _assert_names_all_three(self, text, label):
+        for lang in self.LANGS:
+            self.assertIn(lang, text, f"{label} must name {lang}")
+
+    def test_all_rag_modes_share_the_multilingual_rule(self):
+        # One constant, not four copies — the wording cannot drift per mode.
+        from rag.engine import _MULTILINGUAL_RULE, _PROMPT_MODES
+        self._assert_names_all_three(_MULTILINGUAL_RULE, "_MULTILINGUAL_RULE")
+        self.assertIn("never discard a passage", _MULTILINGUAL_RULE)
+        self.assertIn("language of the question", _MULTILINGUAL_RULE)
+        for name, tmpl in _PROMPT_MODES.items():
+            self.assertIn(_MULTILINGUAL_RULE, tmpl.template, name)
+
+    def test_agent_preamble_names_all_three_languages(self):
+        from core.agent.loop import _AGENT_PREAMBLE
+        self._assert_names_all_three(_AGENT_PREAMBLE, "_AGENT_PREAMBLE")
+        # The cross-language retry nudge is the operative part.
+        self.assertIn("another of", _AGENT_PREAMBLE)
+
+    def test_primer_header_is_trilingual(self):
+        from rag.thesaurus import _PRIMER_HEADER
+        self._assert_names_all_three(_PRIMER_HEADER, "_PRIMER_HEADER")
+        self.assertNotIn("bilingual", _PRIMER_HEADER)
+
+    def test_generator_prompts_name_all_three_languages(self):
+        from deckgen import prompts as deck_p
+        from docgen import prompts as doc_p
+        from docgen import markdown as md_p
+        for label, text in (
+            ("deck outline", deck_p.OUTLINE_SYSTEM_PROMPT),
+            ("deck section", deck_p.SECTION_SYSTEM_PROMPT),
+            ("deck augment", deck_p.AUGMENT_SYSTEM_PROMPT),
+            ("article outline", doc_p.OUTLINE_SYSTEM_PROMPT),
+            ("article section", doc_p.SECTION_SYSTEM_PROMPT),
+            ("article augment", doc_p.AUGMENT_SYSTEM_PROMPT),
+            ("markdown outline", md_p.OUTLINE_SYSTEM_PROMPT),
+            ("markdown section", md_p.SECTION_SYSTEM_PROMPT),
+        ):
+            self._assert_names_all_three(text, label)
+
+    def test_tagging_propose_message_names_all_three_languages(self):
+        from tagging.propose import build_messages
+        user = build_messages("T", "X", {"dep": "d"}, 4)[0]["content"]
+        self._assert_names_all_three(user, "tagging propose user turn")
+
+
 if __name__ == "__main__":
     unittest.main()

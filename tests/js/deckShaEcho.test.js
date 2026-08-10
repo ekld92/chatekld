@@ -124,7 +124,14 @@ describe('deck apply-repair sha echo (Track 3.4)', () => {
         await new Promise((r) => setTimeout(r, 0));
         expect(bodies.applyRepair.base_sha256).toBe('sha-BEFORE'); // stale-diff token of the review
 
+        // E10 (2026-07-22): Compile & Auto-Fix rewrites the user's .tex, so it
+        // now carries the same Track-6e ceremony as apply-repair — the first
+        // click arms the strip, the strip's confirm fires the POST.
         compileBtn.click();
+        expect(bodies.compileFix).toBeUndefined();
+        const fixStrip = document.querySelector('.inline-confirm-strip');
+        expect(fixStrip).toBeTruthy();
+        fixStrip.querySelectorAll('button')[1].click();   // [0] is Cancel-first
         await new Promise((r) => setTimeout(r, 10));
         // Pre-fix: the copy in shaRef still held sha-BEFORE → server 409.
         expect(bodies.compileFix.base_sha256).toBe('sha-AFTER');

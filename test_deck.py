@@ -50,6 +50,58 @@ def test_inprocess_runner_surfaces_loop_exception():
     assert result.error and "boom" in result.error
 
 
+def test_salvage_pass_respects_the_turn_deadline():
+    """2026-07-20 audit M6: the agent=False salvage drain must honour
+    turn_timeout_s — a wedged local model streaming forever previously held
+    the process-wide deck op lock for ~600 s. With a tiny deadline the drain
+    stops and returns a timeout ChatResult (the caller degrades to a
+    placeholder)."""
+    from deckgen import inprocess
+
+    def _slow_gen():
+        # Emits a couple of tokens then stalls past the deadline.
+        yield "partial "
+        yield "answer "
+        import time as _t
+        _t.sleep(0.3)
+        yield "never reached"
+
+    fake_response = mock.Mock(response_gen=_slow_gen())
+    with mock.patch.object(inprocess.obsidian_manager, "stream_chat",
+                           return_value=fake_response):
+        runner = inprocess.InProcessChatRunner(
+            cfg={"provider": "ollama"}, turn_timeout_s=0.05,
+        )
+        result = runner.chat("hi", provider="ollama", model="m", embed="e",
+                             agent=False)
+    assert result.error == "salvage pass timed out"
+    assert "never reached" not in result.text
+
+
+def test_salvage_pass_stops_on_cancel_event():
+    from deckgen import inprocess
+    import threading
+
+    cancel = threading.Event()
+
+    def _gen():
+        yield "one "
+        cancel.set()          # abandoned mid-stream
+        yield "two "
+        yield "should not append after cancel"
+
+    fake_response = mock.Mock(response_gen=_gen())
+    with mock.patch.object(inprocess.obsidian_manager, "stream_chat",
+                           return_value=fake_response):
+        runner = inprocess.InProcessChatRunner(
+            cfg={"provider": "ollama"}, cancel_event=cancel, turn_timeout_s=30,
+        )
+        result = runner.chat("hi", provider="ollama", model="m", embed="e",
+                             agent=False)
+    assert "should not append" not in result.text
+    assert "one " in result.text
+
+
 def test_inprocess_runner_temperature_lands_on_vault_chat_temperature_key():
     """The agent loop reads cfg['vault_chat_temperature'] (not 'temperature'),
     so a per-turn override must be written there or it is silently ignored."""
@@ -146,6 +198,37 @@ def test_deck_generate_requires_topic_and_template():
     assert r.status_code == 400
     r = client.post("/api/deck/generate", json={"topic": "T"}, headers=headers)
     assert r.status_code == 400
+
+
+def test_compile_preview_rejects_bad_path():
+    """compile-preview 400s on a non-.tex / missing path (or a missing latexmk).
+
+    Either the latexmk preflight (400) or the path validation (400) fires; both
+    are 400, so this is robust whether or not a TeX suite is installed on the
+    test host. It never reaches a real compile.
+    """
+    from app import app
+
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    r = client.post("/api/deck/compile-preview", json={"deck_path": "/etc/passwd"}, headers=headers)
+    assert r.status_code == 400
+
+
+def test_preview_pdf_rejects_bad_path_and_missing_pdf(tmp_path):
+    """preview-pdf 400s on an invalid deck path and 404s when no PDF was built."""
+    from app import app
+
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    # Invalid path (not an existing .tex) → 400.
+    r = client.get("/api/deck/preview-pdf?deck_path=/nope/deck.tex", headers=headers)
+    assert r.status_code == 400
+    # A real .tex with no sibling .pdf → 404 (path valid, PDF absent).
+    deck = tmp_path / "deck.tex"
+    deck.write_text("\\documentclass{beamer}\\begin{document}\\end{document}\n")
+    r = client.get(f"/api/deck/preview-pdf?deck_path={deck}", headers=headers)
+    assert r.status_code == 404
 
 
 def test_deck_routes_require_local_origin():
@@ -1132,7 +1215,8 @@ def test_apply_augment_writes_from_staging_with_backup(tmp_path):
     assert aug["changed"]
 
     r = client.post("/api/deck/apply-augment", json={
-        "deck_path": str(deck), "base_sha256": aug["deck_sha256"], "confirm": True,
+        "deck_path": str(deck), "base_sha256": aug["deck_sha256"],
+        "proposed_sha256": aug["proposed_sha256"], "confirm": True,
     }, headers=headers)
     assert r.status_code == 200, r.get_json()
     written = deck.read_text(encoding="utf-8")
@@ -1151,6 +1235,10 @@ def test_apply_augment_requires_confirm_and_base(tmp_path):
     assert r.status_code == 400  # no confirm
     r = client.post("/api/deck/apply-augment", json={"deck_path": str(deck), "confirm": True}, headers=headers)
     assert r.status_code == 400  # no base_sha256
+    r = client.post("/api/deck/apply-augment", json={
+        "deck_path": str(deck), "base_sha256": sha, "confirm": True,
+    }, headers=headers)
+    assert r.status_code == 400  # no proposed_sha256 (preview-binding guard)
 
 
 def test_apply_augment_no_stage_is_400(tmp_path):
@@ -1159,7 +1247,8 @@ def test_apply_augment_no_stage_is_400(tmp_path):
     client = app.test_client()
     headers = {"X-Requested-With": "ChatEKLD"}
     r = client.post("/api/deck/apply-augment", json={
-        "deck_path": str(deck), "base_sha256": sha, "confirm": True,
+        "deck_path": str(deck), "base_sha256": sha,
+        "proposed_sha256": "0" * 64, "confirm": True,
     }, headers=headers)
     assert r.status_code == 400
     assert "Preview" in (r.get_json() or {}).get("error", "")
@@ -1175,9 +1264,43 @@ def test_apply_augment_refuses_stale_deck(tmp_path):
     # Change the deck on disk after staging.
     deck.write_text(_AUG_DECK.replace("Demo", "Edited"), encoding="utf-8")
     r = client.post("/api/deck/apply-augment", json={
-        "deck_path": str(deck), "base_sha256": aug["deck_sha256"], "confirm": True,
+        "deck_path": str(deck), "base_sha256": aug["deck_sha256"],
+        "proposed_sha256": aug["proposed_sha256"], "confirm": True,
     }, headers=headers)
     assert r.status_code == 409
+
+
+def test_apply_augment_refuses_swapped_stage(tmp_path):
+    """Audit #5 (preview-binding): staging is ONE slot per deck path, so a
+    second preview (another window/tab) silently replaces the first. Apply
+    must present the digest of the proposal it previewed — a swapped stage
+    409s instead of writing a proposal the user never reviewed (the base sha
+    can't catch this: the deck on disk is unchanged)."""
+    from app import app
+    deck, sha = _write_deck(tmp_path)
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    aug1, _ = _preview_augment(client, headers, deck,
+                               "\\section{Intro}\n\\begin{frame}{Intro}\\item first preview\\end{frame}")
+    # A second preview (window B) replaces the single staging slot.
+    aug2, _ = _preview_augment(client, headers, deck,
+                               "\\section{Intro}\n\\begin{frame}{Intro}\\item second preview\\end{frame}")
+    assert aug1["proposed_sha256"] != aug2["proposed_sha256"]
+    # Window A applies with ITS preview token → 409, nothing written.
+    r = client.post("/api/deck/apply-augment", json={
+        "deck_path": str(deck), "base_sha256": aug1["deck_sha256"],
+        "proposed_sha256": aug1["proposed_sha256"], "confirm": True,
+    }, headers=headers)
+    assert r.status_code == 409
+    assert "first preview" not in deck.read_text(encoding="utf-8")
+    assert "second preview" not in deck.read_text(encoding="utf-8")
+    # The stage is NOT cleared: window B's own apply still succeeds.
+    r = client.post("/api/deck/apply-augment", json={
+        "deck_path": str(deck), "base_sha256": aug2["deck_sha256"],
+        "proposed_sha256": aug2["proposed_sha256"], "confirm": True,
+    }, headers=headers)
+    assert r.status_code == 200, r.get_json()
+    assert "second preview" in deck.read_text(encoding="utf-8")
 
 
 def test_apply_augment_rescreens_tampered_stage(tmp_path):
@@ -1191,7 +1314,10 @@ def test_apply_augment_rescreens_tampered_stage(tmp_path):
     evil = _AUG_DECK.replace("how we did it", "\\write18{rm -rf /}")
     deckmod._stage_augment(str(deck), sha, evil)   # bypass the preview screen
     r = client.post("/api/deck/apply-augment", json={
-        "deck_path": str(deck), "base_sha256": sha, "confirm": True,
+        "deck_path": str(deck), "base_sha256": sha,
+        # The binding token matches the (tampered) stage — the re-screen must
+        # still refuse on the dangerous macro.
+        "proposed_sha256": deckmod._proposed_digest(evil), "confirm": True,
     }, headers=headers)
     assert r.status_code == 400
     assert "write18" not in deck.read_text(encoding="utf-8")
@@ -1374,6 +1500,33 @@ class TestDeckOpGuard:
         resp.close()
         assert calls == [1]
 
+    def test_thread_spawn_failure_still_releases_lock(self):
+        # B9 (2026-07-13): if Thread.start() raises (thread exhaustion) AFTER
+        # worker_spawned() was recorded, the guard would otherwise wait forever
+        # for a worker_finished() that can never come — leaking the op lock so
+        # every later op 409s. The runner must mark the worker finished, emit an
+        # error frame, and release.
+        import threading
+        from api import sse as ssemod
+
+        calls = []
+
+        def worker(put, cancel):  # never actually runs — start() fails first
+            put({"info": "x"})
+
+        with mock.patch.object(
+            threading.Thread, "start",
+            side_effect=RuntimeError("can't start new thread"),
+        ):
+            resp = ssemod.run_sse_worker(
+                worker, consumer_timeout_s=5, preflight_msgs=[],
+                release=lambda: calls.append(1))
+            frames = list(resp.response)   # drive the generator to completion
+
+        assert calls == [1]                              # lock released
+        assert any('"error"' in f for f in frames)       # error surfaced
+        assert any("[DONE]" in f for f in frames)
+
     def test_disconnect_mid_stream_defers_release_to_worker_exit(self):
         # (b) end-to-end: consume one frame, then close the response while the
         # worker is still alive. The release must NOT fire until the worker
@@ -1506,3 +1659,277 @@ def test_audit_mapping_concurrent_writers_lose_nothing(tmp_path):
         t.join()
     matches, _no_match = bridge._load_mapping(mapping_file)
     assert len(matches) == 10                    # nothing lost to a torn RMW
+
+
+def test_augment_reformat_section_scope(tmp_path):
+    """WP-D3: the reformat operation is a replace-type augment — the model's
+    reformatted section replaces the target, everything else byte-identical,
+    same screen/stage flow as deepen."""
+    from app import app
+    deck, sha = _write_deck(tmp_path)
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+
+    reformatted = (
+        "\\section{Intro}\n\\begin{frame}{Intro}\n"
+        "  \\begin{itemize}\n    \\item what it is\n  \\end{itemize}\n\\end{frame}"
+    )
+    aug, _ = _preview_augment(
+        client, headers, deck, reformatted, operation="reformat",
+    )
+    assert aug is not None and aug["changed"] is True
+    assert aug["operation"] == "reformat"
+    assert "\\section{Methods}" in aug["proposed_tex"]   # untouched section preserved
+    assert aug["deck_sha256"] == sha
+
+
+def test_augment_reformat_zero_section_deck_refused(tmp_path):
+    """Reformat is a replace op: a deck with no \\section has nothing to
+    replace — explicit error, like deepen/table."""
+    from app import app
+    deck, _ = _write_deck(
+        tmp_path,
+        text=(
+            "\\documentclass{beamer}\n\\begin{document}\n"
+            "\\begin{frame}{Only}\nx\n\\end{frame}\n\\end{document}\n"
+        ),
+    )
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    aug, frames = _preview_augment(
+        client, headers, deck, "\\begin{frame}{X}\\end{frame}",
+        operation="reformat", scope="whole",
+    )
+    assert aug is None
+    assert any("no \\section" in f.get("error", "") for f in frames)
+
+
+# --- 2026-07-20 audit batch 2: backup originals, shared lock, refuse-before-write
+
+
+class TestBackupOriginalPreservation:
+    """Audit M1: the rolling .tex.bak destroyed the true original on the
+    SECOND apply; a non-clobbering .tex.orig now preserves it forever."""
+
+    def test_backup_deck_preserves_true_original_across_two_applies(self, tmp_path):
+        from api.routes.deck import _backup_deck
+        deck = tmp_path / "deck.tex"
+        deck.write_text("ORIGINAL", encoding="utf-8")
+        _backup_deck(str(deck))
+        deck.write_text("AFTER FIRST APPLY", encoding="utf-8")
+        _backup_deck(str(deck))
+        assert (tmp_path / "deck.tex.orig").read_text(encoding="utf-8") == "ORIGINAL"
+        assert (tmp_path / "deck.tex.bak").read_text(encoding="utf-8") == "AFTER FIRST APPLY"
+
+    def test_backup_doc_shares_the_contract(self, tmp_path):
+        from api.routes._latexdoc import backup_doc
+        doc = tmp_path / "art.tex"
+        doc.write_text("ORIGINAL", encoding="utf-8")
+        backup_doc(str(doc))
+        doc.write_text("V2", encoding="utf-8")
+        backup_doc(str(doc))
+        assert (tmp_path / "art.tex.orig").read_text(encoding="utf-8") == "ORIGINAL"
+        assert (tmp_path / "art.tex.bak").read_text(encoding="utf-8") == "V2"
+
+    def test_compile_fix_routes_through_backup_deck(self):
+        """2026-07-22 audit H2 (source ratchet): compile-fix used an inline
+        shutil.copy2 backup that skipped preserve_original_once — a second
+        compile-fix run overwrote .bak with the first run's repaired state
+        (original gone), and a later apply-augment then seeded .tex.orig from
+        post-repair content. The worker must use _backup_deck, the same
+        discipline as apply-repair/apply-augment."""
+        import inspect
+        from api.routes.deck import api_deck_compile_fix
+        src = inspect.getsource(api_deck_compile_fix)
+        assert "_backup_deck(deck_path)" in src
+        assert "shutil.copy2(deck_path" not in src
+
+
+class TestSharedLatexOpLock:
+    """Audit H1: deck and docgen accept the same absolute .tex paths, so their
+    op locks must be ONE object or check-then-write interleaves across panels."""
+
+    def test_deck_and_docgen_locks_are_one_object(self):
+        from api.routes._latexdoc import LATEX_OP_LOCK
+        from api.routes.deck import _DECK_OP_LOCK
+        from api.routes.docgen import _DOCGEN_OP_LOCK
+        assert _DECK_OP_LOCK is LATEX_OP_LOCK
+        assert _DOCGEN_OP_LOCK is LATEX_OP_LOCK
+
+
+def test_generate_refuses_existing_deck_before_touching_figures(tmp_path):
+    """Audit M5: the existing-deck refusal must write NOTHING — pre-fix,
+    fresh vault images were copied into <slug>/figures/ before
+    scaffold_deck's overwrite gate finally raised."""
+    from app import app
+    import api.routes.deck as deckmod
+    from deckgen.outline import Section
+    from deckgen.assemble import SectionOutput
+
+    template = "\\documentclass{beamer}\n\\begin{document}\n\\end{document}\n"
+    section = SectionOutput(
+        title="Intro",
+        body="\\section{Intro}\n\\begin{frame}{T}\nbody\n\\end{frame}",
+    )
+    project = tmp_path / "exists"
+    project.mkdir()
+    (project / "exists.tex").write_text("HANDMADE", encoding="utf-8")
+
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    with mock.patch.object(deckmod, "request_outline",
+                           return_value=([Section(title="Intro", points=["a"])], "")), \
+         mock.patch.object(deckmod, "generate_section", return_value=section), \
+         mock.patch.object(deckmod, "_resolve_and_copy_deck_figures") as figs, \
+         mock.patch.object(deckmod.obsidian_manager, "get_status", return_value="done"):
+        r = client.post("/api/deck/generate", json={
+            "topic": "T", "template_tex": template, "out_dir": str(tmp_path),
+            "deck_name": "exists", "citations_enabled": False,
+        }, headers=headers)
+        body = r.get_data(as_text=True)
+
+    frames = _sse_frames(body)
+    assert any("already exists" in f.get("error", "") for f in frames), frames
+    figs.assert_not_called()
+    assert (project / "exists.tex").read_text(encoding="utf-8") == "HANDMADE"
+    assert not (project / "figures").exists()
+
+
+# ---------------------------------------------------------------------------
+# Batch E (2026-07-22): piecewise whole-deck augment (offer-on-refusal)
+# ---------------------------------------------------------------------------
+
+def _big_aug_deck():
+    """A deck whose section REGION exceeds AUGMENT_MAX_SOURCE_CHARS while each
+    individual section stays under it (the piecewise-eligible shape)."""
+    from deckgen.augment import AUGMENT_MAX_SOURCE_CHARS
+    filler = "% pad\n" * ((AUGMENT_MAX_SOURCE_CHARS // 2) // 6)
+    sec = ("\\section{S%d}\n\\begin{frame}{S%d}\n  \\begin{itemize}\\item x\\end{itemize}\n"
+           "\\end{frame}\n%s\n")
+    tex = ("\\documentclass{beamer}\n\\title{Demo}\n\\begin{document}\n\n"
+           "\\frame{\\titlepage}\n\n"
+           + sec % (1, 1, filler) + sec % (2, 2, filler)
+           + "\\end{document}\n")
+    return tex
+
+
+class _FakeRunnerPerSection:
+    """Returns a distinct frame body per .chat call (per-section turns)."""
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def chat(self, *args, **kwargs):
+        from deckgen.result import ChatResult
+        self.calls += 1
+        body = ("\\section{S%d}\n\\begin{frame}{S%d revised}\n  PIECE%d\n"
+                "\\end{frame}\n" % (self.calls, self.calls, self.calls))
+        return ChatResult(text=body, error=None)
+
+
+def test_augment_piecewise_runs_per_section_and_stages(tmp_path):
+    from app import app
+    import api.routes.deck as deckmod
+
+    tex = _big_aug_deck()
+    deck, sha = _write_deck(tmp_path, text=tex)
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    fake = _FakeRunnerPerSection()
+    payload = {
+        "deck_path": str(deck), "instruction": "deepen everything",
+        "operation": "deepen", "scope": "whole", "citations_enabled": False,
+        "piecewise": True,
+    }
+    with mock.patch.object(deckmod, "InProcessChatRunner", fake), \
+         mock.patch.object(deckmod.obsidian_manager, "get_status", return_value="done"):
+        r = client.post("/api/deck/augment", json=payload, headers=headers)
+        frames = _sse_frames(r.get_data(as_text=True))
+    aug = next((f["augment"] for f in frames if "augment" in f), None)
+    assert aug is not None, frames
+    assert aug["changed"] is True
+    assert aug["piecewise"] is True
+    assert aug["edited_sections"] == 2
+    assert fake.calls == 2                       # one turn per section
+    assert "PIECE1" in aug["proposed_tex"] and "PIECE2" in aug["proposed_tex"]
+    # Opening/closing survive verbatim (the byte-identical-outside-spans rule).
+    assert aug["proposed_tex"].startswith("\\documentclass{beamer}")
+    assert aug["proposed_tex"].rstrip().endswith("\\end{document}")
+    # Staged and preview-bound, ready for the unchanged apply-augment.
+    assert aug["proposed_sha256"]
+    assert aug["deck_sha256"] == sha
+
+
+def test_augment_without_piecewise_still_refuses_and_hints(tmp_path):
+    from app import app
+    import api.routes.deck as deckmod
+
+    deck, _sha = _write_deck(tmp_path, text=_big_aug_deck())
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    payload = {
+        "deck_path": str(deck), "instruction": "deepen everything",
+        "operation": "deepen", "scope": "whole", "citations_enabled": False,
+    }
+    with mock.patch.object(deckmod, "InProcessChatRunner", _FakeRunner("x")), \
+         mock.patch.object(deckmod.obsidian_manager, "get_status", return_value="done"):
+        r = client.post("/api/deck/augment", json=payload, headers=headers)
+        frames = _sse_frames(r.get_data(as_text=True))
+    errs = [f["error"] for f in frames if isinstance(f, dict) and "error" in f]
+    assert errs and "too large to revise in one pass" in errs[0]
+    assert "section by section" in errs[0]
+
+
+# ---------------------------------------------------------------------------
+# Batch F (2026-07-22): piecewise section-by-section auto-repair
+# ---------------------------------------------------------------------------
+
+def test_repair_piecewise_reviews_each_section_and_stages(tmp_path):
+    from app import app
+    import api.routes.deck as deckmod
+
+    deck, sha = _write_deck(tmp_path)          # _AUG_DECK: sections Intro, Methods
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+
+    calls = []
+
+    def fake_stream(*, messages, **kwargs):
+        calls.append(messages[0]["content"])
+        # Repair the Intro section only; Methods reviews clean.
+        if "Intro" in messages[0]["content"]:
+            yield ("ISSUES:\n- unbalanced itemize\n\n"
+                   "```latex\n\\section{Intro}\n\\begin{frame}{Intro}\n"
+                   "  \\begin{itemize}\\item FIXED\\end{itemize}\n\\end{frame}\n```\n")
+        else:
+            yield "ISSUES:\nnone\n"
+
+    with mock.patch.object(deckmod, "stream_chat_messages", new=fake_stream):
+        r = client.post("/api/deck/repair-piecewise",
+                        json={"deck_path": str(deck), "base_sha256": sha},
+                        headers=headers)
+    assert r.status_code == 200
+    frames = _sse_frames(r.get_data(as_text=True))
+    aug = next((f["augment"] for f in frames if "augment" in f), None)
+    assert aug is not None, frames
+    assert len(calls) == 2                       # one review per section
+    assert aug["changed"] is True
+    assert aug["operation"] == "repair" and aug["piecewise"] is True
+    assert aug["edited_sections"] == 1
+    assert "FIXED" in aug["proposed_tex"]
+    assert "how we did it" in aug["proposed_tex"]   # untouched section survives
+    assert aug["warnings"] and "Intro: unbalanced itemize" in aug["warnings"][0]
+    assert aug["proposed_sha256"]                 # staged, apply-augment-ready
+
+
+def test_repair_piecewise_stale_base_409(tmp_path):
+    from app import app
+    deck, _sha = _write_deck(tmp_path)
+    client = app.test_client()
+    headers = {"X-Requested-With": "ChatEKLD"}
+    r = client.post("/api/deck/repair-piecewise",
+                    json={"deck_path": str(deck), "base_sha256": "0" * 64},
+                    headers=headers)
+    assert r.status_code == 409

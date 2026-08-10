@@ -9,9 +9,22 @@
 #   pyinstaller) — none are imported at module scope, so the suite is complete
 #   without them; torch/sentence-transformers install fine on Linux and ARE
 #   exercised (the reranker device knob tests), so they stay.
-# * The pytest set = the documented suite command PLUS the targets it omits
-#   (test_launch.py, test_thesaurus.py, deckgen/tests/) — the union every
-#   track batch has been gating on.
+# * The pytest set = the full documented suite command (CLAUDE.md → Tests)
+#   PLUS test_prompts_hub.py + test_launch.py + test_thesaurus.py +
+#   deckgen/tests/ + docgen/tests/ — the union every track batch
+#   gates on. The 2026-07-20 audit added the newer subsystems CI had been
+#   silently skipping (docgen/, tagging/, test_open.py, test_prompts_hub.py),
+#   and the 2026-07-21 CLI/MCP work added tests/test_{cli,driver,driver_contracts,
+#   mcp_server}.py — the exact "a batch shipped with the suite never run" class
+#   this file exists to catch. This list is the documented SUPERSET of the
+#   CLAUDE.md suite command (which is the dev quick-gate); a new test FILE
+#   goes in both (2026-07-22 doc-drift repair: the old "==" claim was false).
+#   The 2026-07-27 retrieval-eval harness added tests/eval/test_{retrieval_
+#   metrics,golden_gen,eval_runner}.py and swept up test_eval_pipeline.py,
+#   which had been running in NEITHER list since it was written (the same
+#   silent-skip class). The `scripts/` tree is not globbed in the py_compile
+#   sweep — the two harness entry points are named individually, like
+#   install_mcp.py, because most of scripts/ is one-off maintenance code.
 # * Suite is hermetic via the root conftest.py (CHATEKLD_BASE_DIR → tempdir);
 #   no app data, no network, no API keys are touched. Live provider smokes
 #   live in live-smoke.yml (manual/scheduled, key-gated), not here.
@@ -66,7 +79,10 @@ jobs:
           python -m py_compile app.py api/routes/*.py api/*.py core/*.py
           core/providers/*.py core/llm/*.py core/llm/adapters/*.py
           core/agent/*.py rag/*.py services/*.py audit/*.py audit/core/*.py
-          audit/engine/*.py audit/engine/reports/*.py deckgen/*.py refactor/*.py
+          audit/engine/*.py audit/engine/reports/*.py deckgen/*.py docgen/*.py
+          refactor/*.py tagging/*.py widget/*.py packaging/widgets/*.py
+          cli/*.py mcp_server/*.py scripts/install_mcp.py
+          scripts/gen_golden_retrieval.py scripts/eval_retrieval.py
 
       - name: Ruff (clean baseline is a suite gate)
         run: ruff check .
@@ -75,10 +91,17 @@ jobs:
         run: >
           python -m pytest smoke_test.py test_concurrency.py
           test_vault_regressions.py test_llm.py test_validators.py
-          test_agent.py test_audit.py test_deck.py test_refactor.py
-          test_plainchat.py test_prompts.py test_compile.py test_health.py
-          test_lancedb_migration.py test_launch.py test_thesaurus.py
-          tests/audit/ tests/eval/test_scoring.py deckgen/tests/ -q
+          test_agent.py test_audit.py test_deck.py test_docgen_route.py
+          test_docgen_md.py test_refactor.py test_plainchat.py test_prompts.py
+          test_prompts_hub.py test_compile.py test_health.py test_open.py
+          test_path_validators.py
+          test_tagging.py test_widget.py test_lancedb_migration.py test_launch.py
+          test_thesaurus.py tests/audit/ tests/eval/test_scoring.py
+          tests/eval/test_eval_pipeline.py tests/eval/test_retrieval_metrics.py
+          tests/eval/test_golden_gen.py tests/eval/test_eval_runner.py
+          tests/test_cli.py tests/test_driver.py tests/test_driver_contracts.py
+          tests/test_driver_replay.py tests/test_mcp_server.py
+          tests/test_server_info.py deckgen/tests/ docgen/tests/ -q
 
       - uses: actions/setup-node@v4
         with:

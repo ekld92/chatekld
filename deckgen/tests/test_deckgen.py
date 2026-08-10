@@ -473,3 +473,166 @@ def test_image_rule_gated_by_images_enabled():
     assert "includegraphics" in section_system_prompt("a", images_enabled=True)
     assert "includegraphics" not in section_system_prompt("a", images_enabled=False)
     assert "includegraphics" not in augment_system_prompt("a", images_enabled=False)
+
+
+# ---------------------------------------------------------------------------
+# substitute_title — the template's \title{...} placeholder must give way to
+# the user's deck title (WP-D2: templated decks previously kept the template
+# title forever, since assemble_with_template reuses the preamble verbatim).
+# ---------------------------------------------------------------------------
+
+class TestSubstituteTitle:
+    PREAMBLE = (
+        "\\documentclass[aspectratio=169]{beamer}\n"
+        "\\usepackage{cress-style}\n"
+        "\\title[Short title]{Your Presentation Title}\n"
+        "\\subtitle{Optional subtitle}\n"
+        "\\author[E. D.]{Etienne}\n"
+        "\\date{\\today}\n"
+    )
+
+    def test_replaces_title_and_short_form(self):
+        from deckgen.assemble import substitute_title
+
+        out = substitute_title(self.PREAMBLE, "Digital psychotherapies")
+        assert "\\title[Digital psychotherapies]{Digital psychotherapies}" in out
+        assert "Your Presentation Title" not in out
+        # Untouched neighbours.
+        assert "\\subtitle{Optional subtitle}" in out
+        assert "\\author[E. D.]{Etienne}" in out
+
+    def test_replaces_subtitle_when_given(self):
+        from deckgen.assemble import substitute_title
+
+        out = substitute_title(self.PREAMBLE, "T", "A subtitle")
+        assert "\\subtitle{A subtitle}" in out
+        assert "Optional subtitle" not in out
+
+    def test_long_title_truncated_in_short_form(self):
+        from deckgen.assemble import substitute_title
+
+        long_title = "A very long presentation title that would overflow the Boadilla footline"
+        out = substitute_title(self.PREAMBLE, long_title)
+        m = __import__("re").search(r"\\title\[([^\]]*)\]", out)
+        assert m and len(m.group(1)) <= 45 and m.group(1).endswith("...")
+        assert f"]{{{long_title}}}" in out
+
+    def test_title_without_optional_arg(self):
+        from deckgen.assemble import substitute_title
+
+        out = substitute_title("\\title{Old}\n", "New")
+        assert out == "\\title{New}\n"
+
+    def test_latex_specials_escaped(self):
+        from deckgen.assemble import substitute_title
+
+        out = substitute_title("\\title{Old}\n", "Cost & benefit: 50% of $x$")
+        assert "\\&" in out and "\\%" in out and "\\$" in out
+
+    def test_does_not_match_titlepage(self):
+        from deckgen.assemble import substitute_title
+
+        src = "\\titlepage\n\\titlegraphic{x}\n"
+        assert substitute_title(src, "New") == src
+
+    def test_nested_braces_in_existing_title(self):
+        from deckgen.assemble import substitute_title
+
+        out = substitute_title("\\title{Old {nested} title}\nrest\n", "New")
+        assert out == "\\title{New}\nrest\n"
+
+    def test_empty_title_is_noop(self):
+        from deckgen.assemble import substitute_title
+
+        assert substitute_title(self.PREAMBLE, "") == self.PREAMBLE
+        assert substitute_title(self.PREAMBLE, "  ") == self.PREAMBLE
+
+    def test_no_title_macro_is_noop(self):
+        from deckgen.assemble import substitute_title
+
+        src = "\\documentclass{beamer}\n"
+        assert substitute_title(src, "New") == src
+
+    def test_unclosed_group_is_noop(self):
+        from deckgen.assemble import substitute_title
+
+        src = "\\title{never closed\n"
+        assert substitute_title(src, "New") == src
+
+
+# ---------------------------------------------------------------------------
+# generate_section — WP-A2 salvage pass. When the agent turn burns its whole
+# budget without usable Beamer output, ONE tool-free single-shot pass
+# (agent=False) runs before the placeholder frame freezes the failure in.
+# ---------------------------------------------------------------------------
+
+class _SalvageClient:
+    """Agent turns return junk; the agent=False salvage returns a real frame."""
+
+    def __init__(self, agent_result, salvage_result):
+        self._agent_result = agent_result
+        self._salvage_result = salvage_result
+        self.agent_calls = 0
+        self.salvage_calls = 0
+
+    def chat(self, message, **kwargs):
+        if kwargs.get("agent", True):
+            self.agent_calls += 1
+            return self._agent_result
+        self.salvage_calls += 1
+        return self._salvage_result
+
+
+def _make_section(title="Intro"):
+    from deckgen.outline import Section
+    return Section(title=title, points=["a", "b"])
+
+
+_GOOD_FRAME = (
+    "\\section{Intro}\n\\begin{frame}{Intro}\n\\begin{itemize}\n"
+    "\\item point\n\\end{itemize}\n\\end{frame}"
+)
+
+
+def _gen(client, **overrides):
+    from deckgen.sections import generate_section
+    kwargs = dict(
+        index=1, section=_make_section(), full_outline=[], topic="T",
+        instructions="", audience="aud", provider="ollama", model="m",
+        embed="e", max_iters=4, temperature=None,
+    )
+    kwargs.update(overrides)
+    return generate_section(client, **kwargs)
+
+
+def test_salvage_pass_rescues_failed_agent_turn():
+    client = _SalvageClient(ChatResult(), ChatResult(text=_GOOD_FRAME))
+    out = _gen(client)
+    assert client.agent_calls == 1
+    assert client.salvage_calls == 1
+    assert not out.placeholder
+    assert "\\begin{frame}" in out.body
+    assert any("salvage" in i for i in out.infos)
+
+
+def test_salvage_failure_still_degrades_to_placeholder():
+    client = _SalvageClient(ChatResult(), ChatResult(text="still no frames"))
+    out = _gen(client)
+    assert client.salvage_calls == 1
+    assert out.placeholder
+    assert "no content generated" in out.body
+
+
+def test_no_salvage_when_agent_turn_succeeds():
+    client = _SalvageClient(ChatResult(text=_GOOD_FRAME), ChatResult(text="x"))
+    out = _gen(client)
+    assert client.agent_calls == 1
+    assert client.salvage_calls == 0
+    assert not out.placeholder
+
+
+def test_no_salvage_after_cancel():
+    client = _SalvageClient(ChatResult(), ChatResult(text=_GOOD_FRAME))
+    out = _gen(client, should_cancel=lambda: True)
+    assert client.salvage_calls == 0
+    assert out.placeholder

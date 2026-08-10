@@ -54,8 +54,9 @@ describe('JS module hierarchy (ratchet lint, Track 7.3)', () => {
         // silent scope change — update this list alongside CLAUDE.md.
         expect(MODULES.sort()).toEqual([
             'api.js', 'app.js', 'audit.js', 'config.js', 'deck.js',
-            'plainchat.js', 'prompts.js', 'refactor.js', 'settings.js',
-            'summarizer.js', 'ui.js', 'vault.js',
+            'docgen.js', 'help.js', 'plainchat.js', 'prompts.js',
+            'refactor.js', 'settings.js', 'summarizer.js', 'tagging.js',
+            'ui.js', 'vault.js',
         ]);
     });
 
