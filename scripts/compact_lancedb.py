@@ -11,7 +11,7 @@ compacted.
 
 What it does:
   1. Refuse to run while the app is open is the caller's responsibility — close
-     ChatEKLD first (interactive confirm; ``--yes`` skips it).
+     CHERQAiN first (interactive confirm; ``--yes`` skips it).
   2. Open the live ``vectors`` table at ``OBSIDIAN_INDEX_DIR/lancedb``.
   3. ``optimize(cleanup_older_than=0)`` — merge data fragments and prune every
      superseded version manifest.
@@ -88,7 +88,7 @@ def main() -> int:
 
     if not args.yes:
         reply = input(
-            "Make sure ChatEKLD is fully closed (a running indexer holds the table).\n"
+            "Make sure CHERQAiN is fully closed (a running indexer holds the table).\n"
             "Proceed with compaction? [y/N] "
         ).strip().lower()
         if reply not in ("y", "yes"):

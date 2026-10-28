@@ -13,19 +13,23 @@ import { fileURLToPath } from 'node:url';
 
 const enc = new TextEncoder();
 
-function sseOnce(frames) {
+function sseOnce(frames, completion = Promise.resolve()) {
     const payload =
-        frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join('') + 'data: [DONE]\n\n';
-    let sent = false;
+        frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join('');
+    let reads = 0;
     return {
         ok: true,
         status: 200,
         body: {
             getReader: () => ({
-                read: async () =>
-                    sent
-                        ? { value: undefined, done: true }
-                        : ((sent = true), { value: enc.encode(payload), done: false }),
+                read: async () => {
+                    if (reads++ === 0) return { value: enc.encode(payload), done: false };
+                    if (reads === 2) {
+                        await completion;
+                        return { value: enc.encode('data: [DONE]\n\n'), done: false };
+                    }
+                    return { value: undefined, done: true };
+                },
                 releaseLock: () => {},
                 cancel: async () => {},
             }),
@@ -44,14 +48,16 @@ describe('static live regions in markup (Track 6b)', () => {
         ['sr-error-announcer', 'role="alert"'],
         ['prewarm-banner', 'role="status"'],
         ['excl-status', 'role="status"'],
-        ['refactor-restore-status', 'role="status"'],
+        ['history-restore-status', 'role="status"'],
         // 2026-07-20 Card Catalog batch: the write-ceremony statuses that were
         // silent to AT (a VoiceOver user confirmed a vault write and heard
         // nothing) are now static live regions like their restore sibling.
-        ['refactor-apply-modal-status', 'role="status"'],
-        ['refactor-normalize-modal-status', 'role="status"'],
         ['settings-status', 'role="status"'],
         ['audit-settings-status', 'role="status"'],
+        // 2026-09-17 review, D5: Library status lines were roled at write time.
+        ['library-note-status', 'role="status"'],
+        ['library-campaign-plan-status', 'role="status"'],
+        ['library-campaign-review-status', 'role="status"'],
         ['image-exts-status', 'role="status"'],
         // 2026-08-09 UI pass: the remaining load-bearing status surfaces were
         // static live regions in the markup but unpinned — removing any role
@@ -64,9 +70,17 @@ describe('static live regions in markup (Track 6b)', () => {
         ['docgen-status', 'role="status"'],
         ['docgen-md-status', 'role="status"'],
         ['docgen-aug-status', 'role="status"'],
-        ['refactor-status', 'role="status"'],
         ['prompts-status', 'role="status"'],
         ['reset-status', 'role="status"'],
+        // 2026-08-18: the vault index status line — setStatusA11y used to
+        // mint the role at write time (textContent first, the same-tick
+        // WebKit hazard this file exists to prevent) and the region was
+        // unpinned, so deleting the role passed the suite.
+        ['obsidian-status-msg', 'role="status"'],
+        // Maintenance tab (private-only feature whose MARKUP ships): the run
+        // status line must be a static live region — the panel JS is stripped
+        // publicly, so the role can only ever come from index.html.
+        ['maintenance-status', 'role="status"'],
     ])('#%s ships with %s in the HTML', (id, role) => {
         // Element-agnostic: most regions are <div>s, #reset-status is a <p>.
         const tag = new RegExp(`<[a-z]+[^>]*id="${id}"[^>]*>`).exec(indexHtml);
@@ -79,6 +93,19 @@ describe('static live regions in markup (Track 6b)', () => {
         expect(tag).toBeTruthy();
         expect(tag[0]).not.toContain('aria-live');
         expect(tag[0]).not.toContain('role=');
+    });
+
+    it.each([
+        'deck-activity', 'deck-aug-activity', 'docgen-activity',
+        'docgen-md-activity', 'docgen-aug-activity',
+    ])('#%s (agent-trace log) is deliberately NOT a live region', (id) => {
+        // 2026-08-18: a deck run appends ~50–100 per-iteration/tool_call
+        // lines; aria-live here monopolized the SR queue for the whole run
+        // (the audit search overlay's deliberate "no aria-live" precedent).
+        // Milestones announce via announceStatus instead.
+        const tag = new RegExp(`<div[^>]*id="${id}"[^>]*>`).exec(indexHtml);
+        expect(tag, `#${id} missing from index.html`).toBeTruthy();
+        expect(tag[0]).not.toContain('aria-live');
     });
 });
 
@@ -148,7 +175,7 @@ describe('vault chat {info} notices reach assistive tech (2026-07-26)', () => {
     });
     afterEach(() => vi.unstubAllGlobals());
 
-    it('announces an {info} frame through the static announcer, and keeps the visible bubble', async () => {
+    it('announces and displays progress during streaming, then clears the completed stage', async () => {
         const announcer = document.getElementById('sr-status-announcer');
         const seen = [];
         const observer = new MutationObserver(() => {
@@ -157,28 +184,34 @@ describe('vault chat {info} notices reach assistive tech (2026-07-26)', () => {
         observer.observe(announcer, { childList: true, characterData: true, subtree: true });
         vi.stubGlobal('requestAnimationFrame', (cb) => { cb(); return 0; });
 
+        let finish;
+        const completion = new Promise(resolve => { finish = resolve; });
         fetchMock.mockImplementation((url) => {
             if (String(url).includes('/api/obsidian/chat')) {
                 return Promise.resolve(sseOnce([
                     { info: 'Loading cross-encoder reranker…' },
                     { token: 'ok' },
-                ]));
+                ], completion));
             }
             return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
         });
         const vault = await import('../../static/js/vault.js');
         document.getElementById('obsidian-input').value = 'une question';
-        await vault.chatWithVault();
-        await new Promise((r) => setTimeout(r, 60));
-        observer.takeRecords();
-        observer.disconnect();
-
-        expect(seen.some((t) => t.includes('cross-encoder reranker'))).toBe(true);
-        // The visual bubble is unchanged — this is an ADDITIVE announcement,
-        // not a replacement of the on-screen notice.
-        const bubble = document.querySelector('#obsidian-chat .message-info');
-        expect(bubble).toBeTruthy();
-        expect(bubble.textContent).toContain('cross-encoder reranker');
+        const run = vault.chatWithVault();
+        try {
+            await vi.waitFor(() => {
+                expect(seen.some((t) => t.includes('cross-encoder reranker'))).toBe(true);
+                const bubble = document.querySelector('#obsidian-chat .message-info');
+                expect(bubble).toBeTruthy();
+                expect(bubble.textContent).toContain('cross-encoder reranker');
+            });
+        } finally {
+            finish();
+            await run;
+            observer.disconnect();
+        }
+        expect(document.querySelector('#obsidian-chat .message-info')).toBeNull();
+        expect(document.querySelector('#obsidian-chat .message-bot').textContent).toContain('ok');
     });
 
     it('RATCHET: the info bubble does not mint its own live-region role at write time', () => {
@@ -209,13 +242,4 @@ describe('vault chat {info} notices reach assistive tech (2026-07-26)', () => {
         expect(onInfo[0]).toContain('announceStatus(');
     });
 
-    it('RATCHET: refactor LLM-action stage lines are announced (_pending → announceStatus)', () => {
-        const src = readFileSync(
-            resolve(dirname(fileURLToPath(import.meta.url)), '../../static/js/refactor.js'),
-            'utf-8',
-        );
-        const pending = /function _pending\(out, text\)\s*\{[\s\S]*?\n\}/.exec(src);
-        expect(pending, '_pending not found in refactor.js').toBeTruthy();
-        expect(pending[0]).toContain('announceStatus(');
-    });
 });

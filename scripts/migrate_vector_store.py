@@ -70,7 +70,7 @@ def _confirm_app_closed(assume_yes: bool) -> bool:
     if assume_yes:
         return True
     print(
-        "\nThe ChatEKLD app MUST be closed before migrating — a running app holds\n"
+        "\nThe CHERQAiN app MUST be closed before migrating — a running app holds\n"
         "the index in memory and could overwrite the migration on its next\n"
         "checkpoint. The original JSON store is archived to .bak, so this is\n"
         "reversible."

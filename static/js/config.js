@@ -11,7 +11,7 @@
  * remembers its own chat model in a distinct config field
  * (openai_model/anthropic_model/google_model), resolved by _resolveSavedChatModel.
  */
-import { secureFetch, consumeSSE } from './api.js';
+import { secureFetch, consumeSSE, logError } from './api.js';
 import { updateProviderBadge, taskBegin, taskEnd, isOnlineProvider, announceStatus, announceError } from './ui.js';
 
 let _activeProvider = 'ollama';
@@ -413,10 +413,19 @@ export async function saveSelectedModels() {
     if (llm) payload.llm = llm;
     if (embed) payload.embed = embed;
     if (Object.keys(payload).length === 0) return;
-    await secureFetch('/api/config', {
-        method: 'POST',
-        body: JSON.stringify(payload)
-    });
+    try {
+        const r = await secureFetch('/api/config', {
+            method: 'POST',
+            body: JSON.stringify(payload)
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    } catch (e) {
+        // A silent persistence failure meant the dropdown showed a model the
+        // server never recorded — the next launch quietly reverted it
+        // (2026-08-18). Announce; the selection stays active client-side.
+        logError('model selection save failed', e);
+        announceError('Model selection could not be saved — it will revert on the next launch.');
+    }
 }
 
 /** Persist the OCR + Vision provider/model selections to /api/config. */

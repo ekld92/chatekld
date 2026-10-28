@@ -1,11 +1,7 @@
 """OpenAI-compatible online adapters (DeepSeek, Z.AI / Zhipu GLM, OpenRouter).
 
-These providers expose an OpenAI-compatible Chat Completions API — same wire
-format, tools dialect, and streaming shape the official OpenAI endpoint uses —
-so they reuse :class:`core.llm.adapters.openai.OpenAIProvider` wholesale and
-only override the pieces that differ: the provider ``name`` (used for usage
-records + error labels), the API-key env var, the fixed API ``base_url``, and
-the curated model list.
+These providers expose an OpenAI-compatible Chat Completions transport but
+retain provider-specific request policy for sampling, reasoning and tools.
 
 Key resolution mirrors the OpenAI adapter: read from the environment at call
 time so a key set after launch is picked up without a restart, and never
@@ -21,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from typing import Optional
 
 from core.llm.adapters.openai import OpenAIProvider
@@ -32,9 +30,8 @@ logger = logging.getLogger(__name__)
 class _OpenAICompatProvider(OpenAIProvider):
     """Shared base for OpenAI-compatible online providers.
 
-    Subclasses set the four class attributes below. Everything else —
-    streaming, tool use, retry/heal, usage recording, error classification —
-    is inherited unchanged from :class:`OpenAIProvider`.
+    Subclasses set their identity and may specialize request construction.
+    Streaming, usage recording, and baseline error classification are shared.
     """
 
     name = "openai_compat"
@@ -80,7 +77,7 @@ class _OpenAICompatProvider(OpenAIProvider):
                 category=ErrorCategory.AUTH,
                 message=(
                     f"{primary} is not set. Add it to the environment before "
-                    f"launching ChatEKLD, or set it in your shell profile."
+                    f"launching CHERQAiN, or set it in your shell profile."
                 ),
                 provider=self.name,
             )
@@ -121,7 +118,7 @@ class _OpenAICompatProvider(OpenAIProvider):
 # enforced it was removed 2026-07-30 as permanently-dead code); the 3→4 config
 # migration resets a persisted alias selection, so no install can still send
 # an id the provider 404s.
-DEEPSEEK_CURATED_MODELS: list[str] = ["deepseek-v4-flash", "deepseek-v4-pro"]
+DEEPSEEK_CURATED_MODELS: list[str] = ["deepseek-flash", "deepseek-v4-pro"]
 
 
 class DeepSeekProvider(_OpenAICompatProvider):
@@ -136,6 +133,16 @@ class DeepSeekProvider(_OpenAICompatProvider):
     # the next model that ships without tool support.
     MODELS_WITHOUT_TOOLS = frozenset()
 
+    def _common_params(self, request) -> dict:
+        params = super()._common_params(request)
+        # The V4 thinking mode is enabled by default. DeepSeek accepts but
+        # ignores temperature and silently floors top_p below 0.95 there.
+        if (request.model or "").lower() in self.CURATED_MODELS:
+            params.pop("temperature", None)
+            if params.get("top_p", 1.0) < 0.95:
+                params.pop("top_p", None)
+        return params
+
 
 # --- Z.AI (Zhipu GLM) -------------------------------------------------------
 # Verified against docs.z.ai/guides/overview/pricing (2026-07-12): current
@@ -144,6 +151,7 @@ class DeepSeekProvider(_OpenAICompatProvider):
 # /api/openai/v1 variant also exists — reachable via ZAI_BASE_URL if ever
 # needed); models use the legacy max_tokens shape.
 ZAI_CURATED_MODELS: list[str] = [
+    "glm-5.3",
     "glm-5.2",
     "glm-5",
     "glm-4.7",
@@ -159,6 +167,27 @@ class ZAIProvider(_OpenAICompatProvider):
     default_base_url = "https://api.z.ai/api/paas/v4"
     base_url_env_var = "ZAI_BASE_URL"
     CURATED_MODELS = ZAI_CURATED_MODELS
+
+    def _common_params(self, request) -> dict:
+        params = super()._common_params(request)
+        if "temperature" in params:
+            params["temperature"] = max(0.0, min(float(params["temperature"]), 1.0))
+        if "top_p" in params:
+            params["top_p"] = max(0.01, min(float(params["top_p"]), 1.0))
+        if request.reasoning_effort and (request.model or "").lower().startswith("glm-5.3"):
+            # GLM-5.3 requires thinking enabled and accepts low/high/max.
+            # The shared UI currently offers only minimal and low.
+            effort = ({"minimal": "low", "low": "low", "medium": "high",
+                       "high": "high", "xhigh": "max", "max": "max"}
+                      .get(request.reasoning_effort))
+            if effort is None:
+                raise LLMError(ErrorCategory.INVALID_REQUEST,
+                               "Unsupported GLM-5.3 reasoning effort",
+                               provider=self.name, model=request.model)
+            params["extra_body"] = {
+                "thinking": {"type": "enabled"}, "reasoning_effort": effort,
+            }
+        return params
 
 
 # --- OpenRouter --------------------------------------------------------------
@@ -195,6 +224,15 @@ OPENROUTER_CURATED_MODELS: list[str] = [
     "nvidia/nemotron-3-super-120b-a12b:free",
 ]
 
+# Advisory model-level union from the most recent key-gated catalog fetch.
+# Endpoint routing can still change; this never proves a parameter reached the
+# selected upstream.  Keep the cache no longer than model_listing's TTL.
+_openrouter_capabilities: dict[
+    tuple[str, str], tuple[float, frozenset[str], frozenset[str] | None]
+] = {}
+_openrouter_capabilities_lock = threading.Lock()
+_OPENROUTER_CAPABILITY_TTL_S = 300.0
+
 
 # Phrasings OpenRouter uses for "no upstream endpoint can satisfy this
 # request shape" (their errors doc lists the 503 wording; the 404 "No
@@ -210,19 +248,117 @@ class OpenRouterProvider(_OpenAICompatProvider):
     base_url_env_var = "OPENROUTER_BASE_URL"
     CURATED_MODELS = OPENROUTER_CURATED_MODELS
 
+    def _fetch_live_models(self) -> list[str]:
+        """Keep OpenRouter namespaced chat ids and advisory parameter metadata."""
+        rows = self._client().models.list()  # _api_key runs before network
+        now = time.monotonic()
+        found: list[str] = []
+        capabilities: dict[
+            tuple[str, str], tuple[float, frozenset[str], frozenset[str] | None]
+        ] = {}
+        for row in rows:
+            mid = getattr(row, "id", None)
+            if mid is None and isinstance(row, dict):
+                mid = row.get("id")
+            if not isinstance(mid, str) or "/" not in mid:
+                continue
+            # The direct OpenAI denylist drops chat-capable */*-codex ids.
+            # OpenRouter advertises text output in the model architecture.
+            arch = getattr(row, "architecture", None)
+            if arch is None and isinstance(row, dict):
+                arch = row.get("architecture")
+            outputs = (arch.get("output_modalities") if isinstance(arch, dict)
+                       else getattr(arch, "output_modalities", None))
+            if isinstance(outputs, list) and "text" not in outputs:
+                continue
+            found.append(mid)
+            raw = getattr(row, "supported_parameters", None)
+            if raw is None and isinstance(row, dict):
+                raw = row.get("supported_parameters")
+            if isinstance(raw, list):
+                reasoning = getattr(row, "reasoning", None)
+                if reasoning is None and isinstance(row, dict):
+                    reasoning = row.get("reasoning")
+                efforts = (reasoning.get("supported_efforts")
+                           if isinstance(reasoning, dict)
+                           else getattr(reasoning, "supported_efforts", None))
+                capabilities[(self._base_url() or "", mid)] = (
+                    now + _OPENROUTER_CAPABILITY_TTL_S,
+                    frozenset(p for p in raw if isinstance(p, str)),
+                    (frozenset(e for e in efforts if isinstance(e, str))
+                     if isinstance(efforts, list) else None),
+                )
+        with _openrouter_capabilities_lock:
+            for key, entry in list(_openrouter_capabilities.items()):
+                if entry[0] <= now:
+                    _openrouter_capabilities.pop(key, None)
+            _openrouter_capabilities.update(capabilities)
+        return found
+
+    def _common_params(self, request) -> dict:
+        params = super()._common_params(request)
+        model = (request.model or "").lower()
+        if params.get("tool_choice") == "auto":
+            # OpenRouter defaults to auto when tools are present. Omitting the
+            # redundant field keeps required routing focused on tool support.
+            params.pop("tool_choice")
+        with _openrouter_capabilities_lock:
+            entry = _openrouter_capabilities.get((self._base_url() or "", request.model))
+        supported = entry[1] if entry and entry[0] > time.monotonic() else None
+        supported_efforts = entry[2] if supported is not None and entry else None
+
+        # Namespaced IDs do not match the direct-provider guards.  Defaults
+        # here are intentionally conservative where an upstream can ignore a
+        # field even though OpenRouter accepts its generic JSON shape.
+        if (model.startswith("google/gemini-3")
+                or model.startswith(("openai/gpt-5", "openai/o"))
+                or model.startswith(("anthropic/claude-sonnet-5",
+                                   "anthropic/claude-opus-5",
+                                   "anthropic/claude-fable-5"))
+                or model.startswith("deepseek/deepseek-v4")):
+            params.pop("temperature", None)
+            params.pop("top_p", None)
+        if supported is not None:
+            for field in ("temperature", "top_p"):
+                if field not in supported:
+                    params.pop(field, None)
+        elif model not in OPENROUTER_CURATED_MODELS:
+            params.pop("temperature", None)
+            params.pop("top_p", None)
+
+        if request.reasoning_effort:
+            if supported is not None and "reasoning" not in supported:
+                raise LLMError(ErrorCategory.INVALID_REQUEST,
+                               "OpenRouter catalog does not list reasoning for this model",
+                               provider=self.name, model=request.model)
+            effort = request.reasoning_effort
+            if effort == "minimal" and model.startswith((
+                "google/gemini-3.7", "google/gemini-3.8",
+                "google/gemini-3.1-pro", "google/gemini-3-pro",
+            )):
+                effort = "low"
+            if supported_efforts is not None and effort not in supported_efforts:
+                raise LLMError(ErrorCategory.INVALID_REQUEST,
+                               f"OpenRouter catalog does not list {effort} reasoning for this model",
+                               provider=self.name, model=request.model)
+            params["extra_body"] = {"reasoning": {"effort": effort}}
+        if "tools" in params or request.reasoning_effort:
+            # The model-level catalog is a union of endpoints. With default
+            # routing, an endpoint may accept a request but ignore unsupported
+            # fields. Require an upstream that handles the tool/reasoning
+            # controls, including when catalog metadata is unavailable.
+            params.setdefault("extra_body", {})["provider"] = {
+                "require_parameters": True,
+            }
+        return params
+
     def _is_capability_routing_error(self, exc: BaseException) -> bool:
         """OpenRouter signals "no upstream endpoint supports this request
         shape" (e.g. tools sent to a model with no tool-capable endpoint) as
         a **503** "There is no available model provider that meets your
-        routing requirements" or a **404** "No endpoints found…" — never the
-        param-named 400 the inherited heal understands. Matching it here lets
-        ``_create_with_heal`` strip tools for ONE retry, degrading the turn
-        to a plain answer (the same path as the tools-400 heal) instead of
-        burning every retry as SERVER_ERROR and then triggering provider
-        fallback. Documented trade-off: a genuinely transient 503 that
-        happens to carry the routing phrase on a tools request costs one
-        tool-less retry; tool-less requests and other 5xx keep their normal
-        retry semantics (the caller gates on ``tools`` being in the payload).
+        routing requirements" or a **404** "No endpoints found…". A match
+        with tools in the request becomes a visible INVALID_REQUEST; dropping
+        required tools would silently change the answer's evidence boundary.
         """
         if getattr(exc, "status_code", None) not in (404, 503):
             return False

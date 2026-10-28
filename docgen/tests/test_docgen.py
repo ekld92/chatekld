@@ -172,6 +172,15 @@ def test_augment_prompt_reformat_forbids_content_change():
     assert "WITHOUT changing its content" in p
 
 
+def test_augment_prompt_never_leaks_doubled_brace_escapes():
+    """docgen mirror of the deckgen pin: op rules are appended AFTER .format(),
+    so a doubled {{...}} escape reaches the model verbatim (Known Issues item
+    9, fixed 2026-08-18)."""
+    for op in ("deepen", "table", "new_section", "reformat"):
+        p = augment_system_prompt("x", operation=op)
+        assert "{{" not in p and "}}" not in p, f"doubled braces leaked in {op!r}"
+
+
 # --------------------------------------------------------------------------- #
 # screen_article_repair (augment safety gate)
 # --------------------------------------------------------------------------- #

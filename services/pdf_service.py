@@ -31,7 +31,7 @@ def _save_upload_limited(file_storage, max_bytes: int) -> str:
             pass
         raise
 
-def _extract_all_pages(pdf_path: str, ocr_cb) -> str:
+def _extract_all_pages(pdf_path: str, ocr_cb, max_pages: int | None = None) -> str:
     """Extract the full text of a PDF, looping page ranges when necessary.
 
     ``extract_structured_from_pdf`` refuses ranges above
@@ -55,11 +55,26 @@ def _extract_all_pages(pdf_path: str, ocr_cb) -> str:
     from core.constants import PDF_MAX_PAGES
 
     page_count = get_pdf_page_count(pdf_path)
+    total_pages = page_count
     if page_count > PDF_MAX_PAGES:
         raise ValueError(
             f"PDF has {page_count} pages; the maximum supported is "
             f"{PDF_MAX_PAGES}."
         )
+    # `max_pages` bounds the work for a caller that will only ever KEEP a
+    # bounded prefix of the result — a Plain Chat attachment, capped at
+    # `chat_attachment_max_chars`. Without it a 2,000-page PDF ran the full
+    # extraction (up to the 600 s subprocess timeout, OCR included) so that
+    # ~95% of the text could be thrown away one layer up. The vault indexer
+    # and the Single Paper upload pass None and are unaffected: they keep
+    # everything, so bounding them would lose real content.
+    #
+    # The bound is deliberately on PAGES, not characters: it is what makes the
+    # extraction itself cheaper. The caller still applies its own character cap
+    # afterwards, and the tagging subsystem's `fresh_max_pages` is the same
+    # idea in the same shape.
+    if max_pages is not None and max_pages > 0:
+        page_count = min(page_count, max_pages)
 
     def _text_of(sections) -> str:
         text = sections.full_text
@@ -72,15 +87,22 @@ def _extract_all_pages(pdf_path: str, ocr_cb) -> str:
         return text or ""
 
     if page_count <= EXTRACT_MAX_PAGES_PER_CALL:
-        # Single-call fast path — identical to the pre-range-loop behaviour.
-        return _text_of(extract_structured_from_pdf(pdf_path, ocr_cb=ocr_cb))
+        # Preserve the unbounded small-document contract.
+        if max_pages is None or max_pages <= 0:
+            return _text_of(extract_structured_from_pdf(pdf_path, ocr_cb=ocr_cb))
+        # Carry the effective prefix through to the actual extractor.
+        return _text_of(extract_structured_from_pdf(
+            pdf_path, end_page=page_count, ocr_cb=ocr_cb,
+            use_markitdown=(page_count == total_pages),
+        ))
 
     parts: list[str] = []
     for start in range(0, page_count, EXTRACT_MAX_PAGES_PER_CALL):
         end = min(start + EXTRACT_MAX_PAGES_PER_CALL, page_count)
         text = _text_of(
             extract_structured_from_pdf(
-                pdf_path, start_page=start, end_page=end, ocr_cb=ocr_cb
+                pdf_path, start_page=start, end_page=end, ocr_cb=ocr_cb,
+                use_markitdown=False,
             )
         )
         if text:
@@ -88,7 +110,8 @@ def _extract_all_pages(pdf_path: str, ocr_cb) -> str:
     # Same separator the vault loader uses between ranges.
     return "\n\n".join(parts)
 
-def _extract_worker(pdf_path: str, result_path: str) -> None:
+def _extract_worker(pdf_path: str, result_path: str,
+                    max_pages: int | None = None) -> None:
     try:
         from services.vision import glm_ocr_manager
         from core.config import load_config
@@ -106,7 +129,8 @@ def _extract_worker(pdf_path: str, result_path: str) -> None:
             glm_ocr_manager.set_model(str(ocr_model))
 
         extracted_text = _extract_all_pages(
-            pdf_path, ocr_cb=glm_ocr_manager.extract_page_text
+            pdf_path, ocr_cb=glm_ocr_manager.extract_page_text,
+            max_pages=max_pages,
         )
         payload = {"status": "ok", "text": extracted_text}
     except Exception as exc:
@@ -151,7 +175,7 @@ def _read_extract_result(result_path: str, exitcode) -> str:
         raise RuntimeError(str(payload.get("error") or "PDF extraction failed"))
     return str(payload.get("text") or "")
 
-def _extract_with_timeout(pdf_path: str) -> str:
+def _extract_with_timeout(pdf_path: str, max_pages: int | None = None) -> str:
     """Run PDF extraction in a subprocess so timeouts actually stop work.
 
     Uses an explicit ``spawn`` context (not ``fork``) so the child does not
@@ -168,7 +192,8 @@ def _extract_with_timeout(pdf_path: str) -> str:
     os.close(fd)
     try:
         ctx = mp.get_context("spawn")
-        proc = ctx.Process(target=_extract_worker, args=(pdf_path, result_path))
+        proc = ctx.Process(target=_extract_worker,
+                           args=(pdf_path, result_path, max_pages))
         proc.start()
         proc.join(PDF_EXTRACT_TIMEOUT_S)
         if proc.is_alive():
@@ -189,14 +214,27 @@ def _extract_with_timeout(pdf_path: str) -> str:
             except OSError:
                 pass
 
-def process_pdf_upload(file_storage, filename: str, max_bytes: int | None = None) -> tuple[str, str]:
-    """Process an uploaded PDF: extract text and store in DB."""
+def process_pdf_upload(file_storage, filename: str, max_bytes: int | None = None,
+                       runner=None) -> tuple[str, str]:
+    """Process an uploaded PDF: extract text and store in DB.
+
+    *runner*, when given, is ``runner(fn) -> fn()`` — the seam the route uses to
+    run the EXTRACTION on a bounded daemon thread instead of inline on the
+    Waitress worker. See ``api/routes/paper.py::_bounded_pdf_extract`` for the
+    measurement; the split is at the same boundary as the chat-attachment one
+    (the streamed save needs the live request, the extractor only needs the
+    temp path) and the ``finally`` below still encloses it, so an abandoned
+    daemon cannot strand the file.
+    """
     upload_id = str(uuid.uuid4())
     max_bytes = max_bytes or PDF_LIMIT_SIZE_MB * 1024 * 1024
     tmp_path = _save_upload_limited(file_storage, max_bytes)
-        
+    if runner is None:
+        def runner(fn):
+            return fn()
+
     try:
-        extracted_text = _extract_with_timeout(tmp_path)
+        extracted_text = runner(lambda: _extract_with_timeout(tmp_path))
         
         # Store in DB
         with DB_LOCK:

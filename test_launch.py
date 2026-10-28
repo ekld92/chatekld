@@ -10,10 +10,142 @@ bootstrap fails fast here.
 """
 
 import importlib
+import pathlib
 import sys
 import types
 
 import pytest
+from unittest.mock import MagicMock
+
+
+@pytest.mark.parametrize("provider", ["ollama", "lm_studio", "openai"])
+@pytest.mark.parametrize("skip", [None, "0", "1"])
+def test_native_lifecycle_can_leave_provider_services_unmanaged(monkeypatch, provider, skip):
+    """Drive main through window close; no sockets, threads or services run."""
+    _install_heavy_stubs(monkeypatch)
+    if skip is None:
+        monkeypatch.delenv("CHATEKLD_SKIP_PROVIDER_STARTUP", raising=False)
+    else:
+        monkeypatch.setenv("CHATEKLD_SKIP_PROVIDER_STARTUP", skip)
+    sys.modules.pop("launch", None)
+    try:
+        launch = importlib.import_module("launch")
+        launch._load_runtime()
+        monkeypatch.setattr(launch, "_load_runtime", lambda: None)
+        monkeypatch.setattr(launch, "load_config", lambda: {"provider": provider})
+        starts = {name: MagicMock(return_value=(True, "")) for name in ("ollama", "lm_studio")}
+        monkeypatch.setattr(launch, "start_ollama_server", starts["ollama"])
+        monkeypatch.setattr(launch, "start_lm_studio_server", starts["lm_studio"])
+        shutdown = MagicMock()
+        monkeypatch.setattr(launch, "shutdown_ollama", shutdown)
+        monkeypatch.setattr(launch, "find_free_port", lambda: 54321)
+        monkeypatch.setattr(launch.socket, "create_connection", MagicMock())
+        monkeypatch.setattr(launch.signal, "signal", MagicMock())
+        monkeypatch.setattr(launch.atexit, "register", MagicMock())
+        monkeypatch.setattr("core.server_info.acquire_server_lease", MagicMock())
+        monkeypatch.setattr("core.server_info.write_server_info", MagicMock())
+        monkeypatch.setattr("core.server_info.clear_server_info", MagicMock())
+        window = MagicMock()
+        monkeypatch.setattr(launch.webview, "create_window", window)
+        joined = []
+
+        class Thread:
+            def __init__(self, *, target, name=None, **kwargs):
+                self.target, self.name = target, name
+
+            def start(self):
+                # Only provider closures execute. Flask, prewarm and the
+                # shutdown watcher remain inert at their external seams.
+                if self.name in ("ollama-start", "lm-studio-start"):
+                    self.target()
+
+            def join(self, timeout):
+                joined.append(self.name)
+
+        monkeypatch.setattr(launch.threading, "Thread", Thread)
+        launch.main()
+        window.assert_called_once()
+        if skip == "1":
+            for start in starts.values():
+                start.assert_not_called()
+            shutdown.assert_not_called()
+            assert joined == []
+        else:
+            selected = "lm_studio" if provider == "lm_studio" else "ollama"
+            starts[selected].assert_called_once()
+            starts["ollama" if selected == "lm_studio" else "lm_studio"].assert_not_called()
+            assert shutdown.call_count == (selected == "ollama")
+            assert joined == (["ollama-start"] if selected == "ollama" else [])
+    finally:
+        sys.modules.pop("launch", None)
+
+
+@pytest.fixture(autouse=True)
+def _restore_environ(monkeypatch, tmp_path):
+    """Redirect checkout dotenv discovery before bootstrap, then restore env.
+
+    Restoring after the test alone still exposes real credentials during the
+    test and chmods the real file. Keep the real loader for fixture coverage,
+    but replace the checkout candidate with a disposable directory.
+    """
+    import os
+    from core import env_files
+
+    checkout = pathlib.Path(__file__).resolve().parent
+    fixture_checkout = tmp_path / "checkout"
+    fixture_checkout.mkdir()
+    real_loader = env_files.load_env_files
+
+    def fixture_loader(dirs):
+        return real_loader([
+            str(fixture_checkout) if pathlib.Path(directory).resolve() == checkout
+            else directory for directory in dirs
+        ])
+
+    monkeypatch.setattr(env_files, "load_env_files", fixture_loader)
+    saved = dict(os.environ)
+    yield fixture_checkout
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+def test_checkout_dotenv_discovery_uses_disposable_source(_restore_environ, monkeypatch):
+    import os
+
+    (_restore_environ / ".env").write_text("CHATEKLD_CHECKOUT_PROBE=fixture\n")
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
+    monkeypatch.delenv("CHATEKLD_CHECKOUT_PROBE", raising=False)
+    _install_heavy_stubs(monkeypatch)
+    sys.modules.pop("launch", None)
+    try:
+        launch = importlib.import_module("launch")
+        launch._load_env_files()
+        assert os.environ["CHATEKLD_CHECKOUT_PROBE"] == "fixture"
+    finally:
+        sys.modules.pop("launch", None)
+
+
+def test_importing_launch_leaves_no_new_environment_key(tmp_path, monkeypatch):
+    """The fixture above is load-bearing; this pins it from inside a test by
+    loading a .env the way the dev checkout does."""
+    import os
+    (tmp_path / ".env").write_text("CHATEKLD_LEAK_PROBE=1\n", encoding="utf-8")
+    _install_heavy_stubs(monkeypatch)
+    sys.modules.pop("launch", None)
+    try:
+        launch = importlib.import_module("launch")
+        monkeypatch.setattr(launch, "_BASE_DIR", str(tmp_path))
+        monkeypatch.setattr(launch.sys, "frozen", True, raising=False)
+        monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
+        launch._load_env_files()
+        assert os.environ.get("CHATEKLD_LEAK_PROBE") == "1"
+    finally:
+        sys.modules.pop("launch", None)
+
+
+def test_the_probe_did_not_survive_into_the_next_test():
+    import os
+    assert "CHATEKLD_LEAK_PROBE" not in os.environ
 
 
 def _install_heavy_stubs(monkeypatch):
@@ -79,6 +211,29 @@ def test_load_env_files_runs_without_nameerror(monkeypatch):
         pytest.fail(f"_load_env_files raised NameError: {exc}")
     finally:
         sys.modules.pop("launch", None)
+
+
+def test_load_env_files_sets_owner_only_mode(monkeypatch, tmp_path):
+    """Existing .env files are chmod'd to 0o600 before dotenv reads them."""
+    import os
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("CHATEKLD_TEST_ENV_LOAD=1\n", encoding="utf-8")
+    os.chmod(env_path, 0o644)
+    monkeypatch.delenv("CHATEKLD_TEST_ENV_LOAD", raising=False)
+    _install_heavy_stubs(monkeypatch)
+    sys.modules.pop("launch", None)
+    try:
+        launch = importlib.import_module("launch")
+        monkeypatch.setattr(launch, "_BASE_DIR", str(tmp_path))
+        monkeypatch.setattr(launch.sys, "frozen", True, raising=False)
+        monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
+        launch._load_env_files()
+        assert (env_path.stat().st_mode & 0o777) == 0o600
+        assert os.environ.get("CHATEKLD_TEST_ENV_LOAD") == "1"
+    finally:
+        sys.modules.pop("launch", None)
+        os.environ.pop("CHATEKLD_TEST_ENV_LOAD", None)
 
 
 def _install_seed_download_stubs(monkeypatch):
@@ -174,3 +329,33 @@ def test_seed_models_argv_branch_exits_without_starting_window(monkeypatch):
     finally:
         sys.modules.pop("launch", None)
     assert excinfo.value.code == 0
+
+
+def test_window_is_created_with_text_selection_enabled():
+    """``create_window`` must pass ``text_select=True``.
+
+    PyWebView defaults it to False and then injects
+    ``body { user-select: none; cursor: default }`` into the document, which
+    makes every answer, summary and report in the app unselectable with the
+    mouse. This is a SOURCE ratchet rather than a call assertion because the
+    only way to reach the real ``create_window`` is to open a native window;
+    and it is worth ratcheting because no other gate can see the regression —
+    ``tests/browser/`` runs Chromium, which never receives pywebview's
+    injection.
+    """
+    src = pathlib.Path(__file__).with_name("launch.py").read_text(encoding="utf-8")
+    start = src.index("webview.create_window(")
+    depth, end = 0, start
+    for i in range(start, len(src)):          # balance parens: min_size=(...) nests
+        if src[i] == "(":
+            depth += 1
+        elif src[i] == ")":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    call = src[start:end]
+    assert "text_select=True" in call, (
+        "launch.py must call webview.create_window(..., text_select=True); "
+        "without it pywebview disables text selection app-wide."
+    )

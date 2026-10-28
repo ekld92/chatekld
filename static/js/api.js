@@ -6,7 +6,7 @@
  */
 
 /**
- * CSRF-safe fetch wrapper; adds the X-Requested-With header required
+ * Local-origin fetch wrapper; adds the X-Requested-With CSRF signal required
  * by the server's local origin check on every request.
  */
 export async function secureFetch(url, options = {}) {
@@ -33,9 +33,11 @@ export async function secureFetch(url, options = {}) {
  * contract (see the streaming routes under api/routes/).
  *
  * @param {Response} response  a fetch() Response whose body is an SSE stream
+ * @param {object} options requireDone rejects premature EOF; readers with their
+ * own business terminal may leave it false and validate that terminal themselves.
  * @yields {object} the parsed payload of each `data:` frame
  */
-export async function* readSSE(response) {
+export async function* readSSE(response, { requireDone = false } = {}) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -44,7 +46,7 @@ export async function* readSSE(response) {
     // per the SSE spec. Non-data lines (comments, blanks) are ignored.
     const payloadOf = (block) =>
         block
-            .split('\n')
+            .split(/\r?\n/)
             .filter((l) => l.startsWith('data:'))
             .map((l) => l.slice(l.startsWith('data: ') ? 6 : 5))
             .join('\n');
@@ -54,7 +56,7 @@ export async function* readSSE(response) {
             const { value, done } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
-            const blocks = buffer.split('\n\n');
+            const blocks = buffer.split(/\r?\n\r?\n/);
             buffer = blocks.pop();  // retain the trailing (possibly partial) frame
             for (const block of blocks) {
                 const data = payloadOf(block);
@@ -63,7 +65,7 @@ export async function* readSSE(response) {
                 try {
                     yield JSON.parse(data);
                 } catch (e) {
-                    console.warn('[ChatEKLD] Skipped malformed SSE frame:', data.slice(0, 120));
+                    console.warn('[CHERQAiN] Skipped malformed SSE frame:', data.slice(0, 120));
                 }
             }
         }
@@ -76,9 +78,11 @@ export async function* readSSE(response) {
         buffer += decoder.decode();
         // Flush a final frame that arrived without a trailing blank line.
         const tail = payloadOf(buffer);
-        if (tail && tail !== '[DONE]') {
+        if (tail === '[DONE]') return;
+        if (tail) {
             try { yield JSON.parse(tail); } catch (e) { /* ignore trailing partial */ }
         }
+        if (requireDone) throw new Error('Response interrupted: stream ended without its completion marker.');
     } finally {
         // Item 3.5: cancel BEFORE releasing the lock (cancel needs it). An
         // early exit — a consumer breaking out of `for await` on an {error}
@@ -123,7 +127,7 @@ export async function safeJson(resp) {
  * itself throw.
  */
 export function logError(msg, error) {
-    console.error(`[ChatEKLD] ${msg}`, error);
+    console.error(`[CHERQAiN] ${msg}`, error);
     try {
         fetch('/api/log', {
             method: 'POST',
@@ -152,8 +156,35 @@ export async function consumeSSE(url, options, handlers) {
     // onError(exc.message) flattened it into a plain Error, so the callers'
     // `e.name === 'AbortError'` friendly-timeout branch was DEAD code.
     let onErrorCalled = false;
+    // Opt-in for chat backstops. The server owns provider/retry policy; the
+    // browser only adds a transport margin to its advertised silence window.
+    // Transport completion is mandatory unless the caller explicitly validates
+    // its business terminal (Library and Notes Sync preserve that contract).
+    const { serverBudget, requireDone = true, ...fetchOptions } = options;
+    const budgetController = serverBudget ? new AbortController() : null;
+    let budgetTimer;
+    let silenceMs = 360000; // bounded handshake / legacy-server fallback
+    const rearm = () => {
+        if (!budgetController) return;
+        clearTimeout(budgetTimer);
+        budgetTimer = setTimeout(() => budgetController.abort(), silenceMs);
+    };
+    const forwardCancel = () => budgetController?.abort();
+    if (budgetController) {
+        options.signal?.addEventListener('abort', forwardCancel, { once: true });
+        if (options.signal?.aborted) forwardCancel();
+        fetchOptions.signal = budgetController.signal;
+        rearm();
+    }
     try {
-        const resp = await secureFetch(url, options);
+        const resp = await secureFetch(url, fetchOptions);
+        if (budgetController) {
+            const seconds = Number(resp.headers?.get?.('X-PaperMind-SSE-Silence-S'));
+            if (Number.isFinite(seconds) && seconds > 0 && seconds <= 86400) {
+                silenceMs = (seconds + 30) * 1000;
+            }
+            rearm();
+        }
         if (!resp.ok) {
             const result = await safeJson(resp);
             const err = result.error || `HTTP ${resp.status} - failed to start stream`;
@@ -164,8 +195,13 @@ export async function consumeSSE(url, options, handlers) {
             handlers.onError?.(err, result);   // may throw; propagates as the caller intends
             return;
         }
+        // The server accepted the request and the stream is open (additive,
+        // 2026-09-23): a caller can tell a request REFUSED before anything
+        // ran (onError without onOpen) from one that failed mid-run.
+        handlers.onOpen?.();
 
-        for await (const frame of readSSE(resp)) {
+        for await (const frame of readSSE(resp, { requireDone })) {
+            rearm();
             if (frame.error) {
                 onErrorCalled = true;
                 handlers.onError?.(frame.error, frame);
@@ -190,5 +226,8 @@ export async function consumeSSE(url, options, handlers) {
         // flatten it through onError.
         if (exc && exc.name === 'AbortError') throw exc;
         handlers.onError?.(exc.message || String(exc));
+    } finally {
+        clearTimeout(budgetTimer);
+        options.signal?.removeEventListener('abort', forwardCancel);
     }
 }

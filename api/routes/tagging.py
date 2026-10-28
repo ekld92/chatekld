@@ -15,22 +15,26 @@ endpoint here mutates anything or triggers an audit scan.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
-import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from flask import Blueprint, jsonify, request, send_file
 
+from api.routes.open import run_open
 from api.security import sanitise_error_msg
 from api.sse import run_sse_worker
-from core.constants import SSE_SINGLE_SHOT_FLOOR_S, SSE_STALL_MARGIN_S
+from core.constants import (SSE_SINGLE_SHOT_FLOOR_S, SSE_STALL_MARGIN_S,
+                            TAGGING_TARGETS)
 from api.validators import (
     coerce_bool,
+    coerce_enum,
     coerce_float_in_range,
     coerce_int_in_range,
     coerce_non_empty_string,
@@ -44,7 +48,9 @@ from audit.manager import audit_manager
 # persisted value fell back to a number the config layer no longer used.
 from core.config import _DEFAULTS as _CFG_DEFAULTS, load_config, resolve_chat_model
 from tagging import candidates as tag_candidates
-from tagging import journal, propose as tag_propose, text_source, zotero_write
+from accession import imports as imports_tracker
+from tagging import journal, metadata_source, propose as tag_propose, session_llm, text_source, zotero_write
+from widget.textclean import clean_display
 # The domain writers were extracted to tagging/writers.py (2026-07-19
 # controller-bloat fix); the route keeps HTTP parsing, lock acquisition and
 # thin delegation. The private names are RE-EXPORTED so the historical
@@ -63,10 +69,35 @@ from tagging.writers import (  # noqa: F401 — re-exports (see above)
     _revert_finder_tag,
     _revert_zotero_commit_locked,
     _revert_zotero_prepare,
+    _revert_zotero_attachment,
+    _revert_zotero_attachment_commit,
+    _revert_zotero_attachment_create,
+    _revert_zotero_attachment_create_commit,
+    _revert_zotero_attachment_create_prepare,
+    _revert_zotero_item_create,
+    _revert_zotero_item_create_commit,
+    _revert_zotero_item_create_prepare,
+    _revert_zotero_attachment_repath,
+    _revert_zotero_attachment_repath_commit,
+    _revert_zotero_attachment_repath_prepare,
+    _revert_zotero_attachment_retitle,
+    _revert_zotero_attachment_retitle_commit,
+    _revert_zotero_attachment_retitle_prepare,
+    _revert_zotero_metadata,
+    _revert_zotero_metadata_commit,
+    _revert_zotero_metadata_prepare,
+    _revert_zotero_child_reparent_commit,
+    _revert_zotero_child_reparent_prepare,
+    _revert_zotero_item_trash_commit,
+    _revert_zotero_item_trash_prepare,
+    _revert_zotero_attachment_prepare,
     _revert_zotero_tag,
+    _tag_key,
     _target_result,
     _zotero_base,
     _zotero_commit_locked,
+    _zotero_journal,
+    _zotero_patch,
     _zotero_prepare,
     _zotero_remove_commit_locked,
     _zotero_remove_journal,
@@ -75,6 +106,11 @@ from tagging.writers import (  # noqa: F401 — re-exports (see above)
 )
 
 tagging_bp = Blueprint("tagging", __name__)
+
+#: Note sync's Zotero-side op kinds (notesync/zotero_notes.py, 2026-09-04).
+#: Journalled HERE so the shared Restore panel reverts them; dispatched by
+#: name so this module never imports the notesync package at load time.
+_NOTESYNC_ZOTERO_KINDS = ("zotero_note_write", "zotero_note_create")
 logger = logging.getLogger(__name__)
 
 # Single-flight gate for the (unbounded-on-local) propose call: at most one
@@ -123,20 +159,35 @@ def api_tagging_vocab():
     return jsonify({"vocab": rows, "count": len(rows), "source": rel})
 
 
-def _project_record(rec: Any, vault_root: Path, biblio_dir: Path) -> dict[str, Any] | None:
+def _project_record(rec: Any, vault_root: Path, biblio_dir: Path,
+                    include_pdfless: bool = False) -> dict[str, Any] | None:
     """Flatten one audit ``Record`` into a tagging-table row, or None if out of scope.
 
-    In scope = the record has at least one resolved PDF under
-    ``biblio_articles/`` (the feature's fixed boundary). Emits the CURRENT tags
-    for each of the three write targets side by side so the UI can show what a
-    later Apply would union into:
+    Emits the CURRENT tags for each of the three write targets side by side so
+    the UI can show what a later Apply would union into:
 
     * ``finder_tags`` — union across the record's biblio PDFs (from the scan)
     * ``note``        — the Obsidian Zotero note's YAML tags (+ its rel path)
     * ``zotero``      — the parent item key, its parent tags, and child-note tags
+
+    **Scope (widened 2026-08-11).** "In scope" used to mean "has at least one
+    resolved PDF under ``biblio_articles/``" — described here as the feature's
+    fixed boundary. It was not a boundary of the *write* path: ``_prepare_tag_write``
+    never required a PDF, and ``apply-all`` already skipped an absent Finder
+    target with a reason, so note and Zotero writes worked fine for a PDF-less
+    entry. It was only this projection that dropped them, which made **2 081**
+    perfectly writable entries invisible to the table, the triage deck and any
+    inventory-driven batch.
+
+    With ``include_pdfless`` those records are emitted with ``pdf_paths: []``
+    and empty ``finder_tags``. Every row now carries **``has_pdf``** so a client
+    can degrade the Finder column and its verbs rather than render an empty cell
+    that looks like "no tags yet". The flag defaults to False so the historical
+    payload is byte-identical: turning it on multiplies the row count several
+    fold, which is a decision for the caller, not a surprise.
     """
     biblio_pdfs = [p for p in rec.pdf_paths if _is_under(Path(p), biblio_dir)]
-    if not biblio_pdfs:
+    if not biblio_pdfs and not include_pdfless:
         return None
 
     bib = rec.bib_entry
@@ -151,13 +202,16 @@ def _project_record(rec: Any, vault_root: Path, biblio_dir: Path) -> dict[str, A
 
     return {
         "citation_key": rec.citation_key,
-        "title": bib.title if bib else None,
+        # Display text: bib fields are LaTeX source (`schizophr\\'enie`,
+        # `{{Swedish}}`) and no widget renders TeX (2026-09-19 UI review).
+        "title": clean_display(bib.title) if bib and bib.title else None,
         "year": bib.year if bib else None,
-        "first_author": (bib.authors[0] if bib and bib.authors else None),
+        "first_author": (clean_display(bib.authors[0]) if bib and bib.authors else None),
+        "has_pdf": bool(biblio_pdfs),
         "pdf_paths": [
             {"abs": str(p), "rel": _rel(p), "name": Path(p).name} for p in biblio_pdfs
         ],
-        "finder_tags": sorted(rec.finder_tag_set),
+        "finder_tags": sorted(rec.finder_tag_set) if biblio_pdfs else [],
         "note": {
             "present": note is not None,
             "rel": _rel(note.path) if note is not None else None,
@@ -179,22 +233,58 @@ def api_tagging_inventory():
 
     404 with a "Run a scan first" message when no completed audit scan is cached
     — the tagging view reuses the audit's ``Record`` join rather than scanning
-    on its own. Only records with a PDF under ``biblio_articles/`` are returned,
-    ordered by year then citation key (matching the audit inventory table).
+    on its own. Ordered by year then citation key (matching the audit inventory
+    table).
+
+    ``?scope=`` selects which records are returned:
+
+    * ``with_pdf`` (default) — only records with a PDF under ``biblio_articles/``.
+      The historical behaviour, byte-identical.
+    * ``all`` — also records with **no** local PDF (``has_pdf: false``,
+      ``pdf_paths: []``, ``finder_tags: []``). Those entries were always
+      writable (note + Zotero); only this projection hid them. 2 081 of them
+      exist in the maintainer's library, so this is opt-in rather than the
+      default: it multiplies the row count several fold and a client that
+      renders every row would change character without asking.
+
+    ``pdfless_count`` reports how many rows are PDF-less, so a caller can see
+    what ``scope=all`` added (and, under the default, is told nothing is hidden
+    because the count is 0).
+
+    ``scanned_at`` (additive, 2026-08-12) is the epoch seconds of the scan this
+    projection came from, or 0 when unknown. Every tag field here is read from
+    the CACHED ``Record`` — no tagging write updates it — so a client that
+    resumes work off this payload needs to know how stale it is. Since
+    2026-08-18 it is the served ``Inventory``'s own ``built_at`` (one atomic
+    read; the manager's ``get_scan_times`` lied mid-scan and after an errored
+    rescan — see the field's comment in ``audit/engine/inventory.py``); never
+    ``get_status_payload``, which drains the one-shot status feed.
     """
     inv, settings = audit_manager.get_inventory()
     if inv is None or settings is None:
         return jsonify({"error": "No scan results. Run an audit scan first."}), 404
 
+    # An unknown value falls back to the historical scope rather than 400ing —
+    # this is a read-only projection, not a write destination.
+    scope = coerce_enum(request.args.get("scope"), ("with_pdf", "all")) or "with_pdf"
+    include_pdfless = scope == "all"
+
     vault_root = settings.vault_root
     biblio_dir = settings.biblio_articles_dir
     rows: list[dict[str, Any]] = []
     for rec in inv.records.values():
-        row = _project_record(rec, vault_root, biblio_dir)
+        row = _project_record(rec, vault_root, biblio_dir, include_pdfless)
         if row is not None:
             rows.append(row)
     rows.sort(key=lambda r: (r["year"] or "", r["citation_key"]))
-    return jsonify({"rows": rows, "count": len(rows)})
+    _built = getattr(inv, "built_at", 0.0)
+    return jsonify({
+        "rows": rows,
+        "count": len(rows),
+        "scope": scope,
+        "pdfless_count": sum(1 for r in rows if not r["has_pdf"]),
+        "scanned_at": _built if isinstance(_built, (int, float)) else 0.0,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +335,8 @@ def _run_propose_bounded(fn):
 def api_tagging_propose():
     """Propose vocabulary tags for one citation key from its cached PDF text.
 
-    Body: ``{citation_key}``. Read-only — proposes, never writes: the UI shows
+    Body: ``{citation_key, session?, unit?}``. Writes no library content;
+    a session records proposal cache and cost in app state. The UI shows
     the suggestions in the picker and the user applies via ``apply-note-tags``
     (which re-validates against the vocabulary). Resolves the key's first
     ``biblio_articles/`` PDF, reads its text cache-first (bounded fresh extract
@@ -271,28 +362,88 @@ def api_tagging_propose():
     vault_root = settings.vault_root
     biblio_dir = settings.biblio_articles_dir
     biblio_pdfs = [p for p in rec.pdf_paths if _is_under(Path(p), biblio_dir)]
-    if not biblio_pdfs:
-        return jsonify({"error": "No biblio_articles PDF for that citation key."}), 404
+    unit_ctx = {"settings": settings, "vault_root": vault_root, "biblio_dir": biblio_dir}
+    if data.get("unit") is not None:
+        # Use the same server-owned identity as apply-all. A cached scan path
+        # may have been reused by another PDF after our earlier rename.
+        pdf, unit_error = _unit_pdf(data["unit"], rec, unit_ctx)
+        if unit_error:
+            return jsonify({"error": unit_error.get("error") or "No current PDF for this unit.",
+                            "reason": unit_error.get("skipped")}), 409
+        biblio_pdfs = [pdf]
 
     cfg = load_config()
     vocab, vocab_rel = _read_vocab(cfg, vault_root)
     if not vocab:
         return jsonify({"error": "Tag vocabulary (_tags.md) is unavailable."}), 400
 
+    # A library-maintenance SESSION (library-workflow lot 3) brings its own
+    # model choice, spending limit and proposal cache. Without one, nothing
+    # below changes: the global provider, its fallback, no cache.
+    session_ctx = None
+    if data.get("session") is not None:
+        session_ctx, err = _propose_session(data.get("session"), settings, cfg)
+        if err is not None:
+            return jsonify(err[0]), err[1]
+    force = coerce_bool(data.get("force")) is True
+
     text_max = (coerce_int_in_range(cfg.get("tagging_text_max_chars"), 500, 40000)
                 or _CFG_DEFAULTS["tagging_text_max_chars"])
-    text, truncated = text_source.read_pdf_text(
-        Path(biblio_pdfs[0]), vault_root, text_max, fresh_max_pages=8)
-    # ONE no-text threshold, owned by text_source (it writes the .notext
-    # marker on the same test) — an inline `40` here silently drifted once.
-    if len(text.strip()) < text_source._MIN_USEFUL_CHARS:
-        return jsonify({
-            "citation_key": citation_key, "proposed": [],
-            "status": "no_text", "truncated": truncated,
-        })
+    from core.extraction_status import ExtractionStatus, status_of
+    extraction_status = ExtractionStatus().to_dict()
+    text, truncated = "", False
+    if biblio_pdfs:
+        pdf_read = text_source.read_pdf_text(
+            Path(biblio_pdfs[0]), vault_root, text_max, fresh_max_pages=8)
+        text, truncated = pdf_read
+        extraction_status = status_of(pdf_read).to_dict()
+        if data.get("unit") is not None:
+            # Recheck after extraction as well: never send text whose file
+            # identity changed during the bounded read to a provider.
+            after, unit_error = _unit_pdf(data["unit"], rec, unit_ctx)
+            if unit_error or after != biblio_pdfs[0]:
+                return jsonify({"error": "The PDF changed during reading; analyse again.",
+                                "reason": "unit_stale"}), 409
 
-    provider = str(cfg.get("provider") or "ollama")
-    model = coerce_string_max_len(cfg.get("tagging_propose_model"), 120) or resolve_chat_model(cfg, provider)
+    # Metadata mode (2026-08-11). No PDF, or a PDF that yielded no usable text
+    # (a scan with no OCR layer), falls back to classifying from the abstract +
+    # bibliographic fields instead of giving up. 2 081 entries in the
+    # maintainer's library have no local PDF at all and previously had NO
+    # classification path — propose 404'd or returned no_text and stopped.
+    #
+    # ONE no-text threshold for the PDF half, owned by text_source (it writes
+    # the .notext marker on the same test) — an inline `40` here silently
+    # drifted once.
+    source_label = "PAPER TEXT"
+    if len(text.strip()) < text_source._MIN_USEFUL_CHARS:
+        # Exclude the controlled vocabulary from EXISTING KEYWORDS: those are
+        # precisely the tags this app writes, so including them would show the
+        # classifier the answer it is being asked for (2026-08-12).
+        document, substantive = metadata_source.from_record(
+            rec, max_chars=text_max, exclude_keywords=set(vocab or ()))
+        if not metadata_source.is_classifiable(substantive):
+            # Genuinely nothing to go on: no usable PDF text AND no abstract or
+            # keywords. Reported as no_text exactly as before, so a client that
+            # predates metadata mode sees the unchanged contract.
+            return jsonify({
+                "citation_key": citation_key, "proposed": [],
+                "status": "no_text", "truncated": truncated,
+                "source": "none", "has_pdf": bool(biblio_pdfs),
+            })
+        text, truncated = document, False
+        source_label = "PAPER METADATA"
+
+    choice = session_ctx["choice"] if session_ctx is not None else None
+    if session_ctx is not None:
+        provider, model = choice.provider, choice.model
+        # A deep copy with every fallback removed: the session names ONE
+        # model, and a failure must be visible rather than quietly paid for
+        # by another provider. The global config is never touched.
+        call_cfg = session_llm.call_config(cfg)
+    else:
+        provider = str(cfg.get("provider") or "ollama")
+        model = coerce_string_max_len(cfg.get("tagging_propose_model"), 120) or resolve_chat_model(cfg, provider)
+        call_cfg = cfg
     max_tags = coerce_int_in_range(cfg.get("tagging_max_tags"), 1, 12) or _CFG_DEFAULTS["tagging_max_tags"]
     max_tokens = (coerce_int_in_range(cfg.get("tagging_propose_max_tokens"), 64, 2048)
                   or _CFG_DEFAULTS["tagging_propose_max_tokens"])
@@ -310,6 +461,31 @@ def api_tagging_propose():
         fewshot_k = _CFG_DEFAULTS["tagging_fewshot_k"]
 
     title = (rec.bib_entry.title if rec.bib_entry and rec.bib_entry.title else citation_key)
+    source = "pdf" if source_label == "PAPER TEXT" else "metadata"
+
+    cache_key = None
+    if session_ctx is not None:
+        cache_key = _proposal_key(provider=provider, model=model, vocab=vocab, text=text,
+                                  title=title, max_tags=max_tags, temperature=temperature,
+                                  max_tokens=max_tokens, source_label=source_label,
+                                  candidate_n=candidate_n, fewshot_k=fewshot_k,
+                                  prompt_sha256=hashlib.sha256(
+                                      tag_propose._SYSTEM_PROMPT.encode("utf-8")).hexdigest())
+        hit = None if force else imports_tracker.cached_proposal(settings, cache_key)
+        if hit is not None and hit.get("proposed"):
+            # Resumption: the same model, vocabulary and source text already
+            # answered. Nothing is sent and nothing is spent. The status is
+            # recomputed from TODAY's min_conf — it is a threshold over the
+            # stored confidences, not part of the model's answer.
+            replay = dict(hit, citation_key=citation_key, from_cache=True, sent=None,
+                          session=session_ctx["id"], confidence_is_calibrated=False,
+                          spend=(imports_tracker.session(settings, session_ctx["id"])
+                                 or {}).get("spend"))
+            replay["extraction_status"] = extraction_status
+            replay["status"] = ("low_confidence"
+                                if min(p["confidence"] for p in hit["proposed"]) < min_conf
+                                else "ok")
+            return jsonify(replay)
 
     def _fn(should_cancel):
         # Label-space reduction + journal exemplars run inside the same
@@ -324,17 +500,79 @@ def api_tagging_propose():
             candidate_n=candidate_n, fewshot_k=fewshot_k,
             should_cancel=should_cancel,
         )
-        return tag_propose.propose_tags(
-            title=title, text=text, vocab=effective_vocab,
-            provider_name=provider, model=model, temperature=temperature,
-            max_tokens=max_tokens, cfg=cfg, max_tags=max_tags,
-            should_cancel=should_cancel, exemplars=exemplars,
-        )
+        if session_ctx is None:
+            return tag_propose.propose_tags(
+                title=title, text=text, vocab=effective_vocab,
+                provider_name=provider, model=model, temperature=temperature,
+                max_tokens=max_tokens, cfg=call_cfg, max_tags=max_tags,
+                should_cancel=should_cancel, exemplars=exemplars,
+                source_label=source_label,
+            )
+        # Budget check on the EXACT prompt this call will send (the candidate
+        # subset and exemplars are only known here), before anything leaves.
+        # The propose gate is single-flight process-wide, so no other
+        # proposal can spend between this check and the charge below.
+        messages = tag_propose.build_messages(title, text, effective_vocab, max_tags,
+                                              exemplars=exemplars, source_label=source_label)
+        prompt_text = tag_propose._SYSTEM_PROMPT + "".join(m["content"] for m in messages)
+        worst = session_llm.worst_case_usd(choice, cfg, prompt_text=prompt_text,
+                                           max_tokens=max_tokens)
+        spend = (imports_tracker.session(settings, session_ctx["id"]) or {}).get("spend") or {}
+        session_llm.check_budget(choice, None if spend.get("unknown") else float(spend.get("usd", 0.0)),
+                                 worst)
+        sent_box["sent"] = session_llm.disclosure(choice, chars=len(prompt_text), source=source)
+        start_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            return tag_propose.propose_tags(
+                title=title, text=text, vocab=effective_vocab,
+                provider_name=provider, model=model, temperature=temperature,
+                max_tokens=max_tokens, cfg=call_cfg, max_tags=max_tags,
+                should_cancel=should_cancel, exemplars=exemplars,
+                source_label=source_label,
+            )
+        finally:
+            # Charged in the worker, even when the provider raised or the
+            # request already answered 504: what the provider billed is spent
+            # whether or not anyone is still listening.
+            try:
+                sent_box["spend"] = imports_tracker.charge_session(
+                    settings, session_ctx["id"], _measured_cost(choice, start_iso, worst))
+            except Exception:  # noqa: BLE001 - never mask the call's own outcome
+                # The spend could not be recorded (store locked past its
+                # timeout). Audit remediation 2026-09-23 (L4, maintainer
+                # decision): the flag was set and then read by NOTHING, so the
+                # session silently under-counted. Now the response says so
+                # (`spend_error`) and the session's spend is marked UNKNOWN in
+                # a second, smaller write — a budgeted session then refuses
+                # further proposals rather than keep spending blind. If even
+                # that cannot be written, `spend_unrecorded` tells the run to
+                # stop proposing.
+                logger.error("tagging propose: session %s spend not recorded",
+                             session_ctx["id"], exc_info=True)
+                sent_box["spend_error"] = True
+                try:
+                    sent_box["spend"] = imports_tracker.mark_spend_unknown(
+                        settings, session_ctx["id"])
+                except Exception:  # noqa: BLE001
+                    logger.error("tagging propose: session %s spend could not even be "
+                                 "marked unknown", session_ctx["id"], exc_info=True)
+                    sent_box["spend_unrecorded"] = True
 
+    sent_box: dict = {}
     try:
         proposed, timed_out, busy = _run_propose_bounded(_fn)
+    except session_llm.BudgetExceeded as exc:
+        # Nothing was sent: the check runs before the call.
+        return jsonify({"error": str(exc), "reason": "budget",
+                        "session": session_ctx["id"] if session_ctx else None}), 409
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": sanitise_error_msg(exc)}), 502
+        # A session names ONE model and has no fallback, so say which one
+        # failed: "no silent fallback" is only useful if the failure is loud.
+        body = {"error": sanitise_error_msg(exc)}
+        if session_ctx is not None:
+            body.update(provider=provider, model=model, sent=sent_box.get("sent"),
+                        spend=sent_box.get("spend"), **_spend_flags(sent_box))
+        return jsonify(body), 502
     if busy:
         return jsonify({"error": "A tag proposal is already running; try again shortly."}), 429
     if timed_out:
@@ -347,10 +585,158 @@ def api_tagging_propose():
         status = "low_confidence"
     else:
         status = "ok"
-    return jsonify({
+    payload = {
         "citation_key": citation_key, "proposed": proposed,
         "status": status, "truncated": truncated,
-    })
+        "extraction_status": extraction_status,
+        # Which evidence produced this: the PDF's text, or the abstract +
+        # bibliographic fields. The deck shows it so a user can weigh a
+        # metadata-only proposal differently before accepting it.
+        "source": source,
+        "has_pdf": bool(biblio_pdfs),
+        # Which model actually spent the tokens (additive, 2026-08-13). It was
+        # invisible everywhere: this response carried no model field, the CLI
+        # batch echoed none, and `papermind status` reports the CHAT model —
+        # which is the wrong answer precisely when `tagging_propose_model` is
+        # set, i.e. exactly when a user has expressed a preference. Resolved
+        # above, so this cannot drift from what was called.
+        "provider": provider,
+        "model": model,
+    }
+    if session_ctx is not None:
+        # Stored WITHOUT the per-call fields, so a later cache hit reports
+        # what it is (a replay, nothing sent) rather than this call's facts.
+        if proposed:
+            # An EMPTY parse is usually transient (a token cap spent on
+            # thinking, a prose reply) — caching it would replay the failure
+            # on every resume without ever asking again.
+            imports_tracker.store_proposal(settings, cache_key, dict(payload))
+        payload.update(session=session_ctx["id"], from_cache=False,
+                       sent=sent_box.get("sent"), spend=sent_box.get("spend"),
+                       **_spend_flags(sent_box),
+                       # The model's own confidence is NOT a calibrated
+                       # probability and never authorises a write; it only
+                       # orders the chips (plan §7).
+                       confidence_is_calibrated=False)
+    return jsonify(payload)
+
+
+def _spend_flags(sent_box: dict) -> dict:
+    """``spend_error``/``spend_unrecorded`` only when set (L4): an unchanged
+    response shape for every call whose spend was recorded normally."""
+    return {k: True for k in ("spend_error", "spend_unrecorded") if sent_box.get(k)}
+
+
+def _unit_pdf(raw_unit, rec, ctx):
+    """``(abs_path, None)`` for the PDF an import-tracker unit names, or
+    ``(None, finder_result)`` explaining why it cannot be used.
+
+    Server-owned identity, never a client path: the unit must be a present
+    ATTACHMENT of THIS record's Zotero item, and the file at its recorded path
+    must still be the file the tracker observed (same inode + birth time). A
+    file replaced since the last observation is refused — tagging it would
+    tag bytes nobody reviewed — and a unit of another record is refused, so a
+    key cannot be pointed at someone else's PDF.
+    """
+    uid = coerce_string_max_len(raw_unit, 200)
+    settings = ctx["settings"]
+    tracked = imports_tracker.unit(settings, uid) if uid else None
+    if not tracked or tracked.get("kind") != "attachment" or tracked.get("state") != "present":
+        return None, {"ok": False, "error": "Unknown or absent import unit.", "skipped": "unit"}
+    item = rec.zotero_item
+    item_key = getattr(item, "item_key", None) if item is not None else None
+    parent = str(tracked.get("parent") or "")
+    lib_id = getattr(item, "library_id", None) if item is not None else None
+    if not item_key or not parent.endswith(f":{item_key}") or (
+            lib_id is not None and parent != f"entry:{lib_id}:{item_key}"):
+        return None, {"ok": False, "error": "That PDF belongs to another record.", "skipped": "unit"}
+    if not tracked.get("rel") or not tracked.get("doc"):
+        return None, {"ok": False, "skipped": "no_pdf"}
+    path = Path(ctx["vault_root"]) / tracked["rel"]
+    if not _is_under(path.resolve(), Path(ctx["biblio_dir"]).resolve()):
+        # Finder tags are scoped to `biblio_articles/` (the writer re-checks
+        # too; saying so here keeps the refusal explicit).
+        return None, {"ok": False, "skipped": "no_pdf"}
+    try:
+        from accession import review
+        fp = review.fingerprint(path)
+    except OSError:
+        return None, {"ok": False, "error": "The PDF moved since the last observation; observe again.",
+                      "skipped": "unit_stale"}
+    if f"doc:{fp['ino']}:{fp.get('birth')}" != tracked["doc"]:
+        return None, {"ok": False, "error": "The PDF was replaced since the last observation; observe again.",
+                      "skipped": "unit_stale"}
+    return path, None
+
+
+def _propose_session(raw_sid, settings, cfg):
+    """``({id, choice}, None)`` or ``(None, (body, status))`` for a propose."""
+    sid = coerce_string_max_len(raw_sid, 64)
+    if not sid:
+        return None, ({"error": "session must be a session id."}, 400)
+    record = imports_tracker.session(settings, sid)
+    if record is None:
+        return None, ({"error": "Unknown session for this library."}, 404)
+    if not record.get("llm"):
+        return None, ({"error": "Choose the model for this session first."}, 400)
+    try:
+        # Re-validated per call: a price may have gone, a provider may have
+        # been renamed. The stored choice is never trusted blindly.
+        choice = session_llm.validate(record["llm"], cfg)
+    except session_llm.SessionLLMError as exc:
+        return None, ({"error": str(exc)}, 400)
+    return {"id": sid, "choice": choice}, None
+
+
+def _proposal_key(**parts) -> str:
+    """Digest of everything that decides a proposal.
+
+    The vocabulary and the source text are hashed, so an edit to ``_tags.md``
+    or a re-extracted PDF is a miss. Few-shot exemplars are deliberately NOT
+    part of it: they are mined from the tagging journal, which grows with
+    every apply, and keying on them would make every cache entry die at the
+    first write of the session it was meant to resume.
+    """
+    vocab = parts.pop("vocab")
+    text = parts.pop("text")
+    parts["vocab_sha256"] = hashlib.sha256(
+        json.dumps(sorted(vocab.items()), ensure_ascii=False).encode()).hexdigest()
+    parts["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _measured_cost(choice, start_iso, worst):
+    """What this call cost, never LESS than can be shown (review 2026-09-21).
+
+    * a local model costs nothing billable: 0;
+    * an UNPRICED online model: None — unknown, never zero. The usage
+      tracker records such a call at $0.00, and trusting that record made an
+      unpriced session read as free and disabled the "unmeasured spend" guard;
+    * a priced online model: the tracker's records since the call started
+      (single-flight, so they are this call's) — but ONLY when every record
+      is a clean success. A failed call is recorded at $0 although the
+      provider billed what it read and generated, and a cancelled stream
+      (the 504 path) is recorded without its input tokens, because usage
+      arrives on the final chunk. In those cases, and when no record exists,
+      the pre-call worst case is charged instead: an over-estimate, which is
+      the only direction a spending limit can tolerate.
+    """
+    if not choice.online:
+        return 0.0
+    if worst is None:
+        return None
+    try:
+        from core.llm.usage import usage_tracker
+        records = usage_tracker.records_since(start_iso, workflow="tagging_propose",
+                                              provider=choice.provider, model=choice.model)
+    except Exception:  # noqa: BLE001 - accounting must not break the call
+        records = []
+    clean = bool(records) and all(
+        getattr(r, "success", True) and not getattr(r, "error_category", "")
+        and float(getattr(r, "cost_usd", 0.0) or 0.0) > 0.0 for r in records)
+    if clean:
+        return float(sum(r.cost_usd for r in records))
+    return worst
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +795,248 @@ def api_tagging_apply_note_tags():
     return jsonify(result), status
 
 
+_PDF_LINK_MAX_KEYS = 200
+
+#: Checkpoint cadence for the batch — refactor/apply.py's JOURNAL_FLUSH_EVERY
+#: and _BatchJournalKeeper._FLUSH_EVERY agree on 25: a once-per-batch save
+#: leaves written notes invisible to Restore on a mid-batch crash, and a
+#: per-note save is the O(N) fsync extreme.
+_PDF_LINK_FLUSH_EVERY = 25
+
+
+@tagging_bp.route("/api/tagging/apply-pdf-links", methods=["POST"])
+def api_tagging_apply_pdf_links():
+    """Write each record's mapped PDFs into its note as a ``pdf:`` wikilink list.
+
+    Body: ``{citation_keys: [...], confirm: true}`` (or a single
+    ``citation_key``). The note gains
+
+        pdf:
+          - "[[smith_2020.pdf]]"
+
+    so the reference note links to its own file, one click away in Obsidian.
+
+    **The client sends KEYS ONLY.** The filenames come from the cached scan's
+    PDF↔bib join, never from the request — the same posture as ``harmonize``,
+    and the reason a client cannot make a note point at an arbitrary file.
+
+    Bounded at ``_PDF_LINK_MAX_KEYS`` and at half the tagging journal's
+    retention window, because each write is a note op with a snapshot and the
+    response promises an undo the journal has to be able to keep
+    (``_HARMONIZE_MAX_NOTE_OPS``' precedent). Journalled as ``note_pdf_links``,
+    reversible from Tagging → Restore.
+
+    Note the interaction that makes this safe to use at all: writing this
+    field makes those PDFs "referenced from a note", and
+    ``maintenance/rename.py`` refuses to rename a referenced PDF. The rename
+    route recognises THIS shape and rewrites it in the same journalled op; any
+    other reference still refuses. Do not change the shape written here
+    without changing `_audit_tagwrite`'s matcher in the same commit.
+    """
+    from tagging.writers import _note_pdf_links_locked
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON"}), 400
+    if coerce_bool(data.get("confirm")) is not True:
+        return jsonify({"error": "Write must be explicitly confirmed (confirm: true)."}), 400
+    raw = data.get("citation_keys")
+    if raw is None and data.get("citation_key"):
+        raw = [data.get("citation_key")]
+    if not isinstance(raw, list) or not raw:
+        return jsonify({"error": "citation_keys must be a non-empty list."}), 400
+    keys, seen = [], set()
+    for k in raw:
+        key = coerce_non_empty_string(k, max_len=128)
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+    if not keys:
+        return jsonify({"error": "citation_keys must be a non-empty list."}), 400
+    if len(keys) > _PDF_LINK_MAX_KEYS:
+        return jsonify({"error": f"At most {_PDF_LINK_MAX_KEYS} keys per request."}), 400
+    if len(keys) > _HARMONIZE_MAX_NOTE_OPS:
+        return jsonify({"error": (
+            f"That is more note writes than the restore journal retains "
+            f"({_HARMONIZE_MAX_NOTE_OPS}); split it so the undo this offers "
+            "can actually be kept.")}), 400
+
+    inv, settings = audit_manager.get_inventory()
+    if inv is None or settings is None:
+        return jsonify({"error": "No scan results. Run an audit scan first."}), 404
+    cfg = load_config()
+    vault_root = settings.vault_root
+
+    from rag.vault import obsidian_manager
+
+    op_epoch = obsidian_manager.try_acquire_lock(ttl=3600)
+    if not op_epoch:
+        return jsonify({"error": "Indexing is in progress; try again shortly."}), 503
+    results: dict = {}
+    written = 0
+    aborted = False
+    manifest = None
+    op_ids: set = set()
+
+    def _keep_landed_ops() -> None:
+        """Best-effort persistence of the ops of notes ALREADY written, before
+        answering an error (audit remediation 2026-09-23, N1 — the fix
+        `_create_notes` got in 2026-09-21). Ops are appended with
+        `defer_save=True` and checkpointed every `_PDF_LINK_FLUSH_EVERY`, so
+        an exception between two checkpoints used to answer 500 while up to
+        24 rewritten notes had no undo record. Never raises: the original
+        error is the answer."""
+        if manifest is None or not op_ids:
+            return
+        try:
+            journal.prune(vault_root, cfg, manifest, protect_op_ids=op_ids)
+            journal.save(vault_root, cfg, manifest)
+        except Exception:  # noqa: BLE001
+            logger.exception("apply-pdf-links: journal save after failure failed")
+
+    try:
+        from api.routes._audit_tagwrite import (
+            ambiguous_pdf_basenames, expected_pdf_links,
+        )
+        ambiguous = ambiguous_pdf_basenames(vault_root)
+        manifest = journal.load(vault_root, cfg)
+        for i, key in enumerate(keys, start=1):
+            rec = inv.records.get(key)
+            if rec is None:
+                results[key] = {"ok": False, "reason": "unknown_key"}
+                continue
+            if rec.obsidian_note is None:
+                results[key] = {"ok": False, "reason": "no_note"}
+                continue
+            names = expected_pdf_links(rec.pdf_paths, vault_root, ambiguous)
+            if not names:
+                results[key] = {"ok": False, "reason": "no_pdf"}
+                continue
+            res, status = _note_pdf_links_locked(
+                rec=rec, names=names, want_sha=None, cfg=cfg,
+                vault_root=vault_root, citation_key=key,
+                manifest=manifest, defer_save=True)
+            results[key] = res
+            if res.get("op_id"):
+                op_ids.add(res["op_id"])
+            if status == 200 and res.get("changed"):
+                written += 1
+            if i % _PDF_LINK_FLUSH_EVERY == 0:
+                if not obsidian_manager.heartbeat(op_epoch):
+                    # A refused heartbeat means the lock was stolen (our TTL
+                    # lapsed); stop writing rather than race the new holder.
+                    # Reported as its own field, never as a `results` entry —
+                    # a client iterating results by citation key would read
+                    # `_aborted` as a paper.
+                    aborted = True
+                    break
+                journal.save(vault_root, cfg, manifest)
+        if aborted:
+            # The lock is someone else's now (audit remediation 2026-09-23,
+            # N2): our in-memory view of the journal may be stale, so a
+            # `prune` on it could evict what the new holder just wrote, and
+            # a plain save would write that stale view back. Merge ONLY our
+            # ops into what is on disk (CLAUDE.md's lost-lock rule), no prune.
+            journal.save_merged(vault_root, cfg, manifest, prefer_ours=op_ids)
+        else:
+            journal.prune(vault_root, cfg, manifest, protect_op_ids=op_ids)
+            journal.save(vault_root, cfg, manifest)
+    except journal.JournalUnreadableError as exc:
+        _keep_landed_ops()
+        return jsonify({"error": sanitise_error_msg(exc), "written": written,
+                        "results": results}), 503
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("apply-pdf-links failed")
+        _keep_landed_ops()
+        return jsonify({"error": sanitise_error_msg(exc), "written": written,
+                        "results": results}), 500
+    finally:
+        obsidian_manager.release_lock(op_epoch)
+    return jsonify({"ok": True, "written": written, "results": results,
+                    **({"aborted": "lock_lost"} if aborted else {})}), 200
+
+
+#: The states of a record's ``pdf:`` list, as ``pdf-links-status`` reports
+#: them. ``current`` is the only one that needs nothing.
+PDF_LINK_STATES = ("current", "absent", "stale", "dirty", "unreadable",
+                   "no_note", "no_pdf")
+
+
+def _pdf_link_state(rec, vault_root, ambiguous: set[str]
+                    ) -> tuple[str, list[str], list[str]]:
+    """``(state, expected entries, entries the note lists)`` for one record.
+
+    The expected entries come from the same ``expected_pdf_links`` call
+    ``apply-pdf-links`` makes, so ``current`` here means "a write would
+    change nothing" and never a looser notion of close enough.
+    """
+    from api.routes._audit_tagwrite import (
+        expected_pdf_links, pdf_list_is_clean, read_pdf_links,
+    )
+
+    names = expected_pdf_links(rec.pdf_paths, vault_root, ambiguous)
+    if rec.obsidian_note is None:
+        return ("no_note" if names else ""), names, []
+    if not names:
+        return "no_pdf", names, []
+    try:
+        text = rec.obsidian_note.path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "unreadable", names, []
+    if not pdf_list_is_clean(text):
+        return "dirty", names, read_pdf_links(text)
+    links = read_pdf_links(text)
+    if links == names:
+        return "current", names, links
+    return ("absent" if not links else "stale"), names, links
+
+
+@tagging_bp.route("/api/tagging/pdf-links-status")
+def api_tagging_pdf_links_status():
+    """Which reference notes carry an accurate ``pdf:`` list (read-only).
+
+    The observational twin of ``apply-pdf-links`` (2026-09-17, annual cleanup
+    T1 — nothing reported this before, so "notes without a pdf: list" had no
+    number). Per record of the cached scan:
+
+    * ``current`` — the list equals the mapped PDFs; a write changes nothing;
+    * ``absent`` — no app-shaped list; ``apply-pdf-links`` would add one;
+    * ``stale`` — an app-shaped list naming other files;
+    * ``dirty`` — a list this app did not write; the writer refuses it;
+    * ``unreadable`` — the note cannot be read as UTF-8;
+    * ``no_note`` — mapped PDFs but no reference note; ``no_pdf`` — a note but
+      no mapped PDF (both informational: nothing to write).
+
+    ``rows`` lists every record NOT ``current`` (records with neither a note
+    nor a PDF are omitted); ``?state=`` narrows them. Reads the notes from
+    disk on the request thread: ~1.2k small files on the live vault.
+    """
+    inv, settings = audit_manager.get_inventory()
+    if inv is None or settings is None:
+        return jsonify({"error": "No scan results. Run an audit scan first."}), 404
+    from api.routes._audit_tagwrite import ambiguous_pdf_basenames
+    ambiguous = ambiguous_pdf_basenames(settings.vault_root)
+    wanted = request.args.get("state") or ""
+    if wanted and wanted not in PDF_LINK_STATES:
+        return jsonify({"error": "Unknown state. Known: " + ", ".join(PDF_LINK_STATES)}), 400
+    counts = {s: 0 for s in PDF_LINK_STATES}
+    rows = []
+    for key in sorted(inv.records):
+        rec = inv.records[key]
+        state, names, links = _pdf_link_state(rec, settings.vault_root, ambiguous)
+        if not state:
+            continue
+        counts[state] += 1
+        if state == "current" or (wanted and state != wanted):
+            continue
+        note = rec.obsidian_note.path if rec.obsidian_note is not None else None
+        rows.append({"citation_key": key, "state": state, "expected": names,
+                     "listed": links,
+                     "note": note.name if note is not None else None})
+    return jsonify({"counts": counts, "rows": rows, "count": len(rows),
+                    "scanned_at": getattr(inv, "built_at", 0)})
+
+
 @tagging_bp.route("/api/tagging/apply-finder-tags", methods=["POST"])
 def api_tagging_apply_finder_tags():
     """Union chosen tags into the citation key's ``biblio_articles/`` PDF Finder tags.
@@ -454,31 +1082,35 @@ def api_tagging_apply_finder_tags():
 
 @tagging_bp.route("/api/tagging/zotero-available")
 def api_tagging_zotero_available():
-    """Probe the configured Zotero endpoint so the UI can enable/disable the write.
+    """Read readiness for this Desktop-selected tagging surface; never authorize.
 
-    ``available`` means "reachable AND usable": on the web transport an
-    unauthenticated endpoint is reachable but cannot write, so a missing or
-    rejected key reports unavailable rather than letting the user click a
-    button that is guaranteed to 503. ``writable`` additionally flags the
-    read-only local API (Zotero ≤ 9 answers GET but 501s every PATCH), so the
-    UI can explain *why* rather than showing an opaque failure later.
+    Reachability is distinct from permission. A Web transport cannot consume
+    scan identities and therefore never advertises an eligible tag target.
     """
+    from tagging import local_api
     cfg = load_config()
     transport = zotero_write.resolve_transport(cfg)
-    available = (transport.can_write
-                 and zotero_write.probe(transport.base_url, timeout=3.0,
-                                        api_key=transport.api_key))
-    return jsonify({
-        "available": available,
-        "base": transport.base_url,
-        "transport": transport.kind,
-        # Local writes are unsupported before Zotero 10; we cannot prove that
-        # without attempting a write, so this is a capability HINT, not a probe.
-        "writable": available,
-        "note": ("Zotero's local API is read-only before Zotero 10 — set "
-                 f"{zotero_write.API_KEY_ENV} to write via the web API."
-                 if transport.kind == "local" else ""),
-    })
+    result = dict(available=False, writable=False, transport=transport.kind,
+                  base=transport.base_url, mode=cfg.get("tagging_zotero_transport", "auto"),
+                  authorized=False, supports_writes=False)
+    if transport.is_web:
+        # This surface only selects Desktop scan records. Probing a Web key
+        # cannot make those identities eligible for a Web write.
+        result["note"] = ("These tags target a Zotero Desktop selection. Authorize Desktop "
+                          "to use it in automatic mode, or explicitly switch Web to local. "
+                          "No Web request has been sent.")
+        return jsonify(result)
+    try:
+        state = local_api.capabilities(transport.base_url, opener=zotero_write._opener, timeout=3)
+        result.update(available=True, authorized=state['authorized'],
+                      supports_writes=state['supports_writes'])
+        result['writable'] = bool(state['authorized'] and state['supports_writes'])
+        result['note'] = ("Zotero Desktop is authorized for this session." if result['writable']
+                          else "Authorize CHERQAiN in Zotero Desktop before applying tags."
+                          if state['supports_writes'] else "This Zotero endpoint does not advertise local writes.")
+    except Exception:
+        result['note'] = "Zotero Desktop is unavailable. Open Zotero and refresh access."
+    return jsonify(result)
 
 
 @tagging_bp.route("/api/tagging/apply-zotero-tags", methods=["POST"])
@@ -637,32 +1269,183 @@ def api_tagging_add_vocab_tag():
     return jsonify({"ok": True, "op_id": op_id, "tag": tag, "rel": vocab_rel})
 
 
+#: Fields the Restore view renders per op.
+#
+# "removed"/"batch_id" joined 2026-07-23: the untag/vocab_retire op kinds carry
+# `removed`, not `added` — without them the Restore view showed those ops with
+# no tag detail, making the per-op fallback undo unusable.
+# "pdf_rel" joined 2026-08-11: a path-addressed finder_untag (a PDF with no
+# citation key) has citation_key None, so without it the op renders with no
+# identity and its undo button is unusable.
+_MANIFEST_FIELDS = ("op_id", "kind", "note_rel", "citation_key", "pdf_rel",
+                    "added", "removed", "batch_id", "ts", "state")
+
+
 @tagging_bp.route("/api/tagging/manifest")
 def api_tagging_manifest():
-    """Return the tagging restore manifest (newest op first) for the Restore UI."""
+    """One newest-first PAGE of the tagging restore manifest.
+
+    Paginated 2026-08-26. The unpaged version loaded and JSON-parsed the whole
+    history on every open — measured at 11,651 ops / 8 MB / ~110 ms on the
+    maintainer's library — and then rendered one table row per op. It now goes
+    through ``journal.load_page`` (bounded SQL, ~1 ms), and the response gained
+    ``total``/``next_before``/``limit`` so the client can page. ``count`` still
+    means "ops in THIS response" and the newest-first ordering is unchanged, so
+    a caller that ignores the new fields sees the first page and nothing breaks.
+
+    ``?limit=`` (1..``MAX_PAGE_SIZE``) and ``?before=`` (the previous page's
+    ``next_before`` cursor) are both optional.
+    """
+    try:
+        vault_root = _vault_root()
+    except AuditConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    cfg = load_config()
+    limit = (coerce_int_in_range(request.args.get("limit"), 1,
+                                 journal.MAX_PAGE_SIZE)
+             or journal.DEFAULT_PAGE_SIZE)
+    before = request.args.get("before")
+    before_seq = None
+    if before not in (None, ""):
+        before_seq = coerce_int_in_range(before, 1, 2 ** 62)
+    try:
+        page = journal.load_page(
+            vault_root, cfg, limit=limit, before_seq=before_seq)
+    except journal.ScopeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except journal.JournalUnreadableError as exc:
+        return jsonify({"error": sanitise_error_msg(exc)}), 503
+    ops = [{k: op.get(k) for k in _MANIFEST_FIELDS} for op in page["ops"]]
+    return jsonify({
+        "ops": ops,
+        "count": len(ops),
+        "total": page["total"],
+        "next_before": page["next_before"],
+        "limit": limit,
+    })
+
+
+@tagging_bp.route("/api/tagging/journal-stats")
+def api_tagging_journal_stats():
+    """Size and composition of the restore journal — no payloads parsed.
+
+    Read-only. Exists because nothing in the app said how large this file had
+    become, while applied Finder/Zotero ops are exempt from eviction by design
+    and therefore accumulate for the lifetime of the library.
+    """
     try:
         vault_root = _vault_root()
     except AuditConfigError as exc:
         return jsonify({"error": str(exc)}), 400
     cfg = load_config()
     try:
-        manifest = journal.load(vault_root, cfg)
+        st = journal.stats(vault_root, cfg)
     except journal.ScopeError as exc:
         return jsonify({"error": str(exc)}), 400
     except journal.JournalUnreadableError as exc:
         return jsonify({"error": sanitise_error_msg(exc)}), 503
-    # "removed"/"batch_id" joined 2026-07-23: the untag/vocab_retire op kinds
-    # carry `removed`, not `added` — without them the Restore view showed
-    # those ops with no tag detail, making the per-op fallback undo unusable.
-    fields = ("op_id", "kind", "note_rel", "citation_key", "added", "removed",
-              "batch_id", "ts", "state")
-    ops = [{k: op.get(k) for k in fields} for op in manifest.get("ops", [])]
-    ops.reverse()
-    return jsonify({"ops": ops, "count": len(ops)})
+    except journal.JournalTransientReadError as exc:
+        return jsonify({"error": sanitise_error_msg(exc)}), 503
+    st["retention"] = {
+        "enabled": bool(cfg.get("tagging_journal_retention_enabled")),
+        "policy": cfg.get("tagging_journal_retention_policy"),
+        "days": cfg.get("tagging_journal_retention_days"),
+        "keep": cfg.get("tagging_journal_retention_keep"),
+    }
+    return jsonify(st)
+
+
+@tagging_bp.route("/api/tagging/compact-journal", methods=["POST"])
+def api_tagging_compact_journal():
+    """Drop applied Finder/Zotero ops per a chosen policy. Confirm-gated.
+
+    ``{policy: "age_days"|"keep_newest", value: int, dry_run?: bool,
+    confirm: true}``. ``dry_run`` needs no confirm and writes nothing — it is
+    how the UI shows the count before asking.
+
+    This is the one action in the subsystem that deliberately destroys restore
+    mappings, so it is confirm-gated, op-locked and ``log_vault_write``-audited
+    like any other write, and it never touches note or vocab ops (they keep
+    their file snapshots and the existing ``_MAX_OPS`` window).
+    """
+    data = request.get_json(silent=True) or {}
+    policy = coerce_enum(data.get("policy"), journal.RETENTION_POLICIES)
+    if policy is None:
+        return jsonify({
+            "error": "policy must be one of: "
+                     + ", ".join(journal.RETENTION_POLICIES)}), 400
+    value = coerce_int_in_range(data.get("value"), 1, 100_000)
+    if not value:
+        return jsonify({"error": "value must be a positive integer."}), 400
+    # Absent means dry run: the destructive branch must be asked for, never
+    # arrived at by omitting a field.
+    dry_run = coerce_bool(data.get("dry_run"))
+    dry_run = True if dry_run is None else dry_run
+    if not dry_run and data.get("confirm") is not True:
+        return jsonify({"error": "confirm: true is required."}), 400
+    try:
+        vault_root = _vault_root()
+    except AuditConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    cfg = load_config()
+
+    if dry_run:
+        try:
+            return jsonify(journal.compact(
+                vault_root, cfg, policy=policy, value=value, dry_run=True))
+        except journal.ScopeError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except (journal.JournalUnreadableError,
+                journal.JournalTransientReadError) as exc:
+            return jsonify({"error": sanitise_error_msg(exc)}), 503
+
+    from rag.vault import obsidian_manager
+
+    op_epoch = obsidian_manager.try_acquire_lock(ttl=600)
+    if not op_epoch:
+        return jsonify({"error": "Indexing is in progress; try again shortly."}), 503
+    try:
+        result = journal.compact(
+            vault_root, cfg, policy=policy, value=value, dry_run=False)
+    except journal.ScopeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (journal.JournalUnreadableError,
+            journal.JournalTransientReadError) as exc:
+        return jsonify({"error": sanitise_error_msg(exc)}), 503
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": sanitise_error_msg(exc)}), 500
+    finally:
+        obsidian_manager.release_lock(op_epoch)
+    return jsonify(result)
+
+
+def _prepare_zotero_revert(cfg, op):
+    """The lock-free READ half of one Zotero op's revert, by kind."""
+    kind = op.get("kind")
+    if kind == "zotero_attachment_trash":
+        return _revert_zotero_attachment_prepare(cfg, op)
+    if kind == "zotero_attachment_create":
+        return _revert_zotero_attachment_create_prepare(cfg, op)
+    if kind == "zotero_item_create":
+        return _revert_zotero_item_create_prepare(cfg, op)
+    if kind == "zotero_attachment_repath":
+        return _revert_zotero_attachment_repath_prepare(cfg, op)
+    if kind == "zotero_attachment_retitle":
+        return _revert_zotero_attachment_retitle_prepare(cfg, op)
+    if kind == "zotero_metadata_write":
+        return _revert_zotero_metadata_prepare(cfg, op)
+    if kind == "zotero_child_reparent":
+        return _revert_zotero_child_reparent_prepare(cfg, op)
+    if kind == "zotero_item_trash":
+        return _revert_zotero_item_trash_prepare(cfg, op)
+    if kind in _NOTESYNC_ZOTERO_KINDS:
+        from notesync import zotero_notes as _zn
+        return _zn.revert_prepare(cfg, op)
+    return _revert_zotero_prepare(cfg, op)
 
 
 def _restore_batch(batch_id: str):
-    """Revert every applied op stamped with *batch_id*, newest-first (SSE).
+    """Recover applied and uncertain ops of *batch_id*, newest-first (SSE).
 
     The batch twin of the single-op restore, and **streamed since 2026-07-30**
     (fix-plan Plan 5, closing the 2026-07-23 deferral): undoing a 150-op retire
@@ -689,23 +1472,78 @@ def _restore_batch(batch_id: str):
     from rag.vault import obsidian_manager
 
     try:
-        peek = journal.load(vault_root, cfg)
-    except (journal.ScopeError, journal.JournalUnreadableError) as exc:
+        # An indexed SELECT, not a whole-history parse: this peek only decides a
+        # 404 and which Zotero reads phase 1 must do. It returns PLAIN dicts and
+        # is never handed to save() — the real manifest is re-loaded under the
+        # op-lock below (2026-09-02; see journal._scoped_ops).
+        batch_ops = [op for op in journal.peek_batch_ops(vault_root, cfg, batch_id)
+                     if op.get("state") in ("applied", "outcome_unknown", "observed_after_recovery")]
+    except (journal.ScopeError, journal.JournalUnreadableError,
+            journal.JournalTransientReadError) as exc:
         return jsonify({"error": sanitise_error_msg(exc)}), 503
-    batch_ops = [op for op in peek["ops"]
-                 if op.get("batch_id") == batch_id and op.get("state") == "applied"]
     if not batch_ops:
-        return jsonify({"error": "No applied ops carry that batch id."}), 404
+        return jsonify({"error": "No unresolved ops carry that batch id."}), 404
 
     consumer_timeout_s = SSE_SINGLE_SHOT_FLOOR_S + SSE_STALL_MARGIN_S
 
     def _worker(put, cancel):
+        # PERF (2026-09-02): batch restore PATCHed Zotero serially under the
+        # obsidian op-lock.
+        #   Before:    phase 2 held the lock across every revert INCLUDING each
+        #              Zotero op's PATCH (and, for a `zotero_attachment_trash`
+        #              op, a GET as well). Each is a network write with a
+        #              15 s timeout, so a 50-op batch against an unreachable
+        #              Zotero froze indexing and every other vault write for
+        #              50 x 15 s = 750 s (>12 min) in one hold. Retire-tag and
+        #              harmonize were refactored away from exactly this in the
+        #              2026-07-23 audit; batch restore never was.
+        #   Change:    retire-tag's four phases. 1: every Zotero READ lock-free
+        #              (the tag reads already were; the attachment GET now is
+        #              too, via the new prepare/commit split in
+        #              tagging/writers.py). 2: ONE hold for the vault-local
+        #              reverts (note / finder) and the manifest save. 3: every
+        #              Zotero PATCH lock-free. 4: a short second hold that
+        #              RELOADS the manifest, records the phase-3 outcomes and
+        #              prunes. Worst-case lock hold is now the local reverts
+        #              only: zero network time, whatever Zotero is doing.
+        #   Safe because:
+        #              the lock never protected the Zotero round-trip in the
+        #              first place — `If-Unmodified-Since-Version` does, and it
+        #              is unchanged. Phase 4 reloads rather than saving the
+        #              phase-2 object, so a writer that took the lock in the gap
+        #              is never clobbered; the state flips are carried across by
+        #              op id. Result ORDER is preserved: results are collected
+        #              per op id and emitted in the original newest-first
+        #              sequence, so the terminal frame is byte-identical to
+        #              before for any batch that succeeds.
+        #   Preserves: per-op conservatism — a store edited since the write is
+        #              still `skipped`, and an unreachable Zotero is still an
+        #              `error` that KEEPS the op `applied` and therefore
+        #              retryable (never a "reverted" claim for a PATCH that did
+        #              not land). "Zotero reads run BEFORE the op-lock (per op,
+        #              the D4 discipline)" now covers the attachment op too.
+        #   Lock/thread contract:
+        #              entry: no lock. Phase 2 acquires and releases the
+        #              obsidian op-lock (heartbeat still acted on). Phase 3
+        #              holds nothing. Phase 4 re-acquires with a bounded retry
+        #              and releases; failing to re-acquire leaves the affected
+        #              ops `applied`, which a re-run resolves conservatively.
+        #   Pinned by: test_tagging.py::TestBatchRestoreLockChoreography
         total_ops = len(batch_ops)
         # Phase 1 — Zotero reads, lock-free (a wedged Zotero must not stall
         # indexing or any other vault write).
         z_prepared: dict[str, dict] = {}
         zotero_ops = [op for op in batch_ops
-                      if op.get("kind") in ("zotero_tag", "zotero_untag")]
+                      if op.get("kind") in ("zotero_tag", "zotero_untag",
+                                            "zotero_attachment_trash",
+                                            "zotero_attachment_create",
+                                            "zotero_attachment_repath",
+                                            "zotero_attachment_retitle",
+                                            "zotero_item_create",
+                                            "zotero_metadata_write",
+                                            "zotero_child_reparent",
+                                            "zotero_item_trash")
+                      or op.get("kind") in _NOTESYNC_ZOTERO_KINDS]
         for i, op in enumerate(zotero_ops, start=1):
             # `cancel` is the skeleton's threading.Event, never a callable —
             # `cancel()` raised TypeError here and _runner's blanket handler
@@ -715,14 +1553,30 @@ def _restore_batch(batch_id: str):
             if cancel.is_set():
                 return
             put({"info": f"Zotero: reading {i}/{len(zotero_ops)}…"})
-            z_prepared[op["op_id"]] = _revert_zotero_prepare(cfg, op)
+            z_prepared[op["op_id"]] = _prepare_zotero_revert(cfg, op)
 
-        # Phase 2 — one lock hold for every revert + the manifest save.
+        # Results are keyed by op id and emitted in `ordered` sequence at the
+        # end, so splitting the loop across three phases cannot reorder the
+        # terminal frame.
+        by_id: dict[str, dict] = {}
+        state_flips: dict[str, str] = {}
+        done_count = 0
+
+        def _record(op, result):
+            nonlocal done_count
+            kind = op.get("kind")
+            by_id[op["op_id"]] = {"op_id": op["op_id"], "kind": kind, **result}
+            done_count += 1
+            put({"info": f"[{done_count}/{total_ops}] {kind or 'op'}: "
+                         f"{result.get('status') or 'done'}"})
+
+        # Phase 2 — one lock hold for every VAULT-LOCAL revert + the save.
         op_epoch = obsidian_manager.try_acquire_lock(ttl=3600)
         if not op_epoch:
             put({"error": "Indexing is in progress; try again shortly."})
             return
-        results: list[dict] = []
+        lock_lost = False
+        ordered: list[dict] = []
         try:
             try:
                 manifest = journal.load(vault_root, cfg)
@@ -733,51 +1587,182 @@ def _restore_batch(batch_id: str):
             # earlier one's (independent stores make order mostly moot; this is
             # the safe default).
             ordered = [op for op in reversed(manifest["ops"])
-                       if op.get("batch_id") == batch_id and op.get("state") == "applied"]
-            for done, op in enumerate(ordered, start=1):
+                       if op.get("batch_id") == batch_id and op.get("state") in ("applied", "outcome_unknown", "observed_after_recovery")]
+            for op in ordered:
+                if op.get("op_id") in z_prepared:
+                    continue  # phase 3 owns it — no network under this lock
                 # Act on a False heartbeat (CLAUDE.md Limits discipline): a
                 # lapsed TTL means another writer may own the lock — stop
-                # reverting rather than write into someone else's hold. Already-
-                # reverted ops were flipped in-memory; the save below still runs
-                # (accepted: the alternative loses those flips and re-running the
-                # batch would re-revert already-restored stores).
+                # reverting rather than write into someone else's hold.
+                # Already-reverted ops were flipped in-memory; the save below
+                # goes through the prefer-ours merge so those flips persist
+                # WITHOUT clobbering ops a new lock owner appended during the
+                # lapse (2026-08-18 — the plain save here was the same clobber
+                # class the write path's merge-save fixed).
                 if not obsidian_manager.heartbeat(op_epoch):
-                    results.append({"op_id": op["op_id"], "kind": op.get("kind"),
-                                    "ok": False, "status": "error",
-                                    "message": "op-lock TTL lapsed; batch restore "
-                                               "aborted — retry to revert the rest"})
+                    lock_lost = True
+                    _record(op, {"ok": False, "status": "error",
+                                 "message": "op-lock TTL lapsed; batch restore "
+                                            "aborted — retry to revert the rest"})
                     put({"info": "op-lock TTL lapsed — stopping; re-run to revert the rest."})
                     break
                 kind = op.get("kind")
                 try:
                     if kind in ("finder_tag", "finder_untag"):
                         result = _revert_finder_tag(vault_root, cfg, op)
-                    elif kind in ("zotero_tag", "zotero_untag"):
-                        prepared = z_prepared.get(op["op_id"])
-                        if prepared is None or "early" in prepared:
-                            result = (prepared or {}).get("early") or {
-                                "ok": False, "status": "error",
-                                "message": "Zotero read failed."}
-                        else:
-                            result = _revert_zotero_commit_locked(prepared, op)
                     else:
                         result = journal.revert_op(vault_root, cfg, op)
                 except Exception as exc:  # noqa: BLE001
                     result = {"ok": False, "status": "error",
                               "message": sanitise_error_msg(exc)}
-                results.append({"op_id": op["op_id"], "kind": kind, **result})
-                put({"info": f"[{done}/{total_ops}] {kind or 'op'}: "
-                             f"{result.get('status') or 'done'}"})
-            journal.save(vault_root, cfg, manifest)
+                _record(op, result)
+            if lock_lost:
+                # prefer_ours: disk-wins would discard the in-memory
+                # `reverted` flips (leaving reverted stores double-revertible)
+                # while a plain save would drop a new owner's ops. Prefer OUR
+                # copies for exactly this batch's ops, nothing else.
+                try:
+                    journal.save_merged(
+                        vault_root, cfg, manifest,
+                        prefer_ours={op["op_id"] for op in ordered})
+                except journal.JournalTransientReadError:
+                    put({"info": "could not persist the reverted flags "
+                                 "(journal volume unreadable); the reverted "
+                                 "ops still show as applied — a re-run will "
+                                 "conservatively re-check each store."})
+            else:
+                journal.save(vault_root, cfg, manifest)
         finally:
             obsidian_manager.release_lock(op_epoch)
 
+        # Phase 3 — Zotero PATCHes, lock-free. A wedged Zotero now costs this
+        # batch its own wall clock and nothing else; indexing runs throughout.
+        touched_items: set = set()
+        if not lock_lost:
+            for op in ordered:
+                if op.get("op_id") not in z_prepared:
+                    continue
+                if cancel.is_set():
+                    break
+                prepared = z_prepared[op["op_id"]]
+                # Two ops on ONE item in a batch (a record merge writes the
+                # kept item's tags AND its Extra): the phase-1 read's version
+                # is stale once the first of them has been PATCHed, and the
+                # second would 412. Re-read — still lock-free — before it.
+                # Found on the disposable copy, 2026-09-17.
+                if op.get("item_key") in touched_items and "commit" in prepared:
+                    prepared = _prepare_zotero_revert(cfg, op)
+                is_attachment = op.get("kind") == "zotero_attachment_trash"
+                try:
+                    if "early" in prepared:
+                        result = prepared["early"]
+                        if prepared.get("state"):
+                            state_flips[op["op_id"]] = prepared["state"]
+                    elif "commit" not in prepared:
+                        result = {"ok": False, "status": "error",
+                                  "message": "Zotero read failed."}
+                    else:
+                        # The commit helpers flip `op["state"]` on THIS object,
+                        # which belongs to the phase-2 manifest we are no longer
+                        # going to save; the flip is carried to the reloaded
+                        # manifest in phase 4 by op id.
+                        if is_attachment:
+                            result = _revert_zotero_attachment_commit(prepared, op)
+                        elif op.get("kind") == "zotero_attachment_create":
+                            result = _revert_zotero_attachment_create_commit(prepared, op)
+                        elif op.get("kind") == "zotero_item_create":
+                            result = _revert_zotero_item_create_commit(prepared, op)
+                        elif op.get("kind") == "zotero_attachment_repath":
+                            result = _revert_zotero_attachment_repath_commit(prepared, op)
+                        elif op.get("kind") == "zotero_attachment_retitle":
+                            result = _revert_zotero_attachment_retitle_commit(prepared, op)
+                        elif op.get("kind") == "zotero_metadata_write":
+                            result = _revert_zotero_metadata_commit(prepared, op)
+                        elif op.get("kind") == "zotero_child_reparent":
+                            result = _revert_zotero_child_reparent_commit(prepared, op)
+                        elif op.get("kind") == "zotero_item_trash":
+                            result = _revert_zotero_item_trash_commit(prepared, op)
+                        elif op.get("kind") in _NOTESYNC_ZOTERO_KINDS:
+                            from notesync import zotero_notes as _zn
+                            result = _zn.revert_commit(prepared, op)
+                        else:
+                            result = _revert_zotero_commit_locked(prepared, op)
+                        if op.get("state") == "reverted":
+                            state_flips[op["op_id"]] = "reverted"
+                        if op.get("item_key"):
+                            touched_items.add(op["item_key"])
+                except Exception as exc:  # noqa: BLE001
+                    result = {"ok": False, "status": "error",
+                              "message": sanitise_error_msg(exc)}
+                _record(op, result)
+
+        # Phase 4 — a short second hold to RECORD the phase-3 outcomes. Never
+        # saves the phase-2 object: it reloads, so a writer that took the lock
+        # in the gap keeps its ops. Failing to re-acquire leaves those ops
+        # `applied`, which is the conservative reading — a re-run re-reads the
+        # store, sees it already matches `before`, and answers `skipped`.
+        journal_recorded = not lock_lost
+        if state_flips:
+            epoch2 = None
+            for _ in range(20):
+                epoch2 = obsidian_manager.try_acquire_lock(ttl=300)
+                if epoch2:
+                    break
+                time.sleep(1)
+            if not epoch2:
+                journal_recorded = False
+                put({"info": "could not re-acquire the op-lock to record the "
+                             "Zotero reverts; they still show as applied — a "
+                             "re-run will conservatively re-check each item."})
+            else:
+                try:
+                    m2 = journal.load(vault_root, cfg)
+                    for op in m2["ops"]:
+                        flip = state_flips.get(op.get("op_id"))
+                        if flip and op.get("state") in ("applied", "outcome_unknown", "observed_after_recovery"):
+                            op["state"] = flip
+                    journal.save(vault_root, cfg, m2)
+                except (journal.ScopeError, journal.JournalUnreadableError,
+                        journal.JournalTransientReadError) as exc:
+                    journal_recorded = False
+                    put({"info": "could not persist the Zotero reverted flags: "
+                                 f"{sanitise_error_msg(exc)}"})
+                finally:
+                    obsidian_manager.release_lock(epoch2)
+
+        results = [by_id.get(op["op_id"], {"op_id": op["op_id"], "kind": op.get("kind"),
+                   "ok": False, "status": "not_attempted", "message": "Restore stopped before this operation."})
+                   for op in ordered]
         reverted = sum(1 for r in results if r.get("status") == "reverted")
-        put({"restore": {"ok": True, "batch_id": batch_id,
-                         "reverted": reverted, "total": len(results),
-                         "results": results}})
+        unresolved = sum(1 for r in results if r.get("status") not in ("reverted", "already_reverted")
+                         and state_flips.get(r["op_id"]) != "reverted")
+        put({"restore": {"ok": unresolved == 0 and journal_recorded and not cancel.is_set(),
+                         "batch_id": batch_id, "reverted": reverted, "total": len(results),
+                         "unresolved": unresolved, "journal_recorded": journal_recorded,
+                         "cancelled": cancel.is_set(), "results": results}})
 
     return run_sse_worker(_worker, consumer_timeout_s=consumer_timeout_s)
+
+
+def _flip_early(vault_root, cfg, op_id, state):
+    """Persist an early-exit state flip (e.g. a 404 that means "gone for good")
+    for the single-op restore, which otherwise returns before the op-lock."""
+    if not state:
+        return
+    from rag.vault import obsidian_manager
+    epoch = obsidian_manager.try_acquire_lock(ttl=300)
+    if not epoch:
+        return
+    try:
+        manifest = journal.load(vault_root, cfg)
+        op = journal.find_op(manifest, op_id)
+        if op is not None and op.get("state") != state:
+            op["state"] = state
+            journal.save(vault_root, cfg, manifest)
+    except Exception:  # noqa: BLE001 — a missed flip only leaves the op retryable
+        logger.exception("could not persist an early restore state")
+    finally:
+        obsidian_manager.release_lock(epoch)
 
 
 @tagging_bp.route("/api/tagging/restore", methods=["POST"])
@@ -827,12 +1812,15 @@ def api_tagging_restore():
     # peek at the op kind needs the manifest, which is a cheap read; we re-load
     # it under the lock for the actual write so the save stays single-writer.
     try:
-        peek_manifest = journal.load(vault_root, cfg)
+        # One indexed SELECT rather than parsing the whole journal for one op
+        # (2026-09-02). PLAIN dict, never saved; the write below re-loads the
+        # real manifest under the op-lock.
+        peek_op = journal.peek_op(vault_root, cfg, op_id)
     except journal.ScopeError as exc:
         return jsonify({"error": str(exc)}), 400
-    except journal.JournalUnreadableError as exc:
+    except (journal.JournalUnreadableError,
+            journal.JournalTransientReadError) as exc:
         return jsonify({"error": sanitise_error_msg(exc)}), 503
-    peek_op = journal.find_op(peek_manifest, op_id)
     if peek_op is None:
         return jsonify({"error": "Unknown op id."}), 404
 
@@ -846,6 +1834,25 @@ def api_tagging_restore():
         if "early" in zotero_prepared:
             # Nothing to write (unreachable / changed-in-Zotero / no key): return
             # without ever taking the op-lock, so a wedged Zotero can't stall it.
+            return jsonify({**zotero_prepared["early"], "op_id": op_id})
+    elif peek_op.get("kind") in _NOTESYNC_ZOTERO_KINDS:
+        # Note sync's Zotero note ops (2026-09-04): same D4 split, read pre-lock.
+        from notesync import zotero_notes as _zn
+        zotero_prepared = _zn.revert_prepare(cfg, peek_op)
+        if "early" in zotero_prepared:
+            return jsonify({**zotero_prepared["early"], "op_id": op_id})
+    elif peek_op.get("kind") == "zotero_metadata_write":
+        # Bibliography-campaign metadata fields (2026-09-16): same split.
+        zotero_prepared = _revert_zotero_metadata_prepare(cfg, peek_op)
+        if "early" in zotero_prepared:
+            return jsonify({**zotero_prepared["early"], "op_id": op_id})
+    elif peek_op.get("kind") in ("zotero_child_reparent", "zotero_item_trash"):
+        # Record merge (2026-09-17): same split, read pre-lock.
+        fn = (_revert_zotero_child_reparent_prepare if peek_op.get("kind") == "zotero_child_reparent"
+              else _revert_zotero_item_trash_prepare)
+        zotero_prepared = fn(cfg, peek_op)
+        if "early" in zotero_prepared:
+            _flip_early(vault_root, cfg, op_id, zotero_prepared.get("state"))
             return jsonify({**zotero_prepared["early"], "op_id": op_id})
 
     op_epoch = obsidian_manager.try_acquire_lock(ttl=3600)
@@ -867,9 +1874,39 @@ def api_tagging_restore():
         # layer so the journal never imports api/finder/Zotero code.
         if kind in ("finder_tag", "finder_untag"):
             result = _revert_finder_tag(vault_root, cfg, op)
+        elif kind == "zotero_attachment_trash":
+            # Restores the attachment from Zotero's trash. One network call, so
+            # it rides the same locked path as a tag revert rather than needing
+            # the prepare/commit split (there is nothing to read first).
+            result = _revert_zotero_attachment(vault_root, cfg, op)
+        elif kind == "zotero_attachment_create":
+            # The inverse of a linked-file create is a trash (never a DELETE).
+            result = _revert_zotero_attachment_create(vault_root, cfg, op)
+        elif kind == "zotero_item_create":
+            # The inverse of an item create is a trash of the parent. It runs
+            # AFTER the attachment op in a batch (ops revert newest-first, and
+            # the attachment is journalled second), so by the time it fires our
+            # own child is already gone.
+            result = _revert_zotero_item_create(vault_root, cfg, op)
+        elif kind == "zotero_attachment_repath":
+            # Put the stored path back — exactly the string Zotero held, not
+            # one recomputed here.
+            result = _revert_zotero_attachment_repath(vault_root, cfg, op)
+        elif kind == "zotero_attachment_retitle":
+            # Put the title back, unless it was retitled again after us.
+            result = _revert_zotero_attachment_retitle(vault_root, cfg, op)
         elif kind in ("zotero_tag", "zotero_untag"):
             # The read already ran pre-lock; only the guarded PATCH runs here.
             result = _revert_zotero_commit_locked(zotero_prepared, op)
+        elif kind in _NOTESYNC_ZOTERO_KINDS:
+            from notesync import zotero_notes as _zn
+            result = _zn.revert_commit(zotero_prepared, op)
+        elif kind == "zotero_metadata_write":
+            result = _revert_zotero_metadata_commit(zotero_prepared, op)
+        elif kind == "zotero_child_reparent":
+            result = _revert_zotero_child_reparent_commit(zotero_prepared, op)
+        elif kind == "zotero_item_trash":
+            result = _revert_zotero_item_trash_commit(zotero_prepared, op)
         else:
             result = journal.revert_op(vault_root, cfg, op)
         journal.save(vault_root, cfg, manifest)
@@ -898,6 +1935,12 @@ def api_tagging_apply_all():
     still lands. A target key omitted from ``targets`` defaults ON. Returns
     ``{citation_key, results:{note,finder,zotero}}`` (HTTP 200); a per-target
     write error is carried inside its sub-result.
+
+    ``unit`` (optional, library-workflow lot 3): an import-tracker attachment
+    id. The Finder target is then THAT PDF only — not every PDF of the record
+    — found by identity, so a rename since the scan does not matter. A record
+    with two PDFs needs one call per unit for its Finder tags; the note and
+    Zotero targets are per record and simply converge (unions).
     """
     data = request.get_json(silent=True)
     ctx, err = _prepare_tag_write(data)
@@ -909,11 +1952,25 @@ def api_tagging_apply_all():
     if not isinstance(raw_targets, dict):
         raw_targets = {}
     # A target is ON unless the body explicitly sets it false (omitted ⇒ on).
-    want = {k: (coerce_bool(raw_targets.get(k)) is not False) for k in ("note", "finder", "zotero")}
+    want = {k: (coerce_bool(raw_targets.get(k)) is not False) for k in TAGGING_TARGETS}
     want_sha = coerce_string_max_len(data.get("content_sha256"), 64)
 
     rec = ctx["rec"]
     results: dict = {}
+
+    # Library-workflow lot 3: the maintenance run names the PDF by its import
+    # tracker UNIT, because a rename made earlier in the same run leaves the
+    # cached scan's path dead. Resolved before the lock (a stat, no I/O on
+    # the manifest); an unusable unit fails ONLY the Finder target.
+    unit_pdf, unit_err, unit_doc = (None, None, None)
+    if isinstance(data, dict) and data.get("unit") is not None and want["finder"]:
+        unit_pdf, unit_err = _unit_pdf(data.get("unit"), rec, ctx)
+        if unit_pdf is not None:
+            # Re-checked by the writer UNDER the lock, right before it reads
+            # the xattr: this pre-lock check alone left a window (the Zotero
+            # prepare phase, the lock wait) in which a replaced file would
+            # have been tagged (review 2026-09-21).
+            unit_doc = (imports_tracker.unit(ctx["settings"], data.get("unit")) or {}).get("doc")
 
     from api.routes import _finder_tagwrite
     from rag.vault import obsidian_manager
@@ -938,10 +1995,11 @@ def api_tagging_apply_all():
                                  "detail": (z_result or {}).get("error")}
                                 if z_status == 503
                                 else _target_result(z_result, z_status))
+                zotero_early["write_not_started"] = True
         except Exception as exc:  # noqa: BLE001
             logger.warning("apply-all zotero prepare failed for %s",
                            ctx["citation_key"], exc_info=True)
-            zotero_early = {"ok": False, "error": sanitise_error_msg(exc)}
+            zotero_early = {"ok": False, "error": sanitise_error_msg(exc), "write_not_started": True}
 
     op_epoch = obsidian_manager.try_acquire_lock(ttl=3600)
     if not op_epoch:
@@ -1005,12 +2063,16 @@ def api_tagging_apply_all():
         if want["finder"]:
             if not _finder_tagwrite.is_macos():
                 results["finder"] = {"ok": False, "skipped": "not_macos"}
+            elif unit_err is not None:
+                results["finder"] = unit_err
             else:
                 def _finder():
                     r, s = _finder_write_locked(
                         rec=rec, valid=ctx["valid"], rejected=ctx["rejected"], cfg=ctx["cfg"],
                         vault_root=ctx["vault_root"], biblio_dir=ctx["biblio_dir"],
-                        citation_key=ctx["citation_key"], manifest=shared_manifest)
+                        citation_key=ctx["citation_key"], manifest=shared_manifest,
+                        pdf_paths=[unit_pdf] if unit_pdf is not None else None,
+                        expect_doc=unit_doc)
                     return ({"ok": False, "skipped": "no_pdf"} if s == 404
                             else _target_result(r, s))
                 _isolated("finder", _finder)
@@ -1072,11 +2134,18 @@ def api_tagging_remove_tags():
     raw_targets = data.get("targets") if isinstance(data, dict) else None
     if not isinstance(raw_targets, dict):
         raw_targets = {}
-    want = {k: (coerce_bool(raw_targets.get(k)) is not False) for k in ("note", "finder", "zotero")}
+    want = {k: (coerce_bool(raw_targets.get(k)) is not False) for k in TAGGING_TARGETS}
     want_sha = coerce_string_max_len(data.get("content_sha256"), 64)
 
     rec = ctx["rec"]
     results: dict = {}
+
+    # `unit` addressing (library-workflow lot 3) is apply-all's only; a
+    # removal naming one would otherwise be silently resolved from the scan
+    # path instead — refuse rather than remove from a file nobody named.
+    if isinstance(data, dict) and data.get("unit") is not None:
+        return jsonify({"error": "unit is accepted by apply-all only; "
+                                 "use pdf_rel to address a file here."}), 400
 
     from api.routes import _finder_tagwrite
     from rag.vault import obsidian_manager
@@ -1091,7 +2160,7 @@ def api_tagging_remove_tags():
     # Zotero READ phase before the lock (apply-all's rationale verbatim).
     zotero_prepared = None
     zotero_early = None
-    if want["zotero"] and rec.zotero_item is not None:
+    if want["zotero"] and rec is not None and rec.zotero_item is not None:
         try:
             zotero_prepared, z_result, z_status = _zotero_remove_prepare(
                 rec=rec, valid=ctx["valid"], cfg=ctx["cfg"],
@@ -1134,7 +2203,12 @@ def api_tagging_remove_tags():
 
     try:
         if want["note"]:
-            if rec.obsidian_note is None:
+            # Path-addressed (rec is None): a note is reached THROUGH the
+            # record, so with no record there is nothing to name. Same
+            # skip-with-reason shape as an absent note on the keyed path.
+            if rec is None:
+                results["note"] = {"ok": False, "skipped": "no_record"}
+            elif rec.obsidian_note is None:
                 results["note"] = {"ok": False, "skipped": "no_note"}
             else:
                 def _note():
@@ -1152,12 +2226,15 @@ def api_tagging_remove_tags():
                     r, s = _finder_remove_locked(
                         rec=rec, valid=ctx["valid"], cfg=ctx["cfg"],
                         vault_root=ctx["vault_root"], biblio_dir=ctx["biblio_dir"],
-                        citation_key=ctx["citation_key"], manifest=shared_manifest)
+                        citation_key=ctx["citation_key"], manifest=shared_manifest,
+                        pdf_paths=ctx.get("pdf_paths"))
                     return ({"ok": False, "skipped": "no_pdf"} if s == 404
                             else _removal_result(r, s))
                 _isolated("finder", _finder)
         if want["zotero"]:
-            if rec.zotero_item is None:
+            if rec is None:
+                results["zotero"] = {"ok": False, "skipped": "no_record"}
+            elif rec.zotero_item is None:
                 results["zotero"] = {"ok": False, "skipped": "no_item"}
             elif zotero_early is not None:
                 results["zotero"] = zotero_early
@@ -1182,12 +2259,20 @@ def api_tagging_remove_tags():
     finally:
         obsidian_manager.release_lock(op_epoch)
 
-    return jsonify({"citation_key": ctx["citation_key"], "results": results}), 200
+    return jsonify({"citation_key": ctx["citation_key"],
+                    "pdf_rel": ctx.get("pdf_rel"), "results": results}), 200
 
 
 # ---------------------------------------------------------------------------
 # Vault-wide tag retirement (Batch G, 2026-07-22): one tag → every store
 # ---------------------------------------------------------------------------
+
+# Hoisted to api/routes/_batch_journal.py 2026-08-30 so the Zotero de-link
+# route can bind the same checkpoint/heartbeat discipline rather than grow a
+# third copy. Re-exported here: `api.routes.tagging._BatchJournalKeeper` is an
+# established patch target.
+from api.routes._batch_journal import _BatchJournalKeeper  # noqa: E402
+
 
 @tagging_bp.route("/api/tagging/retire-tag", methods=["POST"])
 def api_tagging_retire_tag():
@@ -1209,6 +2294,16 @@ def api_tagging_retire_tag():
     (journalled snapshot, kind ``vocab_retire`` — reversible like a note op).
     No vocabulary gate (removal targets what exists). Terminal frame:
     ``{"retire": {tag, batch_id, results, vocab_rows, failures}}``.
+
+    **Finder coverage (2026-08-12).** The candidate loop below reads
+    ``inv.records``, so it could only ever see PDFs the bridge mapped to a
+    citation key — a retire left the tag in place on the ~1250 unmapped /
+    ambiguous / not-in-bib biblio PDFs, the same blindness Tag Hygiene had on
+    the read side. Those PDFs are now enumerated by a direct xattr sweep and
+    written through the PATH-addressed form of ``_finder_remove_locked``, so
+    there is still exactly one Finder write path and their ops revert
+    unchanged. Still out of reach, by design: Zotero child-note tags and
+    ``.bib`` keywords (see Known Issues).
     """
     import uuid as _uuid
 
@@ -1224,7 +2319,7 @@ def api_tagging_retire_tag():
     raw_targets = data.get("targets")
     if not isinstance(raw_targets, dict):
         raw_targets = {}
-    want = {k: (coerce_bool(raw_targets.get(k)) is not False) for k in ("note", "finder", "zotero")}
+    want = {k: (coerce_bool(raw_targets.get(k)) is not False) for k in TAGGING_TARGETS}
     include_vocab = coerce_bool(data.get("include_vocab")) is True
 
     inv, settings = audit_manager.get_inventory()
@@ -1233,39 +2328,76 @@ def api_tagging_retire_tag():
     cfg = load_config()
     vault_root = settings.vault_root
     biblio_dir = settings.biblio_articles_dir
-    tl = tag.lower()
+    # `_tag_key`, not `.lower()`: macOS stores Finder tags in NFD, and the
+    # writers these candidates feed are NFC-insensitive. A `.lower()` sweep
+    # therefore MISSED an NFD-stored spelling that `_finder_remove_locked`
+    # would happily have removed — the tag survived while the terminal frame
+    # reported a clean retire, which is the "floor presented as a total" shape
+    # the unmapped-PDF work was written to end.
+    tl = _tag_key(tag)
 
     note_keys: list[str] = []
     finder_keys: list[str] = []
     zotero_keys: list[str] = []
     for key, rec in inv.records.items():
         if want["note"] and rec.obsidian_note is not None \
-                and tl in {str(t).lower() for t in (rec.obs_tags or [])}:
+                and tl in {_tag_key(t) for t in (rec.obs_tags or [])}:
             note_keys.append(key)
-        if want["finder"] and tl in {str(t).lower() for t in (rec.finder_tag_set or set())} \
+        if want["finder"] and tl in {_tag_key(t) for t in (rec.finder_tag_set or set())} \
                 and any(_is_under(Path(p), biblio_dir) for p in rec.pdf_paths):
             finder_keys.append(key)
         if want["zotero"] and rec.zotero_item is not None \
-                and tl in {str(t).lower() for t in (rec.zotero_item.tags or [])}:
+                and tl in {_tag_key(t) for t in (rec.zotero_item.tags or [])}:
             zotero_keys.append(key)
 
     from api.routes import _finder_tagwrite
     from rag.vault import obsidian_manager
 
+    # Unmapped biblio PDFs (2026-08-12). The loop above iterates `inv.records`,
+    # the citation-key join, so a PDF the bridge never mapped is invisible to
+    # it — the same blindness Tag Hygiene had on the READ side, here on the
+    # WRITE side: `[retire]` silently left those copies of the tag in place.
+    # These PDFs have no Record, so they are addressed by PATH, reusing the
+    # `pdf_paths=` form of `_finder_remove_locked` rather than a new write path.
+    # Enumerating means an xattr sweep of the residual buckets (~1250 files,
+    # ~0.3 s) — paid once per retire, which is a confirmed write, not a poll.
+    finder_pdfs: list[Path] = []
+    if want["finder"] and _finder_tagwrite.is_macos():
+        from audit.core import finder_tags as _ft
+        bridge = getattr(inv, "bridge", None)
+        residual: list[Path] = []
+        for attr in ("unmapped_pdfs", "ambiguous_pdfs", "confirmed_no_match_pdfs"):
+            # `ambiguous_pdfs` is a dict keyed by Path; iterating yields keys.
+            residual.extend(p for p in (getattr(bridge, attr, None) or [])
+                            if isinstance(p, Path))
+        for p in residual:
+            if not _is_under(p, biblio_dir):
+                continue
+            try:
+                names = _ft.read_tag_names(p)
+            except Exception:  # noqa: BLE001 — one unreadable PDF must not abort
+                continue
+            if tl in {_tag_key(t) for t in names}:
+                finder_pdfs.append(p)
+
     if not _finder_tagwrite.is_macos():
         finder_keys = []
+        finder_pdfs = []
 
     consumer_timeout_s = SSE_SINGLE_SHOT_FLOOR_S + SSE_STALL_MARGIN_S
 
     def _worker(put, cancel):
         batch_id = _uuid.uuid4().hex[:12]
         counts = {t: {"removed": 0, "skipped": 0, "failed": 0}
-                  for t in ("note", "finder", "zotero")}
+                  for t in TAGGING_TARGETS}
         failures: list[str] = []
-        total = len(note_keys) + len(finder_keys) + len(zotero_keys)
+        total = (len(note_keys) + len(finder_keys) + len(finder_pdfs)
+                 + len(zotero_keys))
+        unmapped_note = (f" (+{len(finder_pdfs)} unmapped PDF(s))"
+                         if finder_pdfs else "")
         put({"info": f"Retiring '{tag}': {len(note_keys)} note(s), "
-                     f"{len(finder_keys)} PDF record(s), {len(zotero_keys)} "
-                     f"Zotero item(s) from the last scan."})
+                     f"{len(finder_keys)} PDF record(s){unmapped_note}, "
+                     f"{len(zotero_keys)} Zotero item(s) from the last scan."})
 
         # Phase 1 — Zotero READS before the lock (apply-all discipline).
         z_prepared: dict[str, dict | None] = {}
@@ -1304,9 +2436,7 @@ def api_tagging_retire_tag():
             return
         vocab_rows = 0
         stamped: list[str] = []
-        lock_lost = False
         patch_jobs: list[tuple[str, dict, str]] = []  # (key, prepared, op_id)
-        pending_saves = 0
         try:
             try:
                 manifest = journal.load(vault_root, cfg)
@@ -1323,40 +2453,20 @@ def api_tagging_retire_tag():
                 if op_id:
                     stamped.append(op_id)
 
-            # Manifest checkpointing (refactor/apply.py JOURNAL_FLUSH_EVERY
-            # precedent): the writers run defer_save=True and we persist every
-            # 25 ops + force-save before anything that must be durable (the
-            # vocab write's journal-before-write, the lock release). Per-op
-            # note snapshots stay durable regardless — only the op-record
-            # persistence is batched, so a crash costs ≤25 op records while
-            # their snapshots + log_vault_write trail survive.
-            def _bump_save(force=False):
-                nonlocal pending_saves
-                if not force:
-                    pending_saves += 1
-                if pending_saves and (force or pending_saves >= 25):
-                    journal.save(vault_root, cfg, manifest)
-                    pending_saves = 0
-
-            done = 0
-
-            def _tick(label):
-                nonlocal done, lock_lost
-                done += 1
-                # Act on a False heartbeat (CLAUDE.md Limits discipline —
-                # "never discard it"): a lapsed TTL means another writer may
-                # own the lock, so we stop writing, including manifest saves
-                # (saving into a manifest we no longer own could clobber the
-                # new owner's ops — worse than losing ≤25 of our op records).
-                if not obsidian_manager.heartbeat(op_epoch):
-                    lock_lost = True
-                put({"info": f"[{done}/{total}] {label}"})
+            # Checkpointing + heartbeat: the shared _BatchJournalKeeper (see
+            # its docstring — refactor/apply.py's JOURNAL_FLUSH_EVERY
+            # precedent, merge-save after a lost lock).
+            keeper = _BatchJournalKeeper(
+                vault_root=vault_root, cfg=cfg, manifest=manifest,
+                op_epoch=op_epoch, put=put, total=total,
+                manager=obsidian_manager)
+            _bump_save, _tick = keeper.bump_save, keeper.tick
 
             for key in note_keys:
-                if cancel.is_set() or lock_lost:
+                if cancel.is_set() or keeper.lock_lost:
                     break
                 _tick(f"note {key}")
-                if lock_lost:
+                if keeper.lock_lost:
                     break
                 try:
                     r, s = _note_remove_locked(
@@ -1377,10 +2487,10 @@ def api_tagging_retire_tag():
                     _bump_save()  # a failed op record is still an op record
 
             for key in finder_keys:
-                if cancel.is_set() or lock_lost:
+                if cancel.is_set() or keeper.lock_lost:
                     break
                 _tick(f"finder {key}")
-                if lock_lost:
+                if keeper.lock_lost:
                     break
                 try:
                     r, s = _finder_remove_locked(
@@ -1401,13 +2511,42 @@ def api_tagging_retire_tag():
                     failures.append(f"finder {key}: {r.get('error')}")
                     _bump_save()
 
+            # Unmapped biblio PDFs — same writer, addressed by path because
+            # they have no Record. Tallied into the `finder` counters: from the
+            # user's side it is one target, and splitting the count would imply
+            # a distinction the confirm text never made.
+            for pdf in finder_pdfs:
+                if cancel.is_set() or keeper.lock_lost:
+                    break
+                _tick(f"finder {pdf.name}")
+                if keeper.lock_lost:
+                    break
+                try:
+                    r, s = _finder_remove_locked(
+                        rec=None, valid=[tag], cfg=cfg,
+                        vault_root=vault_root, biblio_dir=biblio_dir,
+                        citation_key=None, manifest=manifest,
+                        batch_id=batch_id, defer_save=True, pdf_paths=[pdf])
+                except Exception as exc:  # noqa: BLE001
+                    r, s = {"error": sanitise_error_msg(exc)}, 500
+                if s == 200 and r.get("removed"):
+                    counts["finder"]["removed"] += 1
+                    _stamp(r.get("op_id"))
+                    _bump_save()
+                elif s in (200, 400, 404):
+                    counts["finder"]["skipped"] += 1
+                else:
+                    counts["finder"]["failed"] += 1
+                    failures.append(f"finder {pdf.name}: {r.get('error')}")
+                    _bump_save()
+
             # Zotero: journal the ops now (append + one save with the rest),
             # PATCH after release. Journalling BEFORE the PATCH keeps the
             # crash/cancel trail conservative — an op whose PATCH never ran
             # reverts by re-adding tags that were never removed, an
             # idempotent no-op (see _zotero_remove_journal).
             for key in zotero_keys:
-                if cancel.is_set() or lock_lost:
+                if cancel.is_set() or keeper.lock_lost:
                     break
                 prepared = z_prepared.get(key)
                 if prepared is None:
@@ -1424,7 +2563,7 @@ def api_tagging_retire_tag():
             # Force-checkpoint first so the vocab block's own
             # journal-before-write save is not carrying unrelated deferred ops.
             _bump_save(force=True)
-            if include_vocab and not cancel.is_set() and not lock_lost:
+            if include_vocab and not cancel.is_set() and not keeper.lock_lost:
                 from core.utils import log_vault_write, write_text_atomic
                 from tagging.vocab import retire_tag_from_vocab
                 _vocab, vocab_rel = _read_vocab(cfg, vault_root)
@@ -1477,11 +2616,12 @@ def api_tagging_retire_tag():
                         failures.append(f"vocab: {sanitise_error_msg(exc)}")
 
             _bump_save(force=True)
-            if lock_lost:
+            if keeper.lock_lost:
                 failures.append(
-                    "op-lock TTL lapsed mid-batch; remaining writes skipped "
-                    "and the last few op records may be unpersisted")
-            if not patch_jobs and not lock_lost:
+                    "op-lock TTL lapsed mid-batch; remaining writes were "
+                    "skipped, and already-performed writes' journal records "
+                    "were merged into the on-disk manifest")
+            if not patch_jobs and not keeper.lock_lost:
                 try:
                     # protect_batch_id: without it, a retire touching more
                     # notes than the journal's op cap would evict its OWN
@@ -1512,21 +2652,21 @@ def api_tagging_retire_tag():
                 counts["zotero"]["failed"] += 1
                 failures.append(f"zotero {key}: cancelled before the write")
                 continue
-            done += 1
-            put({"info": f"[{done}/{total}] zotero {key}"})
+            keeper.done += 1
+            put({"info": f"[{keeper.done}/{total}] zotero {key}"})
             try:
                 r, s, new_version = _zotero_remove_patch(prepared)
             except Exception as exc:  # noqa: BLE001
-                r, s, new_version = {"error": sanitise_error_msg(exc)}, 500, None
+                r, s, new_version = {"error": sanitise_error_msg(exc), "outcome_unknown": True}, 500, None
             if s == 200:
-                outcomes.append((op_id, {"version_after": new_version}))
+                outcomes.append((op_id, {"state": "applied", "version_after": new_version}))
                 counts["zotero"]["removed"] += 1
                 _stamp(op_id)
                 _log_vw("tagging_zotero_tag_remove", prepared["item_key"],
                         f"-{len(prepared['removed'])} tags: "
                         f"{', '.join(prepared['removed'])}")
             else:
-                outcomes.append((op_id, {"state": "failed"}))
+                outcomes.append((op_id, {"state": "outcome_unknown" if r.get("outcome_unknown") else "failed"}))
                 counts["zotero"]["failed"] += 1
                 failures.append(f"zotero {key}: {r.get('error')}")
 
@@ -1568,6 +2708,497 @@ def api_tagging_retire_tag():
             "tag": tag, "batch_id": batch_id if stamped else "",
             "results": counts, "vocab_rows": vocab_rows,
             "op_count": len(stamped), "failures": failures,
+        }})
+
+    return run_sse_worker(_worker, consumer_timeout_s=consumer_timeout_s)
+
+
+_HARMONIZE_MAX_KEYS = 2000
+
+# The batch's own one-click undo is only honest while its ops survive in the
+# manifest, and `protect_batch_id` shields them from THIS request's prune only.
+# `journal.prune`'s cap loop never evicts an applied finder/zotero op (their
+# before-lists live inline, with no snapshot file behind them) but note ops ARE
+# evictable: they age out of the `_MAX_OPS`-deep evictable retention window
+# (2026-08-13 — the window is now real; the cap budget previously counted the
+# never-evictable ops too, so a triage-crowded manifest evicted EVERY note op
+# on the very next write). A batch whose note writes exceed the window would
+# still have its earliest ops dropped, snapshots and all, by later writes. A
+# 500-paper harmonize followed by 100 deck Accepts would silently lose the undo
+# for its earliest notes while the button still offered it.
+#
+# Half the window, so pre-existing note ops of ordinary number cannot push the
+# batch over on their own. This is a REFUSAL rather than a warning: the confirm
+# dialog promises "undoable in one click", and a promise the journal cannot
+# keep is worse than making the user run two batches.
+_HARMONIZE_MAX_NOTE_OPS = journal._MAX_OPS // 2
+
+
+def _harmonize_plan(inv, settings, cfg, keys, want):
+    """Resolve the per-record union into vocabulary-gated per-target tag lists.
+
+    Returns ``(plan, out_of_vocab, missing_keys)`` where ``plan`` is a list of
+    ``(citation_key, {target: [vocab ids]})`` for records with something to
+    write. ``missing_keys`` names every selected key that yields no write:
+    unknown keys, rows with nothing to harmonize, AND rows whose every missing
+    surface resolved to nothing writable — so ``len(plan) + len(missing_keys)``
+    always accounts for the whole selection.
+
+    The union is computed SERVER-SIDE from the cached record — the client sends
+    only citation keys. That is the same posture as every other tag write here
+    (the client never supplies the bytes that land), and it means the report,
+    the confirm dialog and the write can't disagree about what "the union" is:
+    all three come from ``find_harmony`` with the same injected synonym map.
+
+    Two resolution steps, in this order, and the order matters:
+
+    1. ``_vocab_id_resolver`` maps each drift surface to the exact ``_tags.md``
+       id sharing its canonical key. The report compares by OpenRefine
+       fingerprint; the writers gate on the LITERAL id under ``nfc().lower()``,
+       which folds neither accents nor separators. Skipping this step would
+       drop every accented or hyphenated tag as out-of-vocabulary while the
+       row reappeared at the next scan — the unresolvable-row loop that
+       ``apply-tag-drift`` already had to be fixed for once.
+    2. ``_canonicalise_tags`` re-gates the resolved ids against the vocabulary.
+       Belt and braces: the resolver is advisory (it returns ``None`` when
+       ``_tags.md`` is unavailable), and this is the security gate every tag
+       write in this module shares. It must not be bypassed just because the
+       ids came from our own resolver.
+
+    A surface that resolves to nothing is REPORTED, never auto-added: admitting
+    a new vocabulary term is a separate, separately-confirmed decision
+    (``add-vocab-tag``), and a batch that quietly grew the controlled vocabulary
+    would defeat the point of having one.
+    """
+    from api.routes.audit import _drift_synonyms, _vocab_id_resolver
+    from audit.engine.reports import tag_harmony as r_tag_harmony
+
+    vocab, _rel = _read_vocab(cfg, settings.vault_root)
+    resolve = _vocab_id_resolver(settings)
+    rows = {r.citation_key: r for r in r_tag_harmony.find_harmony(
+        inv, synonyms=_drift_synonyms(settings))}
+
+    plan: list[tuple[str, dict[str, list[str]]]] = []
+    out_of_vocab: set[str] = set()
+    missing_keys: list[str] = []
+    for key in keys:
+        row = rows.get(key)
+        if row is None:
+            # Either an unknown key or one with nothing to harmonize. Both are
+            # reported rather than silently dropped: a selection built from a
+            # stale report should say so, not look like it worked.
+            missing_keys.append(key)
+            continue
+        per_target: dict[str, list[str]] = {}
+        for target, surfaces in (("note", row.missing_in_note),
+                                 ("finder", row.missing_in_finder),
+                                 ("zotero", row.missing_in_zotero)):
+            if not want[target] or not surfaces:
+                continue
+            ids: list[str] = []
+            for surface in sorted(surfaces):
+                vid = resolve(surface) if resolve is not None else None
+                if vid:
+                    ids.append(vid)
+                else:
+                    out_of_vocab.add(surface)
+            if not ids or not vocab:
+                continue
+            valid, _rejected = _canonicalise_tags(ids, vocab)
+            if valid:
+                per_target[target] = valid
+        if per_target:
+            plan.append((key, per_target))
+        else:
+            # A selected row whose every missing surface resolved to nothing
+            # writable (out-of-vocab, or filtered by `want`): report it like
+            # an unknown key rather than letting the terminal `records` count
+            # shrink without attribution (2026-08-18 — this class landed in
+            # neither bucket, two lines under a comment claiming otherwise).
+            missing_keys.append(key)
+    return plan, sorted(out_of_vocab), missing_keys
+
+
+@tagging_bp.route("/api/tagging/harmonize", methods=["POST"])
+def api_tagging_harmonize():
+    """Propagate each selected record's tag union to its writable surfaces (SSE).
+
+    Body ``{keys:[...], targets?{note,finder,zotero}, confirm:true}``. For every
+    requested citation key the server computes the union of the tags already
+    present on that record's note / Finder / Zotero-parent surfaces and writes
+    whatever each surface is missing. **Purely additive** — nothing is ever
+    removed, so an unwanted tag stays the removal path's job.
+
+    Selection-driven by design, not library-wide. The tagging journal is the
+    binding constraint: every write rewrites the whole manifest, which is
+    already ~3 MB, and a full-library harmonize would add thousands of ops and
+    permanently raise the cost of every future single tag write. Capped at
+    ``_HARMONIZE_MAX_KEYS`` keys per call for the same reason.
+
+    Lock choreography is ``retire-tag``'s, for the same reasons (2026-07-23):
+    Zotero GETs BEFORE the op-lock; vault-local writes + ALL journal appends
+    under ONE hold with a per-record heartbeat that is acted on and the
+    manifest checkpointed every 25 ops; Zotero PATCHes AFTER release
+    (lock-free — the ``If-Unmodified-Since-Version`` guard, not the lock,
+    prevents lost updates, and N sequential PATCHes under the lock would
+    freeze indexing for the whole batch); then a short second hold to record
+    the PATCH outcomes and prune with the batch protected from cap-eviction.
+
+    Every op carries a shared ``batch_id``, so the whole run is undone by the
+    existing ``POST /api/tagging/restore {batch_id}``.
+
+    Terminal frame ``{"harmonize": {batch_id, results, records, op_count,
+    out_of_vocab, unresolved_keys, failures}}``.
+    """
+    import uuid as _uuid
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON"}), 400
+    if coerce_bool(data.get("confirm")) is not True:
+        return jsonify({"error": "Harmonize must be explicitly confirmed (confirm: true)."}), 400
+    raw_keys = data.get("keys")
+    if not isinstance(raw_keys, list) or not raw_keys:
+        return jsonify({"error": "keys must be a non-empty list"}), 400
+    keys: list[str] = []
+    bad: list[str] = []
+    for k in raw_keys:
+        ck = coerce_non_empty_string(k, max_len=128)
+        if ck is None:
+            # Name what failed instead of silently dropping it — the CLI half
+            # of this feature already refuses malformed keys by name, and a
+            # dropped key here would read as "already harmonized".
+            bad.append(repr(k)[:48])
+        elif ck not in keys:
+            keys.append(ck)
+    if bad:
+        return jsonify({
+            "error": f"Invalid citation key value(s): {', '.join(bad[:5])}"
+                     + ("…" if len(bad) > 5 else ""),
+        }), 400
+    if not keys:
+        return jsonify({"error": "keys must be a non-empty list"}), 400
+    # Checked AFTER coercion + dedup: the cap bounds the journal growth of a
+    # real run, so 2001 duplicates of one key must not be refused.
+    if len(keys) > _HARMONIZE_MAX_KEYS:
+        return jsonify({
+            "error": f"Too many keys (max {_HARMONIZE_MAX_KEYS} per request). "
+                     f"Harmonize in batches — each write appends to the "
+                     f"restore journal.",
+        }), 400
+
+    raw_targets = data.get("targets")
+    if not isinstance(raw_targets, dict):
+        raw_targets = {}
+    want = {k: (coerce_bool(raw_targets.get(k)) is not False) for k in TAGGING_TARGETS}
+
+    inv, settings = audit_manager.get_inventory()
+    if inv is None or settings is None:
+        return jsonify({"error": "No scan results. Run an audit scan first."}), 404
+    cfg = load_config()
+    vault_root = settings.vault_root
+    biblio_dir = settings.biblio_articles_dir
+
+    from api.routes import _finder_tagwrite
+    from rag.vault import obsidian_manager
+
+    if not _finder_tagwrite.is_macos():
+        want["finder"] = False
+
+    try:
+        plan, out_of_vocab, unresolved = _harmonize_plan(
+            inv, settings, cfg, keys, want)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("harmonize planning failed", exc_info=True)
+        return jsonify({"error": sanitise_error_msg(exc)}), 500
+
+    if not plan:
+        # Decided before streaming starts, so it keeps a real status code.
+        return jsonify({
+            "error": "Nothing to harmonize for those keys.",
+            "out_of_vocab": out_of_vocab,
+            "unresolved_keys": unresolved,
+        }), 400
+
+    # A batch containing Zotero work must be eligible before any Finder/note
+    # effect starts. The per-item guard remains authoritative at dispatch.
+    zotero_keys = [key for key, targets in plan if "zotero" in targets]
+    if zotero_keys:
+        from tagging import local_api
+        from tagging.writers import _zotero_read_identity
+
+        transport = zotero_write.resolve_transport(cfg)
+        if transport.is_web:
+            return jsonify({"error": (
+                "This selection comes from Zotero Desktop. Writing via Web requires "
+                "an independently verified Web selection; no request was sent. "
+                "Authorize Zotero Desktop in Tagging, then review this selection again."),
+                "zotero_keys": len(zotero_keys)}), 409
+        try:
+            for key in zotero_keys:
+                _zotero_read_identity(transport, inv.records[key].zotero_item)
+            state = local_api.capabilities(transport.base_url,
+                                           opener=zotero_write._opener, timeout=3)
+        except zotero_write.ZoteroError as exc:
+            return jsonify({"error": sanitise_error_msg(exc),
+                            "zotero_keys": len(zotero_keys)}), 409
+        except Exception:
+            return jsonify({"error": "Zotero Desktop is unavailable. Open Zotero, authorize "
+                            "CHERQAiN in Tagging, then review this selection again.",
+                            "zotero_keys": len(zotero_keys)}), 409
+        if not (state['authorized'] and state['supports_writes']):
+            return jsonify({"error": "Zotero Desktop is not authorized for tag writes. "
+                            "Use Authorize Zotero Desktop in Tagging, then review this selection again.",
+                            "zotero_keys": len(zotero_keys)}), 409
+
+    # Bound the batch by the ops the journal can actually RETAIN, not just by
+    # the keys requested — see _HARMONIZE_MAX_NOTE_OPS. Checked after planning
+    # because it is the note writes that matter, not the selection size: 500
+    # papers of which 30 need a note write is fine, 150 that all do is not.
+    note_ops = sum(1 for _k, t in plan if "note" in t)
+    if note_ops > _HARMONIZE_MAX_NOTE_OPS:
+        return jsonify({
+            "error": (
+                f"This selection needs {note_ops} note writes, more than the "
+                f"restore journal can keep ({_HARMONIZE_MAX_NOTE_OPS}). The "
+                f"one-click undo would be silently incomplete after the next "
+                f"tag write, so harmonize in smaller batches."),
+            "note_ops": note_ops,
+            "max_note_ops": _HARMONIZE_MAX_NOTE_OPS,
+        }), 400
+
+    consumer_timeout_s = SSE_SINGLE_SHOT_FLOOR_S + SSE_STALL_MARGIN_S
+
+    def _worker(put, cancel):
+        batch_id = _uuid.uuid4().hex[:12]
+        counts = {t: {"written": 0, "skipped": 0, "failed": 0}
+                  for t in TAGGING_TARGETS}
+        failures: list[str] = []
+        stamped: list[str] = []
+        # `total` drives the [done/total] counter, so it counts the UNITS OF
+        # WORK — one per (record, target) — while the message quotes the tag
+        # count, which is what the report's meta line and the confirm dialog
+        # promised. Conflating the two made a run the confirm announced as
+        # "37 tags" stream "[12/12]".
+        total = sum(len(t) for _k, t in plan)
+        tag_writes = sum(len(ids) for _k, t in plan for ids in t.values())
+        put({"info": f"Harmonizing {len(plan)} paper(s): {tag_writes} tag "
+                     f"write(s) across {total} target(s)."})
+        if out_of_vocab:
+            put({"info": f"{len(out_of_vocab)} tag(s) skipped — absent from "
+                         f"_tags.md: {', '.join(out_of_vocab[:8])}"
+                         + ("…" if len(out_of_vocab) > 8 else "")})
+
+        # Phase 1 — Zotero READS before the lock (apply-all discipline).
+        z_prepared: dict[str, dict | None] = {}
+        for key, targets in plan:
+            if "zotero" not in targets:
+                continue
+            if cancel.is_set():
+                return
+            put({"info": f"Zotero: reading {key}…"})
+            try:
+                prepared, res, status = _zotero_prepare(
+                    rec=inv.records[key], valid=targets["zotero"], rejected=[],
+                    cfg=cfg, citation_key=key)
+                z_prepared[key] = prepared
+                if prepared is None:
+                    if status == 200:
+                        counts["zotero"]["skipped"] += 1
+                    else:
+                        counts["zotero"]["failed"] += 1
+                        failures.append(
+                            f"zotero {key}: {(res or {}).get('error', status)}")
+            except Exception as exc:  # noqa: BLE001
+                z_prepared[key] = None
+                counts["zotero"]["failed"] += 1
+                failures.append(f"zotero {key}: {sanitise_error_msg(exc)}")
+
+        # Phase 2 — vault-local writes + ALL journal appends under one hold.
+        op_epoch = obsidian_manager.try_acquire_lock(ttl=3600)
+        if not op_epoch:
+            put({"error": "Indexing is in progress; try again shortly."})
+            return
+        patch_jobs: list[tuple[str, dict, str]] = []
+        try:
+            try:
+                manifest = journal.load(vault_root, cfg)
+            except (journal.ScopeError, journal.JournalUnreadableError) as exc:
+                put({"error": sanitise_error_msg(exc)})
+                return
+
+            # Checkpointing + heartbeat: the shared _BatchJournalKeeper
+            # (retire's discipline, hoisted — see its docstring).
+            keeper = _BatchJournalKeeper(
+                vault_root=vault_root, cfg=cfg, manifest=manifest,
+                op_epoch=op_epoch, put=put, total=total,
+                manager=obsidian_manager)
+            _bump_save, _tick = keeper.bump_save, keeper.tick
+
+            for key, targets in plan:
+                if cancel.is_set() or keeper.lock_lost:
+                    break
+                rec = inv.records[key]
+                if "note" in targets:
+                    _tick(f"note {key}")
+                    if keeper.lock_lost:
+                        break
+                    try:
+                        r, s = _note_write_locked(
+                            rec=rec, valid=targets["note"], rejected=[],
+                            want_sha=None, cfg=cfg, vault_root=vault_root,
+                            citation_key=key, manifest=manifest,
+                            batch_id=batch_id, defer_save=True)
+                    except Exception as exc:  # noqa: BLE001
+                        r, s = {"error": sanitise_error_msg(exc)}, 500
+                    if s == 200 and r.get("added"):
+                        counts["note"]["written"] += 1
+                        stamped.append(r.get("op_id"))
+                        _bump_save()
+                    elif s == 200:
+                        counts["note"]["skipped"] += 1
+                    else:
+                        counts["note"]["failed"] += 1
+                        failures.append(f"note {key}: {r.get('error')}")
+                        _bump_save()
+
+                if "finder" in targets:
+                    if cancel.is_set() or keeper.lock_lost:
+                        break
+                    _tick(f"finder {key}")
+                    if keeper.lock_lost:
+                        break
+                    try:
+                        r, s = _finder_write_locked(
+                            rec=rec, valid=targets["finder"], rejected=[],
+                            cfg=cfg, vault_root=vault_root,
+                            biblio_dir=biblio_dir, citation_key=key,
+                            manifest=manifest, batch_id=batch_id,
+                            defer_save=True)
+                    except Exception as exc:  # noqa: BLE001
+                        r, s = {"error": sanitise_error_msg(exc)}, 500
+                    if s == 200 and r.get("added"):
+                        counts["finder"]["written"] += 1
+                        stamped.append(r.get("op_id"))
+                        _bump_save()
+                    elif s in (200, 404):
+                        counts["finder"]["skipped"] += 1
+                    else:
+                        counts["finder"]["failed"] += 1
+                        failures.append(f"finder {key}: {r.get('error')}")
+                        _bump_save()
+
+                # Zotero: journal now, PATCH after the lock is released. Only
+                # the SKIPPED ones tick here — a queued op is ticked in phase 3
+                # when its PATCH actually runs, so [done/total] counts each
+                # unit once (retire's discipline; ticking in both phases made
+                # the counter overshoot its own total).
+                if "zotero" in targets:
+                    if cancel.is_set() or keeper.lock_lost:
+                        break
+                    prepared = z_prepared.get(key)
+                    if prepared is None:
+                        _tick(f"zotero {key} (skipped)")
+                        continue
+                    op = _zotero_journal(prepared=prepared, citation_key=key,
+                                         manifest=manifest, batch_id=batch_id)
+                    patch_jobs.append((key, prepared, op["op_id"]))
+                    _bump_save()
+
+            _bump_save(force=True)
+            if keeper.lock_lost:
+                failures.append(
+                    "the operation lock lapsed mid-batch; remaining writes "
+                    "were skipped (nothing already written was lost)")
+            # `not keeper.lock_lost` matters as much as `not patch_jobs`: a lapsed TTL
+            # means another writer may own the lock, and pruning + saving into
+            # a manifest we no longer own could clobber their ops. Phase 4
+            # re-acquires properly and reloads, so nothing is lost by skipping.
+            if not patch_jobs and not keeper.lock_lost:
+                try:
+                    journal.prune(vault_root, cfg, manifest,
+                                  protect_batch_id=batch_id)
+                    journal.save(vault_root, cfg, manifest)
+                except Exception:  # noqa: BLE001
+                    logger.warning("harmonize manifest prune/save failed",
+                                   exc_info=True)
+        finally:
+            obsidian_manager.release_lock(op_epoch)
+
+        # Phase 3 — the Zotero PATCHes, lock-free.
+        from core.utils import log_vault_write as _log_vw
+        outcomes: list[tuple[str, dict]] = []
+        for key, prepared, op_id in patch_jobs:
+            if cancel.is_set():
+                # An op whose PATCH never ran must NOT stay "applied": the
+                # revert would conservatively SKIP it (the item never reached
+                # the op's `after` state — _revert_zotero_prepare's equality
+                # check), so the hazard is not a wrong write but a journal
+                # claiming a write that did not happen, which inflates the
+                # batch-restore's accounting. Flip it to failed.
+                outcomes.append((op_id, {"state": "failed"}))
+                counts["zotero"]["failed"] += 1
+                failures.append(f"zotero {key}: cancelled before the write")
+                continue
+            keeper.done += 1
+            put({"info": f"[{keeper.done}/{total}] zotero {key}"})
+            try:
+                r, s, new_version = _zotero_patch(prepared)
+            except Exception as exc:  # noqa: BLE001
+                r, s, new_version = {"error": sanitise_error_msg(exc), "outcome_unknown": True}, 500, None
+            if s == 200:
+                outcomes.append((op_id, {"state": "applied", "version_after": new_version}))
+                counts["zotero"]["written"] += 1
+                stamped.append(op_id)
+                _log_vw("tagging_zotero_tag_add", prepared["item_key"],
+                        f"+{len(prepared['added'])} tags: "
+                        f"{', '.join(prepared['added'])}")
+            else:
+                outcomes.append((op_id, {"state": "outcome_unknown" if r.get("outcome_unknown") else "failed"}))
+                counts["zotero"]["failed"] += 1
+                failures.append(f"zotero {key}: {r.get('error')}")
+
+        # Phase 4 — record the outcomes + prune under a fresh short hold. The
+        # manifest is RELOADED: another writer may have taken the lock between
+        # our two holds, and saving the phase-2 object would clobber their ops.
+        if patch_jobs:
+            epoch2 = None
+            for _ in range(20):
+                epoch2 = obsidian_manager.try_acquire_lock(ttl=600)
+                if epoch2:
+                    break
+                time.sleep(1)
+            if not epoch2:
+                failures.append(
+                    "could not re-acquire the op-lock to record Zotero "
+                    "outcomes; a failed Zotero op may show as applied in the "
+                    "journal — its revert will be conservatively skipped (the "
+                    "item never reached the written state), but the batch "
+                    "undo will report more ops than it can actually revert")
+            else:
+                try:
+                    manifest2 = journal.load(vault_root, cfg)
+                    for op_id, mut in outcomes:
+                        op2 = journal.find_op(manifest2, op_id)
+                        if op2 is not None:
+                            op2.update(mut)
+                    journal.prune(vault_root, cfg, manifest2,
+                                  protect_batch_id=batch_id)
+                    journal.save(vault_root, cfg, manifest2)
+                except Exception:  # noqa: BLE001
+                    logger.warning("harmonize phase-4 finalize failed",
+                                   exc_info=True)
+                finally:
+                    obsidian_manager.release_lock(epoch2)
+
+        put({"harmonize": {
+            "batch_id": batch_id if stamped else "",
+            "results": counts,
+            "records": len(plan),
+            "op_count": len([s for s in stamped if s]),
+            "out_of_vocab": out_of_vocab,
+            "unresolved_keys": unresolved,
+            "failures": failures,
         }})
 
     return run_sse_worker(_worker, consumer_timeout_s=consumer_timeout_s)
@@ -1648,7 +3279,7 @@ def api_tagging_open_pdf():
     if err is not None:
         return jsonify(err), status
     try:
-        subprocess.Popen(["open", pdf])
+        run_open(["open", pdf])
     except OSError as exc:
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     return jsonify({"ok": True})
@@ -1697,11 +3328,14 @@ def api_tagging_snippet():
     biblio_pdfs = [p for p in rec.pdf_paths if _is_under(Path(p), biblio_dir)]
     if not biblio_pdfs:
         return jsonify({"citation_key": citation_key, "snippet": "", "truncated": False, "chars": 0})
-    text, _trunc = text_source.read_pdf_text(
+    result = text_source.read_pdf_text(
         Path(biblio_pdfs[0]), settings.vault_root, _SNIPPET_MAX_CHARS, fresh_max_pages=3)
+    from core.extraction_status import status_of
+    text, _trunc = result
     snippet = text.strip()
     return jsonify({
         "citation_key": citation_key, "snippet": snippet,
+        "extraction_status": status_of(result).to_dict(),
         "truncated": bool(_trunc) or len(snippet) >= _SNIPPET_MAX_CHARS,
         "chars": len(snippet),
     })

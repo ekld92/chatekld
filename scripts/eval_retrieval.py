@@ -1599,7 +1599,7 @@ def bm25_sidecar_is_stale(index_dir: str) -> Optional[str]:
 # --------------------------------------------------------------------------
 
 def detect_live_server() -> Optional[str]:
-    """Base URL of a live ChatEKLD server, or ``None``.
+    """Base URL of a live CHERQAiN server, or ``None``.
 
     Reuses the app's own discovery ladder (``core/driver.py::resolve_base_url``:
     ``CHATEKLD_API_URL`` → ``BASE_DIR/server.json`` pid+health → the legacy
@@ -1633,7 +1633,7 @@ def confirm_proceed(assume_yes: bool) -> bool:
     if assume_yes:
         return True
     print(
-        "\nThe ChatEKLD app MUST be closed before evaluating — the manager's\n"
+        "\nThe CHERQAiN app MUST be closed before evaluating — the manager's\n"
         "locks are in-process only, so a running app would race this run on\n"
         "the BM25 sidecar and the index checkpoints.\n"
         "\nThis run WRITES:\n"
@@ -1790,7 +1790,7 @@ def main(argv: Optional[list] = None) -> int:
     # bypass it (see detect_live_server).
     live = detect_live_server()
     if live:
-        print(f"ERROR: a ChatEKLD server is LIVE at {live}. Two processes hold two "
+        print(f"ERROR: a CHERQAiN server is LIVE at {live}. Two processes hold two "
               f"independent in-process locks over one index — this run would race it "
               f"on the BM25 sidecar and the index checkpoints, and its numbers would "
               f"be unreproducible. Quit the app (or stop `papermind server`) and "

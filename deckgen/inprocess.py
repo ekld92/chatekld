@@ -1,6 +1,6 @@
 """In-process ChatRunner: drive the vault agent loop without HTTP.
 
-The CLI talks to a *running* app over HTTP (:class:`~deckgen.client.ChatEKLDClient`).
+The CLI talks to a *running* app over HTTP (:class:`~deckgen.client.CHERQAiNClient`).
 When deckgen runs **inside** the app (the Deck Generator window), looping back out
 over HTTP to ourselves would be wasteful and fragile, so this adapter exposes the
 same ``.chat(...) -> ChatResult`` contract that ``outline.py`` / ``sections.py``
@@ -75,7 +75,7 @@ def _event_to_dict(event) -> Optional[dict]:
 
 
 class InProcessChatRunner:
-    """A ``ChatEKLDClient``-compatible runner that uses the in-process agent loop."""
+    """A ``CHERQAiNClient``-compatible runner that uses the in-process agent loop."""
 
     def __init__(
         self,
@@ -102,12 +102,12 @@ class InProcessChatRunner:
         # bound section length without touching any other path's config.
         self._max_tokens = max_tokens
 
-    # -- preflight parity with ChatEKLDClient -------------------------------
+    # -- preflight parity with CHERQAiNClient -------------------------------
 
     def status(self) -> dict:
         """Vault index status, read straight off the singleton (no HTTP).
 
-        Same shape ``ChatEKLDClient.status`` returns, so the orchestration core's
+        Same shape ``CHERQAiNClient.status`` returns, so the orchestration core's
         preflight is identical whether it runs in-process or over the API.
         """
         return obsidian_manager.get_status_payload()

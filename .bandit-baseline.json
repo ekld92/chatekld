@@ -1,0 +1,230 @@
+{
+  "errors": [],
+  "generated_at": "2026-08-25T00:00:00Z",
+  "metrics": {},
+  "results": [
+    {
+      "code": "481         try:\n482             root = ET.fromstring(body.decode(\"utf-8\", errors=\"replace\"))\n483         except ET.ParseError as exc:\n",
+      "col_offset": 19,
+      "end_col_offset": 72,
+      "filename": "accession/sources.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 20,
+        "link": "https://cwe.mitre.org/data/definitions/20.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+      "line_number": 482,
+      "line_range": [
+        482
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+      "test_id": "B314",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "126         req = urllib.request.Request(url, headers=_APP_HEADERS)\n127         with urllib.request.urlopen(req, timeout=1.5) as resp:\n128             return resp.status == 200\n",
+      "col_offset": 13,
+      "end_col_offset": 53,
+      "filename": "core/driver.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 22,
+        "link": "https://cwe.mitre.org/data/definitions/22.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
+      "line_number": 127,
+      "line_range": [
+        127
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b310-urllib-urlopen",
+      "test_id": "B310",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "207     try:\n208         with urllib.request.urlopen(req, timeout=timeout) as resp:\n209             body = resp.read().decode(\"utf-8\")\n",
+      "col_offset": 13,
+      "end_col_offset": 57,
+      "filename": "core/driver.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 22,
+        "link": "https://cwe.mitre.org/data/definitions/22.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
+      "line_number": 208,
+      "line_range": [
+        208
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b310-urllib-urlopen",
+      "test_id": "B310",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "262     try:\n263         with urllib.request.urlopen(req, timeout=timeout) as resp:\n264             for raw in resp:\n",
+      "col_offset": 13,
+      "end_col_offset": 57,
+      "filename": "core/driver.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 22,
+        "link": "https://cwe.mitre.org/data/definitions/22.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
+      "line_number": 263,
+      "line_range": [
+        263
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b310-urllib-urlopen",
+      "test_id": "B310",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "334     try:\n335         with urllib.request.urlopen(req, timeout=600) as resp:\n336             return json.loads(resp.read().decode(\"utf-8\"))\n",
+      "col_offset": 13,
+      "end_col_offset": 53,
+      "filename": "core/driver.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 22,
+        "link": "https://cwe.mitre.org/data/definitions/22.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
+      "line_number": 335,
+      "line_range": [
+        335
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b310-urllib-urlopen",
+      "test_id": "B310",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "138             )\n139             with urllib.request.urlopen(req, timeout=3):\n140                 pass\n",
+      "col_offset": 17,
+      "end_col_offset": 55,
+      "filename": "core/providers/lms.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 22,
+        "link": "https://cwe.mitre.org/data/definitions/22.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
+      "line_number": 139,
+      "line_range": [
+        139
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b310-urllib-urlopen",
+      "test_id": "B310",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "151             )\n152             with urllib.request.urlopen(req, timeout=5) as resp:\n153                 data = json.loads(resp.read())\n",
+      "col_offset": 17,
+      "end_col_offset": 55,
+      "filename": "core/providers/lms.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 22,
+        "link": "https://cwe.mitre.org/data/definitions/22.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
+      "line_number": 152,
+      "line_range": [
+        152
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b310-urllib-urlopen",
+      "test_id": "B310",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "118         )\n119         with urllib.request.urlopen(req, timeout=1.0) as resp:\n120             return resp.status == 200\n",
+      "col_offset": 13,
+      "end_col_offset": 53,
+      "filename": "core/server_info.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 22,
+        "link": "https://cwe.mitre.org/data/definitions/22.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
+      "line_number": 119,
+      "line_range": [
+        119
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b310-urllib-urlopen",
+      "test_id": "B310",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "438             rows = conn.execute(\n439                 \"SELECT attachment_id, filename, kind, extracted_text, chars, \"\n440                 f\"truncated FROM chat_attachments WHERE attachment_id IN ({marks})\",\n441                 list(ids),\n",
+      "col_offset": 16,
+      "end_col_offset": 74,
+      "filename": "services/attachment_service.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 439,
+      "line_range": [
+        439,
+        440
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "470             rows = conn.execute(\n471                 \"SELECT attachment_id, filename, kind, extracted_text, chars, \"\n472                 f\"truncated FROM chat_attachments WHERE attachment_id IN ({marks})\",\n473                 unique,\n",
+      "col_offset": 16,
+      "end_col_offset": 74,
+      "filename": "services/attachment_service.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 471,
+      "line_range": [
+        471,
+        472
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "816                 row[0] for row in conn.execute(\n817                     \"SELECT op_id FROM operation_tombstones WHERE op_id IN \"\n818                     f\"({','.join('?' for _ in chunk)})\",\n819                     chunk,\n",
+      "col_offset": 20,
+      "end_col_offset": 23,
+      "filename": "tagging/journal.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 817,
+      "line_range": [
+        817,
+        818
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    }
+  ]
+}

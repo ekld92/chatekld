@@ -1,0 +1,14 @@
+{
+  "$comment": "Time-bounded exceptions for the CI dependency-audit gates. Every entry needs an owner, a rationale, the affected path and an expiry; scripts/check_dependency_audits.py FAILS on an expired waiver, so an exception cannot become permanent by neglect. Empty is the correct steady state.",
+  "pip_audit": [
+    {
+      "id": "PYSEC-2026-3740",
+      "package": "nltk",
+      "owner": "cherqain-maintainers",
+      "expires": "2026-12-03",
+      "path": "requirements-lock-{linux,macos}.txt -> nltk (transitive, via llama-index-core's SentenceSplitter)",
+      "rationale": "No upstream fix exists: the advisory's own text says 'Patched versions: Not yet patched', and nltk 3.10.3 (the current release, which this lock now pins) clears the other 21 nltk advisories but not this one. It is a file-sandbox bypass in the model-artifact load/save helpers - TransitionParser.train/.parse, AveragedPerceptron.save/.load, PerceptronTagger.save_to_json and save_maxent_params - all of which are unreachable here: a repository-wide grep finds no reference to any of them, and nltk enters only transitively through llama-index-core's SentenceSplitter, which uses the punkt_tab and stopwords CORPORA. Exploiting it needs a caller-controlled model path; the app never passes one, and it seeds both corpora itself into NLTK_DATA_DIR (launch.py::_pin_nltk_data). Re-assess at expiry: drop the waiver the moment a patched nltk ships."
+    }
+  ],
+  "npm_audit": []
+}

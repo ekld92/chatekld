@@ -47,6 +47,9 @@ from typing import Any
 
 from ..config import Settings
 from ..core import hashing as core_hashing
+from ..core.pdf_identifiers import (
+    extract_printed_identifier as _extract_printed_identifier,
+)
 from .bridge import _filename_authoryear_candidates, _normalize_author_lastname
 from .duplicates import DuplicateSet, candidate_pdfs
 from .inventory import Inventory, _norm_title
@@ -71,8 +74,10 @@ _MIN_PAGE1_TOKENS = 20
 _KEY_TOKENS = 150
 
 _TOKEN_RE = re.compile(r"[a-z]{3,}")
-_DOI_RE = re.compile(r"\b10\.\d{4,9}/[^\s\"'<>]+", re.IGNORECASE)
-_ARXIV_RE = re.compile(r"arxiv[:\s/]*(\d{4}\.\d{4,5})(?:v\d+)?", re.IGNORECASE)
+# _DOI_RE / _ARXIV_RE / extract_identifier moved to core/pdf_identifiers.py
+# (2026-08-19) so the bridge's DOI resolution rung shares ONE definition with
+# this tier — near_duplicates imports from bridge, so the bridge could not
+# import back here. Re-exported below; behaviour is unchanged.
 
 
 def _fold_tokens(text: str) -> list[str]:
@@ -102,23 +107,9 @@ def text_key(text: str) -> str | None:
     return _tokens_digest(tokens[:_KEY_TOKENS])
 
 
-def extract_identifier(text: str) -> str | None:
-    """First DOI or arXiv id printed on the page, canonicalised, else None."""
-    if not text:
-        return None
-    doi = _DOI_RE.search(text)
-    arxiv = _ARXIV_RE.search(text)
-    # Nearest the top of the page wins (cited papers' DOIs come later).
-    best = None
-    if doi and arxiv:
-        best = doi if doi.start() < arxiv.start() else arxiv
-    else:
-        best = doi or arxiv
-    if best is None:
-        return None
-    if best is doi:
-        return "doi:" + doi.group(0).lower().rstrip(".,;)]}")
-    return "arxiv:" + arxiv.group(1)
+# Re-exported so `from .near_duplicates import extract_identifier` — used by
+# tests/audit/test_near_duplicates.py — keeps resolving.
+extract_identifier = _extract_printed_identifier
 
 
 @dataclass
@@ -140,6 +131,11 @@ class NearDupReport:
     dismissed_count: int = 0   # groups hidden by a persisted user decision
     compared_pairs: int = 0    # plan 6: similarity pairs actually scored
     similarity_available: bool = True  # plan 6: False when rapidfuzz is absent
+    # The rows behind the two counts (annual cleanup A6, 2026-09-17): a count
+    # tells a reviewer something was hidden or never compared, but not WHAT,
+    # so a dismissal could not be re-verified and a blind spot not read.
+    dismissed_candidates: list[NearDupCandidate] = field(default_factory=list)
+    no_text_paths: list[Path] = field(default_factory=list)
 
 
 def _pair_id(kind: str, member_ids: list[str]) -> str:
@@ -222,21 +218,25 @@ def find_near_duplicates(
         if len(set(shas.values())) < 2:
             return
         pid = _pair_id(kind, list(set(shas.values())))
+        cand = NearDupCandidate(
+            kind=kind, evidence=evidence, pair_id=pid,
+            paths=sorted(shas.keys()), similarity=similarity)
         if pid in dismissed:
             report.dismissed_count += 1
+            report.dismissed_candidates.append(cand)
             return
-        report.candidates.append(NearDupCandidate(
-            kind=kind, evidence=evidence, pair_id=pid,
-            paths=sorted(shas.keys()), similarity=similarity))
+        report.candidates.append(cand)
 
     def _add_record_group(kind: str, keys: list[str], evidence: str) -> None:
         pid = _pair_id(kind, keys)
+        cand = NearDupCandidate(
+            kind=kind, evidence=evidence, pair_id=pid,
+            citation_keys=sorted(keys))
         if pid in dismissed:
             report.dismissed_count += 1
+            report.dismissed_candidates.append(cand)
             return
-        report.candidates.append(NearDupCandidate(
-            kind=kind, evidence=evidence, pair_id=pid,
-            citation_keys=sorted(keys)))
+        report.candidates.append(cand)
 
     # ---- text tiers (page1_text + identifier), one provider call per PDF --
     tokens_by_pdf: dict[Path, list[str]] = {}
@@ -252,10 +252,12 @@ def find_near_duplicates(
             text = pdf_text_provider(p)
             if not text:
                 report.no_text_count += 1
+                report.no_text_paths.append(p)
                 continue
             tokens = _fold_tokens(text)
             if len(tokens) < _MIN_PAGE1_TOKENS:
                 report.no_text_count += 1
+                report.no_text_paths.append(p)
             else:
                 # First-_KEY_TOKENS prefix everywhere (key, Jaccard, ratio) —
                 # both the cached-whole-doc and fresh-page-1 provider shapes
@@ -373,6 +375,7 @@ def find_near_duplicates(
                             similarity=score)
 
     report.candidates.sort(key=lambda c: (c.kind, c.pair_id))
+    report.dismissed_candidates.sort(key=lambda c: (c.kind, c.pair_id))
     return report
 
 

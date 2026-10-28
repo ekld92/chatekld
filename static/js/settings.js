@@ -70,15 +70,9 @@ const _NUMERIC_FIELDS = [
     ['docgen-retry-backoff', 'docgen_retry_backoff_s', 'int'],
     ['set-chat-temp', 'chat_temperature', 'float'],
     ['set-chat-system-prompt', 'chat_system_prompt', 'string'],
-    // Note Refactor. The scope sub-folder and the scope-wide strip-preamble
-    // toggle are owned by the Note Refactor tab (refactor.js) and deliberately
-    // NOT mirrored here (no double-save), like the vault knobs above.
-    ['set-refactor-extract-model', 'refactor_extract_model', 'string'],
-    ['set-refactor-review-model', 'refactor_review_model', 'string'],
-    ['set-refactor-review-max-tokens', 'refactor_review_max_tokens', 'int'],
-    ['set-refactor-rewrite-max-tokens', 'refactor_rewrite_max_tokens', 'int'],
-    ['set-refactor-thumb-max-side', 'refactor_thumb_max_side', 'int'],
-    ['set-refactor-archive-dir', 'refactor_archive_dir', 'string'],
+    ['set-chat-attachment-max-chars', 'chat_attachment_max_chars', 'int'],
+    // Preserve the existing archive-location setting for recovery.
+    ['set-history-archive-dir', 'refactor_archive_dir', 'string'],
     // Biblio Tagging (Library Audit sub-view). Propose model/params + the
     // Zotero local-API base + the restore-archive dir. Config-only knobs.
     ['set-tagging-propose-model', 'tagging_propose_model', 'string'],
@@ -94,17 +88,43 @@ const _NUMERIC_FIELDS = [
     ['set-tagging-fewshot-k', 'tagging_fewshot_k', 'int'],
     ['set-tagging-zotero-base', 'tagging_zotero_api_base', 'string'],
     ['set-tagging-archive-dir', 'tagging_archive_dir', 'string'],
+    ['set-notesync-containment', 'notesync_containment', 'float'],
+    ['set-notesync-template', 'notesync_template', 'string'],
+    ['set-tagging-journal-retention-days', 'tagging_journal_retention_days', 'int'],
+    ['set-tagging-journal-retention-keep', 'tagging_journal_retention_keep', 'int'],
+    // Accession (Library Audit → PDFs Without Zotero). The enable toggle is
+    // deliberately NOT here — it lives on the report beside its egress
+    // disclosure, and two owners of one key would double-save. These are the
+    // knobs that had validators but no controls (2026-08-19 review).
+    ['set-accession-contact-email', 'accession_contact_email', 'string'],
+    ['set-accession-max-candidates', 'accession_max_candidates', 'int'],
+    ['set-accession-timeout', 'accession_timeout_s', 'int'],
+    ['set-accession-batch-max', 'accession_batch_max', 'int'],
 ];
+
+// The accession source registry (mirrors api/routes/config.py's
+// ACCESSION_SOURCE_NAMES). Composed into the accession_sources array like
+// fallback_on's categories; an all-unticked state sends nothing (the server
+// keeps its previous set — "query no catalogue" is never a meaningful save).
+const _ACCESSION_SOURCES = ['crossref', 'europepmc', 'arxiv', 'hal', 'thesesfr',
+                            'openlibrary', 'googlebooks'];
 const _SELECT_FIELDS = [
+    ['set-online-reasoning-effort', 'online_reasoning_effort'],
     ['set-reranker-device', 'vault_reranker_device'],
     ['set-vector-backend', 'vault_vector_backend'],
     ['set-fallback-provider', 'fallback_provider'],
+    ['set-tagging-journal-retention-policy', 'tagging_journal_retention_policy'],
 ];
 const _BOOL_FIELDS = [
     ['set-prewarm-enabled', 'vault_prewarm_enabled'],
+    // Config-only (never a chat-body override); default on.
+    ['set-paper-labels-enabled', 'vault_paper_labels'],
     ['set-deck-review-enabled', 'deck_review_enabled'],
-    ['set-refactor-table-double-read', 'refactor_table_double_read'],
     ['set-prompt-capture-enabled', 'prompt_capture_enabled'],
+    // Ships off. The only setting in the app whose effect is to delete undo
+    // records, so it is never enabled by a default.
+    ['set-tagging-journal-retention-enabled', 'tagging_journal_retention_enabled'],
+    ['set-notesync-zotero-authoritative', 'notesync_zotero_authoritative'],
 ];
 
 // Populate the settings-owned controls from /api/config and wire auto-save.
@@ -114,6 +134,7 @@ export function initSettings(cfg) {
     _wireSettingsFilter();
     _applyConfig(cfg);
     _wire();
+    _wireArchiveDirPickers();
     _wireLogViewer();
     _wireReopenRefresh();
 }
@@ -129,6 +150,7 @@ function _applyConfig(cfg) {
     _setVal('set-online-timeout', cfg.online_timeout_s ?? 60);
     _setVal('set-online-retries', cfg.online_max_retries ?? 3);
     _setVal('set-online-max-tokens', cfg.online_max_tokens ?? 4096);
+    _setSelectVal('set-online-reasoning-effort', cfg.online_reasoning_effort ?? 'provider_default');
     _setVal('set-agent-wall-clock', cfg.agent_wall_clock_s ?? 300);
     _setVal('set-local-timeout', cfg.local_request_timeout_s ?? 0);
     // `??` so a persisted empty host ("" ⇒ use env var / localhost) stays empty
@@ -171,14 +193,9 @@ function _applyConfig(cfg) {
     // stays empty rather than reverting to the default placeholder text.
     _setVal('set-chat-temp', cfg.chat_temperature ?? 0.3);
     _setVal('set-chat-system-prompt', cfg.chat_system_prompt ?? 'You are a helpful assistant.');
-    // Note Refactor knobs. `??` so a persisted empty model/dir ("" ⇒ fall back
-    // to the vision/chat model / default archive dir) stays empty.
-    _setVal('set-refactor-extract-model', cfg.refactor_extract_model ?? '');
-    _setVal('set-refactor-review-model', cfg.refactor_review_model ?? '');
-    _setVal('set-refactor-review-max-tokens', cfg.refactor_review_max_tokens ?? 1024);
-    _setVal('set-refactor-rewrite-max-tokens', cfg.refactor_rewrite_max_tokens ?? 4096);
-    _setVal('set-refactor-thumb-max-side', cfg.refactor_thumb_max_side ?? 384);
-    _setVal('set-refactor-archive-dir', cfg.refactor_archive_dir ?? '');
+    _setVal('set-chat-attachment-max-chars', cfg.chat_attachment_max_chars ?? 120000);
+    // An empty archive directory selects the existing app-data default.
+    _setVal('set-history-archive-dir', cfg.refactor_archive_dir ?? '');
     // Biblio Tagging knobs. `??` so an explicitly-empty propose model
     // ("" ⇒ chat model) / archive dir ("" ⇒ default) stays empty.
     _setVal('set-tagging-propose-model', cfg.tagging_propose_model ?? '');
@@ -191,13 +208,35 @@ function _applyConfig(cfg) {
     _setVal('set-tagging-fewshot-k', cfg.tagging_fewshot_k ?? 3);
     _setVal('set-tagging-zotero-base', cfg.tagging_zotero_api_base ?? 'http://127.0.0.1:23119');
     _setVal('set-tagging-archive-dir', cfg.tagging_archive_dir ?? '');
+    _setVal('set-notesync-containment', cfg.notesync_containment ?? 0.85);
+    _setVal('set-notesync-template', cfg.notesync_template ?? '');
+    _setCheck('set-tagging-journal-retention-enabled',
+              cfg.tagging_journal_retention_enabled ?? false);
+    _setCheck('set-notesync-zotero-authoritative', cfg.notesync_zotero_authoritative ?? false);
+    _setSelectVal('set-tagging-journal-retention-policy',
+                  cfg.tagging_journal_retention_policy ?? 'age_days');
+    _setVal('set-tagging-journal-retention-days', cfg.tagging_journal_retention_days ?? 365);
+    _setVal('set-tagging-journal-retention-keep', cfg.tagging_journal_retention_keep ?? 5000);
+
+    // Accession knobs. A missing/invalid accession_sources means the server
+    // resolves the full registry, so every box reads checked.
+    _setVal('set-accession-contact-email', cfg.accession_contact_email ?? '');
+    _setVal('set-accession-max-candidates', cfg.accession_max_candidates ?? 5);
+    _setVal('set-accession-timeout', cfg.accession_timeout_s ?? 15);
+    _setVal('set-accession-batch-max', cfg.accession_batch_max ?? 50);
+    const accSrc = (Array.isArray(cfg.accession_sources)
+        && cfg.accession_sources.length)
+        ? cfg.accession_sources : _ACCESSION_SOURCES;
+    for (const name of _ACCESSION_SOURCES) {
+        _setCheck(`set-accession-src-${name}`, accSrc.includes(name));
+    }
 
     _setSelectVal('set-reranker-device', cfg.vault_reranker_device ?? 'auto');
     _setSelectVal('set-vector-backend', cfg.vault_vector_backend ?? 'simple');
     _setSelectVal('set-fallback-provider', cfg.fallback_provider ?? '');
     _setCheck('set-prewarm-enabled', cfg.vault_prewarm_enabled ?? true);
+    _setCheck('set-paper-labels-enabled', cfg.vault_paper_labels ?? true);
     _setCheck('set-deck-review-enabled', cfg.deck_review_enabled ?? false);
-    _setCheck('set-refactor-table-double-read', cfg.refactor_table_double_read ?? true);
     _setCheck('set-prompt-capture-enabled', cfg.prompt_capture_enabled ?? true);
 
     const fo = Array.isArray(cfg.fallback_on) ? cfg.fallback_on : [];
@@ -263,7 +302,7 @@ export async function refreshSettings() {
 // summary so the accordion is scannable ("what's in here, how much") without
 // opening it. Computed from the live DOM, so it never drifts from the markup;
 // idempotent (re-running replaces the span).
-/** G4 (2026-07-22 audit): live filter over the ~84 settings controls.
+/** G4 (2026-07-22 audit): live filter over the ~100 settings controls.
  *
  * Matches each .control-group's full text (label + hint), hides non-matching
  * rows, hides sections with no match and auto-OPENS sections with one — so
@@ -303,6 +342,11 @@ function _wireSettingsFilter() {
             filtering = true;
         }
         sections.forEach((sec) => {
+            // data-gated: a capability-gated section (the private-only
+            // Maintenance block) that ships hidden. The filter must neither
+            // reveal it nor count its rows — its owner module removes the
+            // marker when its probe succeeds, after which it filters normally.
+            if (sec.dataset.gated) return;
             let secHas = false;
             sec.querySelectorAll('.control-group').forEach((row) => {
                 const match = !q || row.textContent.toLowerCase().includes(q);
@@ -342,12 +386,23 @@ function _wireSettingsFilter() {
         if (!q && filtering) {
             filtering = false;
             allDetails.forEach((d) => {
+                if (d.dataset.gated) return; // never force a gated block visible
                 d.hidden = false;
                 d.open = d.dataset.wasOpen === '1';
             });
         }
         if (countEl) countEl.textContent = q ? `${shown} match(es)` : '';
-        if (q) announceStatus(`${shown} matching setting(s).`);
+        // A zero-result query is a dead end unless it says where else to look:
+        // the audit_* paths/thresholds live in their own modal and the live
+        // per-query toggles on their panels (2026-09-03 UI review).
+        const emptyEl = document.getElementById('settings-filter-empty');
+        if (emptyEl) emptyEl.hidden = !(q && shown === 0);
+        if (q) {
+            announceStatus(shown === 0
+                ? 'No matching settings here. Vault, Zotero and audit-threshold '
+                  + 'settings live in Library Audit, Settings.'
+                : `${shown} matching setting(s).`);
+        }
     };
     input.addEventListener('input', () => {
         window.clearTimeout(timer);
@@ -440,6 +495,7 @@ function _wire() {
         ..._SELECT_FIELDS.map((f) => f[0]),
         ..._BOOL_FIELDS.map((f) => f[0]),
         ..._FALLBACK_CATEGORIES.map((c) => `set-fallback-on-${c}`),
+        ..._ACCESSION_SOURCES.map((s) => `set-accession-src-${s}`),
     ];
     for (const id of ids) {
         const el = document.getElementById(id);
@@ -451,6 +507,44 @@ function _wire() {
         if (el.type === 'range' || el.type === 'number' || el.type === 'text' || el.type === 'textarea') {
             el.addEventListener('input', debounce);
         }
+    }
+}
+
+export async function pickSettingsFolder(inputId) {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+    try {
+        const resp = await secureFetch(inputId.startsWith('set-thesaurus-') ? '/api/config/native-pick-file' : '/api/config/native-pick-folder', { method: 'POST', body: JSON.stringify(inputId.startsWith('set-thesaurus-') ? {kind: 'markdown', relative_to_vault: true} : {}) });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) {
+            const msg = (data && data.error) || `Could not open folder picker (HTTP ${resp.status}).`;
+            _settingsStatus(msg, true);
+            announceError(msg);
+            return;
+        }
+        if (data && data.path) {
+            input.value = inputId.startsWith('set-thesaurus-') ? data.relative_path : data.path;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    } catch (e) {
+        logError('Settings folder pick failed', e);
+        _settingsStatus('Could not open the folder picker.', true);
+    }
+}
+
+function _wireArchiveDirPickers() {
+    const pairs = [
+        ['set-thesaurus-abbrev-path-browse', 'set-thesaurus-abbrev-path'],
+        ['set-thesaurus-tags-path-browse', 'set-thesaurus-tags-path'],
+        ['set-history-archive-dir-browse', 'set-history-archive-dir'],
+        ['set-tagging-archive-dir-browse', 'set-tagging-archive-dir'],
+    ];
+    for (const [btnId, inputId] of pairs) {
+        const btn = document.getElementById(btnId);
+        if (!btn || btn.dataset.wired === '1') continue;
+        btn.dataset.wired = '1';
+        btn.addEventListener('click', () => { pickSettingsFolder(inputId); });
     }
 }
 
@@ -490,6 +584,18 @@ export async function saveSettings() {
         if (el && el.checked) fo.push(cat);
     }
     payload.fallback_on = fo;
+    // Accession sources: sent only when ≥1 box is ticked AND the section is
+    // in the DOM — an all-unticked save would mean "the full registry" on the
+    // server (its []-degrade rule), the opposite of what unticking says.
+    const accSrc = [];
+    let accSeen = false;
+    for (const name of _ACCESSION_SOURCES) {
+        const el = document.getElementById(`set-accession-src-${name}`);
+        if (!el) continue;
+        accSeen = true;
+        if (el.checked) accSrc.push(name);
+    }
+    if (accSeen && accSrc.length) payload.accession_sources = accSrc;
     // The pending counter increments AFTER the payload build (2026-07-29 audit
     // 15a): incrementing first left every line of the DOM-reading loops above
     // inside the window between `+= 1` and the chain's `finally` decrement —
@@ -517,15 +623,45 @@ export async function saveSettings() {
             // until now the only silent-failure mode left in this path was a
             // rejected VALUE, not a rejected request. `dropped` names them.
             const body = await resp.json().catch(() => null);
-            _flagDropped(body && Array.isArray(body.dropped) ? body.dropped : []);
+            const dropped = body && Array.isArray(body.dropped) ? body.dropped : [];
+            _flagDropped(dropped);
+            _settingsStatus(dropped.length
+                ? `Saved — ${dropped.length} value(s) rejected (see the marked fields).`
+                : 'Saved ✓');
         } catch (e) {
             logError('Settings save failed', e);
+            // Visible AND announced (2026-08-18): the announceError below
+            // reaches the visually-hidden alert region only, so a sighted
+            // user previously got ZERO indication the change didn't persist —
+            // while the modal header promises "Changes save automatically".
+            _settingsStatus('Could not save — the change is NOT persisted. '
+                + 'Check the app is still running, then re-edit the field.', true);
             announceError('Settings could not be saved — the change is not persisted.');
         } finally {
             _savesPending -= 1;
         }
     });
     await _saveChain;
+}
+
+// The transient save-state line: writes the shipped #settings-status region
+// (role="status" in the static markup — the polite announcement rides the
+// visible write). A success tick auto-clears; an error stays until the next
+// save outcome replaces it.
+let _settingsStatusTimer = null;
+function _settingsStatus(msg, isErr = false) {
+    const el = document.getElementById('settings-status');
+    if (!el) return;
+    el.textContent = msg;
+    // Reuses the existing modal error style (no new color pair for the
+    // contrast ratchet): danger-on-modal is already a covered surface.
+    el.classList.toggle('settings-field-error', !!isErr);
+    if (_settingsStatusTimer) { clearTimeout(_settingsStatusTimer); _settingsStatusTimer = null; }
+    if (!isErr) {
+        _settingsStatusTimer = setTimeout(() => {
+            if (el.textContent === msg) el.textContent = '';
+        }, 4000);
+    }
 }
 
 // Config key → the control that writes it, derived from the same tuple tables

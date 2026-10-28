@@ -32,9 +32,13 @@ from .config import Settings
 from .engine import duplicates as eng_duplicates
 from .engine import inventory as eng_inventory
 from .engine.reports import (
+    dead_curation as r_dead_curation,
+    multi_pdf as r_multi_pdf,
+    not_in_zotero as r_not_in_zotero,
     finder_tag_drift as r_finder_tag_drift,
     note_tag_drift as r_note_tag_drift,
     read_unzoterod as r_read_unzoterod,
+    tag_harmony as r_tag_harmony,
     tag_hygiene as r_tag_hygiene,
     unread_unzoterod as r_unread_unzoterod,
     zotero_no_pdf as r_zotero_no_pdf,
@@ -46,6 +50,7 @@ from . import serialize
 # (Reconciliation, Gaps, Curation) so results read in the same order as the
 # tablist the user is looking at.
 REPORT_ORDER: tuple[str, ...] = (
+    "library_documents",
     "inventory",
     "note_tag_drift",
     "finder_tag_drift",
@@ -58,6 +63,13 @@ REPORT_ORDER: tuple[str, ...] = (
     "ambiguous_pdfs",
     "skipped_pdfs",
     "tag_hygiene",
+    "tag_harmony",
+    "orphan_notes",
+    "orphan_zotero_items",
+    "zotero_attachments",
+    "multi_pdf",
+    "not_in_zotero",
+    "dead_curation",
 )
 
 # Result caps. Per-group keeps one dense report (inventory is thousands of
@@ -137,6 +149,10 @@ def _author_year(author: Any, year: Any) -> str:
     return " · ".join(str(p) for p in (author, year) if p)
 
 
+class CorpusCancelled(Exception):
+    """Raised by :func:`build_corpus` when its caller asked it to stop."""
+
+
 def build_corpus(
     inv: eng_inventory.Inventory,
     settings: Settings,
@@ -146,6 +162,7 @@ def build_corpus(
     near_duplicates: Any = None,
     drift_include_parent_tags: bool = False,
     drift_synonyms: dict[str, str] | None = None,
+    should_cancel: Any = None,
 ) -> list[_Entry]:
     """Build the flat searchable corpus over every report of one cached scan.
 
@@ -155,8 +172,20 @@ def build_corpus(
     ``drift_include_parent_tags`` / ``drift_synonyms`` mirror the drift report
     routes' options (same injection rule) so a search hit always corresponds to
     a row the drift tabs actually render.
+
+    ``should_cancel`` (optional, 2026-09-02) is polled BETWEEN report sections.
+    A build whose scan has been replaced keeps a superseded Inventory alive for
+    the rest of its run — two multi-hundred-megabyte inventories at once — and
+    its result is discarded anyway. Returning early raises
+    :class:`CorpusCancelled` rather than a partial corpus, because a partial
+    one is indistinguishable from a complete one at the call site and would
+    silently hide rows the reports do render.
     """
     entries: list[_Entry] = []
+
+    def _check():
+        if should_cancel is not None and should_cancel():
+            raise CorpusCancelled()
 
     # -- inventory -------------------------------------------------------
     for r in serialize.inventory_records(inv, settings):
@@ -179,6 +208,8 @@ def build_corpus(
             ),
         ))
 
+    _check()
+
     # -- note_tag_drift --------------------------------------------------
     drift_rows = r_note_tag_drift.find_drift(
         inv,
@@ -200,6 +231,8 @@ def build_corpus(
                 citation_key=r.get("citation_key"),
             ),
         ))
+
+    _check()
 
     # -- finder_tag_drift ------------------------------------------------
     # vocab_id_for is deliberately omitted (vendored-tree rule: the resolver
@@ -225,6 +258,8 @@ def build_corpus(
                 citation_key=r.get("citation_key"),
             ),
         ))
+
+    _check()
 
     # -- annotation-based PDF reports ------------------------------------
     # Same precomputed-annotations contract as the report routes: serve from
@@ -256,6 +291,8 @@ def build_corpus(
                  pdf_rel=pdf.get("rel")),
         ))
 
+    _check()
+
     # -- bib/Zotero gap reports ------------------------------------------
     for r in (serialize.report_zotero_unread(r_zotero_unread.find(inv))
               .get("rows") or []):
@@ -276,6 +313,8 @@ def build_corpus(
                  _author_year(r.get("author"), r.get("year")),
                  citation_key=r.get("citation_key")),
         ))
+
+    _check()
 
     # -- curation reports -------------------------------------------------
     ambiguous = serialize.report_ambiguous_pdfs(inv, settings)
@@ -300,6 +339,98 @@ def build_corpus(
             _row(pdf.get("name"), pdf.get("rel"), pdf_rel=pdf.get("rel")),
         ))
 
+    for r in (serialize.report_tag_harmony(
+            r_tag_harmony.find_harmony(inv, synonyms=drift_synonyms),
+            settings).get("rows") or []):
+        entries.append(_Entry(
+            "tag_harmony",
+            _hay(r.get("citation_key"), r.get("title"), r.get("author"),
+                 r.get("union")),
+            _row(r.get("citation_key"),
+                 # Joined so a bib-less record (no author) does not render a
+                 # dangling " · " after the count.
+                 " · ".join(p for p in (
+                     f"{r.get('write_count')} tag(s) to propagate",
+                     _author_year(r.get("author"), None)) if p),
+                 citation_key=r.get("citation_key")),
+        ))
+
+    # Orphan buckets. Searchable because "where did that note go?" is exactly
+    # the question an orphan answers, and a row absent from the corpus reads to
+    # the user as "the vault does not contain it".
+    for r in (serialize.orphan_notes(inv, settings).get("rows") or []):
+        entries.append(_Entry(
+            "orphan_notes",
+            _hay(r.get("rel"), r.get("name")),
+            _row(r.get("name"), r.get("rel")),
+        ))
+
+    for r in (serialize.orphan_zotero_items(inv).get("rows") or []):
+        tags = r.get("tags") or []
+        entries.append(_Entry(
+            "orphan_zotero_items",
+            _hay(r.get("title"), r.get("citation_key"), r.get("item_key"), tags),
+            _row(r.get("title") or r.get("item_key"),
+                 " · ".join(x for x in (
+                     r.get("citation_key"),
+                     f"{len(tags)} tags" if tags else None) if x),
+                 citation_key=r.get("citation_key")),
+        ))
+
+    # Every file Zotero holds against an item. In the corpus for the same
+    # reason the orphan buckets are: a filename absent from a search that
+    # claims to cover every report reads as "Zotero does not have it", and
+    # this is the one report that can answer "which item is holding that PDF?".
+    for r in (serialize.zotero_attachments(inv).get("rows") or []):
+        entries.append(_Entry(
+            "zotero_attachments",
+            _hay(r.get("filename"), r.get("path"), r.get("parent_title"),
+                 r.get("citation_key"), r.get("item_key"), r.get("link_mode")),
+            _row(r.get("filename") or r.get("item_key"),
+                 " · ".join(x for x in (
+                     r.get("link_mode"),
+                     r.get("parent_title"),
+                     (f"{r.get('annotation_count')} annotations"
+                      if r.get("annotation_count") else None)) if x),
+                 citation_key=r.get("citation_key")),
+        ))
+
+    # 2026-09-06 harmonization reports. Rendered without their route-side
+    # enrichments (the Possible Duplicates decision needs the hash memo, the
+    # accession join lives app-side), which changes nothing about WHICH rows
+    # exist — only the detail text — so a hit still names a row the tab shows.
+    for r in (serialize.report_multi_pdf(r_multi_pdf.find(inv), settings)
+              .get("rows") or []):
+        files = r.get("files") or []
+        entries.append(_Entry(
+            "multi_pdf",
+            _hay(r.get("citation_key"), r.get("title"), r.get("author"),
+                 [f.get("name") for f in files], [f.get("rel") for f in files]),
+            _row(r.get("citation_key"),
+                 f"{len(files)} PDFs: " + ", ".join(f.get("name") or "" for f in files),
+                 citation_key=r.get("citation_key")),
+        ))
+
+    for r in (serialize.report_not_in_zotero(
+            r_not_in_zotero.find(inv, settings), settings).get("rows") or []):
+        pdf = r.get("pdf") or {}
+        entries.append(_Entry(
+            "not_in_zotero",
+            _hay(pdf.get("rel"), pdf.get("name")),
+            _row(pdf.get("name"), pdf.get("rel"), pdf_rel=pdf.get("rel")),
+        ))
+
+    for r in (serialize.report_dead_curation(
+            r_dead_curation.find(inv, settings), settings).get("rows") or []):
+        pdf = r.get("pdf") or {}
+        entries.append(_Entry(
+            "dead_curation",
+            _hay(pdf.get("rel"), pdf.get("name"), r.get("citation_key"), r.get("kind")),
+            _row(pdf.get("name"),
+                 " · ".join(x for x in (r.get("kind"), r.get("citation_key")) if x),
+                 citation_key=r.get("citation_key"), pdf_rel=pdf.get("rel")),
+        ))
+
     try:
         hygiene = serialize.report_tag_hygiene(r_tag_hygiene.find(inv, vocab))
     except Exception:  # noqa: BLE001 — hygiene is advisory; never fail a search
@@ -313,6 +444,8 @@ def build_corpus(
                  f"{r.get('total')} uses" + ("" if r.get("in_vocab") else " · not in vocabulary")),
         ))
 
+    _check()
+
     # -- duplicates -------------------------------------------------------
     for d in (serialize.report_duplicates(duplicates or [], settings).get("rows") or []):
         paths = d.get("paths") or []
@@ -325,6 +458,8 @@ def build_corpus(
                  f"{len(paths)} copies",
                  pdf_rel=rels[0] if rels else None),
         ))
+
+    _check()
 
     # -- near_duplicates --------------------------------------------------
     # Like duplicates, a separately-cached, skippable phase passed in by the
@@ -350,17 +485,37 @@ def build_corpus(
     return entries
 
 
-def search(corpus: Iterable[_Entry], query: str) -> dict[str, Any]:
+#: Reports whose visible row set is narrowed at RENDER time by a decision
+#: sidecar rather than at scan time. The corpus is memoised per cached scan
+#: while such a decision applies on the next report LOAD, so the filtering
+#: cannot happen during the build without either rebuilding the corpus on
+#: every dismissal or letting search disagree with the tab.
+_KEY_FILTERED_REPORTS = frozenset({"zotero_no_pdf"})
+
+
+def search(corpus: Iterable[_Entry], query: str, *,
+           hidden_keys: set[str] | frozenset[str] | None = None) -> dict[str, Any]:
     """Answer *query* against *corpus*, grouped by report and capped.
 
     Returns ``{"q", "total", "shown", "truncated", "groups":[…]}`` where each
     group is ``{"report", "count", "truncated", "rows":[…]}``. ``count`` is the
     group's true match count even when ``rows`` was capped, so the UI can say
     how much it is hiding rather than silently truncating.
+
+    ``hidden_keys`` are citation keys the user has dismissed from a
+    render-time-filtered report (currently the "needs no local PDF" decisions
+    behind *Bib Entries Without PDFs*). Applied HERE rather than in
+    :func:`build_corpus` because the corpus is memoised per cached scan while a
+    dismissal takes effect on the next report load: filtering at build time
+    would force a full rebuild per decision. Dropping them keeps the corpus
+    invariant that a hit always corresponds to a row the user can go and look
+    at — without it, a dismissed entry stayed findable in search and led to a
+    report that no longer listed it.
     """
     tokens = [t for t in fold(query).split() if t]
     if not tokens:
         return {"q": query, "total": 0, "shown": 0, "truncated": False, "groups": []}
+    hidden = hidden_keys or frozenset()
 
     by_report: dict[str, list[dict[str, Any]]] = {}
     counts: dict[str, int] = {}
@@ -368,6 +523,9 @@ def search(corpus: Iterable[_Entry], query: str) -> dict[str, Any]:
     for entry in corpus:
         hay = entry.haystack
         if not all(tok in hay for tok in tokens):
+            continue
+        if (hidden and entry.report in _KEY_FILTERED_REPORTS
+                and entry.row.get("citation_key") in hidden):
             continue
         total += 1
         counts[entry.report] = counts.get(entry.report, 0) + 1

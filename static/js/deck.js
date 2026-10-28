@@ -6,7 +6,7 @@
  * strings are rendered with textContent / createElement, never innerHTML.
  */
 import { secureFetch, consumeSSE, logError, safeJson } from './api.js';
-import { setStatusA11y, taskBegin, taskEnd, copyToClipboard, confirmInline } from './ui.js';
+import { setStatusA11y, taskBegin, taskEnd, taskNote, copyToClipboard, confirmInline, showTaskError } from './ui.js';
 
 let _generating = false;
 let _previewing = false;
@@ -33,7 +33,21 @@ export async function initDeck(cfg) {
     }
 }
 
+/** One-shot Retry boundary under the given root (docgen.js's pattern — the
+ * checkpoint makes a retry cheap, which made the missing button costly: a
+ * failed multi-minute run used to end with only a red status line). */
+function _showRetryBoundary(root, message, retryFn) {
+    if (!root) return;
+    const box = document.createElement('div');
+    box.className = 'task-error-boundary';
+    root.appendChild(box);
+    showTaskError(box, message, [
+        { label: 'Retry', primary: true, onClick: () => { box.remove(); retryFn(); } },
+    ]);
+}
+
 function _status(msg, isError = false) {
+    taskNote('deck-', msg, isError ? 'failed' : null);
     const el = $('deck-status');
     if (!el) return;
     el.style.display = msg ? 'block' : 'none';
@@ -57,6 +71,9 @@ function _mkCancelButton(logEl) {
     btn.setAttribute('aria-label', 'Cancel the running deck operation');
     btn.addEventListener('click', () => {
         if (_abortCtrl) _abortCtrl.abort();
+        // The abort leaves the host cleared, so the previous preview's
+        // blob has nothing referencing it (2026-09-02).
+        _previewTeardown();
         btn.disabled = true;
         btn.textContent = 'Cancelling…';
     });
@@ -69,6 +86,7 @@ function _wasCancelled() {
 }
 
 function _addActivity(text, muted = false) {
+    taskNote('deck-', text);
     const log = $('deck-activity');
     if (!log) return;
     const line = document.createElement('div');
@@ -85,11 +103,12 @@ export async function pickTemplateFile() {
     try {
         const r = await secureFetch('/api/deck/native-pick-file', { method: 'POST' });
         const d = await safeJson(r);
+        if (!r.ok) throw new Error((d?.error || 'Native picker unavailable.') + ' Use the desktop window or enter the path manually.');
         if (d && d.path) {
             $('deck-template-path').value = d.path;
             await loadTemplate();
         }
-    } catch (e) { logError('Template pick failed', e); }
+    } catch (e) { logError('Template pick failed', e); _status(e.message, true); }
 }
 
 /** Native-pick the output folder for the scaffolded deck. */
@@ -97,8 +116,9 @@ export async function pickOutDir() {
     try {
         const r = await secureFetch('/api/deck/native-pick-folder', { method: 'POST' });
         const d = await safeJson(r);
+        if (!r.ok) throw new Error((d?.error || 'Native picker unavailable.') + ' Use the desktop window or enter the path manually.');
         if (d && d.path) $('deck-out-dir').value = d.path;
-    } catch (e) { logError('Output folder pick failed', e); }
+    } catch (e) { logError('Output folder pick failed', e); _status(e.message, true); }
 }
 
 /**
@@ -218,6 +238,7 @@ export async function generate() {
     };
 
     _generating = true;
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('deck-generate', 'Generating deck');
     _setDeckBusy(true);
     _clear($('deck-activity'));
@@ -237,30 +258,40 @@ export async function generate() {
                 if (evt.iteration) _addActivity(`· iteration ${evt.iteration}`, true);
                 else if (evt.tool_call) _addActivity(`· ${evt.tool_call.name}()`, true);
                 else if (evt.tool_result) _addActivity(`· tool result${evt.tool_result.is_error ? ' [error]' : ''}`, true);
-                else if (evt.deck) _renderDeck(evt.deck);
+                else if (evt.deck) {
+                    outcome = evt.deck.scaffold_error ? 'partial' : evt.deck.tex_path ? 'completed' : 'unknown';
+                    _renderDeck(evt.deck);
+                }
             },
             onError: (err) => {
+                outcome = _wasCancelled() ? 'cancelled' : 'failed';
                 _status(err, true);
                 _addActivity('ERROR: ' + err);
+                _showRetryBoundary($('deck-result'), err, generate);
             }
         });
 
     } catch (e) {
+        outcome = _wasCancelled() ? 'cancelled' : 'failed';
         // C2/#14: distinguish the user's own Cancel from a real failure. The
         // per-section checkpoint means a cancelled run resumes on the next click.
         if (_wasCancelled()) {
-            _status('Generation cancelled. Re-run to resume from the last section.', false);
+            _status('Cancellation requested. Inspect the output folder for published files before retrying. Saved sections can be resumed.', false);
             _addActivity('Cancelled by user.', true);
         } else {
             logError('Deck generation failed', e);
             _status('Deck generation failed (see console).', true);
+            // The checkpoint makes a retry resume from the last completed
+            // section — offer it instead of ending on a red banner.
+            _showRetryBoundary($('deck-result'), 'Deck generation failed.', generate);
         }
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'unknown';
         _generating = false;
         _abortCtrl = null;
         if (cancelBtn) cancelBtn.remove();
         _setDeckBusy(false);
-        taskEnd('deck-generate');
+        taskEnd('deck-generate', outcome);
     }
 }
 
@@ -525,6 +556,7 @@ async function _runPiecewiseRepair(deck, btn) {
     if (_deckOpBusy()) { _status('Another deck operation is running — wait for it.', true); return; }
     btn.disabled = true;
     _setDeckBusy(true);
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('deck-repair-pw', 'Piecewise repair');
     _clear($('deck-aug-activity'));
     _clear($('deck-aug-result'));
@@ -537,9 +569,10 @@ async function _runPiecewiseRepair(deck, btn) {
         }, {
             onInfo: (info) => _augActivity(info),
             onOther: (evt) => {
-                if (evt.augment) { sawAugment = true; _renderAugment(evt.augment); }
+                if (evt.augment) { sawAugment = true; outcome = evt.augment.rejected_reason ? 'failed' : 'completed'; _renderAugment(evt.augment); }
             },
             onError: (err) => {
+                outcome = _wasCancelled() ? 'cancelled' : 'failed';
                 _augStatus(err, true);
                 _augActivity('ERROR: ' + err);
             },
@@ -548,12 +581,14 @@ async function _runPiecewiseRepair(deck, btn) {
             _augStatus('Piecewise repair preview ready below (Augment panel) — nothing written yet.');
         }
     } catch (e) {
+        outcome = _wasCancelled() ? 'cancelled' : 'failed';
         logError('Piecewise repair failed', e);
         _augStatus('Piecewise repair failed (see console).', true);
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'cancelled';
         btn.disabled = false;
         _setDeckBusy(false);
-        taskEnd('deck-repair-pw');
+        taskEnd('deck-repair-pw', outcome);
     }
 }
 
@@ -641,11 +676,12 @@ export async function pickAugmentDeck() {
     try {
         const r = await secureFetch('/api/deck/native-pick-file', { method: 'POST' });
         const d = await safeJson(r);
+        if (!r.ok) throw new Error((d?.error || 'Native picker unavailable.') + ' Use the desktop window or enter the path manually.');
         if (d && d.path) {
             $('deck-aug-path').value = d.path;
             await loadDeckSections();
         }
-    } catch (e) { logError('Augment deck pick failed', e); }
+    } catch (e) { logError('Augment deck pick failed', e); _augStatus(e.message, true); }
 }
 
 /** Parse the deck at the path input (/api/deck/deck-sections) and fill the scope picker. */
@@ -728,6 +764,7 @@ export async function augmentPreview(piecewise) {
     if (piecewise === true) payload.piecewise = true;
 
     _augmenting = true;
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('deck-augment', 'Augmenting deck');
     _setDeckBusy(true);
     _clear($('deck-aug-activity'));
@@ -747,9 +784,10 @@ export async function augmentPreview(piecewise) {
                 if (evt.iteration) _augActivity(`· iteration ${evt.iteration}`, true);
                 else if (evt.tool_call) _augActivity(`· ${evt.tool_call.name}()`, true);
                 else if (evt.tool_result) _augActivity(`· tool result${evt.tool_result.is_error ? ' [error]' : ''}`, true);
-                else if (evt.augment) _renderAugment(evt.augment);
+                else if (evt.augment) { outcome = evt.augment.rejected_reason ? 'failed' : 'completed'; _renderAugment(evt.augment); }
             },
             onError: (err, frame) => {
+                outcome = _wasCancelled() ? 'cancelled' : 'failed';
                 _augStatus(err, true);
                 _augActivity('ERROR: ' + err);
                 // Offer the piecewise run when the refusal is the size cap
@@ -767,19 +805,23 @@ export async function augmentPreview(piecewise) {
         });
 
     } catch (e) {
+        outcome = _wasCancelled() ? 'cancelled' : 'failed';
         if (_wasCancelled()) {
             _augStatus('Augmentation cancelled — nothing was written.', false);
             _augActivity('Cancelled by user.', true);
         } else {
             logError('Deck augmentation failed', e);
             _augStatus('Augmentation failed (see console).', true);
+            _showRetryBoundary($('deck-aug-result'), 'Augmentation failed.',
+                () => augmentPreview(piecewise));
         }
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'cancelled';
         _augmenting = false;
         _abortCtrl = null;
         if (cancelBtn) cancelBtn.remove();
         _setDeckBusy(false);
-        taskEnd('deck-augment');
+        taskEnd('deck-augment', outcome);
     }
 }
 
@@ -936,6 +978,7 @@ export async function runCompileFix(deckPath, shaRef, btn) {
     _status('Starting LaTeX compilation & repair loop…');
     _addActivity('Initializing latexmk subprocess...');
 
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('deck-compile-fix', 'Compiling deck');
     // Client-side abort (P6.2, 2026-07-30). Generate and Augment have had a
     // Cancel button since their SSE wiring landed; compile-fix — the LONGEST
@@ -975,6 +1018,7 @@ export async function runCompileFix(deckPath, shaRef, btn) {
             onOther: (evt) => {
                 if (evt.compile) {
                     const c = evt.compile;
+                    outcome = c.success ? 'completed' : 'failed';
                     if (c.tex_sha256) shaRef.sha = c.tex_sha256;
                     if (c.success) {
                         _status('Compilation succeeded!', false);
@@ -994,12 +1038,14 @@ export async function runCompileFix(deckPath, shaRef, btn) {
                 }
             },
             onError: (err) => {
+                outcome = _wasCancelled() ? 'cancelled' : 'failed';
                 _status(err, true);
                 _addActivity('Error: ' + err);
             }
         });
 
     } catch (e) {
+        outcome = _wasCancelled() ? 'cancelled' : 'failed';
         if (_wasCancelled()) {
             _status('Compile & auto-fix cancelled.');
             _addActivity('Cancelled by user.', true);
@@ -1008,12 +1054,13 @@ export async function runCompileFix(deckPath, shaRef, btn) {
             _status('Compile-fix request failed (see console).', true);
         }
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'cancelled';
         _compileFixing = false;
         _setDeckBusy(false);
         btn.disabled = false;
         _abortCtrl = null;
         if (cancelBtn) cancelBtn.remove();
-        taskEnd('deck-compile-fix');
+        taskEnd('deck-compile-fix', outcome);
     }
 }
 
@@ -1021,6 +1068,40 @@ export async function runCompileFix(deckPath, shaRef, btn) {
 // compiles don't leak a blob per click (same discipline as refactor.js's
 // _objectUrls, but a single slot: only one preview frame exists at a time).
 let _previewObjectUrl = null;
+
+/**
+ * Release the current preview's blob URL.
+ *
+ * PERF (2026-09-02): a preview blob no longer outlives the iframe that shows it.
+ *   Before:    the previous object URL was revoked only at the moment the NEXT
+ *              one landed. Every path that clears the host WITHOUT producing a
+ *              new blob — a compile that fails, a Cancel, a PDF fetch that
+ *              errors — removed the <iframe> referencing it and left a
+ *              multi-megabyte blob alive with nothing pointing at it, for the
+ *              rest of the process. Repeat a failing compile and you leak one
+ *              PDF per attempt.
+ *   Change:    one named teardown, called wherever the host is cleared and from
+ *              Cancel.
+ *   Safe because:
+ *              it only ever runs where the iframe has just been (or is about to
+ *              be) removed by _clear(host); a live preview's URL is never
+ *              revoked out from under it.
+ *   Preserves: the bytes still arrive via secureFetch and render from a blob:
+ *              URL — an /api iframe src is 403'd by the origin guard
+ *              (tests/js/deckPreview.test.js's source ratchet).
+ *   NOT done deliberately: a tab switch hides the panel but keeps the iframe in
+ *              the DOM, so that blob backs something the user can come back to.
+ *              Revoking there would be a UX regression, not a leak fix. Recorded
+ *              in CLAUDE.md Known Issues.
+ *   Pinned by: tests/js/previewBlobTeardown.test.js
+ */
+function _previewTeardown() {
+    if (_previewObjectUrl) {
+        URL.revokeObjectURL(_previewObjectUrl);
+        _previewObjectUrl = null;
+    }
+}
+
 
 /**
  * Compile the deck as-is and render the resulting PDF inline (axis i preview).
@@ -1045,6 +1126,7 @@ export async function runDeckPreview(deckPath, btn, host, statusFn = _status) {
     const original = btn.textContent;
     btn.textContent = 'Compiling…';
     statusFn('Compiling deck for preview…');
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('deck-preview', 'Compiling deck');
     // Client-side abort (P6.2, 2026-07-30). compile-preview is a SYNCHRONOUS
     // route, so aborting frees the UI (and this fetch) — it does NOT stop the
@@ -1070,10 +1152,14 @@ export async function runDeckPreview(deckPath, btn, host, statusFn = _status) {
         });
         const d = await safeJson(r);
         if (!r.ok) {
+            outcome = 'failed';
             statusFn(d.error || `Preview failed (${r.status})`, true);
             return;
         }
         _clear(host);
+        // The iframe just went; release whatever blob it was showing before
+        // any early return below can strand it (2026-09-02).
+        _previewTeardown();
         if (d.success && d.has_pdf) {
             // Same signal as the compile call: without it, Cancel during the
             // (potentially large) PDF download was inert — the blob completed
@@ -1082,13 +1168,14 @@ export async function runDeckPreview(deckPath, btn, host, statusFn = _status) {
                 `/api/deck/preview-pdf?deck_path=${encodeURIComponent(deckPath)}`,
                 { signal: _abortCtrl.signal });
             if (!pdfResp.ok) {
+                outcome = 'failed';
                 const pd = await safeJson(pdfResp);
                 statusFn(pd.error || `PDF fetch failed (${pdfResp.status})`, true);
                 return;
             }
             const blob = await pdfResp.blob();
-            if (_previewObjectUrl) URL.revokeObjectURL(_previewObjectUrl);
             _previewObjectUrl = URL.createObjectURL(blob);
+            outcome = 'completed';
             statusFn('Preview compiled.', false);
             const frame = document.createElement('iframe');
             frame.className = 'deck-preview-frame';
@@ -1120,6 +1207,7 @@ export async function runDeckPreview(deckPath, btn, host, statusFn = _status) {
             });
             host.appendChild(openBtn);
         } else {
+            outcome = 'failed';
             statusFn('Compilation failed — see the log below.', true);
             const pre = document.createElement('pre');
             pre.className = 'deck-preview-log';
@@ -1130,6 +1218,7 @@ export async function runDeckPreview(deckPath, btn, host, statusFn = _status) {
             host.appendChild(pre);
         }
     } catch (e) {
+        outcome = _wasCancelled() ? 'unknown' : 'failed';
         if (_wasCancelled()) {
             statusFn('Stopped waiting for the preview (the server compile finishes on its own).');
         } else {
@@ -1137,12 +1226,13 @@ export async function runDeckPreview(deckPath, btn, host, statusFn = _status) {
             statusFn('Preview request failed (see console).', true);
         }
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'unknown';
         _previewing = false;
         _setDeckBusy(false);
         btn.disabled = false;
         btn.textContent = original;
         _abortCtrl = null;
         if (cancelBtn) cancelBtn.remove();
-        taskEnd('deck-preview');
+        taskEnd('deck-preview', outcome);
     }
 }

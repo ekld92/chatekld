@@ -1,6 +1,6 @@
 """CLI smoke test for the Library Audit subsystem.
 
-Reads the active ChatEKLD config to build :class:`audit.config.Settings`,
+Reads the active CHERQAiN config to build :class:`audit.config.Settings`,
 then runs one or more diagnostic checks against the configured vault and
 Zotero database. No data is written back to either store.
 
@@ -26,6 +26,8 @@ Bridge + reports::
 """
 
 from __future__ import annotations
+
+from audit.core.pdf_paths import pdf_files
 
 import argparse
 import logging
@@ -176,7 +178,7 @@ def check_duplicates(settings: Settings) -> int:
     print(f"\n[duplicates] hashing PDFs under {settings.attachments_dir}")
     if not settings.attachments_dir.exists():
         return 0
-    pdfs = [p for p in settings.attachments_dir.rglob("*.pdf") if p.is_file()]
+    pdfs = [p for p in pdf_files(settings.attachments_dir) if p.is_file()]
     print(f"  PDFs found:           {len(pdfs)}")
     dupes = hashing.find_duplicate_sets(pdfs)
     print(f"  duplicate sets:       {len(dupes)}")
@@ -206,16 +208,30 @@ def check_bridge(settings: Settings) -> int:
     skip_prefix = settings.biblio_skip_prefix or None
     pdfs = [
         p
-        for p in settings.biblio_articles_dir.rglob("*.pdf")
+        for p in pdf_files(settings.biblio_articles_dir)
         if p.is_file()
         and (skip_prefix is None or not p.name.lower().startswith(skip_prefix))
     ]
-    result = eng_bridge.build_bridge(settings, entries, pdfs)
+    # Same Zotero-link rung as the inventory, or this diagnostic would
+    # disagree with what the app pairs. An unreadable database leaves it out.
+    zotero_links: dict | None = None
+    if settings.zotero_sqlite.exists():
+        try:
+            from .engine.inventory import zotero_link_index
+            zotero_links = zotero_link_index(
+                zotero.read_items(settings.zotero_sqlite, settings.zotero_storage),
+                pdfs)
+        except Exception as e:  # noqa: BLE001 — a diagnostic, never fatal
+            print(f"  (Zotero unreadable, link rung skipped: {type(e).__name__})")
+    result = eng_bridge.build_bridge(settings, entries, pdfs, zotero_links=zotero_links)
     sources = Counter(result.source_per_pdf.values())
     print(f"  bib entries:               {len(entries)}")
     print(f"  active PDFs:               {len(pdfs)}")
     print(f"  Z_Zotero_Notes w/ FM:      {result.notes_with_fm}")
     print(f"  FM pointer-fields seen:    {result.fm_pointer_fields_seen}")
+    print(f"  matched by Zotero link:    {sources.get('zotero_link', 0)}")
+    print(f"  Zotero overrides curation: {len(result.zotero_overrides)}")
+    print(f"  linked by >1 Zotero item:  {len(result.zotero_multi_links)}")
     print(f"  matched by manual:         {sources.get('manual', 0)}")
     print(f"  matched by FM pointer:     {sources.get('fm_pointer', 0)}")
     print(f"  matched by FM author+year: {sources.get('fm_authoryear', 0)}")
@@ -291,6 +307,9 @@ def check_unread_unzoterod(settings: Settings) -> int:
     print("\n[unread-unzoterod] PDFs not in bib AND look unread (aim ii)")
     inv = eng_inventory.build_inventory(settings, count_annotations=False)
     rep = r_unread_unzoterod.find(inv, settings)
+    if rep.error:
+        print(f"  unavailable: {rep.error}")
+        return 1
     print(f"  rows: {len(rep.rows)}  (threshold = {rep.threshold} annotations)")
     print(f"  ambiguous-bridge PDFs (excluded): {rep.ambiguous_count}")
     for row in rep.rows[:20]:
@@ -319,6 +338,9 @@ def check_read_unzoterod(settings: Settings) -> int:
     print("\n[read-unzoterod] PDFs not in bib, ranked by annotation count (aim iv)")
     inv = eng_inventory.build_inventory(settings, count_annotations=False)
     rep = r_read_unzoterod.find(inv, settings)
+    if rep.error:
+        print(f"  unavailable: {rep.error}")
+        return 1
     print(
         f"  rows: {len(rep.rows)}  (suggested read cutoff = {rep.suggested_read_cutoff} annotations)"
     )

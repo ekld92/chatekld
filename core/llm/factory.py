@@ -7,7 +7,7 @@ from typing import Callable, Iterator, Optional
 
 from core.llm.base import LLMProvider, StreamingResponse, coerce_error
 from core.llm.policy import FallbackPolicy
-from core.llm.types import ErrorCategory, LLMError, LLMRequest, LLMResponse
+from core.llm.types import ErrorCategory, FinishReason, LLMError, LLMRequest, LLMResponse
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +83,12 @@ def _capture_request(request: LLMRequest, provider_name: str) -> None:
     exact system field, ``retrieved_context_chunks`` gives the grounding size,
     and the last user turn is the query — so no per-caller enrichment is needed.
     Only tagged requests (``request.workflow`` set) are recorded; the capture
-    module itself never raises, so this is a cheap, safe passthrough.
+    module itself never raises, so this is a cheap, safe passthrough. A caller
+    that already captured richer context sets ``prompt_capture_recorded`` in
+    internal metadata; usage attribution still keeps its workflow tag.
     """
-    if not getattr(request, "workflow", ""):
+    if (not getattr(request, "workflow", "")
+            or request.metadata.get("prompt_capture_recorded") is True):
         return
     from core import prompt_capture
 
@@ -104,6 +107,14 @@ def _capture_request(request: LLMRequest, provider_name: str) -> None:
         context_chunks=len(request.retrieved_context_chunks or []),
         query=last_user,
     )
+
+
+def _with_reasoning_effort(request: LLMRequest, cfg: Optional[dict]) -> LLMRequest:
+    """Apply the one global opt-in without changing default wire payloads."""
+    effort = (cfg or {}).get("online_reasoning_effort", "provider_default")
+    if effort in ("low", "minimal") and request.reasoning_effort is None:
+        return dataclasses.replace(request, reasoning_effort=effort)
+    return request
 
 
 def resolve_chat_provider(
@@ -127,6 +138,7 @@ def resolve_chat_provider(
     fallback. Non-transient errors (auth, invalid_request) always
     surface to the caller regardless of policy.
     """
+    request = _with_reasoning_effort(request, cfg)
     primary = get_llm_provider(policy.primary, cfg=cfg)
     # Prompt Hub capture: record the effective system prompt BEFORE dispatch so
     # the panel reflects what we sent even if the call then errors. Tagged by
@@ -189,6 +201,8 @@ def stream_with_fallback(
     *,
     cfg: Optional[dict] = None,
     on_fallback: Optional[Callable[[str, str], None]] = None,
+    on_final: Optional[Callable[[LLMResponse], None]] = None,
+    on_truncation: Optional[Callable[[str], None]] = None,
     log_context: str = "fallback",
 ) -> Iterator[str]:
     """Stream tokens through the primary provider, falling back before token 1.
@@ -203,6 +217,7 @@ def stream_with_fallback(
     from core.config import resolve_chat_model
     from core.llm.redact import redact
 
+    request = _with_reasoning_effort(request, cfg)
     primary = get_llm_provider(provider_name, cfg=cfg)
     # Prompt Hub capture (see resolve_chat_provider): record what the primary
     # provider is about to receive. This one seam covers plain chat, online
@@ -225,10 +240,21 @@ def stream_with_fallback(
         )
 
     yielded_any = False
+    def _finish(final: LLMResponse) -> None:
+        if on_final is not None:
+            on_final(final)
+        if final.finish_reason == FinishReason.LENGTH and on_truncation is not None:
+            on_truncation(
+                f"Output was cut off at max_tokens={request.max_tokens}; "
+                "increase the output cap for a longer reply."
+            )
+
     try:
-        for token in primary.stream(request).response_gen:
+        primary_stream = primary.stream(request)
+        for token in primary_stream.response_gen:
             yielded_any = True
             yield token
+        _finish(primary_stream.final)
         return
     except LLMError as err:
         if yielded_any:
@@ -262,7 +288,9 @@ def stream_with_fallback(
     fallback_model = resolve_chat_model(model_cfg, policy.fallback)
     fallback_request = dataclasses.replace(request, model=fallback_model)
     
-    yield from fallback.stream(fallback_request).response_gen
+    fallback_stream = fallback.stream(fallback_request)
+    yield from fallback_stream.response_gen
+    _finish(fallback_stream.final)
 
 
 

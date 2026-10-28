@@ -24,6 +24,7 @@ import difflib
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
+from pathlib import Path
 
 from ..inventory import Inventory
 from ..normalize import fingerprint as _fingerprint
@@ -62,11 +63,19 @@ class TagHygieneRow:
 
 @dataclass
 class TagHygieneReport:
-    """Frequency rows (total desc) + top co-occurrence pairs."""
+    """Frequency rows (total desc) + top co-occurrence pairs.
+
+    ``unmapped_rows`` is a SEPARATE bucket, deliberately not folded into
+    ``rows`` — see :func:`find`.
+    """
 
     rows: list[TagHygieneRow] = field(default_factory=list)
     cooccurrence: list[dict] = field(default_factory=list)  # {a, b, count}
     vocab_size: int = 0
+    # Finder tags on biblio PDFs the bridge never mapped to a citation key.
+    unmapped_rows: list[TagHygieneRow] = field(default_factory=list)
+    unmapped_pdf_count: int = 0        # PDFs scanned for the bucket
+    unmapped_tagged_count: int = 0     # of those, how many carry >=1 Finder tag
 
 
 def find(inv: Inventory, vocab: dict[str, str] | None = None) -> TagHygieneReport:
@@ -132,8 +141,98 @@ def find(inv: Inventory, vocab: dict[str, str] | None = None) -> TagHygieneRepor
              for (a, b), n in cooccur.items() if n >= _COOCCUR_MIN_KEYS]
     pairs.sort(key=lambda p: (-p["count"], p["a"], p["b"]))
 
+    unmapped_rows, n_pdfs, n_tagged = _unmapped_finder_rows(inv, vocab_fps, vocab_fp_list)
+
     return TagHygieneReport(
         rows=rows,
         cooccurrence=pairs[:_COOCCUR_TOP],
         vocab_size=len(vocab or {}),
+        unmapped_rows=unmapped_rows,
+        unmapped_pdf_count=n_pdfs,
+        unmapped_tagged_count=n_tagged,
     )
+
+
+def _unmapped_finder_rows(inv: Inventory, vocab_fps: dict, vocab_fp_list: list):
+    """Finder tags on biblio PDFs that have NO citation key. Returns (rows, n, tagged).
+
+    The main report iterates ``inv.records``, the citation-key join, so a PDF
+    the bridge never mapped contributes nothing to it — including its
+    out-of-vocabulary tags. Measured on the maintainer's vault 2026-08-11: a
+    direct sweep found 5 distinct out-of-vocab Finder tags where the report
+    showed 2, the two whose PDFs happened to carry mapped keys. The report's
+    "out of vocabulary" count was a floor presented as a total.
+
+    These rows are kept **separate** rather than merged into ``rows`` (a
+    deliberate maintainer decision, 2026-08-11): folding them in would move
+    every hygiene figure in one release, breaking comparability with earlier
+    runs and with the recorded audit baselines, and ``audit_library.py``'s
+    ``--max-hygiene`` bar would silently change meaning. A separate bucket
+    with its own count is the same disclose-what-you-omit posture the
+    ``read_unzoterod`` report's meta line takes.
+
+    Counts are per PDF (one file carrying a tag counts once), not per paper as
+    in the main rows — an unmapped PDF *is* the unit, since there is no record
+    to aggregate copies under. All three residual bridge buckets are included —
+    ``unmapped_pdfs``, ``ambiguous_pdfs`` (multiple candidate keys, parked for
+    triage) and ``confirmed_no_match_pdfs`` (curated "not in the bib") — because
+    every one of them is equally unreachable by citation key today, which is the
+    property that made their tags invisible in the first place.
+    """
+    from audit.core import finder_tags
+
+    bridge = getattr(inv, "bridge", None)
+    if bridge is None:
+        return [], 0, 0
+    paths: list = []
+    for attr in ("unmapped_pdfs", "ambiguous_pdfs", "confirmed_no_match_pdfs"):
+        # `unmapped_pdfs` / `confirmed_no_match_pdfs` are ``list[Path]`` and
+        # `ambiguous_pdfs` is ``dict[Path, list[str]]`` — iterating the dict
+        # yields its Path keys, so one loop covers all three. The isinstance
+        # gate keeps a future shape change degrading to "fewer rows" rather
+        # than crashing a report.
+        for p in (getattr(bridge, attr, None) or []):
+            if isinstance(p, Path):
+                paths.append(p)
+
+    variant_counts: dict[str, Counter] = defaultdict(Counter)
+    source_counts: dict[str, Counter] = defaultdict(Counter)
+    n_tagged = 0
+    for p in paths:
+        try:
+            names = finder_tags.read_tag_names(p)
+        except Exception:  # noqa: BLE001 — a report must not fail on one bad file
+            continue
+        if not names:
+            continue
+        n_tagged += 1
+        for raw in names:
+            tag = str(raw).strip().lstrip("#").strip()
+            if not tag:
+                continue
+            fp = _fingerprint(tag)
+            if not fp:
+                continue
+            variant_counts[fp][tag] += 1
+            source_counts[fp]["finder"] += 1
+
+    rows: list[TagHygieneRow] = []
+    for fp, variants in variant_counts.items():
+        in_vocab = fp in vocab_fps
+        near = None
+        if not in_vocab and vocab_fp_list:
+            match = difflib.get_close_matches(
+                fp, vocab_fp_list, n=1, cutoff=_NEIGHBOUR_SIMILARITY)
+            near = vocab_fps[match[0]] if match else None
+        counts = dict(source_counts[fp])
+        rows.append(TagHygieneRow(
+            fingerprint=fp,
+            variants=[v for v, _n in variants.most_common()],
+            counts=counts,
+            total=sum(counts.values()),
+            in_vocab=in_vocab,
+            vocab_tag=vocab_fps.get(fp),
+            near_vocab=near,
+        ))
+    rows.sort(key=lambda r: (-r.total, r.fingerprint))
+    return rows, len(paths), n_tagged

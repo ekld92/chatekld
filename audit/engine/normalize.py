@@ -86,6 +86,26 @@ def group_by_key(
     return out
 
 
+def fold_tag(value: str) -> str:
+    """The DEPTH key: NFC, leading ``#``s stripped, case-folded. Nothing more.
+
+    Deliberately weaker than :func:`tag_key`. Depth answers "how many distinct
+    tags describe this paper", and the fingerprint would fold ``mental_pain``
+    onto ``pain mental`` — a legitimate answer to a different question, and one
+    that would silently change what ``--max-tags N`` selects. This is exactly
+    the historical ``lstrip("#").lower()`` the batch and the table used, plus
+    NFC and ``casefold``: macOS stores Finder tags in NFD, so without NFC the
+    same accented tag counts twice across surfaces.
+
+    ONE definition, shared by ``audit/serialize.py::tag_coverage`` (the
+    dashboard histogram), ``tagging/batch.py::tag_depth`` (``--min/--max-tags``)
+    and ``static/js/tagging.js::_rowDepth`` (the table cell and cohort filter).
+    They must agree or the cohort a user picks is not the cohort the batch
+    processes; the dashboard half used a raw set union until 2026-08-26.
+    """
+    return unicodedata.normalize("NFC", str(value)).lstrip("#").casefold()
+
+
 def tag_key(value: str) -> str:
     """The comparison key: ``fingerprint(clean_tag(value))`` with a fallback.
 

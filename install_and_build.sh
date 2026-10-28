@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install_and_build.sh — Unified Installer & Builder for ChatEKLD
+# install_and_build.sh — Unified Installer & Builder for CHERQAiN
 # =============================================================================
 # Run this once to setup the environment and build the macOS .app bundle.
 # =============================================================================
@@ -18,7 +18,7 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 divider() { echo "------------------------------------------------------------"; }
 
 divider
-echo "  ChatEKLD — Unified Installer & Builder"
+echo "  CHERQAiN — Unified Installer & Builder"
 divider
 
 # --- 1. System Check ---
@@ -39,7 +39,7 @@ fi
 # unsupported in the README.
 HOST_ARCH="$(uname -m)"
 if [[ "$HOST_ARCH" != "arm64" ]]; then
-    error "ChatEKLD builds an arm64-only (Apple Silicon) bundle; this host is '$HOST_ARCH'. Build on an Apple Silicon Mac (Intel is unsupported — see README)."
+    error "CHERQAiN builds an arm64-only (Apple Silicon) bundle; this host is '$HOST_ARCH'. Build on an Apple Silicon Mac (Intel is unsupported — see README)."
 fi
 
 # --- 2. Dependencies (Homebrew, Ollama, Python) ---
@@ -79,14 +79,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # works for any user (the previous hardcoded /Users/<name>/... path broke on
 # every machine but the author's).
 #
-# Resolution order: CHATEKLD_VENV_DIR override → legacy PAPERMIND_VENV_DIR
+# Resolution order: CHERQAIN_VENV_DIR → CHATEKLD_VENV_DIR → PAPERMIND_VENV_DIR
 # override → an EXISTING venv at the legacy default (~/venvs/papermind2026, kept
 # so a pre-rename install is not needlessly rebuilt) → the new default
 # ~/venvs/chatekld2026. NOTE: under `set -u` an unset HOME would abort here —
 # acceptable, since a macOS terminal/Finder launch always sets HOME.
 _NEW_DEFAULT_VENV="$HOME/venvs/chatekld2026"
 _LEGACY_DEFAULT_VENV="$HOME/venvs/papermind2026"
-if [[ -n "${CHATEKLD_VENV_DIR:-}" ]]; then
+if [[ -n "${CHERQAIN_VENV_DIR:-}" ]]; then
+    VENV_DIR="$CHERQAIN_VENV_DIR"
+elif [[ -n "${CHATEKLD_VENV_DIR:-}" ]]; then
     VENV_DIR="$CHATEKLD_VENV_DIR"
 elif [[ -n "${PAPERMIND_VENV_DIR:-}" ]]; then
     VENV_DIR="$PAPERMIND_VENV_DIR"
@@ -96,7 +98,7 @@ elif [[ -d "$_LEGACY_DEFAULT_VENV" ]]; then
 else
     VENV_DIR="$_NEW_DEFAULT_VENV"
 fi
-APP_NAME="ChatEKLD_$(date +%Y-%m-%d)"
+APP_NAME="CHERQAiN_$(date +%Y-%m-%d)"
 
 if [[ ! -d "$VENV_DIR" ]]; then
     info "Creating virtual environment with Python 3.12…"
@@ -115,12 +117,16 @@ fi
 info "Installing dependencies…"
 "$VENV_DIR/bin/pip" install --upgrade pip
 
-# Apply the exact-version lock (constraints.txt) when present so a fresh install
-# resolves the SAME validated versions the maintainer built against (torch /
-# transformers / sentence-transformers in particular drift across majors). The
-# human-maintained ranges live in requirements.txt; constraints.txt pins them.
-if [[ -f "$SCRIPT_DIR/constraints.txt" ]]; then
-    info "Applying version lock from constraints.txt"
+# The macOS artifact pins every resolved transitive and every accepted package
+# hash. This prevents a mutable index response or dependency re-resolution from
+# changing a release build after review. requirements.txt remains the readable
+# policy input and constraints.txt the exact resolution input used to regenerate
+# the platform locks.
+if [[ -f "$SCRIPT_DIR/requirements-lock-macos.txt" ]]; then
+    info "Applying hash-locked macOS dependency artifact"
+    "$VENV_DIR/bin/pip" install --require-hashes -r "$SCRIPT_DIR/requirements-lock-macos.txt"
+elif [[ -f "$SCRIPT_DIR/constraints.txt" ]]; then
+    warn "Hash lock missing — using constraints.txt (development fallback only)."
     "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" -c "$SCRIPT_DIR/constraints.txt"
 else
     warn "constraints.txt not found — installing from requirements.txt ranges (versions may drift)."
@@ -132,6 +138,11 @@ fi
 # pip prints a noisy warning when it is absent (the expected case), which can
 # mislead users into thinking installation failed.
 
+# Rebuilding an existing installation need not seed or load runtime models.
+# Keep the historical first-install default; maintenance builds opt out explicitly.
+if [[ "${CHERQAIN_SKIP_MODEL_CACHE:-${CHATEKLD_SKIP_MODEL_CACHE:-0}}" == "1" ]]; then
+    info "Skipping model/tokenizer cache preparation (CHATEKLD_SKIP_MODEL_CACHE=1)."
+else
 info "Pre-caching tiktoken encoding data (required for offline RAG)..."
 # Pin the cache to the app's durable location (core.constants.TIKTOKEN_CACHE_DIR,
 # which launch.py exports at startup) so the bundled .app finds it and macOS
@@ -187,11 +198,13 @@ else
     warn "Could not resolve NLTK_DATA_DIR — data will be fetched on first index if needed."
 fi
 
+fi
+
 # --- 4. Models ---
 # We no longer pull models by default to keep the installer fast.
 # Users can select and pull models in the UI after launch.
 info "Installer ready. No models will be pulled by default."
-info "You can select and pull models in the ChatEKLD UI after launching."
+info "You can select and pull models in the CHERQAiN UI after launching."
 
 # --- 5. Generate Icon & Build .app ---
 info "Generating icon and building $APP_NAME.app..."
@@ -201,9 +214,9 @@ info "Generating icon and building $APP_NAME.app..."
 rm -rf "$SCRIPT_DIR/build" "$SCRIPT_DIR/dist"
 rm -f  "$SCRIPT_DIR"/*.spec
 find "$SCRIPT_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} +
-find "$SCRIPT_DIR" -maxdepth 1 -name 'ChatEKLD_*.app' -exec rm -rf {} +
+find "$SCRIPT_DIR" -maxdepth 1 -name 'CHERQAiN_*.app' -exec rm -rf {} +
 # Drop any previously packaged .dmg so a rebuild never ships a stale-dated image.
-find "$SCRIPT_DIR" -maxdepth 1 -name 'ChatEKLD_*.dmg' -delete
+find "$SCRIPT_DIR" -maxdepth 1 -name 'CHERQAiN_*.dmg' -delete
 find "$SCRIPT_DIR" -name '*.pyc' -delete
 
 # Generate Icon
@@ -248,6 +261,10 @@ cd "$SCRIPT_DIR"
 # exact latent failure mode that bit `refactor/` in 2d9fa53), and the dead
 # `pydantic_settings` collect/hidden-import flags (never installed, never
 # imported; their red ERROR line taught the eye to skim past ERRORs) are gone.
+# 2026-09-07: `notesync`/`accession`/`widget` joined them. They shipped after
+# that pass and had been surviving on the static-import graph alone — the same
+# latent state, and `notesync` is reached partly through function-local
+# imports. `maintenance` is deliberately absent: it is stripped at publish.
 eval "\"$VENV_DIR/bin/pyinstaller\" \\
     --name \"$APP_NAME\" \\
     --osx-bundle-identifier \"com.chatekld.app\" \\
@@ -262,9 +279,12 @@ eval "\"$VENV_DIR/bin/pyinstaller\" \\
     --add-data \"api:api\" \\
     --add-data \"audit:audit\" \\
     --add-data \"deckgen:deckgen\" \\
-    --add-data \"refactor:refactor\" \\
+    --add-data \"vault_history:vault_history\" \\
     --add-data \"tagging:tagging\" \\
     --add-data \"docgen:docgen\" \\
+    --add-data \"notesync:notesync\" \\
+    --add-data \"accession:accession\" \\
+    --add-data \"widget:widget\" \\
     --add-data \"cli:cli\" \\
     --add-data \"mcp_server:mcp_server\" \\
     --add-data \"README.md:.\" \\
@@ -336,7 +356,7 @@ if [[ -d "$SCRIPT_DIR/dist/$APP_NAME.app" ]]; then
     info "Packaging $APP_NAME.dmg…"
     DMG_NAME="$APP_NAME.dmg"
     DMG_ROOT="$(mktemp -d)"
-    DMG_STAGE="$DMG_ROOT/ChatEKLD"
+    DMG_STAGE="$DMG_ROOT/CHERQAiN"
     mkdir -p "$DMG_STAGE"
     cp -R "$SCRIPT_DIR/$APP_NAME.app" "$DMG_STAGE/"
     # Drag-install target: a symlink to /Applications inside the image.
@@ -357,7 +377,7 @@ if [[ -d "$SCRIPT_DIR/dist/$APP_NAME.app" ]]; then
     # First-run instructions, generated (heredoc) so the exact dated app name and
     # the inner binary path are always correct for THIS build.
     cat > "$DMG_STAGE/READ ME FIRST.txt" <<EOF
-ChatEKLD — first run on a new Mac
+CHERQAiN — first run on a new Mac
 =================================
 
 This app is ad-hoc signed (no Apple notarization), so macOS Gatekeeper will block
@@ -381,7 +401,7 @@ it the first time until you approve it once. It runs 100% locally.
    you stay online: the app downloads them on first use instead.
 
 4. GIVE IT A MODEL
-   ChatEKLD needs a model provider. Either:
+   CHERQAiN needs a model provider. Either:
      • install Ollama (https://ollama.com) or LM Studio (https://lmstudio.ai) and
        pull an embedding model (nomic-embed-text) + a chat model, OR
      • use an online provider: create the file
@@ -391,7 +411,7 @@ it the first time until you approve it once. It runs 100% locally.
        TAVILY_API_KEY enables the vault agent's web search).
 
 5. LAUNCH
-   Open ChatEKLD from Applications.
+   Open CHERQAiN from Applications.
 
 6. OPTIONAL — DESKTOP WIDGETS
    The "widgets" folder in this window contains a SwiftBar menu-bar plugin and
@@ -403,7 +423,7 @@ Everything the app stores lives under ~/Library/Application Support/ChatEKLD/.
 Requires an Apple Silicon (arm64) Mac; Intel is not supported.
 EOF
     # UDZO = zlib-compressed read-only image (the standard distribution format).
-    hdiutil create -volname "ChatEKLD" -srcfolder "$DMG_STAGE" \
+    hdiutil create -volname "CHERQAiN" -srcfolder "$DMG_STAGE" \
         -ov -format UDZO "$SCRIPT_DIR/$DMG_NAME" >/dev/null
     rm -rf "$DMG_ROOT"
     info "Successfully packaged $DMG_NAME."
@@ -412,7 +432,7 @@ else
 fi
 
 divider
-echo -e "${GREEN}ChatEKLD is ready!${NC}"
+echo -e "${GREEN}CHERQAiN is ready!${NC}"
 echo "Local (this Mac): drag $APP_NAME.app to /Applications and double-click to launch."
 echo "To share with another Mac: send $APP_NAME.dmg — it bundles the app, first-run"
 echo "instructions, and the offline model-seed helper. The recipient must run the"

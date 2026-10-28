@@ -25,19 +25,20 @@ function mountVaultDom() {
     `;
 }
 
-function sseOk(frames) {
+function sseOk(frames, completion = Promise.resolve()) {
     const payload =
-        frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join('') + 'data: [DONE]\n\n';
+        frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join('');
     let sent = false;
     return {
         ok: true,
         status: 200,
         body: {
             getReader: () => ({
-                read: async () =>
-                    sent
-                        ? { value: undefined, done: true }
-                        : ((sent = true), { value: enc.encode(payload), done: false }),
+                read: async () => {
+                    if (!sent) { sent = true; return {value: enc.encode(payload), done: false}; }
+                    await completion;
+                    return {value: enc.encode('data: [DONE]\n\n'), done: false};
+                },
                 releaseLock: () => {},
                 cancel: async () => {},
             }),
@@ -52,7 +53,7 @@ describe('vault chat info-frame dedupe (2026-07-29)', () => {
         vi.resetModules();
         vault = await import('../../static/js/vault.js');
     });
-    afterEach(() => vi.unstubAllGlobals());
+    afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
     it('progressKey is digit-blind and nothing else', () => {
         const a = vault.progressKey("Still waiting for the reranker 'm' (30s) — downloading…");
@@ -64,6 +65,8 @@ describe('vault chat info-frame dedupe (2026-07-29)', () => {
     });
 
     it('repeated heartbeats update one bubble; new stages append', async () => {
+        let finish;
+        const completion = new Promise(resolve => { finish = resolve; });
         vi.stubGlobal('fetch', vi.fn((url) => {
             if (String(url).includes('/api/obsidian/chat')) {
                 return Promise.resolve(sseOk([
@@ -72,21 +75,27 @@ describe('vault chat info-frame dedupe (2026-07-29)', () => {
                     { info: 'Still waiting for the reranker (90s)…' },
                     { info: 'Retrieving context…' },
                     { token: 'bonjour' },
-                ]));
+                ], completion));
             }
             return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
         }));
 
-        await vault.chatWithVault();
+        const run = vault.chatWithVault();
+        await vi.waitFor(() => expect(document.querySelectorAll('#obsidian-chat .message-info').length).toBeGreaterThan(0));
 
         const infos = [...document.querySelectorAll('#obsidian-chat .message-info')];
         expect(infos.length, 'three heartbeats must collapse into one bubble').toBe(2);
         // The surviving heartbeat bubble carries the LATEST figure.
         expect(infos[0].textContent).toContain('(90s)');
         expect(infos[1].textContent).toContain('Retrieving context');
+        finish();
+        await run;
+        expect(document.querySelectorAll('#obsidian-chat .message-info')).toHaveLength(0);
     });
 
     it('an A/B/A sequence keeps three bubbles (no history rewriting)', async () => {
+        let finish;
+        const completion = new Promise(resolve => { finish = resolve; });
         vi.stubGlobal('fetch', vi.fn((url) => {
             if (String(url).includes('/api/obsidian/chat')) {
                 return Promise.resolve(sseOk([
@@ -94,14 +103,56 @@ describe('vault chat info-frame dedupe (2026-07-29)', () => {
                     { info: 'Retrieving context…' },
                     { info: 'Building lexical index (40s)…' },
                     { token: 'ok' },
-                ]));
+                ], completion));
             }
             return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
         }));
 
-        await vault.chatWithVault();
+        const run = vault.chatWithVault();
+        await vi.waitFor(() => expect(document.querySelectorAll('#obsidian-chat .message-info').length).toBeGreaterThan(0));
 
         const infos = [...document.querySelectorAll('#obsidian-chat .message-info')];
         expect(infos.length).toBe(3);
+        finish();
+        await run;
+        expect(document.querySelectorAll('#obsidian-chat .message-info')).toHaveLength(0);
     });
+    it('clears waiting stages on error while preserving durable notices and partial text', async () => {
+        vi.stubGlobal('fetch', vi.fn(url => Promise.resolve(String(url).includes('/api/obsidian/chat')
+            ? sseOk([{info: 'Waiting for model response…'}, {info: 'Coverage is limited.'},
+                {token: 'Kept answer'}, {error: 'Disconnected'}])
+            : {ok: true, status: 200, json: async () => ({})})));
+        await vault.chatWithVault();
+        const chat = document.getElementById('obsidian-chat');
+        expect(chat.textContent).not.toContain('Waiting for model response');
+        expect(chat.textContent).toContain('Coverage is limited.');
+        expect(chat.textContent).toContain('Kept answer');
+        expect(chat.textContent).toContain('interrupted');
+    });
+
+    it('cleans progress on Stop and ignores callbacks from the finished turn', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => ({ok: true, json: async () => ({})})));
+        const api = await import('../../static/js/api.js');
+        let handlers;
+        vi.spyOn(api, 'consumeSSE').mockImplementation((_url, options, callbacks) => {
+            handlers = callbacks;
+            callbacks.onInfo('Waiting for model response…');
+            callbacks.onToken('Partial answer');
+            return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () =>
+                reject(Object.assign(new Error('Stopped'), {name: 'AbortError'}))));
+        });
+        const run = vault.chatWithVault();
+        await vi.waitFor(() => expect(handlers).toBeDefined());
+        vault.stopChat();
+        await run;
+        const chat = document.getElementById('obsidian-chat');
+        expect(chat.textContent).not.toContain('Waiting for model response');
+        expect(chat.textContent).toContain('Partial answer');
+        const terminal = chat.innerHTML;
+        handlers.onInfo('Late progress…');
+        handlers.onToken('Late answer');
+        handlers.onOther({retrieval: [{source: 'late.pdf'}]});
+        expect(chat.innerHTML).toBe(terminal);
+    });
+
 });

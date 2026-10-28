@@ -6,15 +6,12 @@ Zotero itself*, so writing through it cannot corrupt ``zotero.sqlite``. The
 **web** transport talks to ``https://api.zotero.org`` with a user API key and
 reaches the same library through Zotero's sync.
 
-**Why both exist:** verified live 2026-07-20 against Zotero 9.0.6 — the local
-API answers GET but returns **501 "Method not implemented"** for PATCH/PUT
-(write support is slated for Zotero 10), so the local transport cannot write
-tags today. The identical PATCH against api.zotero.org returned 204, preserved
-per-tag ``type`` metadata verbatim, honoured ``If-Unmodified-Since-Version``
-(412 on a stale version), and synced down to the desktop app. The web transport
-is therefore the working write path until Zotero 10 ships; ``auto`` picks it
-whenever a key is present and falls back to local otherwise, so nothing
-regresses when the local API gains PATCH.
+Zotero 10 supports local writes after explicit runtime authorization. Local
+versions carry their database's server ID into writes and restores; Web API
+versions remain separate. Under ``auto``, an explicitly authorized Desktop
+session takes priority; otherwise existing Web API-key selection is retained.
+Local authorization keys stay in CHERQAiN process memory and never enter
+configuration, results or restore journals.
 
 Two behavioural differences the callers must respect:
 
@@ -42,6 +39,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import NoReturn
+
+from tagging.local_api import version_headers as _version_headers
 
 DEFAULT_BASE_URL = "http://127.0.0.1:23119"
 WEB_BASE_URL = "https://api.zotero.org"
@@ -58,6 +58,21 @@ class ZoteroUnavailable(Exception):
     """The Zotero API could not be reached (Zotero closed / offline / DNS)."""
 
 
+class ZoteroNotSent(ZoteroUnavailable):
+    """The connection itself failed (refused, host not resolvable) BEFORE any
+    request bytes left the socket, so the write cannot have landed. A timeout
+    or a reset after connecting stays a plain :class:`ZoteroUnavailable`:
+    the request may have been received (2026-09-17 review, B2)."""
+
+
+def _unavailable(exc: BaseException) -> ZoteroUnavailable:
+    reason = getattr(exc, "reason", exc)
+    import socket
+    if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
+        return ZoteroNotSent(str(exc))
+    return ZoteroUnavailable(str(exc))
+
+
 class ZoteroVersionConflict(Exception):
     """The item changed in Zotero since we read it (HTTP 412) — retry."""
 
@@ -65,17 +80,26 @@ class ZoteroVersionConflict(Exception):
 class ZoteroError(Exception):
     """Any other API failure (bad status, malformed response)."""
 
+    def __init__(self, message: str = "", *, http_code: int | None = None):
+        super().__init__(message)
+        self.http_code = http_code
+
 
 class ZoteroAuthError(ZoteroError):
     """Missing/invalid/insufficient API key (HTTP 401/403) — not retryable."""
+
+
+class ZoteroNotFound(ZoteroError):
+    """An authoritative item read returned 404, not a connection failure."""
 
 
 class ZoteroRateLimited(ZoteroError):
     """HTTP 429/503 with a server wait hint. Subclasses :class:`ZoteroError`
     so existing ``except ZoteroError`` handlers keep working (→ HTTP 502)."""
 
-    def __init__(self, message: str, retry_after_s: float | None = None):
-        super().__init__(message)
+    def __init__(self, message: str, retry_after_s: float | None = None,
+                 *, http_code: int | None = None):
+        super().__init__(message, http_code=http_code)
         self.retry_after_s = retry_after_s
 
 
@@ -114,9 +138,9 @@ class ZoteroTransport:
     def can_write(self) -> bool:
         """True when this transport is *expected* to accept a tag write.
 
-        Local is optimistically True — it is the correct answer once Zotero 10
-        ships PATCH, and a 501 surfaces as :class:`ZoteroWriteUnsupported`
-        either way. Web requires a key.
+        This is transport eligibility, not a permission probe. Local authorization
+        is checked at the request boundary; reads and capability checks never
+        prompt. Web requires a configured key.
         """
         return bool(self.api_key) if self.is_web else True
 
@@ -162,8 +186,9 @@ def resolve_transport(cfg: dict | None = None) -> ZoteroTransport:
     """Pick the transport from config + environment.
 
     ``tagging_zotero_transport``: ``auto`` (default) | ``local`` | ``web``.
-    Under ``auto`` a configured API key selects the web transport — because the
-    local one cannot write on Zotero ≤ 9 — and its absence falls back to local.
+    Under ``auto``, explicit Desktop authorization takes priority for this
+    session. Otherwise a configured Web API key selects web, falling back to
+    local when absent. Explicit local/web configuration remains authoritative.
     The web base is https-validated at call time (see ``_validated_web_base``);
     a malformed one raises rather than sending the key over an unsafe transport.
     """
@@ -177,7 +202,10 @@ def resolve_transport(cfg: dict | None = None) -> ZoteroTransport:
         return ZoteroTransport("local", local_base, None)
     if mode == "web":
         return ZoteroTransport("web", _validated_web_base(cfg.get("tagging_zotero_web_api_base")), key)
-    # auto: web only when a key is present (only it can write); else local.
+    from tagging.local_api import prefers_local
+    if prefers_local(local_base):
+        return ZoteroTransport('local', local_base, None)
+    # Explicit Desktop authorization overrides only automatic selection.
     if key:
         return ZoteroTransport("web", _validated_web_base(cfg.get("tagging_zotero_web_api_base")), key)
     return ZoteroTransport("local", local_base, None)
@@ -217,7 +245,8 @@ _opener = urllib.request.build_opener(_NoRedirect)
 
 def _urlopen(req, timeout):
     """Open *req* through the no-redirect opener (E1)."""
-    return _opener.open(req, timeout=timeout)
+    from tagging.local_api import open_request
+    return open_request(req, timeout, opener=_opener)
 
 
 def _key_fingerprint(api_key: str) -> str:
@@ -275,17 +304,23 @@ def _retry_after_s(exc: urllib.error.HTTPError) -> float | None:
         return None
 
 
-def _raise_for_http(exc: urllib.error.HTTPError, what: str):
+def _raise_for_http(exc: urllib.error.HTTPError, what: str) -> NoReturn:
     """Map an HTTPError onto the module's exception vocabulary."""
+    if exc.code == 404:
+        raise ZoteroNotFound(
+            'Zotero item not found (404).', http_code=404,
+        ) from exc
     if exc.code in (401, 403):
         raise ZoteroAuthError(
-            f"Zotero {what} refused (HTTP {exc.code}) — check the API key's permissions."
+            f"Zotero {what} refused (HTTP {exc.code}) — check the API key's permissions.",
+            http_code=exc.code,
         ) from exc
     if exc.code == 501:
         raise ZoteroWriteUnsupported(
             "This Zotero endpoint does not implement writes (HTTP 501). "
             "Zotero's local API is read-only before Zotero 10 — configure a "
-            f"{API_KEY_ENV} to write through the web API instead."
+            f"{API_KEY_ENV} to write through the web API instead.",
+            http_code=501,
         ) from exc
     if exc.code in (429, 503):
         retry_after = _retry_after_s(exc)
@@ -297,9 +332,12 @@ def _raise_for_http(exc: urllib.error.HTTPError, what: str):
         # writes never sleep on it (see _arm_backoff).
         _arm_backoff(retry_after)
         raise ZoteroRateLimited(
-            f"Zotero {what} rate-limited (HTTP {exc.code}).", retry_after
+            f"Zotero {what} rate-limited (HTTP {exc.code}).", retry_after,
+            http_code=exc.code,
         ) from exc
-    raise ZoteroError(f"Zotero {what} failed: HTTP {exc.code}") from exc
+    raise ZoteroError(
+        f"Zotero {what} failed: HTTP {exc.code}", http_code=exc.code,
+    ) from exc
 
 
 def library_path(item, *, user_id: int | None = None) -> str:
@@ -316,7 +354,14 @@ def library_path(item, *, user_id: int | None = None) -> str:
 
 
 def _url(base_url: str, lib_path: str, item_key: str) -> str:
-    return f"{base_url.rstrip('/')}/api/{lib_path}/items/{item_key}"
+    return _items_url(base_url, lib_path) + '/' + item_key
+
+
+def _items_url(base_url: str, lib_path: str) -> str:
+    from tagging.local_api import origin
+    if origin(base_url):
+        return f"{base_url.rstrip('/')}/api/{lib_path}/items"
+    return _web_url(_validated_web_base(base_url), f'{lib_path}/items')
 
 
 def _web_url(base_url: str, path: str) -> str:
@@ -419,7 +464,7 @@ def probe(base_url: str = DEFAULT_BASE_URL, timeout: float = _TIMEOUT_S,
 
 def get_item_tags_full(base_url: str, lib_path: str, item_key: str,
                        timeout: float = _TIMEOUT_S,
-                       api_key: str | None = None) -> tuple[int, list[dict]]:
+                       api_key: str | None = None, server_id: str | None = None) -> tuple[int, list[dict]]:
     """Return ``(version, raw_tags)`` — the item's tag dicts VERBATIM.
 
     ``raw_tags`` preserves every per-tag field Zotero stores (notably
@@ -430,13 +475,18 @@ def get_item_tags_full(base_url: str, lib_path: str, item_key: str,
     manual on each write. Raises :class:`ZoteroUnavailable` /
     :class:`ZoteroError` on transport / shape problems.
     """
+    from tagging.local_api import read_headers
+    extra = read_headers(base_url, server_id)
     _await_backoff()
     req = urllib.request.Request(
-        _url(base_url, lib_path, item_key), method="GET", headers=_headers(api_key))
+        _url(base_url, lib_path, item_key), method="GET", headers=_headers(api_key, extra))
     try:
         with _urlopen(req, timeout) as resp:
             _note_backoff(resp.headers)
             payload = json.loads(resp.read().decode("utf-8"))
+            server_id = resp.headers.get('Zotero-Server-ID')
+            if extra and server_id != extra['Zotero-Server-ID']:
+                raise ZoteroError('Zotero database identity changed during restore lookup.')
     except urllib.error.HTTPError as exc:
         _raise_for_http(exc, "GET")
     except (urllib.error.URLError, OSError) as exc:
@@ -452,7 +502,8 @@ def get_item_tags_full(base_url: str, lib_path: str, item_key: str,
         raise ZoteroError("Zotero item has no integer version.")
     raw_tags = [t for t in data.get("tags", [])
                 if isinstance(t, dict) and str(t.get("tag", "")).strip()]
-    return version, raw_tags
+    from tagging.local_api import Version
+    return Version(version, server_id), raw_tags
 
 
 def tag_names(raw_tags: list[dict]) -> list[str]:
@@ -462,7 +513,7 @@ def tag_names(raw_tags: list[dict]) -> list[str]:
 
 def get_item_tags(base_url: str, lib_path: str, item_key: str,
                   timeout: float = _TIMEOUT_S,
-                  api_key: str | None = None) -> tuple[int, list[str]]:
+                  api_key: str | None = None, server_id: str | None = None) -> tuple[int, list[str]]:
     """Name-only convenience over :func:`get_item_tags_full`.
 
     Kept for callers that only *compare* tag sets (the conservative revert
@@ -470,7 +521,7 @@ def get_item_tags(base_url: str, lib_path: str, item_key: str,
     or it reintroduces the metadata-stripping bug documented there.
     """
     version, raw = get_item_tags_full(base_url, lib_path, item_key,
-                                      timeout=timeout, api_key=api_key)
+                                      timeout=timeout, api_key=api_key, **({"server_id": server_id} if server_id is not None else {}))
     return version, tag_names(raw)
 
 
@@ -499,7 +550,7 @@ def set_item_tags(base_url: str, lib_path: str, item_key: str, tags: list,
         _url(base_url, lib_path, item_key), data=body, method="PATCH",
         headers=_headers(api_key, {
             "Content-Type": "application/json",
-            "If-Unmodified-Since-Version": str(int(version)),
+            **_version_headers(version),
         }),
     )
     try:
@@ -512,4 +563,599 @@ def set_item_tags(base_url: str, lib_path: str, item_key: str, tags: list,
             raise ZoteroVersionConflict("Item changed in Zotero (412).") from exc
         _raise_for_http(exc, "PATCH")
     except (urllib.error.URLError, OSError) as exc:
+        raise _unavailable(exc) from exc
+
+
+# --- child NOTE bodies (note sync Phase 4, 2026-09-04) ----------------------
+#
+# A Zotero note is an item whose ``note`` field is HTML. Both verbs are
+# version-guarded exactly like the tag writers, and the same rule applies:
+# *version* comes from a fresh :func:`get_item`, never from a write response.
+# Verified live 2026-09-04 (spike S1): PATCH answers 204, a stale version 412,
+# and an ``<img data-attachment-key>`` node inside the HTML survives untouched.
+
+def set_item_note(base_url: str, lib_path: str, note_key: str, html: str,
+                  version: int, timeout: float = _TIMEOUT_S,
+                  api_key: str | None = None) -> int:
+    """PATCH a note item's ``note`` (HTML), guarded by *version*; return the
+    new version. Raises :class:`ZoteroVersionConflict` on 412,
+    :class:`ZoteroWriteUnsupported` on 501, :class:`ZoteroUnavailable` on
+    transport failure, :class:`ZoteroError` else."""
+    body = json.dumps({"note": str(html or "")}).encode("utf-8")
+    req = urllib.request.Request(
+        _url(base_url, lib_path, note_key), data=body, method="PATCH",
+        headers=_headers(api_key, {
+            "Content-Type": "application/json",
+            **_version_headers(version),
+        }),
+    )
+    try:
+        with _urlopen(req, timeout) as resp:
+            _note_backoff(resp.headers)
+            new_version = resp.headers.get("Last-Modified-Version")
+            return int(new_version) if new_version and new_version.isdigit() else version
+    except urllib.error.HTTPError as exc:
+        if exc.code == 412:
+            raise ZoteroVersionConflict("Note changed in Zotero (412).") from exc
+        _raise_for_http(exc, "PATCH")
+    except (urllib.error.URLError, OSError) as exc:
+        raise _unavailable(exc) from exc
+
+
+def create_child_note(base_url: str, lib_path: str, parent_key: str, html: str,
+                      timeout: float = _TIMEOUT_S,
+                      api_key: str | None = None, server_id: str | None = None) -> str:
+    """POST one child note under *parent_key*; return the NEW note's key.
+
+    The only verb in the app that CREATES a Zotero item. Its undo is a trash
+    (``set_item_deleted``), never a DELETE — the same argument as the
+    attachment de-link.
+    """
+    payload = [{"itemType": "note", "parentItem": parent_key, "note": str(html or "")}]
+    url = _items_url(base_url, lib_path)
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers=_headers(api_key, {"Content-Type": "application/json",
+                                  **({'Zotero-Server-ID': server_id} if server_id else {})}))
+    try:
+        with _urlopen(req, timeout) as resp:
+            _note_backoff(resp.headers)
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        _raise_for_http(exc, "POST")
+    except (urllib.error.URLError, OSError) as exc:
         raise ZoteroUnavailable(str(exc)) from exc
+    except ValueError as exc:
+        raise ZoteroError(f"Malformed Zotero response: {exc}") from exc
+    ok = (body.get("successful") or {}) if isinstance(body, dict) else {}
+    entry = ok.get("0") if isinstance(ok, dict) else None
+    key = entry.get("key") if isinstance(entry, dict) else None
+    if not key:
+        failed = (body.get("failed") or {}) if isinstance(body, dict) else {}
+        raise ZoteroError(f"Zotero did not create the note: {failed or body}")
+    return _created_item_key(entry)
+
+
+class CreatedItemKey(str):
+    """A string-compatible key carrying only POST acknowledgement evidence."""
+
+    creation_data: dict | None
+    creation_version: int | None
+
+    def __new__(cls, key, data=None, version=None):
+        obj = super().__new__(cls, key)
+        obj.creation_data = data
+        obj.creation_version = version
+        return obj
+
+
+# Backward-compatible name for attachment callers and stored test fixtures.
+CreatedAttachmentKey = CreatedItemKey
+
+
+def _created_item_key(entry):
+    key = entry['key']
+    data, version = entry.get('data'), entry.get('version')
+    if (not isinstance(data, dict) or data.get('key') != key
+            or type(version) is not int or version <= 0):
+        data, version = None, None
+    return CreatedItemKey(str(key), data, version)
+
+
+#: Item types a proposal may mint. A CLOSED vocabulary, for the same reason
+#: `_canonicalise_tags` gates tags: the type decides which fields Zotero will
+#: keep, and a client (or an LLM proposal) that could name any type could mint
+#: an item whose fields silently vanish on save. `attachment` and `note` are
+#: absent deliberately — they have their own verbs, and both need a parent.
+PARENT_ITEM_TYPES = (
+    "journalArticle", "bookSection", "book", "report", "thesis",
+    "conferencePaper", "webpage", "blogPost", "magazineArticle",
+    "newspaperArticle", "preprint", "document", "manuscript",
+)
+
+#: Keys a caller may never put in `fields` — every one of them is STRUCTURE
+#: rather than bibliographic content, and the field map is the one part of
+#: this payload a client controls.
+#:
+#: `parentItem` would make a CHILD (this verb mints top-level items);
+#: `key`/`version` would make it a keyed create, which Zotero Desktop refuses
+#: with `primaryData not loaded` (see `create_linked_file_attachment`, whose
+#: reservation is retained rather than retried unkeyed); `itemType`,
+#: `creators` and `tags` arrive as their own arguments, and letting the map
+#: reach them would mean a string landing where Zotero expects an array;
+#: `deleted` would create an item already in the trash; the two `date*`
+#: stamps are the server's to write. Refusing them explicitly matters
+#: because the alternative — relying on these assignments running after the
+#: loop — is a safety property that a later reordering silently removes.
+_RESERVED_FIELD_KEYS = frozenset({
+    "itemType", "parentItem", "key", "version", "collections", "relations",
+    "creators", "tags", "deleted", "dateAdded", "dateModified",
+})
+
+
+def create_parent_item(base_url: str, lib_path: str, item_type: str,
+                       fields: dict | None = None,
+                       creators: list | None = None,
+                       tags: list | None = None,
+                       timeout: float = _TIMEOUT_S,
+                       api_key: str | None = None,
+                       server_id: str | None = None) -> CreatedItemKey:
+    """POST one TOP-LEVEL item; return its key plus creation evidence.
+
+    The second item-creating verb after `create_child_note`, and the first
+    that mints a PARENT. Deliberately unkeyed: a reserved-key create is
+    refused by Zotero Desktop (see `create_linked_file_attachment`), so the
+    lost-response guard is the caller's attempt store, never a key we chose.
+
+    Its undo is a trash (`set_item_deleted`), never a DELETE — the same
+    argument as the note create and the attachment de-link.
+    """
+    if item_type not in PARENT_ITEM_TYPES:
+        raise ZoteroError(f"Refusing to create an item of type {item_type!r}.")
+    content: dict = {}
+    for name, value in (fields or {}).items():
+        if name in _RESERVED_FIELD_KEYS:
+            raise ZoteroError(f"Field {name!r} may not be set on a create.")
+        if value in (None, ""):
+            continue
+        content[str(name)] = str(value)
+    # Structure last, so it wins whatever the field map contained. The guard
+    # above already refuses these names; this is the belt to its braces.
+    payload: dict = {**content, "itemType": item_type,
+                     "tags": list(tags or []), "relations": {},
+                     "collections": []}
+    cleaned: list[dict] = []
+    for creator in (creators or []):
+        if not isinstance(creator, dict):
+            raise ZoteroError("Each creator must be an object.")
+        ctype = str(creator.get("creatorType") or "author")
+        if "name" in creator:
+            built = {"creatorType": ctype, "name": str(creator["name"])}
+        else:
+            built = {"creatorType": ctype,
+                     "firstName": str(creator.get("firstName") or ""),
+                     "lastName": str(creator.get("lastName") or "")}
+            if not built["lastName"]:
+                continue
+        cleaned.append(built)
+    if cleaned:
+        payload["creators"] = cleaned
+    url = _items_url(base_url, lib_path)
+    req = urllib.request.Request(
+        url, data=json.dumps([payload]).encode("utf-8"), method="POST",
+        headers=_headers(api_key, {"Content-Type": "application/json",
+                                  **({'Zotero-Server-ID': server_id} if server_id else {})}))
+    try:
+        with _urlopen(req, timeout) as resp:
+            _note_backoff(resp.headers)
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        _raise_for_http(exc, "POST")
+    except (urllib.error.URLError, OSError) as exc:
+        raise ZoteroUnavailable(str(exc)) from exc
+    except ValueError as exc:
+        raise ZoteroError(f"Malformed Zotero response: {exc}") from exc
+    ok = (body.get("successful") or {}) if isinstance(body, dict) else {}
+    entry = ok.get("0") if isinstance(ok, dict) else None
+    key = entry.get("key") if isinstance(entry, dict) else None
+    if not key:
+        failed = (body.get("failed") or {}) if isinstance(body, dict) else {}
+        raise ZoteroError(f"Zotero did not create the item: {failed or body}")
+    return _created_item_key(entry)
+
+
+def create_linked_file_attachment(base_url: str, lib_path: str, parent_key: str,
+                                  path: str, title: str,
+                                  content_type: str = "application/pdf",
+                                  timeout: float = _TIMEOUT_S,
+                                  api_key: str | None = None, item_key: str | None = None,
+                                  server_id: str | None = None) -> str:
+    """POST one ``linked_file`` attachment under *parent_key*; return its key.
+
+    Spike S1 (2026-09-06, live against api.zotero.org): a linked-file
+    attachment is a plain item write — ``path`` and no upload step; the
+    server holds no bytes for it (``GET …/file`` answers 404), so it consumes
+    no Zotero storage, and it syncs down to the desktop within seconds. The
+    bytes stay in the vault. Its undo is a trash (``set_item_deleted``), never
+    a DELETE — the same argument as the de-link and the note create.
+    """
+    payload: list[dict] = [{
+        "itemType": "attachment", "linkMode": "linked_file",
+        "parentItem": parent_key, "title": str(title or ""),
+        "contentType": content_type, "charset": "", "path": str(path),
+        "tags": [], "relations": {},
+    }]
+    if item_key is not None:
+        if len(item_key) != 8 or any(c not in '23456789ABCDEFGHIJKLMNPQRSTUVWXYZ' for c in item_key):
+            raise ZoteroError('Invalid reserved attachment key.')
+        payload[0].update(key=item_key, version=0)
+    url = _items_url(base_url, lib_path)
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers=_headers(api_key, {"Content-Type": "application/json",
+                                  **({'Zotero-Server-ID': server_id} if server_id else {})}))
+    try:
+        with _urlopen(req, timeout) as resp:
+            _note_backoff(resp.headers)
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        _raise_for_http(exc, "POST")
+    except (urllib.error.URLError, OSError) as exc:
+        raise ZoteroUnavailable(str(exc)) from exc
+    except ValueError as exc:
+        raise ZoteroError(f"Malformed Zotero response: {exc}") from exc
+    ok = (body.get("successful") or {}) if isinstance(body, dict) else {}
+    entry = ok.get("0") if isinstance(ok, dict) else None
+    key = entry.get("key") if isinstance(entry, dict) else None
+    if not key:
+        failed = (body.get("failed") or {}) if isinstance(body, dict) else {}
+        failure = failed.get('0', {}) if isinstance(failed, dict) else {}
+        from tagging.local_api import origin
+        if (item_key is not None and origin(base_url) and isinstance(failure, dict)
+                and failure.get('code') == 400
+                and "'primaryData' not loaded" in str(failure.get('message', ''))):
+            raise ZoteroWriteUnsupported(
+                'Zotero Desktop rejected creation with a reserved attachment key '
+                '(verified in Zotero 10.0.1). The reservation is retained; no unkeyed '
+                'retry was sent. Durable attachment creation requires a compatible '
+                'Desktop implementation or an explicitly selected Web transport.')
+        raise ZoteroError(f"Zotero did not create the attachment: {failed or body}")
+    # The successful entry describes this object at creation. The response
+    # header is a library version and is deliberately not an undo baseline.
+    return _created_item_key(entry)
+
+
+# --- attachment de-link ----------------------------------------------------
+#
+# Removing an attachment from a Zotero item is a TRASH, never a DELETE, and the
+# distinction is the whole safety argument (see api/routes/zotlink.py):
+#
+#   * `PATCH {"deleted": 1}` is reversible with `{"deleted": 0}`, keeps the
+#     item KEY (so its relations and any annotations survive), and — for an
+#     `imported_*` attachment, whose bytes live in ~/Zotero/storage/<key>/ —
+#     leaves those bytes on disk until the user empties Zotero's trash.
+#   * `DELETE /items/<key>` destroys all three. Re-creating the attachment
+#     afterwards mints a NEW key, so the round trip is not an undo.
+#
+# So no DELETE verb is offered here. Doing that deliberately, and saying why,
+# is cheaper than discovering it from a user's lost highlights.
+
+def get_item(base_url: str, lib_path: str, item_key: str,
+             timeout: float = _TIMEOUT_S,
+             api_key: str | None = None, server_id: str | None = None) -> tuple[dict, int]:
+    """GET one item; return ``(data, version)``.
+
+    ``data`` is the item's ``data`` object verbatim — for an attachment that
+    carries ``linkMode``, ``parentItem``, ``filename``/``path`` and, when the
+    item is already trashed, ``deleted``. The version is read from the
+    ``Last-Modified-Version`` header, falling back to the body's own field, and
+    is what the caller must pass to :func:`set_item_deleted`.
+    """
+    from tagging.local_api import read_headers
+    extra = read_headers(base_url, server_id)
+    _await_backoff()
+    req = urllib.request.Request(
+        _url(base_url, lib_path, item_key), method="GET", headers=_headers(api_key, extra))
+    try:
+        with _urlopen(req, timeout) as resp:
+            _note_backoff(resp.headers)
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+            header_version = resp.headers.get("Last-Modified-Version")
+            server_id = resp.headers.get('Zotero-Server-ID')
+            if extra and server_id != extra['Zotero-Server-ID']:
+                raise ZoteroError('Zotero database identity changed during restore lookup.')
+    except urllib.error.HTTPError as exc:
+        _raise_for_http(exc, "GET")
+        raise                                   # pragma: no cover — _raise_for_http raises
+    except (urllib.error.URLError, OSError) as exc:
+        raise ZoteroUnavailable(str(exc)) from exc
+    except ValueError as exc:
+        raise ZoteroError("Malformed Zotero item response.") from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise ZoteroError("Unexpected item payload from Zotero.")
+    if header_version and str(header_version).isdigit():
+        version = int(header_version)
+    else:
+        try:
+            version = int(data.get("version") or payload.get("version") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ZoteroError("Malformed Zotero item version.") from exc
+    from tagging.local_api import Version
+    return data, Version(version, server_id)
+
+
+def set_attachment_path(base_url: str, lib_path: str, item_key: str,
+                        path: str, version: int, timeout: float = _TIMEOUT_S,
+                        api_key: str | None = None) -> int:
+    """Re-point a ``linked_file`` attachment at *path*; return the new version.
+
+    ONE field. The attachment's ``title`` — what Zotero displays — is
+    deliberately not touched: the maintainer's contract is that the vault
+    filename is authoritative and Zotero's display name is nobody's business,
+    so a rename must move the POINTER and nothing else. ``filename`` and
+    ``md5`` are null for a linked file (verified live, spike S1) and stay
+    that way; Zotero stores nothing.
+
+    This exists because the library now holds 5 242 ``linked_file``
+    attachments carrying ABSOLUTE vault paths (the 2026-09-06 attach run), so
+    every rename breaks a real reference. It was performed by hand nine times
+    after the Zotero-preference and Attanger rename incidents; this is that
+    call, with a version guard.
+
+    Version-guarded exactly like :func:`set_item_tags`: *version* MUST come
+    from a fresh :func:`get_item` and never from a previous write's response
+    (a write reports the LIBRARY version, which can already differ from the
+    item's own — observed live, a POST returned 77060 while the item was at
+    77061 and a PATCH reusing it 412'd).
+
+    Raises :class:`ZoteroVersionConflict` on 412,
+    :class:`ZoteroWriteUnsupported` on 501 (the read-only local API before
+    Zotero 10), :class:`ZoteroUnavailable` on transport failure.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("path must be a non-empty string.")
+    return _patch_attachment_field(base_url, lib_path, item_key, "path", path,
+                                   version, timeout, api_key)
+
+
+def set_attachment_title(base_url: str, lib_path: str, item_key: str,
+                         title: str, version: int, timeout: float = _TIMEOUT_S,
+                         api_key: str | None = None) -> int:
+    """Set an attachment's display ``title``; return the new version.
+
+    The annual cleanup's T4 (2026-09-18, decision D3: an attachment's title
+    equals its vault filename). ONE field, like :func:`set_attachment_path`,
+    so the revert is the same PATCH with the old title. Measured before it was
+    built: 653 of 6,246 personal linked attachments carried a title other than
+    their filename, 505 of them "Full Text PDF"/"PDF" from connector saves.
+
+    Version-guarded exactly like :func:`set_attachment_path` (and for the same
+    reason: *version* comes from a fresh :func:`get_item`, never from a
+    previous write's response).
+    """
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("title must be a non-empty string.")
+    return _patch_attachment_field(base_url, lib_path, item_key, "title", title,
+                                   version, timeout, api_key)
+
+
+def _patch_attachment_field(base_url, lib_path, item_key, field, value,
+                            version, timeout, api_key) -> int:
+    """PATCH one attachment field under ``If-Unmodified-Since-Version``."""
+    body = json.dumps({field: value}).encode("utf-8")
+    req = urllib.request.Request(
+        _url(base_url, lib_path, item_key), data=body, method="PATCH",
+        headers=_headers(api_key, {
+            "Content-Type": "application/json",
+            **_version_headers(version),
+        }),
+    )
+    try:
+        with _urlopen(req, timeout) as resp:
+            _note_backoff(resp.headers)
+            new_version = resp.headers.get("Last-Modified-Version")
+            return int(new_version) if new_version and new_version.isdigit() else version
+    except urllib.error.HTTPError as exc:
+        if exc.code == 412:
+            raise ZoteroVersionConflict("Attachment changed in Zotero (412).") from exc
+        _raise_for_http(exc, "PATCH")
+        raise                                   # pragma: no cover — _raise_for_http raises
+    except (urllib.error.URLError, OSError) as exc:
+        raise ZoteroUnavailable(str(exc)) from exc
+
+
+def set_item_parent(base_url: str, lib_path: str, item_key: str,
+                    parent_key: str, version: int, timeout: float = _TIMEOUT_S,
+                    api_key: str | None = None) -> int:
+    """Move a CHILD item (attachment or note) under *parent_key*; return the new version.
+
+    The record-merge verb's re-parent (annual cleanup T8, 2026-09-17). ONE
+    field — ``parentItem`` — so the child keeps its key, its path, its
+    annotations and its own tags; only which item it hangs off changes, and
+    the revert is the same PATCH with the old parent. Version-guarded exactly
+    like :func:`set_item_tags`: *version* MUST be the child's own current
+    version from a fresh read, never a write response's library version.
+
+    Raises :class:`ZoteroVersionConflict` on 412, :class:`ZoteroWriteUnsupported`
+    on 501, :class:`ZoteroUnavailable` on transport failure, ``ValueError`` on
+    an empty parent key.
+    """
+    if not isinstance(parent_key, str) or not parent_key.strip():
+        raise ValueError("parent_key must be a non-empty string.")
+    body = json.dumps({"parentItem": parent_key}).encode("utf-8")
+    req = urllib.request.Request(
+        _url(base_url, lib_path, item_key), data=body, method="PATCH",
+        headers=_headers(api_key, {
+            "Content-Type": "application/json",
+            **_version_headers(version),
+        }),
+    )
+    try:
+        with _urlopen(req, timeout) as resp:
+            _note_backoff(resp.headers)
+            new_version = resp.headers.get("Last-Modified-Version")
+            return int(new_version) if new_version and new_version.isdigit() else version
+    except urllib.error.HTTPError as exc:
+        if exc.code == 412:
+            raise ZoteroVersionConflict("Item changed in Zotero (412).") from exc
+        _raise_for_http(exc, "PATCH")
+        raise                                   # pragma: no cover — _raise_for_http raises
+    except (urllib.error.URLError, OSError) as exc:
+        raise ZoteroUnavailable(str(exc)) from exc
+
+
+#: Fields a metadata write may never carry: structure, identity, children and
+#: server-owned stamps. ``extra`` and ``citationKey`` are NOT here — they are
+#: ordinary fields that the writer refuses unless EXPLICITLY selected, because
+#: Better BibTeX keeps its pinned key in one of them.
+METADATA_RESERVED_FIELDS = frozenset({
+    "itemType", "parentItem", "key", "version", "collections", "relations",
+    "tags", "deleted", "dateAdded", "dateModified", "creators",
+})
+
+
+def set_item_fields(base_url: str, lib_path: str, item_key: str,
+                    fields: dict, version: int, timeout: float = _TIMEOUT_S,
+                    api_key: str | None = None) -> int:
+    """PATCH exactly *fields* on one item; return the new version.
+
+    The metadata executor's ONE write verb (phase 5, 2026-09-16). Only the
+    given data fields ride the body — a structural key in *fields* is a
+    caller bug and is refused here rather than sent, since Zotero would accept
+    some of them silently. Version-guarded exactly like :func:`set_item_tags`:
+    *version* MUST come from a fresh :func:`get_item`, never from a previous
+    write's response. The caller re-reads the item after the PATCH: Zotero
+    normalises on save (observed on 10.0.1: a title-only PATCH promoted an
+    ``Extra: Citation Key:`` line into native ``citationKey``), so what landed
+    is only known from the readback, never from the request.
+
+    Raises :class:`ZoteroVersionConflict` on 412,
+    :class:`ZoteroWriteUnsupported` on 501, :class:`ZoteroUnavailable` on
+    transport failure, ``ValueError`` on an empty or reserved field set.
+    """
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("fields must be a non-empty mapping.")
+    reserved = sorted(set(fields) & METADATA_RESERVED_FIELDS)
+    if reserved:
+        raise ValueError(f"Reserved fields cannot be written: {', '.join(reserved)}.")
+    if any(not isinstance(name, str) or not name for name in fields):
+        raise ValueError("Field names must be non-empty strings.")
+    body = json.dumps(fields, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        _url(base_url, lib_path, item_key), data=body, method="PATCH",
+        headers=_headers(api_key, {
+            "Content-Type": "application/json",
+            **_version_headers(version),
+        }),
+    )
+    try:
+        with _urlopen(req, timeout) as resp:
+            _note_backoff(resp.headers)
+            new_version = resp.headers.get("Last-Modified-Version")
+            return int(new_version) if new_version and new_version.isdigit() else version
+    except urllib.error.HTTPError as exc:
+        if exc.code == 412:
+            raise ZoteroVersionConflict("Item changed in Zotero (412).") from exc
+        _raise_for_http(exc, "PATCH")
+        raise                                   # pragma: no cover — _raise_for_http raises
+    except (urllib.error.URLError, OSError) as exc:
+        raise ZoteroUnavailable(str(exc)) from exc
+
+
+def set_item_deleted(base_url: str, lib_path: str, item_key: str,
+                     deleted: bool, version: int, timeout: float = _TIMEOUT_S,
+                     api_key: str | None = None) -> int:
+    """Move an item to Zotero's trash (or back out of it); return the new version.
+
+    ``deleted=True`` trashes, ``deleted=False`` restores — one verb for both
+    directions so the undo cannot drift from the do. Version-guarded exactly
+    like :func:`set_item_tags`: *version* MUST come from a fresh :func:`get_item`
+    and never from a previous write's response (a write reports the LIBRARY
+    version, which can already differ from the item's own).
+
+    Raises :class:`ZoteroVersionConflict` on 412, :class:`ZoteroWriteUnsupported`
+    on 501 (the read-only local API before Zotero 10), :class:`ZoteroUnavailable`
+    on transport failure.
+    """
+    body = json.dumps({"deleted": 1 if deleted else 0}).encode("utf-8")
+    req = urllib.request.Request(
+        _url(base_url, lib_path, item_key), data=body, method="PATCH",
+        headers=_headers(api_key, {
+            "Content-Type": "application/json",
+            **_version_headers(version),
+        }),
+    )
+    try:
+        with _urlopen(req, timeout) as resp:
+            _note_backoff(resp.headers)
+            new_version = resp.headers.get("Last-Modified-Version")
+            return int(new_version) if new_version and new_version.isdigit() else version
+    except urllib.error.HTTPError as exc:
+        if exc.code == 412:
+            raise ZoteroVersionConflict("Item changed in Zotero (412).") from exc
+        _raise_for_http(exc, "PATCH")
+        raise                                   # pragma: no cover — _raise_for_http raises
+    except (urllib.error.URLError, OSError) as exc:
+        raise ZoteroUnavailable(str(exc)) from exc
+
+
+def get_item_children(base_url: str, lib_path: str, parent_key: str,
+                      timeout: float = _TIMEOUT_S, api_key: str | None = None,
+                      server_id: str | None = None) -> list[dict]:
+    """Read current child paths before a selected-file create/retry.
+
+    Zotero API v3 /items/<key>/children, paginated on the same trusted origin.
+    Refuse incomplete or changing results rather than treating them as empty.
+    https://www.zotero.org/support/dev/web_api/v3/basics
+    """
+    from tagging.local_api import read_headers
+    extra = read_headers(base_url, server_id)
+    children = []
+    version = None
+    instance = server_id
+    for start in range(0, 1000, 100):
+        _await_backoff()
+        req = urllib.request.Request(
+            _url(base_url, lib_path, parent_key) + f'/children?format=json&limit=100&start={start}',
+            headers=_headers(api_key, extra), method='GET')
+        try:
+            with _urlopen(req, timeout) as resp:
+                _note_backoff(resp.headers)
+                current_instance = resp.headers.get('Zotero-Server-ID')
+                if instance is not None and current_instance != instance:
+                    raise ZoteroError('Zotero database identity changed during child lookup.')
+                instance = current_instance
+                current = resp.headers.get('Last-Modified-Version')
+                if version is not None and current != version:
+                    raise ZoteroError('Zotero changed while checking attachments. Retry.')
+                version = current
+                raw = resp.read(2_000_001)
+                if len(raw) > 2_000_000:
+                    raise ZoteroError('Zotero attachment response is too large.')
+                items = json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            _raise_for_http(exc, 'GET')
+        except (urllib.error.URLError, OSError) as exc:
+            raise ZoteroUnavailable(str(exc)) from exc
+        except ValueError as exc:
+            raise ZoteroError('Malformed Zotero attachment response.') from exc
+        if not isinstance(items, list):
+            raise ZoteroError('Malformed Zotero attachment list.')
+        for item in items:
+            data = item.get('data') if isinstance(item, dict) else None
+            if not isinstance(data, dict):
+                raise ZoteroError('Malformed Zotero child item.')
+            children.append(data)
+        if len(items) < 100:
+            return children
+    raise ZoteroError('Too many attachments to verify completely. No attachment created.')
+
+
+def linked_file_paths(base_url: str, lib_path: str, parent_key: str,
+                      timeout: float = _TIMEOUT_S, api_key: str | None = None,
+                      server_id: str | None = None) -> set[str]:
+    """Return verified live linked paths in one database/version namespace."""
+    return {str(data['path']) for data in get_item_children(
+        base_url, lib_path, parent_key, timeout=timeout, api_key=api_key, server_id=server_id)
+        if data.get('linkMode') == 'linked_file' and not data.get('deleted') and data.get('path')}

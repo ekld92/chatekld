@@ -1,6 +1,6 @@
 """Per-section generation phase.
 
-For each outline section, run one agent-mode chat turn (so ChatEKLD's agent can
+For each outline section, run one agent-mode chat turn (so CHERQAiN's agent can
 search/read the vault) asking for the section's Beamer frames, then sanitize the
 output into an embeddable body.
 """
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     # Type-only: importing the HTTP client at runtime would pull in ``requests``,
     # which the in-process (app) path must not require. The in-process runner is
     # duck-typed as a ChatRunner (anything exposing ``.chat(...) -> ChatResult``).
-    from .client import ChatEKLDClient
+    from .client import CHERQAiNClient
 
 
 def _beamer_placeholder(section) -> str:
@@ -36,7 +36,7 @@ def _beamer_placeholder(section) -> str:
 
 
 def generate_section(
-    client: ChatEKLDClient,
+    client: CHERQAiNClient,
     *,
     index: int,
     section,            # outline.Section
@@ -58,6 +58,7 @@ def generate_section(
     retry_backoff_s: float = 0.0,
     should_cancel=None,
     sanitize=sanitize_section,
+    post_process=None,
     system_prompt_builder=section_system_prompt,
     build_message=build_section_message,
     placeholder_builder=_beamer_placeholder,
@@ -82,8 +83,22 @@ def generate_section(
     images_enabled)``; ``build_message`` the same kwargs as
     :func:`deckgen.prompts.build_section_message`; ``placeholder_builder`` a
     single ``section`` and return the fallback body.
+
+    *post_process* is an optional ``(body) -> body`` applied after *sanitize* on
+    both the agent and the salvage path. The route binds it to
+    :func:`deckgen.latex.rewrite_source_tags` (with the bibliography and the
+    document class's citation macro closed over) so the model's inline
+    ``(source: note.md)`` attributions become real citations. ``None`` — every
+    non-route caller, including the CLI and the tests — leaves the body exactly
+    as *sanitize* produced it.
     """
     from .retry import chat_with_retry
+
+    def _finish(text: str) -> str:
+        """sanitize, then the optional class-specific post-pass. One pair, two
+        call sites (agent + salvage) — kept together so neither can drift."""
+        out = sanitize(text)
+        return post_process(out) if (post_process is not None and out) else out
 
     message = build_message(
         topic=topic,
@@ -114,7 +129,7 @@ def generate_section(
         temperature=temperature,
     )
 
-    body = sanitize(result.text)
+    body = _finish(result.text)
     infos = list(result.infos)
     placeholder = False
     if result.error:
@@ -154,7 +169,7 @@ def generate_section(
         if salvage is not None:
             if salvage.error:
                 infos.append(f"salvage pass error: {salvage.error}")
-            body = sanitize(salvage.text)
+            body = _finish(salvage.text)
             if body:
                 result = salvage
                 infos.append("salvage pass produced usable content")

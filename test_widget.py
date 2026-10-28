@@ -359,6 +359,10 @@ class TestWidgetRoutes(unittest.TestCase):
             for p in self._patches(self._inv_pair()):
                 st.enter_context(p)
             self.mod._on_scan_result()
+            # The build runs on the coalescing daemon since 2026-09-02: join
+            # INSIDE the patch scope, or it would run against the real
+            # singletons and this assertion would pin nothing.
+            self.mod.join_snapshot_refresh()
         self.assertEqual(w_store.read_snapshot()["paper"]["key"], "smith2020")
 
     def test_listener_is_registered_on_the_manager(self):
@@ -373,7 +377,7 @@ class TestWidgetRoutes(unittest.TestCase):
             for p in self._patches(self._inv_pair())[:3]:
                 st.enter_context(p)
             st.enter_context(mock.patch(
-                "subprocess.Popen", side_effect=OSError("no open")))
+                "api.routes.open.run_open", side_effect=OSError("no open")))
             r = self.client.post("/api/widget/refresh", json={},
                                  headers=_HEADERS)
         self.assertEqual(r.status_code, 200)
@@ -530,3 +534,62 @@ class TestSwiftBarPluginHardening(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSnapshotOffScanThread(unittest.TestCase):
+    """PERF (2026-09-02): the result listener no longer builds on the SCAN
+    thread — it enqueues onto one coalescing daemon.
+
+    The build reaches a PDF text extraction for the excerpt, and the audit
+    status says the scan is finished while its thread is still working.
+    """
+
+    def setUp(self):
+        import api.routes.widget as widget_routes
+        self.mod = widget_routes
+
+    def test_the_listener_returns_before_the_build_runs(self):
+        started = __import__("threading").Event()
+        release = __import__("threading").Event()
+        threads = []
+
+        def _slow():
+            threads.append(__import__("threading").current_thread())
+            started.set()
+            release.wait(5)
+            return None
+
+        caller = __import__("threading").current_thread()
+        with mock.patch.object(self.mod, "_build_and_write", side_effect=_slow):
+            self.mod._on_scan_result()
+            # The listener returned while the build is still running: that is
+            # the whole point — the scan thread is free.
+            self.assertTrue(started.wait(5), "the build never started")
+            release.set()
+            # getattr: pre-change the build was synchronous and there is no
+            # joiner, so the ASSERTION below carries the red.
+            getattr(self.mod, "join_snapshot_refresh", lambda: None)()
+        self.assertTrue(threads, "the build never ran")
+        self.assertIsNot(threads[0], caller,
+                         "the build ran on the caller's (scan) thread")
+
+    def test_repeat_requests_coalesce_into_one_follow_up(self):
+        import threading as th
+        gate = th.Event()
+        calls = []
+
+        def _blocking():
+            calls.append(1)
+            gate.wait(5)
+            return None
+
+        with mock.patch.object(self.mod, "_build_and_write",
+                               side_effect=_blocking):
+            self.mod._on_scan_result()
+            for _ in range(5):
+                self.mod._on_scan_result()
+            gate.set()
+            getattr(self.mod, "join_snapshot_refresh", lambda: None)()
+        # One build in flight plus ONE coalesced follow-up — never six.
+        self.assertLessEqual(len(calls), 2, f"{len(calls)} builds")
+        self.assertGreaterEqual(len(calls), 1)

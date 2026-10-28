@@ -27,6 +27,7 @@ from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
 
 from core.constants import (
+    PDF_EXTRACT_TIMEOUT_S,
     PDF_LIMIT_SIZE_MB,
     PROMPT_PRESETS,
     SYSTEM_PROMPT_LIMIT,
@@ -39,6 +40,7 @@ from core.utils import (
     cap, parse_temperature, parse_num_ctx, parse_num_predict,
     parse_top_p, parse_repeat_penalty, write_text_atomic
 )
+from api.bounded import run_bounded_action
 from api.security import sanitise_error_msg
 from api.validators import (
     coerce_bool,
@@ -235,6 +237,8 @@ def api_summarise():
         from datetime import datetime, timezone
         from core.llm.usage import usage_frame_payload, usage_tracker
         start_iso = datetime.now(timezone.utc).isoformat()
+        received_text = False
+        failure = None
         try:
             for token in summarise_stream(
                 stored_text,
@@ -259,11 +263,13 @@ def api_summarise():
                 if cancel.is_set():
                     break
                 if token:
+                    received_text = received_text or bool(token.strip())
                     put({"token": token})
+            if not cancel.is_set() and not received_text:
+                failure = "No usable summary text was returned. Review the generation settings before trying again."
         except Exception as e:
             if not cancel.is_set():
-                put({"error": sanitise_error_msg(e)})
-            return
+                failure = sanitise_error_msg(e)
         if cancel.is_set():
             return
         # Best-effort real token/cost totals for this summary (map-reduce runs
@@ -277,6 +283,10 @@ def api_summarise():
                 put({"usage": payload})
         except Exception:
             logger.debug("paper usage frame failed", exc_info=True)
+        # The shared SSE consumer terminates on an error frame. Send retained
+        # usage first, including billed-but-empty or partially failed output.
+        if failure:
+            put({"error": failure})
 
     return run_sse_worker(
         _paper_worker,
@@ -289,9 +299,10 @@ def api_summarise():
 def api_upload():
     """Accept a PDF upload, extract its text, and store it under a new id.
 
-    Validates the multipart ``file`` part: a sanitised ``.pdf`` filename and a
-    ``Content-Length`` within the ``PDF_LIMIT_SIZE_MB`` cap (a pre-read guard;
-    ``process_pdf_upload`` enforces the same byte cap while streaming to disk).
+    Validates the multipart ``file`` part and a sanitised ``.pdf`` filename.
+    The app-level request guard rejects an oversized multipart envelope before
+    parsing; ``process_pdf_upload`` independently enforces the exact PDF byte
+    cap while streaming to disk, including unknown-length transfers.
     Extraction runs in a subprocess so a hang can be killed by timeout. Returns
     ``{upload_id, filename}``; a ``ValueError`` (bad/empty PDF) is a 400 and any
     other failure a 500, both sanitised.
@@ -308,19 +319,71 @@ def api_upload():
     if not filename.lower().endswith(".pdf"):
         return jsonify({"error": "Only PDF files are supported"}), 400
 
-    content_length = request.content_length or 0
     max_bytes = PDF_LIMIT_SIZE_MB * 1024 * 1024
-    if content_length > max_bytes:
-        return jsonify({"error": f"PDF exceeds {PDF_LIMIT_SIZE_MB} MB limit"}), 400
 
     from services.pdf_service import process_pdf_upload
     try:
-        upload_id, _text = process_pdf_upload(file, filename, max_bytes=max_bytes)
+        upload_id, _text = process_pdf_upload(file, filename, max_bytes=max_bytes,
+                                              runner=_bounded_pdf_extract)
         return jsonify({"upload_id": upload_id, "filename": filename})
+    except _UploadBusy as e:
+        return jsonify({"error": str(e)}), 429
+    except _UploadTimedOut as e:
+        return jsonify({"error": str(e)}), 504
     except ValueError as e:
         return jsonify({"error": sanitise_error_msg(e)}), 400
     except Exception as e:
         return jsonify({"error": sanitise_error_msg(e)}), 500
+
+class _UploadTimedOut(Exception):
+    """The PDF extraction outran its deadline; the worker is freed (504)."""
+
+
+class _UploadBusy(Exception):
+    """Another paper upload is extracting (429)."""
+
+
+#: Just OUTSIDE the extraction subprocess's own PDF_EXTRACT_TIMEOUT_S, per the
+#: timeout chain's outer-must-exceed-inner rule — a tighter value would 504 a
+#: legal extraction and discard work the user is waiting for.
+_UPLOAD_DEADLINE_S = float(PDF_EXTRACT_TIMEOUT_S + SSE_STALL_MARGIN_S)
+
+
+def _bounded_pdf_extract(fn):
+    """Run the paper upload's extraction on a bounded daemon, one at a time.
+
+    PERF (2026-09-02): extraction leaves the Waitress request thread.
+      Before:    process_pdf_upload joined the extraction subprocess INLINE for
+                 up to PDF_EXTRACT_TIMEOUT_S (600 s), holding one of thirty-two
+                 pool slots with no ceiling of its own and no way to say "busy".
+      Change:    the extractor runs through api.bounded.run_bounded_action. The
+                 streamed save stays on the request thread, which is where it
+                 has to be (it reads the request stream).
+      Safe because:
+                 the extractor is handed a temp path and touches no Flask
+                 state, and process_pdf_upload's `finally` still removes that
+                 file. A daemon that finishes after a 504 writes its uploads
+                 row; the id was never returned, so nothing references it.
+      Preserves: the subprocess's own PDF_EXTRACT_TIMEOUT_S is still the inner
+                 bound and still the one that terminates the worker — this
+                 deadline sits outside it and never truncates a legal run.
+      Honest limit: extraction is not interruptible, so a 504 frees the worker
+                 but not the subprocess, which ends on its own timeout.
+      Action name: distinct from chat_attachment_pdf, so a paper upload and a
+                 chat attachment never make each other wait.
+      Pinned by: test_paper_upload_bounded.py
+    """
+    res, timed_out, busy = run_bounded_action(
+        "paper_upload_pdf", lambda should_cancel: fn(),
+        deadline_s=_UPLOAD_DEADLINE_S)
+    if busy:
+        raise _UploadBusy("Another PDF is still being read. "
+                          "Wait for it to finish and try again.")
+    if timed_out:
+        raise _UploadTimedOut(
+            f"Reading that PDF timed out after {int(_UPLOAD_DEADLINE_S)} seconds.")
+    return res
+
 
 @paper_bp.route("/api/upload/<upload_id>", methods=["DELETE"])
 def api_delete_upload(upload_id: str):

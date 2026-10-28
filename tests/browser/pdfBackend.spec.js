@@ -1,0 +1,91 @@
+import {test, expect} from '@playwright/test';
+
+test('real PDF backend renders pages, zooms, navigates and reopens durable review', async ({page})=>{
+    await page.goto('/');
+    await page.evaluate(async()=>{
+        const {secureFetch}=await import('/static/js/api.js');
+        const response=await secureFetch('/api/accession/review/workspace');
+        if(!response.ok) throw new Error(await response.text());
+        document.body.innerHTML='<main id="fixture"></main>';
+        const {mountPendingReview}=await import('/static/js/pendingReview.js');
+        window.fixtureTeardown=mountPendingReview(document.getElementById('fixture'),await response.json());
+    });
+    await page.getByRole('button',{name:'backend-one.pdf',exact:true}).click();
+    const picture=page.locator('.pending-page-scroll img');
+    await expect(picture).toBeVisible();
+    await expect.poll(()=>picture.evaluate(img=>img.naturalWidth)).toBeGreaterThan(0);
+    const first=await picture.getAttribute('src');
+    await page.getByRole('button',{name:'Next page',exact:true}).click();
+    await expect(picture).toHaveAttribute('alt', /page 2$/);
+    await expect.poll(()=>picture.evaluate(img=>img.naturalWidth)).toBeGreaterThan(0);
+    expect(await picture.getAttribute('src')).not.toBe(first);
+    await page.getByRole('combobox',{name:'PDF zoom',exact:true}).selectOption('1.5');
+    await expect(picture).toHaveCSS('width', /.+px/);
+    await expect.poll(()=>picture.evaluate(img=>img.naturalWidth)).toBeGreaterThan(1000);
+    await page.getByRole('button',{name:'backend-two.pdf',exact:true}).click();
+    await expect(picture).toHaveAttribute('alt', /backend-two.pdf, page 1$/);
+    await page.getByRole('button',{name:'backend-one.pdf',exact:true}).click();
+    await expect(picture).toHaveAttribute('alt', /backend-one.pdf, page 1$/);
+    await expect.poll(()=>picture.evaluate(img=>img.naturalWidth)).toBeGreaterThan(0);
+    await page.locator('[data-review="confirm"]').click();
+    await page.getByRole('button',{name:'Confirm',exact:true}).click();
+    await page.getByRole('button',{name:'backend-one.pdf',exact:true}).click();
+    await expect(page.locator('tr[data-pdf="biblio_articles/backend-one.pdf"]')).toContainText('PDF identity confirmed — check Zotero reference');
+    await page.getByRole('button',{name:'Register/link…',exact:true}).click();
+    await page.locator('[data-field="publicationTitle"]').fill('Edited journal');
+    await page.getByRole('button',{name:'Add creator',exact:true}).click();
+    await page.locator('[data-suggest]').selectOption('0');
+    await expect(page.locator('[data-name="firstName"]')).toHaveValue('Ada');
+    await page.getByRole('button',{name:'Add creator',exact:true}).click();
+    await page.locator('[data-suggest]').nth(1).selectOption('1');
+    await expect(page.locator('[data-name="name"]')).toHaveValue('Fixture Society');
+    await page.locator('[data-role]').nth(1).fill('editor');
+    await page.getByRole('button',{name:'backend-two.pdf',exact:true}).click();
+    await page.getByRole('button',{name:'backend-one.pdf',exact:true}).click();
+    await page.getByRole('button',{name:'Register/link…',exact:true}).click();
+    await expect(page.locator('[data-field="publicationTitle"]')).toHaveValue('Edited journal');
+    await expect(page.locator('[data-role]').nth(1)).toHaveValue('editor');
+    const persisted=await page.evaluate(async()=>{
+        const {secureFetch}=await import('/static/js/api.js');
+        return (await secureFetch('/api/accession/review/workspace')).json();
+    });
+    expect(persisted.rows.find(r=>r.pdf.name==='backend-one.pdf').review.status).toBe('confirmed');
+    await page.screenshot({path:'test-results/pdf-backend-renderer.png',fullPage:true});
+    await page.evaluate(()=>window.fixtureTeardown());
+});
+
+test('entry PDF manager deletes and restores actual disposable files through Flask',async({page})=>{
+    await page.goto('/');
+    await page.waitForFunction(()=>!!window.selectAuditReport);
+    await page.locator('#tab-audit').click();
+    await page.evaluate(()=>window.selectAuditReport('inventory'));
+    await page.locator('[data-manage-pdfs="Managed"]').click();
+    await expect(page.getByText('Managed PDF fixture',{exact:true})).toBeVisible();
+    await page.getByRole('radio',{name:'Keep biblio_articles/managed-keep.pdf',exact:true}).check();
+    await page.getByRole('combobox',{name:'Action for biblio_articles/managed-remove.pdf',exact:true}).selectOption('delete');
+    await page.getByRole('button',{name:'Preview selected cleanup',exact:true}).click();
+    await expect(page.getByRole('heading',{name:'Review changes'})).toBeVisible();
+    await page.getByRole('button',{name:'Confirm this plan…',exact:true}).click();
+    await page.getByRole('button',{name:'Apply reviewed changes',exact:true}).click();
+    await expect(page.locator('[data-pm-status]')).toContainText('Operation complete');
+    const missing=await page.evaluate(async()=>{
+        const {secureFetch}=await import('/static/js/api.js');
+        return (await secureFetch('/api/audit/pdf?rel=biblio_articles%2Fmanaged-remove.pdf')).status;
+    });
+    expect(missing).toBe(404);
+    await page.getByText(/Operations and recovery/).click();
+    await page.getByRole('button',{name:'Restore files and mappings…',exact:true}).click();
+    await page.getByRole('button',{name:'Restore',exact:true}).click();
+    await expect(page.locator('[data-pm-status]')).toContainText('Operation restored');
+    await expect(page.locator('[data-pm-rel="biblio_articles/managed-remove.pdf"]')).toBeVisible();
+    const restored=await page.evaluate(async()=>{
+        const {secureFetch}=await import('/static/js/api.js');
+        return (await secureFetch('/api/audit/pdf?rel=biblio_articles%2Fmanaged-remove.pdf')).status;
+    });
+    expect(restored).toBe(200);
+    await page.locator('[data-pm-rel="biblio_articles/managed-keep.pdf"] [data-pm-view="0"]').click();
+    await page.locator('[data-pm-rel="biblio_articles/managed-remove.pdf"] [data-pm-view="1"]').click();
+    await expect(page.locator('[data-pm-preview="0"] iframe')).toHaveAttribute('src', /^blob:/);
+    await expect(page.locator('[data-pm-preview="1"] iframe')).toHaveAttribute('src', /^blob:/);
+    await page.screenshot({path:'test-results/pdf-management.png',fullPage:true});
+});

@@ -18,6 +18,7 @@ anchor and posts here instead:
 Sibling of ``/api/audit/reveal`` (which stays audit-scoped: Zotero storage
 roots, ``zotero://`` jumps); this route is deliberately vault-only.
 """
+import logging
 import os
 import subprocess
 import sys
@@ -29,10 +30,42 @@ from api.security import sanitise_error_msg
 from core.config import load_config
 from core.paths import resolve_under_root
 
+logger = logging.getLogger(__name__)
+
 open_bp = Blueprint("open", __name__)
 
 _URL_MAX = 2048
 _PATH_MAX = 1024
+
+
+#: Seconds to wait for macOS `open` to hand off to LaunchServices. It returns
+#: as soon as the hand-off is done, so this is a wedge bound, not a UI wait.
+_OPEN_TIMEOUT_S = 10
+
+
+def run_open(args) -> None:
+    """Run macOS ``open`` and REAP the child.
+
+    # DURABILITY (2026-09-02, performance plan Phase 5): every `open` child was
+    # a zombie until process exit.
+    # Before: four route sites called subprocess.Popen(["open", …]) and never
+    #   waited, so each reveal/open left a defunct process entry for the life
+    #   of the app — one per click, all session long.
+    # Change: subprocess.run with a short timeout, which waits (reaping the
+    #   child) and kills a wedged one instead of leaking it.
+    # Safe because: `open` returns as soon as LaunchServices has the request,
+    #   so the wait is milliseconds in practice; a timeout is treated as
+    #   success-with-a-warning because the hand-off has already happened by
+    #   then, and OSError still propagates so the callers' 500 path is
+    #   unchanged.
+    # Pinned by: test_open.py::TestOpenChildIsReaped.
+    """
+    try:
+        subprocess.run(args, timeout=_OPEN_TIMEOUT_S, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        # The child is killed by run(); the hand-off has already happened.
+        logger.warning("`open` did not return within %ss: %r", _OPEN_TIMEOUT_S, args)
 
 
 def _vault_root() -> str:
@@ -80,7 +113,7 @@ def api_open():
             return jsonify({"error": "File not found in the vault"}), 404
         target = os.path.join(vault_root, rel)
         try:
-            subprocess.Popen(["open", "-R", target])  # noqa: S603,S607
+            run_open(["open", "-R", target])  # noqa: S603,S607
         except OSError as exc:
             return jsonify({"error": sanitise_error_msg(exc)}), 500
         return jsonify({"ok": True, "action": "reveal", "rel": rel})

@@ -70,13 +70,14 @@ def section_system_prompt(
     )
 
 
-def build_outline_message(topic: str, instructions: str, max_sections: int) -> str:
+def build_outline_message(topic: str, instructions: str, max_sections: int,
+                          *, outline_kind: str = "note", unit: str = "sections") -> str:
     parts = [f"Topic: {topic}"]
     if instructions.strip():
         parts.append(f"Instructions from the author:\n{instructions.strip()}")
     parts.append(
-        f"Design a note outline on this topic using ONLY knowledge found in the "
-        f"vault. Return a JSON array of between 3 and {max_sections} sections, each "
+        f"Design a {outline_kind} outline on this topic using ONLY knowledge found in the "
+        f"vault. Return a JSON array of between 3 and {max_sections} {unit}, each "
         'an object {"title": str, "points": [str, ...]}. Output ONLY the JSON array.\n'
         'Example shape (structure only — do not reuse this content): '
         '[{"title": "Background", "points": ["what it is", "why it matters"]}]'
@@ -93,6 +94,7 @@ def build_section_message(
     title: str,
     points: list,
     candidate_bib_block: str = "",  # unused for Markdown; kept for hook parity
+    content_description: str = "the section's prose",
 ) -> str:
     outline_lines = []
     for i, sec in enumerate(full_outline, start=1):
@@ -110,7 +112,7 @@ def build_section_message(
     parts.append(
         f"Now write ONLY section {index}: \"{title}\".\n"
         f"Cover these points:\n{point_block}\n\n"
-        "Start with a `## " + title + "` heading, then the section's prose. Do not "
+        "Start with a `## " + title + f"` heading, then {content_description}. Do not "
         "repeat material that belongs to other sections."
     )
     return "\n\n".join(parts)

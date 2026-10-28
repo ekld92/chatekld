@@ -1,6 +1,6 @@
 """Model-free prompt-invariant regression net.
 
-These tests pin the *structural* invariants of ChatEKLD's prompts so an
+These tests pin the *structural* invariants of CHERQAiN's prompts so an
 accidental edit (or a future "improvement") that breaks grounding, citation
 consistency, the untrusted-content guards, or the LaTeX/JSON contracts shows
 up as a failing assertion rather than a silent quality regression. They run

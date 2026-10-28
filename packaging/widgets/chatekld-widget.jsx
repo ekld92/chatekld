@@ -1,6 +1,6 @@
-// ChatEKLD — desktop card (Übersicht widget).
+// CHERQAiN — desktop card (Übersicht widget).
 //
-// Reads BASE_DIR/widget.json — the durable snapshot ChatEKLD writes at the
+// Reads BASE_DIR/widget.json — the durable snapshot CHERQAiN writes at the
 // end of each manual audit scan and on the in-app "Refresh widget" button.
 // It never calls the app's API and never triggers a scan; it re-reads the
 // file on a timer, so freshness is your last scan, by design, and the card
@@ -104,7 +104,7 @@ function shq(s) {
 }
 
 // The app installs under a DATED name (ChatEKLD_2026-08-06.app), so
-// `open -a ChatEKLD` fails; the bundle id is the stable handle and is
+// `open -a CHERQAiN` fails; the bundle id is the stable handle and is
 // hard-coded by install_and_build.sh.
 const APP_BUNDLE_ID = "com.chatekld.app";
 
@@ -140,15 +140,15 @@ export const render = ({ output }) => {
   if (!data || typeof data !== "object") {
     return card(
       <div>
-        <p className="kick">ChatEKLD</p>
-        <p className="empty">No snapshot yet — run a library scan in ChatEKLD.</p>
+        <p className="kick">CHERQAiN</p>
+        <p className="empty">No snapshot yet — run a library scan in CHERQAiN.</p>
       </div>
     );
   }
   if (data.version !== 1) {
     return card(
       <div>
-        <p className="kick">ChatEKLD</p>
+        <p className="kick">CHERQAiN</p>
         <p className="empty">Please update this widget — the snapshot format changed.</p>
       </div>
     );

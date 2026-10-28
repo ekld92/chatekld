@@ -60,6 +60,7 @@ from core.llm.types import (
     FinishReason,
     LLMError,
     LLMRequest,
+    LLMResponse,
     ToolResult,
     ToolTurn,
 )
@@ -321,7 +322,7 @@ def run_agent_loop(
             system_prompt=iter_system_prompt,
             tools=tools.schemas,
             tool_choice="none" if force_final else "auto",
-            tool_history=tool_history,
+            tool_history=_budget_tool_history(tool_history),
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_s=call_timeout_s,
@@ -348,7 +349,18 @@ def run_agent_loop(
             _emit(on_event, ErrorEvent(redact(str(exc))))
             return budget
 
+        assert isinstance(response, LLMResponse)  # stream=False above
+
         budget.record(response.usage)
+
+        if response.finish_reason == FinishReason.TOOL_USE and response.tool_calls:
+            # Keep a successful fallback's model for the remaining tool turns;
+            # switching back would invalidate its opaque reasoning history.
+            if _used_provider != policy.primary:
+                from core.config import resolve_chat_model
+                from core.llm.policy import FallbackPolicy
+                model = response.model or resolve_chat_model(cfg, _used_provider)
+                policy = FallbackPolicy(primary=_used_provider)
 
         # Branch 1: model called tools. Dispatch them, append the turn,
         # continue.
@@ -383,6 +395,7 @@ def run_agent_loop(
             tool_history.append(ToolTurn(
                 calls=list(response.tool_calls),
                 results=turn_results,
+                provider_state=response.provider_state,
             ))
             continue
 
@@ -402,6 +415,14 @@ def run_agent_loop(
                 ))
             _emit(on_event, DoneEvent())
             capability_state.record_success()
+            return budget
+
+        if response.finish_reason == FinishReason.LENGTH:
+            _emit(on_event, InfoEvent(
+                "The model used the entire output allowance before producing "
+                "visible text. Increase online_max_tokens and try again."
+            ))
+            _emit(on_event, DoneEvent())
             return budget
 
         # Branch 2b: a safety/content filter stopped generation. This is a
@@ -432,6 +453,113 @@ def run_agent_loop(
     ))
     _emit(on_event, DoneEvent())
     return budget
+
+
+# PERF (2026-09-02): the tool history the provider sees is character-bounded.
+# Before: every completed ToolTurn was re-sent VERBATIM on every subsequent
+#   generate() call. Tool outputs are kept at their per-tool caps
+#   (vault_search 12 000, vault_list_materials 20 000, vault_read_note
+#   32 512 chars), so prompt characters grow quadratically in iteration
+#   count: measured on a scripted 6-iteration turn whose tool returns
+#   30 000 chars, the six requests carried 0 + 30 003 + 60 006 + 90 009 +
+#   120 012 + 150 015 = 450 045 history characters in total, the last one
+#   150 015 on its own. A deck runs one such turn per section.
+# Change: _budget_tool_history() renders the history the REQUEST carries:
+#   the newest turns verbatim while they fit _HISTORY_CHAR_BUDGET (never
+#   fewer than _HISTORY_KEEP_VERBATIM), every older turn's result content
+#   replaced by a one-line stub naming what was elided. Same scripted turn
+#   after: 0 + 30 246 + 60 492 + 60 617 + 60 742 + 60 867 = 272 964 total,
+#   the last one 60 867 — bounded, not growing. The loop's own
+#   ``tool_history`` list is untouched, so the on_event trace, the
+#   ToolResultEvent stream and the SSE frames are byte-identical.
+# Safe because:
+#   Elision only ever REPLACES ToolResult.content on turns older than the
+#   verbatim window; no turn is dropped, no call is dropped, and the
+#   ordering is unchanged. Under the budget the function returns the input
+#   OBJECT, so a short turn's request is byte-identical to before this
+#   existed. The model loses the full text of an old observation and is
+#   told so in its place, which is the authorised trade (performance plan,
+#   Phase 3 item 1).
+# Preserves: "Every tool_use keeps its paired tool_result (Anthropic 400s
+#   otherwise) and Gemini thought signatures survive. Elide oldest-first,
+#   never mid-turn." — every ToolTurn keeps its full ``calls`` list (the
+#   ToolCall objects, including ``thought_signature``, are re-used by
+#   identity) and one ToolResult per result, with tool_call_id and is_error
+#   carried over; only whole turns, oldest-first, are ever stubbed.
+# Lock/thread contract: pure function, no lock, runs on the caller's thread.
+# Pinned by: test_agent.py::TestToolHistoryBudget (red before the change:
+#   "151230 not less than or equal to 150000 : per-request chars:
+#   [0, 30246, 60492, 90738, 120984, 151230]").
+
+#: Character budget for the tool-result content one request may carry. Sized
+#: above two vault_read_note turns (2 x 32 512) so the common two-read
+#: sequence is never elided at all.
+_HISTORY_CHAR_BUDGET = 70_000
+#: Newest turns always sent verbatim, whatever the budget says — a model must
+#: at minimum see the outcome of the call it just made.
+_HISTORY_KEEP_VERBATIM = 2
+
+
+def _elided_content(result: ToolResult) -> str:
+    """One-line stand-in for an older turn's result content."""
+    return (
+        "[earlier tool output elided to keep the prompt bounded: "
+        f"{len(result.content)} characters were returned for this call in an "
+        "earlier iteration]"
+    )
+
+
+def _budget_tool_history(
+    history: list[ToolTurn],
+    *,
+    budget_chars: int = _HISTORY_CHAR_BUDGET,
+    keep_verbatim: int = _HISTORY_KEEP_VERBATIM,
+) -> list[ToolTurn]:
+    """The history to SEND: newest turns verbatim, older ones stubbed.
+
+    Returns the input list object unchanged when it already fits, so a
+    short turn's request is byte-identical to the pre-budget behaviour.
+    """
+    if not history:
+        return history
+    total = sum(len(r.content) for turn in history for r in turn.results)
+    if total <= budget_chars:
+        return history
+
+    # Walk newest -> oldest, keeping turns verbatim while they fit. The
+    # keep_verbatim floor wins over the budget: a single oversized turn is
+    # never stubbed just for being large.
+    kept = 0
+    running = 0
+    first_verbatim = len(history)
+    for idx in range(len(history) - 1, -1, -1):
+        turn_chars = sum(len(r.content) for r in history[idx].results)
+        if kept >= keep_verbatim and running + turn_chars > budget_chars:
+            break
+        running += turn_chars
+        kept += 1
+        first_verbatim = idx
+    if first_verbatim == 0:
+        return history
+
+    out: list[ToolTurn] = []
+    for idx, turn in enumerate(history):
+        if idx >= first_verbatim:
+            out.append(turn)
+            continue
+        out.append(ToolTurn(
+            calls=list(turn.calls),
+            provider_state=turn.provider_state,
+            results=[
+                ToolResult(
+                    tool_call_id=r.tool_call_id,
+                    content=_elided_content(r),
+                    is_error=r.is_error,
+                )
+                for r in turn.results
+            ],
+        ))
+    return out
 
 
 # Ceiling ladder for the agent path's per-call local timeout (item 2.6). Keys

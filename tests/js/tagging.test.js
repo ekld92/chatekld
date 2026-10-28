@@ -187,7 +187,7 @@ describe('tagging write flow (slice 2)', () => {
         fetchMock.mockImplementation((url) => {
             const u = String(url);
             if (u.includes('/api/tagging/inventory')) return Promise.resolve(okJson(SAMPLE));
-            if (u.includes('/api/tagging/zotero-available')) return Promise.resolve(okJson({ available: true }));
+            if (u.includes('/api/tagging/zotero-available')) return Promise.resolve(okJson({ available: true, writable: true }));
             if (u.includes('/api/tagging/apply-zotero-tags')) {
                 return Promise.resolve(okJson({ ok: true, added: ['dep'], rejected: [] }));
             }
@@ -313,7 +313,7 @@ function deckFetch(overrides = {}) {
         }
         if (u.includes('/api/tagging/inventory')) return Promise.resolve(okJson(DECK_SAMPLE));
         if (u.includes('/api/tagging/vocab')) return Promise.resolve(okJson({ vocab: [{ tag: 'dep', gloss: 'Dépression' }] }));
-        if (u.includes('/api/tagging/zotero-available')) return Promise.resolve(okJson({ available: true }));
+        if (u.includes('/api/tagging/zotero-available')) return Promise.resolve(okJson({ available: true, writable: true }));
         if (u.includes('/api/tagging/snippet')) return Promise.resolve(okJson({ snippet: 'excerpt text', chars: 12 }));
         return Promise.resolve(okJson({}));
     };
@@ -925,7 +925,7 @@ describe('tagging load UX (2026-07-19)', () => {
                 // this request even started; concurrent = both requests are
                 // issued in the same tick.
                 order.push('zotero-start');
-                return Promise.resolve(okJson({ available: true }));
+                return Promise.resolve(okJson({ available: true, writable: true }));
             }
             return Promise.resolve(okJson({}));
         });
@@ -943,7 +943,7 @@ describe('tagging load UX (2026-07-19)', () => {
         await flush();
         const zotCb = body.querySelector('input[data-target="zotero"]');
         expect(zotCb.disabled).toBe(true);
-        expect(zotCb.getAttribute('aria-label')).toContain('not reachable');
+        expect(zotCb.getAttribute('aria-label')).toContain('not authorized');
     });
 });
 

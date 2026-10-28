@@ -36,8 +36,12 @@ the local-streaming path (``query``), the online path (``_query_online`` →
 tool (``retrieve``). The deep mechanics (rerank-pool sizing, cutoff semantics,
 the LanceDB MMR split, wikilink caps) are documented in ``rag/CLAUDE.md``.
 """
+import contextlib
+import copy
 import logging
-from typing import Any, Callable, Iterator, Optional
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterator, Optional, cast
 from llama_index.core import VectorStoreIndex
 from llama_index.core.indices.query.embedding_utils import get_top_k_mmr_embeddings
 from llama_index.core.indices.vector_store.retrievers import VectorIndexRetriever
@@ -47,12 +51,18 @@ from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import BaseRetriever, QueryFusionRetriever
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from rag.lancedb_store import is_lancedb_store
+from core.perf_metrics import measured, measured_lock, span
 from core.providers import get_provider
 from core.config import load_config, is_online_provider, resolve_embed_provider
 from core.llm.policy import parse_policy_from_config
 from core.llm.types import LLMRequest, RetrievedChunk
 
 logger = logging.getLogger(__name__)
+
+
+def _is_runtime_instance(value: Any, candidate: Any) -> bool:
+    """``isinstance`` that tolerates tests/embedders patching a class symbol."""
+    return isinstance(candidate, type) and isinstance(value, candidate)
 
 # Optional retrieval/rerank dependencies. Both are import-guarded so the
 # engine module still loads when either is missing — the manager falls back
@@ -91,7 +101,12 @@ class _ClientSideMMRRetriever(BaseRetriever):
         super().__init__()
 
     def _retrieve(self, query_bundle: QueryBundle) -> list:
-        nodes: list[NodeWithScore] = self._inner.retrieve(query_bundle)
+        with span("search.vector"):
+            nodes: list[NodeWithScore] = self._inner.retrieve(query_bundle)
+        return self._select(nodes, query_bundle)
+
+    @measured("retrieval.mmr")
+    def _select(self, nodes: list[NodeWithScore], query_bundle: QueryBundle) -> list:
         if len(nodes) <= 1:
             return nodes
         embeddings = [nws.node.embedding for nws in nodes]
@@ -103,7 +118,7 @@ class _ClientSideMMRRetriever(BaseRetriever):
             query_embedding = self._embed_model.get_query_embedding(query_bundle.query_str)
         scores, ids = get_top_k_mmr_embeddings(
             query_embedding,
-            embeddings,
+            cast(list[list[float]], embeddings),
             similarity_top_k=self._top_k,
             mmr_threshold=self._mmr_threshold,
         )
@@ -113,6 +128,99 @@ class _ClientSideMMRRetriever(BaseRetriever):
             nws.score = score
             selected.append(nws)
         return selected
+
+
+def _paper_index_for(cfg: Any) -> Any:
+    """The paper-label index for this request, or ``None`` (labels off/absent).
+
+    ``vault_paper_labels`` is config-only (default on). The index is keyed by the
+    configured vault and cached on its file stat in ``rag.paper_index``, so this
+    is one ``stat`` per request once warm.
+    """
+    try:
+        if not bool((cfg or {}).get("vault_paper_labels", True)):
+            return None
+        from rag import paper_index
+
+        return paper_index.load((cfg or {}).get("obsidian_vault_path") or "")
+    except Exception:  # noqa: BLE001 — labels are an enrichment, never a failure
+        logger.debug("Paper index unavailable; chunks stay unlabelled.",
+                     exc_info=True)
+        return None
+
+
+def _label_nodes(nodes: list, index: Any) -> list:
+    """Return the nodes with a readable ``metadata["paper"]`` on labelled COPIES.
+
+    Runs AFTER postprocessing, so it can never move a ranking. A node whose
+    ``source`` the index knows is replaced by a ``model_copy`` carrying a NEW
+    metadata dict with ``paper = "<label> [<key>]"``; every other node, and every
+    original, is left untouched. Defence in depth: every node reaching here is
+    already deep-detached by ``read_snapshot`` (``_detach_node``), but a copy
+    keeps the label out of any shared docstore object should a caller ever
+    skip that stage.
+    ``index is None`` returns *nodes* itself, so the prompt is byte-identical to
+    the unlabelled path. Locally the label rides ``MetadataMode.LLM`` as one more
+    ``paper: …`` line; online, ``core.llm.prompt._render_one`` appends it to the
+    source line. Both stay inside the untrusted ``<context>`` wrapper.
+    """
+    if index is None or not nodes:
+        return nodes
+    out: list = []
+    for nws in nodes:
+        node = getattr(nws, "node", None)
+        meta = getattr(node, "metadata", None)
+        if node is None or not isinstance(meta, dict):
+            out.append(nws)
+            continue
+        try:
+            paper = index.paper_for_source(meta.get("source"))
+        except Exception:  # noqa: BLE001
+            paper = None
+        if not paper:
+            out.append(nws)
+            continue
+        labelled = node.model_copy(update={"metadata": {
+            **meta, "paper": f"{paper['label']} [{paper['key']}]"}})
+        out.append(NodeWithScore(node=labelled, score=nws.score))
+    return out
+
+
+class _MaterializedRetriever(BaseRetriever):
+    """Return one already-detached candidate snapshot to the synthesizer."""
+
+    def __init__(self, nodes: list[NodeWithScore]) -> None:
+        self._nodes = nodes
+        super().__init__()
+
+    def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
+        del query_bundle
+        return self._nodes
+
+
+@dataclass
+class _PreparedRetrieval:
+    """A bounded retrieval call graph whose remote work is already complete."""
+
+    kind: str
+    retriever: Any
+    query_bundle: QueryBundle | None = None
+    children: list["_PreparedRetrieval"] = field(default_factory=list)
+    keys: list[tuple[str, int]] = field(default_factory=list)
+
+
+@dataclass
+class _PreparedQuery:
+    """Request-local state crossing the prepare/read/finish boundary."""
+
+    message: str
+    cfg: dict
+    retrieval: _PreparedRetrieval
+    postprocessors: list[Any]
+    llm: Any
+    primer: str
+    base_template: Any
+    qa_template: Any
 
 
 # Wikilink graph-expansion defaults (Phase 2).  The expansion retriever widens
@@ -182,10 +290,13 @@ class _WikilinkExpansionRetriever(BaseRetriever):
             return None
 
     def _retrieve(self, query_bundle: QueryBundle) -> list:
-        # 1) Run the wrapped retriever for the seed hits.  Expansion is purely
-        #    additive, so every cheap bail-out returns the seeds untouched: no
-        #    seeds to expand from, or either cap at 0 (feature disabled).
         seeds: list[NodeWithScore] = self._inner.retrieve(query_bundle)
+        return self._expand(seeds)
+
+    def _expand(self, seeds: list[NodeWithScore]) -> list[NodeWithScore]:
+        """Expand materialized seeds using only the graph/docstore snapshot."""
+        # Expansion is purely additive, so every cheap bail-out returns the
+        # seeds untouched: no seeds to expand from, or either cap at 0.
         if not seeds or not self._neighbor_note_cap or not self._neighbor_node_cap:
             return seeds
         # seed_notes — notes already surfaced as seeds; never re-expanded (the
@@ -270,15 +381,12 @@ class _ThesaurusExpansionRetriever(BaseRetriever):
     seeds unchanged. A failing variant retrieval is logged and skipped — it can
     never break the original query's results.
 
-    COST / CONCURRENCY: ``stream_chat`` runs ``engine.query()`` retrieval inside
-    ``_index_mutation_lock`` (serialising it against the indexer's
-    ``idx.insert``). Each variant here is a *separate, synchronous* inner
-    retrieval whose dense leg issues a blocking embedding HTTP call, so enabling
-    expansion turns the one embed-under-lock into ~(max_variants+1) serial
-    embeds under that lock — extending its hold time and contention with an
-    in-progress index run by the same factor. This is an accepted trade for the
-    recall gain (the default cap keeps it to ~4×); revisit the bound here before
-    raising ``vault_thesaurus_max_variants``.
+    COST / CONCURRENCY: each variant remains a separate synchronous retrieval,
+    bounded by ``max_variants``. AP-09 precomputes all query embeddings before
+    the mutation lock; only the bounded vector/BM25 reads share its snapshot
+    epoch. Merge and rerank consume detached nodes after release, so increasing
+    this cap still raises retrieval work but never extends the lock with remote
+    embedding or cross-encoder latency.
     """
 
     def __init__(
@@ -313,6 +421,18 @@ class _ThesaurusExpansionRetriever(BaseRetriever):
         if not variants:
             return seeds
 
+        variant_results: list[list[NodeWithScore]] = []
+        for variant in variants:
+            try:
+                variant_results.append(self._inner.retrieve(variant))
+            except Exception:
+                logger.debug("Thesaurus variant retrieval failed: %r", variant, exc_info=True)
+        return self._merge_results([seeds, *variant_results])
+
+    def _merge_results(
+        self, result_sets: list[list[NodeWithScore]]
+    ) -> list[NodeWithScore]:
+        """Merge original and variant result sets with the legacy ordering."""
         # Union seeds + every variant's hits, deduped by node id, keeping the
         # MAX native score so the score scale stays cutoff-compatible. First-seen
         # insertion order gives a stable tie-break (seeds before variants).
@@ -328,15 +448,9 @@ class _ThesaurusExpansionRetriever(BaseRetriever):
             elif self._score(nws) > self._score(cur):
                 best[nid] = nws
 
-        for nws in seeds:
-            _add(nws)
-        for variant in variants:
-            try:
-                for nws in self._inner.retrieve(variant):
-                    _add(nws)
-            except Exception:
-                logger.debug("Thesaurus variant retrieval failed: %r", variant, exc_info=True)
-                continue
+        for nodes in result_sets:
+            for nws in nodes:
+                _add(nws)
 
         merged = [best[nid] for nid in order]
         # Stable sort by score desc; ties keep insertion order (seeds first).
@@ -488,6 +602,30 @@ def _combine_system_prompt(primer: str, custom: str) -> str:
     return "\n\n".join(parts)
 
 
+#: Serialises cross-encoder inference across concurrent vault chats.
+#:
+#: Before AP-09 the reranker ran inside ``engine.query()``, i.e. under
+#: ``_index_mutation_lock``, which serialised it as a side effect. AP-09 moved
+#: reranking to ``finish_query``/``finish_retrieve`` — deliberately lock-free,
+#: which is the whole point of the split — but each request only gets a shallow
+#: ``copy.copy`` FACADE of the reranker: the loaded cross-encoder underneath is
+#: one manager-level singleton shared by every request. Two chats could
+#: therefore call ``.predict()`` on the same torch model at once, which the
+#: previous arrangement made impossible and which nothing else bounds. On Apple
+#: Silicon that doubles peak activation memory in the same unified pool the LLM
+#: is using — the resource the ``vault_reranker_device`` knob exists to protect.
+#:
+#: This gate restores exactly the old serialisation and nothing more: it covers
+#: the rerank pass only, so query rewriting, embedding, fusion, the docstore
+#: read and synthesis all stay concurrent. Net effect versus pre-AP-09 is
+#: strictly better, and versus post-AP-09 it trades rerank parallelism the
+#: hardware could not honour anyway for a bounded memory profile. Reranking a
+#: pool bounded by ``rerank_pool_ceiling`` is short and CPU/GPU-bound, so a
+#: blocking acquire cannot deadlock: the SSE stall guard bounds the request and
+#: no other lock is held here.
+_RERANK_GATE = threading.Lock()
+
+
 # Candidate-pool sizing for the reranker stage.
 # The fusion / dense retriever fetches this many candidates and the
 # cross-encoder rerank narrows them down to ``final_top_k``.  Larger pools
@@ -560,6 +698,7 @@ class SimpleQueryEngine:
         primer_enabled: bool = False,
         primer_max_chars: int = _PRIMER_MAX_CHARS,
         stage_cb: Optional[Callable[[str], None]] = None,
+        embed_provider_name: Optional[str] = None,
     ):
         """Capture the per-query configuration; build nothing yet.
 
@@ -591,6 +730,7 @@ class SimpleQueryEngine:
         self.index = index
         self.llm_name = llm_name
         self.embed_name = embed_name
+        self.embed_provider_name = embed_provider_name
         self.top_k = top_k
         self.provider_name = provider_name
         self.similarity_cutoff = similarity_cutoff
@@ -677,45 +817,78 @@ class SimpleQueryEngine:
         return min(max(final_top_k * multiplier, floor), ceiling)
 
     def query(self, message: str, streaming: bool = True) -> Any:
-        """Run the full RAG loop and return a streaming response object.
+        """Run prepare/read/finish directly (manager callers lock ``read``)."""
+        prepared = self.prepare(message)
+        nodes = self.read_snapshot(prepared)
+        return self.finish_query(prepared, nodes, streaming=streaming)
 
-        Builds the retrieval pipeline once, layers the user prefix over the
-        selected answer-mode template, then forks by provider kind:
+    @measured("retrieval.prepare")
+    def prepare(self, message: str) -> _PreparedQuery:
+        """Build and precompute a request without reading mutable index state.
 
-          * **Online** chat provider → retrieval runs in-process and only the
-            retrieved chunks + the query leave the machine; returns an
-            ``_OnlineStreamingResponse`` (built around ``base_template`` — the
-            online ``build_rag_messages`` path applies the user prefix via the
-            request's ``system_prompt`` field, not by baking it into the QA
-            template, so the *unprefixed* template is passed here on purpose).
-          * **Local** provider → a ``RetrieverQueryEngine`` streams through the
-            local LlamaIndex LLM using the prefixed ``qa_template``.
-
-        Both branches return an object exposing ``response_gen`` (a token
-        iterator), so ``api/routes/vault.py`` consumes them identically. The
-        ``streaming`` flag is honoured only on the local path; the online path
-        always streams.
+        AP-09 lock invariant: pipeline construction, query-rewrite LLM calls,
+        query embeddings, prompt assembly, and per-request helper tuning happen
+        here, before ``ObsidianVaultManager`` takes ``_index_mutation_lock``.
+        The returned call graph is bounded by the existing query/variant caps.
+        It contains no live result nodes and therefore cannot observe a partial
+        index mutation. A failure or caller cancellation in this stage has no
+        persisted effect; no migration or on-disk index format changes are
+        involved. Moving remote/CPU-heavy work out of the critical section is
+        what reduces writer starvation without weakening insert/delete atomicity.
         """
         cfg = load_config()
         retriever, postprocessors, llm = self._build_retrieval_pipeline(cfg)
-
         primer = self._build_primer(message, cfg)
         base_template = _PROMPT_MODES.get(self.prompt_mode, RAG_QA_PROMPT_STRICT)
-        # Local path: bake the app primer (above the safety preamble) then the
-        # user prefix on top, into the QA template.  Online path: the primer
-        # rides the provider's native system field instead (see _query_online),
-        # so it gets the *unprefixed* base template, as before.
         primed_template = _apply_vault_primer(base_template, primer)
         qa_template = _apply_custom_prefix(primed_template, self.custom_system_prompt)
+        return _PreparedQuery(
+            message=message,
+            cfg=cfg,
+            retrieval=self._prepare_retrieval(retriever, QueryBundle(message)),
+            postprocessors=postprocessors,
+            llm=llm,
+            primer=primer,
+            base_template=base_template,
+            qa_template=qa_template,
+        )
+
+    @measured("retrieval.snapshot")
+    def read_snapshot(self, prepared: _PreparedQuery) -> list[NodeWithScore]:
+        """Read one consistent candidate set and detach it from mutable state.
+
+        The manager holds its index mutation lock only around this method. All
+        vector/BM25/docstore reads and the small deterministic fusion needed to
+        identify graph neighbours share that one lock epoch. Every returned
+        node is deep-copied before release, so later reranking and synthesis
+        cannot race an insert/delete or mutate cached docstore objects. Reads
+        are bounded by existing top-k, fusion-query, thesaurus, and wikilink
+        caps. Exceptions publish no partial snapshot and change no persisted
+        state; cancellation is consequently retry-safe and format-compatible.
+        """
+        nodes = self._read_prepared(prepared.retrieval)
+        return [self._detach_node(nws) for nws in nodes]
+
+    def finish_query(
+        self,
+        prepared: _PreparedQuery,
+        nodes: list[NodeWithScore],
+        *,
+        streaming: bool = True,
+    ) -> Any:
+        """Rerank detached nodes and synthesize a response without index locks."""
+        nodes = self._postprocess_nodes(
+            prepared.message, nodes, prepared.postprocessors
+        )
+        nodes = _label_nodes(nodes, _paper_index_for(prepared.cfg))
 
         if is_online_provider(self.provider_name):
-            return self._query_online(
-                message=message,
-                retriever=retriever,
-                postprocessors=postprocessors,
-                qa_template=base_template,
-                cfg=cfg,
-                primer=primer,
+            return self._query_online_from_chunks(
+                message=prepared.message,
+                chunks=self._nodes_to_chunks(nodes),
+                qa_template=prepared.base_template,
+                cfg=prepared.cfg,
+                primer=prepared.primer,
             )
 
         # Prompt Hub capture (local bypass): the local RAG path has NO provider
@@ -728,22 +901,22 @@ class SimpleQueryEngine:
 
         prompt_capture.record(
             "vault_rag",
-            getattr(qa_template, "template", "") or str(qa_template),
+            getattr(prepared.qa_template, "template", "") or str(prepared.qa_template),
             provider=self.provider_name,
             model=getattr(self, "llm_name", "") or "",
-            query=message,
+            query=prepared.message,
             note="Local path: composed QA template; {context_str}/{query_str} "
             "are filled with the retrieved chunks and question at query time.",
         )
 
         query_engine = RetrieverQueryEngine.from_args(
-            retriever=retriever,
-            llm=llm,
+            retriever=_MaterializedRetriever(nodes),
+            llm=prepared.llm,
             streaming=streaming,
-            text_qa_template=qa_template,
-            node_postprocessors=postprocessors,
+            text_qa_template=prepared.qa_template,
+            node_postprocessors=[],
         )
-        return query_engine.query(message)
+        return query_engine.query(prepared.message)
 
     def retrieve(self, message: str) -> list[RetrievedChunk]:
         """Run the same retrieval + postprocessing pipeline as
@@ -754,10 +927,21 @@ class SimpleQueryEngine:
         turn can issue several searches without paying the LLM-call
         overhead of ``stream_chat`` per query.
         """
-        cfg = load_config()
-        retriever, postprocessors, _ = self._build_retrieval_pipeline(cfg)
-        return self._retrieve_chunks(message, retriever, postprocessors)
+        prepared = self.prepare(message)
+        return self.finish_retrieve(prepared, self.read_snapshot(prepared))
 
+    def finish_retrieve(
+        self, prepared: _PreparedQuery, nodes: list[NodeWithScore]
+    ) -> list[RetrievedChunk]:
+        """Postprocess an immutable snapshot into provider-neutral chunks."""
+        return self._nodes_to_chunks(_label_nodes(
+            self._postprocess_nodes(
+                prepared.message, nodes, prepared.postprocessors
+            ),
+            _paper_index_for(prepared.cfg),
+        ))
+
+    @measured("retrieval.pipeline_init")
     def _build_retrieval_pipeline(
         self, cfg: dict
     ) -> tuple[Any, list[Any], Optional[Any]]:
@@ -830,21 +1014,35 @@ class SimpleQueryEngine:
         else:
             retrieval_breadth = final_top_k
 
+        # BM25 and the cross-encoder are expensive manager-level caches, but
+        # their top-k attributes are request policy, not corpus/model state.
+        # Shallow request-local facades share only immutable corpus/model data;
+        # this prevents two prepared chats from racing while retuning the
+        # singleton. No persisted representation changes, and a failed request
+        # cannot leave a later request with its limits. Copying a small facade
+        # is bounded and avoids serializing CPU-heavy reranking under the index
+        # mutation lock.
+        request_bm25 = (
+            copy.copy(self.bm25_retriever)
+            if self.bm25_retriever is not None
+            else None
+        )
+        request_reranker = (
+            copy.copy(self.reranker) if self.reranker is not None else None
+        )
+
         chat_is_online = is_online_provider(self.provider_name)
-        # QUERY-path embed bound (improvement plan 2026-07-04, item 2.1). This
-        # embed model embeds exactly one query string, and it does so while the
-        # caller holds `_index_mutation_lock` — with the contractually
-        # unbounded indexing embed defaults, one wedged local backend call held
-        # that lock forever and stranded every subsequent chat worker on it
-        # (each SSE consumer timed out ~330 s and abandoned another blocked
-        # thread; restart-only recovery). Bounding HERE (construction) rather
+        # QUERY-path embed bound (improvement plan 2026-07-04, item 2.1).
+        # Embeddings now run in prepare(), before `_index_mutation_lock`; the
+        # finite call timeout still bounds abandoned workers and shutdown.
+        # Bounding HERE (construction) rather
         # than at the call keeps the indexing path's embed objects untouched —
         # they are built by get_embedding WITHOUT request_timeout_s, so batch
         # indexing stays deliberately unbounded. Invariant (pinned by
         # TestQueryEmbedBound): every embed object built for the retrieval
         # phase carries a finite per-call HTTP timeout.
         if chat_is_online:
-            embed_provider = get_provider(resolve_embed_provider(cfg, self.provider_name))
+            embed_provider = get_provider(getattr(self, "embed_provider_name", None) or resolve_embed_provider(cfg, self.provider_name))
             embed_model = embed_provider.get_embedding(
                 self.embed_name, request_timeout_s=QUERY_EMBED_TIMEOUT_S)
             llm = None
@@ -853,7 +1051,9 @@ class SimpleQueryEngine:
             if self.temperature is not None:
                 llm_kwargs["temperature"] = float(self.temperature)
             llm = self._provider.get_llm(self.llm_name, **llm_kwargs)
-            embed_model = self._provider.get_embedding(
+            embed_provider = (get_provider(self.embed_provider_name)
+                              if getattr(self, "embed_provider_name", None) else self._provider)
+            embed_model = embed_provider.get_embedding(
                 self.embed_name, request_timeout_s=QUERY_EMBED_TIMEOUT_S)
 
         dense_kwargs: dict[str, Any] = {
@@ -873,7 +1073,9 @@ class SimpleQueryEngine:
         client_mmr = want_mmr and is_lancedb_store(vstore)
         if want_mmr and not client_mmr:
             dense_kwargs["vector_store_query_mode"] = "mmr"
-            dense_kwargs["vector_store_kwargs"] = {"mmr_threshold": float(self.mmr_lambda)}
+            dense_kwargs["vector_store_kwargs"] = {
+                "mmr_threshold": float(cast(float, self.mmr_lambda))
+            }
         elif client_mmr:
             # Over-fetch so MMR has a pool to diversify from (capped to keep the
             # client-side O(pool²) selection bounded), then narrow to breadth.
@@ -881,7 +1083,10 @@ class SimpleQueryEngine:
         dense_retriever: BaseRetriever = VectorIndexRetriever(**dense_kwargs)
         if client_mmr:
             dense_retriever = _ClientSideMMRRetriever(
-                dense_retriever, embed_model, float(self.mmr_lambda), retrieval_breadth
+                dense_retriever,
+                embed_model,
+                float(cast(float, self.mmr_lambda)),
+                retrieval_breadth,
             )
 
         # Multi-query expansion needs a real LLM to rewrite the query; the
@@ -892,22 +1097,17 @@ class SimpleQueryEngine:
             self.num_queries if (self.query_expansion and llm is not None) else 1
         )
 
-        uses_fusion = self.bm25_retriever is not None or effective_num_queries > 1
+        uses_fusion = request_bm25 is not None or effective_num_queries > 1
+        retriever: BaseRetriever
         if uses_fusion:
-            if self.bm25_retriever is not None:
-                # THE one tuning write for the shared BM25 singleton (item
-                # 2.7). This runs inside the caller's _index_mutation_lock
-                # hold — the same hold that executes the retrieval below — so
-                # tune and use are atomic w.r.t. concurrent requests. The
-                # manager's fetch paths are read-only by contract; adding a
-                # retune anywhere outside this window reintroduces the race.
+            if request_bm25 is not None:
                 try:
-                    self.bm25_retriever.similarity_top_k = retrieval_breadth
+                    request_bm25.similarity_top_k = retrieval_breadth
                 except Exception:
                     logger.debug("Could not retune BM25 similarity_top_k", exc_info=True)
             retrievers = [dense_retriever]
-            if self.bm25_retriever is not None:
-                retrievers.append(self.bm25_retriever)
+            if request_bm25 is not None:
+                retrievers.append(request_bm25)
             fusion_llm = llm if llm is not None else _mock_llm()
             mode, weights = _fusion_mode_and_weights(cfg, n_legs=len(retrievers))
             # weights is None on the default path — passing retriever_weights
@@ -915,21 +1115,6 @@ class SimpleQueryEngine:
             # _fusion_mode_and_weights), and omitting it keeps the pinned RRF
             # construction byte-identical to the pre-knob behaviour.
             fusion_kwargs = {"retriever_weights": weights} if weights is not None else {}
-            # COST / CONCURRENCY (2026-07-22 audit P3 — documented, not fixed):
-            # with query_expansion on (effective_num_queries > 1) this fusion
-            # retriever makes a full LLM GENERATION call (the query rewrite)
-            # inside retrieve(), which the callers run while holding
-            # _index_mutation_lock — strictly more expensive than the
-            # thesaurus retriever's ~4x embeds-under-lock trade documented
-            # below, and bounded only by the local LLM's request timeout. Each
-            # expanded Send therefore stalls a concurrent indexing run's
-            # inserts and pushes parallel chats toward the 120 s
-            # _acquire_retrieval_lock error. Hoisting the rewrite outside the
-            # lock needs the pipeline build (and its per-query LLM object) out
-            # from under the item-2.7 retune-exclusivity invariant — the same
-            # restructuring risk that deferred W7a (rerank under the lock);
-            # recorded in the root CLAUDE.md Known Issues. The knob is
-            # default-off and local-only, which bounds the blast radius.
             retriever = QueryFusionRetriever(
                 retrievers=retrievers,
                 llm=fusion_llm,
@@ -986,7 +1171,7 @@ class SimpleQueryEngine:
         if (
             self.wikilink_expansion
             and self.wikilink_graph is not None
-            and self.reranker is not None
+            and request_reranker is not None
         ):
             docstore = getattr(self.index, "docstore", None)
             if docstore is not None:
@@ -1022,16 +1207,12 @@ class SimpleQueryEngine:
                 )
 
         postprocessors: list[Any] = []
-        if self.reranker is not None:
-            # THE one tuning write for the shared reranker singleton (item
-            # 2.7) — same contract as the BM25 retune above: inside the
-            # mutation-lock hold that also runs the rerank, so a concurrent
-            # request can never retrim an in-flight pass.
+        if request_reranker is not None:
             try:
-                self.reranker.top_n = final_top_k
+                request_reranker.top_n = final_top_k
             except Exception:
                 logger.debug("Could not retune reranker top_n", exc_info=True)
-            postprocessors.append(self.reranker)
+            postprocessors.append(request_reranker)
         elif not uses_fusion:
             # The absolute cosine cutoff is only meaningful on raw dense scores.
             # Fused scores are on a different scale entirely — RRF sums are
@@ -1047,6 +1228,159 @@ class SimpleQueryEngine:
 
         return retriever, postprocessors, llm
 
+    def _prepare_retrieval(
+        self, retriever: Any, query_bundle: QueryBundle
+    ) -> _PreparedRetrieval:
+        """Precompute remote work while preserving the legacy call graph."""
+        if isinstance(retriever, _WikilinkExpansionRetriever):
+            return _PreparedRetrieval(
+                "wikilink",
+                retriever,
+                children=[self._prepare_retrieval(retriever._inner, query_bundle)],
+            )
+        if isinstance(retriever, _ThesaurusExpansionRetriever):
+            bundles = [query_bundle]
+            if retriever._thesaurus and retriever._max_variants > 0:
+                try:
+                    variants = retriever._thesaurus.expand_query(
+                        query_bundle.query_str, retriever._max_variants
+                    )
+                    bundles.extend(QueryBundle(value) for value in variants)
+                except Exception:
+                    logger.debug(
+                        "Thesaurus expand_query failed; using original query.",
+                        exc_info=True,
+                    )
+            return _PreparedRetrieval(
+                "thesaurus",
+                retriever,
+                children=[
+                    self._prepare_retrieval(retriever._inner, bundle)
+                    for bundle in bundles
+                ],
+            )
+        if _is_runtime_instance(retriever, QueryFusionRetriever):
+            bundles = [query_bundle]
+            if retriever.num_queries > 1:
+                bundles.extend(retriever._get_queries(query_bundle.query_str))
+            children: list[_PreparedRetrieval] = []
+            keys: list[tuple[str, int]] = []
+            for bundle in bundles:
+                for idx, child_retriever in enumerate(retriever._retrievers):
+                    children.append(self._prepare_retrieval(child_retriever, bundle))
+                    keys.append((bundle.query_str, idx))
+            return _PreparedRetrieval("fusion", retriever, children=children, keys=keys)
+
+        vector: Any = (
+            retriever._inner
+            if isinstance(retriever, _ClientSideMMRRetriever)
+            else retriever
+        )
+        if _is_runtime_instance(vector, VectorIndexRetriever) and vector._needs_embedding():
+            if query_bundle.embedding is None and query_bundle.embedding_strs:
+                with span("query.embedding"):
+                    query_bundle.embedding = vector._embed_model.get_agg_embedding_from_queries(
+                        query_bundle.embedding_strs
+                    )
+        return _PreparedRetrieval("base", retriever, query_bundle=query_bundle)
+
+    @measured("retrieval.read_fusion")
+    def _read_prepared(self, plan: _PreparedRetrieval) -> list[NodeWithScore]:
+        """Execute only bounded index-backed reads from a prepared call graph."""
+        if plan.kind == "base":
+            assert plan.query_bundle is not None
+            if _is_runtime_instance(plan.retriever, BM25Retriever):
+                stage = "search.bm25"
+            elif (_is_runtime_instance(plan.retriever, VectorIndexRetriever)
+                  or isinstance(plan.retriever, _ClientSideMMRRetriever)):
+                stage = "search.dense"
+            else:
+                stage = "search.other"
+            with span(stage):
+                return plan.retriever.retrieve(plan.query_bundle)
+        if plan.kind == "wikilink":
+            seeds = self._read_prepared(plan.children[0])
+            with span("retrieval.wikilink"):
+                return plan.retriever._expand(seeds)
+        if plan.kind == "thesaurus":
+            result_sets = [self._read_prepared(plan.children[0])]
+            for child in plan.children[1:]:
+                try:
+                    result_sets.append(self._read_prepared(child))
+                except Exception:
+                    logger.debug("Thesaurus variant retrieval failed.", exc_info=True)
+            with span("retrieval.thesaurus_merge"):
+                return plan.retriever._merge_results(result_sets)
+        if plan.kind == "fusion":
+            results = {
+                key: self._read_prepared(child)
+                for key, child in zip(plan.keys, plan.children)
+            }
+            return self._fuse_prepared(plan.retriever, results)
+        raise RuntimeError(f"Unknown prepared retrieval kind: {plan.kind}")
+
+    @staticmethod
+    @measured("retrieval.fusion")
+    def _fuse_prepared(fusion: Any, results: dict) -> list[NodeWithScore]:
+        mode = str(getattr(fusion.mode, "value", fusion.mode))
+        if mode == "reciprocal_rerank":
+            nodes = fusion._reciprocal_rerank_fusion(results)
+        elif mode == "relative_score":
+            nodes = fusion._relative_score_fusion(results)
+        elif mode == "dist_based_score":
+            nodes = fusion._relative_score_fusion(results, dist_based=True)
+        elif mode == "simple":
+            nodes = fusion._simple_fusion(results)
+        else:  # pragma: no cover - guarded by LlamaIndex construction
+            raise ValueError(f"Invalid fusion mode: {fusion.mode}")
+        return nodes[: fusion.similarity_top_k]
+
+    @staticmethod
+    def _detach_node(nws: NodeWithScore) -> NodeWithScore:
+        """Deep-copy one candidate so it cannot be mutated after lock release.
+
+        Cost, measured (Apple Silicon, 1.2 kB chunks, median of 5): 1.2 ms for a
+        full 200-node pool at ``rerank_pool_ceiling``, 0.3 ms at 50, 0.05 ms at
+        the default top_k of 8. Against a retrieval that ends in a multi-second
+        model call this is noise, so the copy is deliberately left whole rather
+        than trimmed — the alternative considered was dropping ``embedding``
+        before copying (nothing downstream reads it: MMR and wikilink expansion
+        both run inside the locked read, and rerank and synthesis score text),
+        which measured 16.6 ms → 1.2 ms on backends that populate it. That is
+        still ~15 ms per query and buys a shallow-copy step that touches shared
+        docstore objects, which is not a trade worth making for correctness-
+        critical code. Re-measure before revisiting; do not assume.
+        """
+        node = nws.node
+        if hasattr(node, "model_copy"):
+            detached = node.model_copy(deep=True)
+        else:  # pragma: no cover - compatibility with older LlamaIndex nodes
+            detached = copy.deepcopy(node)
+        return NodeWithScore(node=detached, score=nws.score)
+
+    @staticmethod
+    def _postprocess_nodes(
+        message: str,
+        nodes: list[NodeWithScore],
+        postprocessors: list[Any],
+    ) -> list[NodeWithScore]:
+        bundle = QueryBundle(message)
+        for post in postprocessors:
+            # Only the cross-encoder is gated (see _RERANK_GATE): it is the one
+            # postprocessor backed by a shared loaded model. SimilarityPostprocessor
+            # and friends are pure score filters and must stay concurrent.
+            gate = (_RERANK_GATE if SentenceTransformerRerank is not None
+                    and isinstance(post, SentenceTransformerRerank)
+                    else contextlib.nullcontext())
+            timed_gate = measured_lock(gate, "reranker.lock") if gate is _RERANK_GATE else gate
+            with timed_gate:
+                with span("retrieval.rerank" if gate is _RERANK_GATE else "retrieval.filter"):
+                    try:
+                        nodes = post.postprocess_nodes(nodes, query_bundle=bundle)
+                    except TypeError:
+                        nodes = post.postprocess_nodes(nodes, bundle)
+        return nodes
+
     def _retrieve_chunks(
         self,
         message: str,
@@ -1056,14 +1390,9 @@ class SimpleQueryEngine:
         """Run the retriever, walk postprocessors, and convert nodes to
         :class:`RetrievedChunk` instances."""
         nodes = retriever.retrieve(message)
-        from llama_index.core.schema import QueryBundle
-        bundle = QueryBundle(message)
-        for post in postprocessors:
-            try:
-                nodes = post.postprocess_nodes(nodes, query_bundle=bundle)
-            except TypeError:
-                nodes = post.postprocess_nodes(nodes, bundle)
-        return self._nodes_to_chunks(nodes)
+        return self._nodes_to_chunks(
+            self._postprocess_nodes(message, nodes, postprocessors)
+        )
 
     @staticmethod
     def _nodes_to_chunks(nodes: list) -> list[RetrievedChunk]:
@@ -1096,7 +1425,10 @@ class SimpleQueryEngine:
         constructor value as the defensive fallback — a bad config value can't
         crash the chat.  Shares the engine's thesaurus object with expansion.
         """
-        if not (self.primer_enabled and self.thesaurus is not None):
+        if not (
+            getattr(self, "primer_enabled", False)
+            and getattr(self, "thesaurus", None) is not None
+        ):
             return ""
         try:
             max_chars = int(cfg.get("vault_primer_max_chars", self.primer_max_chars))
@@ -1114,7 +1446,8 @@ class SimpleQueryEngine:
             else None
         )
         try:
-            return self.thesaurus.build_primer(
+            thesaurus = cast(Any, self.thesaurus)
+            return thesaurus.build_primer(
                 message, max_chars, header=header, core_terms=core_terms
             )
         except Exception:  # pragma: no cover - build_primer is defensive
@@ -1140,6 +1473,24 @@ class SimpleQueryEngine:
         user query are sent — never the full vault.
         """
         chunks = self._retrieve_chunks(message, retriever, postprocessors)
+        return self._query_online_from_chunks(
+            message=message,
+            chunks=chunks,
+            qa_template=qa_template,
+            cfg=cfg,
+            primer=primer,
+        )
+
+    def _query_online_from_chunks(
+        self,
+        *,
+        message: str,
+        chunks: list[RetrievedChunk],
+        qa_template: Any,
+        cfg: dict,
+        primer: str = "",
+    ) -> Any:
+        """Build the online response from an already-detached candidate set."""
 
         qa_text = getattr(qa_template, "template", None) or str(qa_template)
 
@@ -1176,10 +1527,14 @@ class SimpleQueryEngine:
             temperature=self.temperature,
             max_tokens=max_tokens,
             timeout_s=timeout_s,
+            workflow="vault_rag",
+            metadata={"prompt_capture_recorded": True},
         )
 
-        # Prompt Hub capture (online vault RAG): record directly here rather than
-        # tagging request.workflow so we can report the retrieved-chunk count
+        # Prompt Hub capture (online vault RAG): record directly here so we can
+        # report the retrieved-chunk count. The metadata flag prevents the
+        # factory from replacing this richer capture; workflow still attributes
+        # provider usage to Ask rather than other concurrent generation.
         # (the chunks are already rendered into the user message, so they are NOT
         # on request.retrieved_context_chunks for the factory seam to count).
         from core import prompt_capture
@@ -1195,11 +1550,14 @@ class SimpleQueryEngine:
             "prefix); the safety preamble + retrieved context ride the user message.",
         )
 
+        if self.stage_cb is None:
+            return _OnlineStreamingResponse(
+                policy=policy, request=request, used_chunks=used_chunks,
+                chat_provider_name=self.provider_name,
+            )
         return _OnlineStreamingResponse(
-            policy=policy,
-            request=request,
-            used_chunks=used_chunks,
-            chat_provider_name=self.provider_name,
+            policy=policy, request=request, used_chunks=used_chunks,
+            chat_provider_name=self.provider_name, info_cb=self.stage_cb,
         )
 
 
@@ -1278,11 +1636,13 @@ class _OnlineStreamingResponse:
         request: LLMRequest,
         used_chunks: list[RetrievedChunk],
         chat_provider_name: str,
+        info_cb: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.policy = policy
         self.request = request
         self.used_chunks = used_chunks
         self.chat_provider_name = chat_provider_name
+        self.info_cb = info_cb
         self._iter: Optional[Iterator[str]] = None
 
     @property
@@ -1318,5 +1678,6 @@ class _OnlineStreamingResponse:
             request=self.request,
             policy=self.policy,
             cfg=cfg,
+            on_truncation=self.info_cb,
             log_context="vault chat fallback"
         )

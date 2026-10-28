@@ -52,6 +52,8 @@ import base64
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from core.extraction_status import ExtractionStatus, OCRText
+
 import fitz  # PyMuPDF
 
 # Suppress MuPDF's C-level error messages (e.g. "could not parse color space")
@@ -171,7 +173,8 @@ class ArticleSections:
     detected_tables: int = 0
     page_count: int = 0
     # Confidence score in [0.0, 1.0] for the extracted text.
-    # 1.0 → text came from a reliable text layer (PyMuPDF).
+    # Heuristic only, never validated transcription accuracy.
+    # 1.0 → text came from the text layer (PyMuPDF).
     # 0.0–1.0 → OCR fallback; product of page-coverage and per-page
     #           alphanumeric quality (see _perform_ocr_fallback).
     # 0.0 (default) → no text was extracted at all.
@@ -183,10 +186,11 @@ class ArticleSections:
     #                  (slide decks, instrument manuals, image-dense reports).
     doc_type: str = "text_layer"
     # True when extraction did not cover the whole requested range — currently
-    # set only by the OCR fallback when more pages were requested than the
-    # per-call OCR cap allowed.  Callers (vault indexer) use it to warn and to
+    # set for known OCR failures/token caps or extraction budgets. Callers use it
+    # to warn and to
     # avoid caching an incomplete range as if it were complete.
     truncated: bool = False
+    extraction_status: ExtractionStatus = field(default_factory=ExtractionStatus)
 
 
 # ---------------------------------------------------------------------------
@@ -924,7 +928,8 @@ def _try_markitdown_extraction(
         # Apply character budget to prevent unbounded RAM usage on very large
         # PDFs.  Truncation preserves the leading content which is the highest-
         # value portion for scientific papers (title, abstract, intro).
-        if char_budget is not None and len(text) > char_budget:
+        was_truncated = char_budget is not None and len(text) > char_budget
+        if was_truncated:
             text = text[:char_budget]
 
         if len(text) < _OCR_MIN_CHARS:
@@ -949,6 +954,11 @@ def _try_markitdown_extraction(
             # pdfminer may reorder columns or merge stray characters, but
             # substantially higher than GLM-OCR on scanned images.
             ocr_confidence=0.7,
+            truncated=was_truncated,
+            extraction_status=ExtractionStatus(
+                completeness="partial" if was_truncated else "unknown",
+                origin="markitdown",
+                warnings=("Legacy whole-file fallback does not establish requested page provenance.",)),
             doc_type="text_layer",
         )
 
@@ -968,6 +978,7 @@ def _perform_ocr_fallback(
     char_budget: int | None,
     ocr_max_pages: int | None = None,
     page_done_cb: Optional[Callable[[int], None]] = None,
+    cancel_cb: Optional[Callable[[], bool]] = None,
 ) -> ArticleSections:
     """Render each page to a PNG and call ``ocr_cb`` to extract its text.
 
@@ -1050,6 +1061,9 @@ def _perform_ocr_fallback(
     # pages_attempted: pages where ocr_cb was invoked (denominator for coverage).
     # pages_with_text: pages that returned a non-empty string.
     # quality_sum: sum of per-page alphanumeric+whitespace character ratios.
+    attempted_pages: list[int] = []
+    failed_pages: list[int] = []
+    truncated_pages: list[int] = []
     pages_attempted: int = 0
     pages_with_text: int = 0
     quality_sum: float = 0.0
@@ -1061,6 +1075,9 @@ def _perform_ocr_fallback(
         page_count = len(doc)
 
         for rel_idx in range(pages_to_ocr):
+            if cancel_cb is not None and cancel_cb():
+                ocr_truncated = True
+                break
             abs_page = start_page + rel_idx
 
             # Guard: never read past the last page (defensive; page_end was
@@ -1132,7 +1149,6 @@ def _perform_ocr_fallback(
 
             # Count every page where ocr_cb is invoked so coverage scoring
             # reflects all attempted pages, not just successful ones.
-            pages_attempted += 1
 
             # Per-page progress hook — lets a long (now up-to-1000-page) OCR range
             # refresh the indexer's operation-lock heartbeat so the TTL cannot
@@ -1142,6 +1158,12 @@ def _perform_ocr_fallback(
                     page_done_cb(abs_page)
                 except Exception:
                     pass
+
+            if cancel_cb is not None and cancel_cb():
+                ocr_truncated = True
+                break
+            pages_attempted += 1
+            attempted_pages.append(abs_page + 1)
 
             # Call the OCR callback, guarding against any exception the callback
             # may raise (e.g. a transient Ollama connection failure, or a test
@@ -1153,8 +1175,14 @@ def _perform_ocr_fallback(
                 page_text = ocr_cb(b64)
             except Exception:
                 # Treat callback exceptions the same as an empty OCR result:
-                # skip this page without surfacing the error to the caller.
-                page_text = ""
+                # retain the text from other pages and report this failed page.
+                page_text = OCRText("", failed=True)
+            if getattr(page_text, "failed", False):
+                failed_pages.append(abs_page + 1)
+                ocr_truncated = True
+            if getattr(page_text, "truncated", False):
+                truncated_pages.append(abs_page + 1)
+                ocr_truncated = True
             if not page_text:
                 continue
 
@@ -1203,9 +1231,19 @@ def _perform_ocr_fallback(
         detected_tables=0,
         page_count=page_count,
         ocr_confidence=ocr_confidence,
-        # All pages were rendered and sent to GLM-OCR; no embedded text layer.
+        # Attempted pages were rendered for OCR; skipped/failed pages remain explicit.
         doc_type="scanned",
         truncated=ocr_truncated,
+        extraction_status=ExtractionStatus(
+            completeness="partial" if ocr_truncated else "unknown", origin="ocr",
+            warnings=("OCR confidence is a coverage/character heuristic, not transcription accuracy.",),
+            requested_range=(start_page + 1, page_end),
+            attempted_pages=tuple(attempted_pages),
+            completed_pages=tuple(p for p in attempted_pages if p not in failed_pages and p not in truncated_pages),
+            skipped_pages=tuple(range(start_page + len(attempted_pages) + 1, page_end + 1)),
+            failed_pages=tuple(failed_pages),
+            truncated_pages=tuple(truncated_pages),
+        ),
     )
 
 
@@ -1219,6 +1257,7 @@ def extract_structured_from_pdf(
     ocr_max_pages: int | None = None,
     page_done_cb: Optional[Callable] = None,
     use_markitdown: bool = True,
+    cancel_cb: Optional[Callable[[], bool]] = None,
 ) -> ArticleSections:
     """
     Extract text from a PDF with layout-aware structural parsing and resource safety.
@@ -1342,9 +1381,12 @@ def extract_structured_from_pdf(
             return _perform_ocr_fallback(
                 file_path, ocr_cb, start_page, page_end, char_budget,
                 ocr_max_pages=ocr_max_pages, page_done_cb=page_done_cb,
+                cancel_cb=cancel_cb,
             )
         return ArticleSections(page_count=page_count)
 
+    budget_limited = (char_budget is not None and
+                      sum(len(b.text) for b in all_blocks if b.block_type == "text") >= char_budget)
     body_font_size = _detect_body_font_size(all_blocks)
     _classify_blocks(all_blocks, body_font_size)
 
@@ -1365,6 +1407,7 @@ def extract_structured_from_pdf(
             return _perform_ocr_fallback(
                 file_path, ocr_cb, start_page, page_end, char_budget,
                 ocr_max_pages=ocr_max_pages, page_done_cb=page_done_cb,
+                cancel_cb=cancel_cb,
             )
         return ArticleSections(page_count=page_count)
 
@@ -1385,6 +1428,7 @@ def extract_structured_from_pdf(
             return _perform_ocr_fallback(
                 file_path, ocr_cb, start_page, page_end, char_budget,
                 ocr_max_pages=ocr_max_pages, page_done_cb=page_done_cb,
+                cancel_cb=cancel_cb,
             )
 
     # Classify by figure density: more figure blocks than pages typically
@@ -1403,9 +1447,13 @@ def extract_structured_from_pdf(
         detected_figures=figure_count,
         detected_tables=table_count,
         page_count=page_count,
-        # Text came from the embedded text layer — highest possible confidence.
+        # Historical heuristic value for text-layer output; not an accuracy score.
         ocr_confidence=1.0,
         doc_type=_doc_type,
+        truncated=budget_limited,
+        extraction_status=ExtractionStatus(
+            completeness="partial" if budget_limited else "unknown", origin="text_layer",
+            warnings=("Legacy layout extraction does not certify page completeness.",)),
     )
 
 

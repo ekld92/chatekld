@@ -14,6 +14,10 @@ PUBLISHING.md
 
 # JS test harness (Vitest) — dev-only; runtime JS stays vendored under static/js/vendor/
 node_modules/
+# Playwright run artefacts (regenerable; the browser binary lives in
+# ~/Library/Caches/ms-playwright, not the repo).
+test-results/
+playwright-report/
 
 # Python
 venv/
@@ -32,8 +36,17 @@ AppIcon.icns
 
 # Built app bundles (dated builds)
 ChatEKLD_*.app/
+# Local installation backups and disposable review/build checkout.
+# Ignore entire directories, including manifests and intermediate files.
+/.local-install-backups/
+/.adversarial-review.tmp/
 # Packaged distribution images (dated builds)
 ChatEKLD_*.dmg
+# The vault-maintenance launcher is a BUILD PRODUCT of
+# scripts/vault_maintain/vault_sync.applescript — never commit the bundle.
+# Rebuild it with scripts/vault_maintain/build_vault_sync_app.sh.
+Vault Sync.app/
+Vault Sync.app.bak/
 
 # User data — contains API keys, personal library paths, and indexed vectors.
 # These live in ~/Library/Application Support/ChatEKLD/ when the app runs
@@ -43,6 +56,7 @@ feedback.jsonl
 report_types.json
 llamaindex_storage/
 uploads.db
+inventory.json
 
 # Retrieval-eval harness artifacts — these EMBED VAULT CONTENT and must never
 # reach a remote. A golden set carries a `chunk_preview` excerpt of the source
@@ -112,3 +126,11 @@ config.json.evalbak
 *.synctex.gz
 *.fls
 *.fdb_latexmk
+
+# Isolated campaign runtime: regenerable multi-GB RAG indexes and local settings
+/campaigns/thesis_enrichment_sol_2026-10-01/runtime/
+
+CHERQAiN_*.app/
+CHERQAiN_*.dmg
+
+.mypy_cache/

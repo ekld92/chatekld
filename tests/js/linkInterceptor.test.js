@@ -102,6 +102,33 @@ describe('installLinkInterceptor', () => {
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
+    // launch.py now enables text selection in the PyWebView window, so a user
+    // can drag-select a sentence. A drag that starts and ends inside one anchor
+    // still fires a `click` ON that anchor — without a guard, selecting a
+    // sentence containing a link opened Finder or a browser tab instead.
+    it('ignores a click that ends an active text selection', () => {
+        const sel = { isCollapsed: false, toString: () => 'some selected text' };
+        vi.stubGlobal('getSelection', () => sel);
+        const evt = clickAnchor('https://example.com/paper');
+        expect(fetchMock).not.toHaveBeenCalled();
+        // Navigation is not prevented either: nothing was intercepted, and the
+        // browser does not navigate on a selection-ending click anyway.
+        expect(evt.defaultPrevented).toBe(false);
+    });
+
+    it('still intercepts when the selection is collapsed (a real click)', () => {
+        vi.stubGlobal('getSelection', () => ({ isCollapsed: true, toString: () => '' }));
+        const evt = clickAnchor('https://example.com/paper');
+        expect(evt.defaultPrevented).toBe(true);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('still intercepts when getSelection throws or is absent', () => {
+        vi.stubGlobal('getSelection', () => { throw new Error('unavailable'); });
+        expect(clickAnchor('https://example.com/a').defaultPrevented).toBe(true);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
     it('is idempotent per root (no double POST on repeat install)', () => {
         const root = document.createElement('div');
         const a = document.createElement('a');

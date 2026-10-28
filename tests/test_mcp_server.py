@@ -1,6 +1,7 @@
 """Unit tests for mcp_server/server.py MCP JSON-RPC protocol implementation."""
 import json
 import os
+import time
 import sys
 import unittest
 from unittest import mock
@@ -254,3 +255,106 @@ class TestInstallMcpCursorRegistration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAuditReadTools(unittest.TestCase):
+    """Batch G (2026-08-26): read-only audit tools over MCP.
+
+    Before this, `core/driver.py::ENDPOINTS` had 26 rows and NOT ONE was an
+    audit read — an agent could start a scan and never see its result. These
+    three close that, and the property that must hold is that they add no
+    write surface whatsoever.
+    """
+
+    def test_the_new_tools_are_reads_not_writes(self):
+        """`_is_write_call` gates the single-slot semaphore and the
+        log_vault_write audit line. A read misclassified as a write would
+        serialise harmlessly; a WRITE misclassified as a read would bypass
+        both — so the classification is asserted explicitly."""
+        from mcp_server.server import _is_write_call
+        for name in ("audit_summary", "audit_report", "audit_inventory", "notesync_status"):
+            self.assertFalse(_is_write_call(name, {}), name)
+
+    def test_the_tools_are_advertised_with_schemas(self):
+        from mcp_server.server import MCP_TOOLS
+        by_name = {t["name"]: t for t in MCP_TOOLS}
+        for name in ("audit_summary", "audit_report", "audit_inventory", "notesync_status"):
+            self.assertIn(name, by_name, name)
+        # The report name is a URL path segment downstream, so the schema
+        # constrains it rather than accepting any string.
+        schema = by_name["audit_report"]["inputSchema"]
+        self.assertIn("enum", schema["properties"]["name"])
+        self.assertIn("tag_hygiene", schema["properties"]["name"]["enum"])
+
+    def test_the_advertised_report_names_match_the_drivers_allowlist(self):
+        """Two lists that must not drift: a name the schema offers but the
+        driver refuses is a tool that fails on a valid-looking argument."""
+        from core.driver import AUDIT_REPORT_NAMES
+        from mcp_server.server import MCP_TOOLS
+        by_name = {t["name"]: t for t in MCP_TOOLS}
+        advertised = by_name["audit_report"]["inputSchema"]["properties"]["name"]["enum"]
+        self.assertEqual(list(advertised), list(AUDIT_REPORT_NAMES))
+
+    def test_every_advertised_report_is_a_real_route_report(self):
+        """And the driver's allowlist must not offer a report the route would
+        404 — the third list in the chain."""
+        from api.routes.audit import _REPORT_NAMES
+        from core.driver import AUDIT_REPORT_NAMES
+        unknown = sorted(set(AUDIT_REPORT_NAMES) - set(_REPORT_NAMES))
+        self.assertEqual(unknown, [], f"driver offers unknown reports: {unknown}")
+
+    def test_dispatch_routes_each_tool_to_its_driver(self):
+        from mcp_server import server as srv
+        with mock.patch.object(srv, "audit_summary",
+                               return_value={"status": "ok"}) as summ, \
+                mock.patch.object(srv, "audit_report",
+                                  return_value={"status": "ok"}) as rep, \
+                mock.patch.object(srv, "audit_inventory",
+                                  return_value={"status": "ok"}) as inv:
+            srv._dispatch_tool("audit_summary", {})
+            srv._dispatch_tool("audit_report", {"name": "tag_hygiene"})
+            srv._dispatch_tool("audit_inventory", {})
+        summ.assert_called_once_with()
+        rep.assert_called_once_with(name="tag_hygiene")
+        inv.assert_called_once_with()
+
+
+class TestWriteSlotWaiting(unittest.TestCase):
+    """TIMEOUT CHAIN (2026-09-02): the MCP write-slot wait must OUTLAST the
+    writes it serialises, while still never starving the worker pool.
+
+    The wait was 300 s against a driver that gives a refactor apply 900 s, so
+    a second write queued behind a legitimate first one was told "busy, retry
+    shortly" at a moment when retrying could only fail the same way.
+    """
+
+    def test_the_wait_outlasts_the_longest_driver_write(self):
+        from mcp_server import server
+        self.assertGreater(server.WRITE_LOCK_TIMEOUT_S, 900.0,
+                           "a write can be refused inside a legal write")
+
+    def test_the_pool_can_never_be_fully_occupied_by_writers(self):
+        """The property the 300 s bound was introduced for, kept."""
+        from mcp_server import server
+        waiters = getattr(server, "_WRITE_WAITER_MAX", None)
+        if waiters is None:
+            self.skipTest("no waiter bound on this build")
+        holder = 1
+        self.assertLess(holder + waiters, server.executor._max_workers,
+                        "no worker is left for ping/tools/list")
+
+    def test_an_over_queued_write_is_refused_immediately(self):
+        from mcp_server import server
+        acquire = getattr(server, "_acquire_write_slot", None)
+        if acquire is None:
+            self.skipTest("no waiter bound on this build")
+        server._write_semaphore.acquire()          # somebody holds the slot
+        try:
+            with mock.patch.object(server, "_write_waiters",
+                                   server._WRITE_WAITER_MAX):
+                t0 = time.monotonic()
+                self.assertFalse(acquire())
+                self.assertLess(time.monotonic() - t0, 1.0,
+                                "an over-queued caller waited instead of failing")
+        finally:
+            server._write_semaphore.release()

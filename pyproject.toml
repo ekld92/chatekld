@@ -18,6 +18,7 @@ target-version = "py312"
 # are excluded (node_modules/.venv/etc. are excluded by Ruff's defaults).
 extend-exclude = [
     "static",   # JS/CSS — Vitest owns this side (tests/js/)
+    "campaigns", # Preserved research-run evidence, not application source.
 ]
 
 [tool.ruff.lint]
@@ -26,18 +27,10 @@ extend-exclude = [
 select = ["E4", "E7", "E9", "F"]
 
 # ---------------------------------------------------------------------------
-# mypy (improvement plan Track 7.5) — PERMISSIVE and ADVISORY, not a suite gate.
-#
-# Why advisory: a permissive pass over this large, deliberately-untyped codebase
-# surfaces ~60 findings, and the defect-shaped ones are almost all FALSE POSITIVES
-# from untyped third-party libs (PIL `Image.LANCZOS`, lancedb `**kwargs`, waitress)
-# or benign dynamic patterns — not real bugs. Gating on zero would mean a pile of
-# noise-suppressing `# type: ignore`s, which is the opposite of "permissive" and
-# adds no safety. So `ruff check .` stays the enforced static gate (CLAUDE.md
-# §Tests); mypy is a standalone advisory tool (`mypy` with no args uses the `files`
-# below) — deliberately NOT a pre-commit hook. Ratchet toward a gate as modules gain
-# real annotations — do it deliberately, never by drive-by (same discipline as the
-# Ruff rule set).
+# Mypy remains permissively configured, but CI enforces the shared production
+# scope through scripts/check_mypy_ratchet.py. Remediation files have zero
+# allowances; legacy budgets are per-file ceilings, harvested when reduced.
+# Standalone mypy remains diagnostic; the ratchet is the authoritative gate.
 [tool.mypy]
 python_version = "3.12"
 # The app is NOT a package and several top-level dirs (api/core/rag/services) have
@@ -53,5 +46,18 @@ follow_imports = "silent"
 # Ruff's F rules — not a typing crusade over untyped function bodies.
 check_untyped_defs = false
 # `mypy` (no args) checks the app source; tests + generated/vendored-JS trees excluded.
-files = ["app.py", "launch.py", "api", "core", "rag", "services", "deckgen", "refactor", "audit"]
-exclude = '(^|/)(build|dist|node_modules|\.venv|static|deckgen/tests)/'
+files = ["app.py", "launch.py", "api", "core", "rag", "services", "deckgen", "vault_history", "audit"]
+exclude = '(^|/)(build|dist|node_modules|\.venv|static|tests|campaigns)/'
+
+[tool.pytest.ini_options]
+# Keep collection inside the source tree. `install_and_build.sh` leaves a
+# ~1.3 GB `ChatEKLD_<date>.app` (plus PyInstaller's `build/` and `dist/`) in
+# the repo root; they are gitignored, so CI never sees them, but pytest walks
+# them and tries to import torch's and pyarrow's own test modules — 43
+# collection errors that have nothing to do with the change under test. A
+# local build should not turn the suite red. Retained installation backups and
+# adversarial-review source copies are evidence, not additional test roots.
+norecursedirs = [
+    "CHERQAiN_*.app", "ChatEKLD_*.app", "build", "dist", "node_modules", ".git",
+    "*.egg-info", "__pycache__", ".local-install-backups", ".adversarial-review.tmp",
+]

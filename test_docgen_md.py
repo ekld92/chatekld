@@ -33,8 +33,8 @@ def _cfg(tmp_path) -> dict:
 # --- journal create_note op ------------------------------------------------- #
 
 def test_create_note_writes_and_journals(vault, tmp_path):
-    from refactor import journal
-    from refactor.create_note import create_note
+    from vault_history import journal
+    from vault_history.create_note import create_note
 
     cfg = _cfg(tmp_path)
     man = journal.load(vault, cfg)
@@ -47,8 +47,8 @@ def test_create_note_writes_and_journals(vault, tmp_path):
 
 
 def test_create_note_refuses_existing(vault, tmp_path):
-    from refactor import journal
-    from refactor.create_note import create_note
+    from vault_history import journal
+    from vault_history.create_note import create_note
 
     cfg = _cfg(tmp_path)
     (vault / "notes" / "dup.md").write_text("existing\n", encoding="utf-8")
@@ -59,8 +59,8 @@ def test_create_note_refuses_existing(vault, tmp_path):
 
 
 def test_revert_create_note_deletes_the_file(vault, tmp_path):
-    from refactor import journal
-    from refactor.create_note import create_note
+    from vault_history import journal
+    from vault_history.create_note import create_note
 
     cfg = _cfg(tmp_path)
     man = journal.load(vault, cfg)
@@ -73,8 +73,8 @@ def test_revert_create_note_deletes_the_file(vault, tmp_path):
 
 
 def test_revert_create_note_skips_when_edited(vault, tmp_path):
-    from refactor import journal
-    from refactor.create_note import create_note
+    from vault_history import journal
+    from vault_history.create_note import create_note
 
     cfg = _cfg(tmp_path)
     man = journal.load(vault, cfg)
@@ -87,8 +87,8 @@ def test_revert_create_note_skips_when_edited(vault, tmp_path):
 
 
 def test_revert_create_note_idempotent_when_gone(vault, tmp_path):
-    from refactor import journal
-    from refactor.create_note import create_note
+    from vault_history import journal
+    from vault_history.create_note import create_note
 
     cfg = _cfg(tmp_path)
     man = journal.load(vault, cfg)
@@ -134,10 +134,11 @@ def _sse_frames(resp):
     return out
 
 
-def test_generate_md_writes_note_and_is_restorable(vault):
+@pytest.mark.parametrize("output_kind", ["report", "deck"])
+def test_generate_md_writes_note_and_is_restorable(vault, output_kind):
     from app import app
     import api.routes.docgen as route
-    from refactor import journal
+    from vault_history import journal
 
     def fake_outline(client, **kw):
         return [Section(title="Intro", points=["a"]), Section(title="Body", points=["b"])], mock.Mock()
@@ -150,10 +151,10 @@ def test_generate_md_writes_note_and_is_restorable(vault):
     with mock.patch.object(route.obsidian_manager, "get_vault_path", return_value=str(vault)), \
          mock.patch.object(route.obsidian_manager, "try_acquire_lock", return_value=1), \
          mock.patch.object(route.obsidian_manager, "release_lock", return_value=None), \
-         mock.patch.object(route.md, "request_outline", fake_outline), \
-         mock.patch.object(route.md, "generate_section", fake_section):
+         mock.patch.object(route.markdown_slides if output_kind == "deck" else route.md, "request_outline", fake_outline), \
+         mock.patch.object(route.markdown_slides if output_kind == "deck" else route.md, "generate_section", fake_section):
         r = client.post("/api/docgen/generate-md", json={
-            "topic": "My Note", "doc_name": "my-note", "doc_title": "My Note",
+            "topic": "My Note", "doc_name": "my-note", "doc_title": "My Note", "output_kind": output_kind,
             "scope_subdir": "notes", "confirm": True, "force_fresh": True,
         }, headers=_HEADERS)
         assert r.status_code == 200
@@ -171,10 +172,12 @@ def test_generate_md_writes_note_and_is_restorable(vault):
     # Provenance frontmatter (2026-07-22) precedes the title; both stamped
     # keys and the legacy body shape must be present.
     assert text.startswith("---\n")
-    assert 'generated_by: "ChatEKLD docgen"' in text
+    assert 'generated_by: "CHERQAiN docgen"' in text
     assert "model:" in text and "provider:" in text
     assert "\n# My Note\n" in text
     assert "## Intro" in text and "## Body" in text
+    if output_kind == "deck":
+        assert "\n\n---\n\n## Body" in text
     assert "\\begin{frame}" not in text and "\\documentclass" not in text
 
     # The write is journalled + reversible via the shared Restore path.

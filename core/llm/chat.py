@@ -97,5 +97,6 @@ def stream_chat_messages(
         policy=policy,
         cfg=cfg,
         on_fallback=on_fallback,
+        on_truncation=_emit,
         log_context="plain-chat fallback"
     )

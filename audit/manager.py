@@ -23,7 +23,7 @@ import threading
 import time
 from typing import Optional
 
-from .config import AuditConfigError, Settings, load_settings
+from .config import AuditConfigError, Settings, load_settings, settings_context
 from .engine import duplicates as eng_duplicates
 from .engine import dup_decisions as eng_dup_decisions
 from .engine import inventory as eng_inventory
@@ -63,6 +63,7 @@ class AuditManager:
         self._duplicates: Optional[list[eng_duplicates.DuplicateSet]] = None
         self._near_duplicates: Optional[eng_near_duplicates.NearDupReport] = None
         self._settings: Optional[Settings] = None
+        self._scan_settings: Optional[Settings] = None
         # Route-injected page-1 PDF-text provider for the near-duplicate
         # tiers (plan 2026-08-05/4); None on the CLI path.
         self._pdf_text_provider = None
@@ -148,6 +149,7 @@ class AuditManager:
         include_duplicates: bool = True,
         include_near_duplicates: bool = True,
         pdf_text_provider=None,
+        reconciliation_refresh=None,
     ) -> tuple[bool, str]:
         """Start a scan thread. Returns ``(started, message)``.
 
@@ -177,7 +179,7 @@ class AuditManager:
             # until the new run completes so the UI has data to show
             # during the brief gap; the cached result is replaced under
             # the same lock once the worker finishes.
-            self._settings = settings
+            self._scan_settings = settings
             self._pdf_text_provider = pdf_text_provider
             self._stop_event = threading.Event()
             self._error = ""
@@ -201,7 +203,7 @@ class AuditManager:
             target=self._run,
             name=f"audit-scan-{run_id}",
             args=(settings, count_annotations, include_duplicates,
-                  include_near_duplicates, run_id, stop_event),
+                  include_near_duplicates, run_id, stop_event, reconciliation_refresh, pdf_text_provider),
             daemon=True,
         )
         with self._state_lock:
@@ -244,18 +246,49 @@ class AuditManager:
         torn apart by a concurrent reset/new-scan.
         """
         with self._state_lock:
-            return self._inventory, self._settings
+            inventory, settings = self._inventory, self._settings
+        if settings is None or inventory is None:
+            return None, None
+        try:
+            if settings_context(settings) != settings_context(load_settings()):
+                return None, None
+        except (AuditConfigError, OSError):
+            return None, None
+        with self._state_lock:
+            if inventory is not self._inventory or settings is not self._settings:
+                return None, None
+            return inventory, settings
 
     def get_duplicates(self) -> tuple[Optional[list[eng_duplicates.DuplicateSet]], Optional[Settings]]:
         """Return the cached duplicate sets + their settings (None until ready)."""
+        inventory, settings = self.get_inventory()
         with self._state_lock:
-            return self._duplicates, self._settings
+            if (inventory is None or inventory is not self._inventory
+                    or settings is not self._settings):
+                return None, None
+            return self._duplicates, settings
 
     def get_near_duplicates(self) -> tuple[Optional["eng_near_duplicates.NearDupReport"], Optional[Settings]]:
         """Return the cached near-duplicate report + settings (None until ready
         or when the phase was skipped on the last run)."""
+        inventory, settings = self.get_inventory()
         with self._state_lock:
-            return self._near_duplicates, self._settings
+            if (inventory is None or inventory is not self._inventory
+                    or settings is not self._settings):
+                return None, None
+            return self._near_duplicates, settings
+
+    def get_scan_times(self) -> tuple[float, float]:
+        """Return ``(started_at, finished_at)`` for the last/current scan.
+
+        A NON-DRAINING companion to :meth:`get_status_payload`, which calls
+        ``drain_messages()`` and therefore consumes the one-shot status feed the
+        UI is polling. A data endpoint that just wants to say how old its
+        snapshot is must never pay that price — the same reason the widgets are
+        forbidden from touching the status routes. Zeros mean "never ran".
+        """
+        with self._state_lock:
+            return self._started_at, self._finished_at
 
     def register_result_listener(self, cb) -> None:
         """Register a callback fired when the cached result is replaced/cleared.
@@ -278,6 +311,7 @@ class AuditManager:
         """Drop cached results without touching the running state."""
         with self._state_lock:
             self._inventory = None
+            self._settings = None
             self._duplicates = None
             self._near_duplicates = None
         self._fire_result_listeners()
@@ -298,6 +332,7 @@ class AuditManager:
             self._stop_event.set()
             self._run_id += 1
             self._inventory = None
+            self._settings = None
             self._duplicates = None
             self._near_duplicates = None
             self._error = ""
@@ -318,6 +353,8 @@ class AuditManager:
         include_near_duplicates: bool,
         run_id: int,
         stop_event: "threading.Event",
+        reconciliation_refresh=None,
+        pdf_text_provider=None,
     ) -> None:
         """The scan worker body (one per thread); never called directly.
 
@@ -348,6 +385,17 @@ class AuditManager:
             except Exception:  # noqa: BLE001 — a stale anchor must not fail a scan
                 logger.debug("scan-time mapping-hash re-anchor skipped", exc_info=True)
 
+            reconciliation_error = None
+            if reconciliation_refresh is not None:
+                try:
+                    refresh_result = reconciliation_refresh(settings)
+                    if isinstance(refresh_result, dict) and not refresh_result.get('freshness', {}).get('available', True):
+                        reconciliation_error = refresh_result['freshness'].get('error') or 'Evidence unavailable'
+                        self._emit('PDF reconciliation unavailable: ' + reconciliation_error)
+                except Exception:  # noqa: BLE001
+                    reconciliation_error = 'Refresh failed; inspect the log'
+                    logger.exception('PDF reconciliation refresh failed')
+                    self._emit('PDF reconciliation unavailable; previous successful observations retained.')
             self._emit("Building inventory (bib + bridge + Zotero + Obsidian)...")
             inv = eng_inventory.build_inventory(
                 settings,
@@ -357,6 +405,11 @@ class AuditManager:
                 # the status feed so the (potentially multi-second) parallel
                 # read is visible in the UI and Cancel has something to act on.
                 progress_fn=self._emit,
+                # Feeds the bridge's DOI resolution rung (step 3.5). Same
+                # cache-first, page-1-bounded callable the near-duplicate
+                # tiers use; None on the CLI path degrades that rung to
+                # embedded PDF metadata only.
+                pdf_text_provider=pdf_text_provider,
             )
             if stop_event.is_set():
                 # Cancelled before duplicate detection ever ran: clear the
@@ -417,7 +470,7 @@ class AuditManager:
                 self._emit("Scanning for near-duplicate candidates...")
                 near = eng_near_duplicates.find_near_duplicates(
                     settings, inv, duplicates or [],
-                    pdf_text_provider=self._pdf_text_provider,
+                    pdf_text_provider=pdf_text_provider,
                     hash_cache=_hash_memo,
                     dismissed=eng_dup_decisions.load_dismissed(),
                     ratio_cutoff=settings.near_dup_ratio,
@@ -447,7 +500,7 @@ class AuditManager:
                 f"{len(inv.bridge.unmapped_pdfs)} unmapped PDFs"
                 + (f", {len(duplicates)} duplicate sets" if duplicates is not None else "")
                 + (f", {len(near.candidates)} near-duplicate candidates" if near is not None else "")
-                + "."
+                + ("; PDF reconciliation unavailable." if reconciliation_error else ".")
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("Audit scan failed")
@@ -487,6 +540,7 @@ class AuditManager:
                 return
             if inv is not None:
                 self._inventory = inv
+                self._settings = self._scan_settings
                 replaced_result = True
             if dupes is not None:
                 self._duplicates = dupes

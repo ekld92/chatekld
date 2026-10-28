@@ -1,13 +1,16 @@
 {
-  "name": "chatekld-js-tests",
+  "name": "cherqain-js-tests",
   "private": true,
   "type": "module",
-  "description": "JS unit-test harness only (Vitest + jsdom). The app itself ships no npm build step: runtime third-party JS stays vendored under static/js/vendor/ (see CLAUDE.md — never load runtime JS from a CDN or node_modules).",
+  "description": "Test harnesses only: Vitest + jsdom for unit tests, Playwright + Chromium for the browser matrix (layout, enforced CSP, blob-PDF rendering — none of which jsdom can observe). The app itself ships no npm build step: runtime third-party JS stays vendored under static/js/vendor/ (see CLAUDE.md — never load runtime JS from a CDN or node_modules).",
   "scripts": {
-    "test:js": "vitest run"
+    "test:js": "vitest run",
+    "test:browser": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "axe-core": "^4.13.0",
     "jsdom": "^26.1.0",
-    "vitest": "^3.2.4"
+    "vitest": "4.1.12"
   }
 }

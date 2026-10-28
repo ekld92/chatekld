@@ -13,7 +13,7 @@
  * breaking API change with no functional gain. Do not "fix" the names.
  */
 import { secureFetch, consumeSSE, logError, safeJson } from './api.js';
-import { setStatusA11y, taskBegin, taskEnd, copyToClipboard, confirmInline, showTaskError } from './ui.js';
+import { setStatusA11y, taskBegin, taskEnd, taskNote, copyToClipboard, confirmInline, showTaskError, showTab } from './ui.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -22,6 +22,40 @@ let _compileFixing = false;
 let _previewing = false;
 let _compileAvailable = false;
 let _previewObjectUrl = null;
+
+/**
+ * Release the current preview's blob URL.
+ *
+ * PERF (2026-09-02): a preview blob no longer outlives the iframe that shows it.
+ *   Before:    the previous object URL was revoked only at the moment the NEXT
+ *              one landed. Every path that clears the host WITHOUT producing a
+ *              new blob — a compile that fails, a Cancel, a PDF fetch that
+ *              errors — removed the <iframe> referencing it and left a
+ *              multi-megabyte blob alive with nothing pointing at it, for the
+ *              rest of the process. Repeat a failing compile and you leak one
+ *              PDF per attempt.
+ *   Change:    one named teardown, called wherever the host is cleared and from
+ *              Cancel.
+ *   Safe because:
+ *              it only ever runs where the iframe has just been (or is about to
+ *              be) removed by _clear(host); a live preview's URL is never
+ *              revoked out from under it.
+ *   Preserves: the bytes still arrive via secureFetch and render from a blob:
+ *              URL — an /api iframe src is 403'd by the origin guard
+ *              (tests/js/deckPreview.test.js's source ratchet).
+ *   NOT done deliberately: a tab switch hides the panel but keeps the iframe in
+ *              the DOM, so that blob backs something the user can come back to.
+ *              Revoking there would be a UX regression, not a leak fix. Recorded
+ *              in CLAUDE.md Known Issues.
+ *   Pinned by: tests/js/previewBlobTeardown.test.js
+ */
+function _previewTeardown() {
+    if (_previewObjectUrl) {
+        URL.revokeObjectURL(_previewObjectUrl);
+        _previewObjectUrl = null;
+    }
+}
+
 // One AbortController per in-flight SSE op: Cancel aborts the fetch, the
 // server sees the consumer disconnect, and the worker's cancel event stops
 // generation at the next gate (all writes are cancel-gated server-side).
@@ -48,6 +82,9 @@ function _mkCancelButton(logEl) {
     btn.setAttribute('aria-label', 'Cancel the running generation');
     btn.addEventListener('click', () => {
         if (_abortCtrl) _abortCtrl.abort();
+        // The abort leaves the host cleared, so the previous preview's
+        // blob has nothing referencing it (2026-09-02).
+        _previewTeardown();
         btn.disabled = true;
         btn.textContent = 'Cancelling…';
     });
@@ -86,6 +123,7 @@ export async function initDocgen() {
 }
 
 function _status(msg, isError = false) {
+    taskNote('docgen-', msg, isError ? 'failed' : null);
     const el = $('docgen-status');
     if (!el) return;
     el.style.display = msg ? 'block' : 'none';
@@ -95,6 +133,7 @@ function _status(msg, isError = false) {
 function _clear(el) { while (el && el.firstChild) el.removeChild(el.firstChild); }
 
 function _addActivity(text, muted = false) {
+    taskNote('docgen-', text);
     const log = $('docgen-activity');
     if (!log) return;
     const line = document.createElement('div');
@@ -110,19 +149,21 @@ export async function pickTemplateFile() {
     try {
         const r = await secureFetch('/api/docgen/native-pick-file', { method: 'POST' });
         const d = await safeJson(r);
+        if (!r.ok) throw new Error((d?.error || 'Native picker unavailable.') + ' Use the desktop window or enter the path manually.');
         if (d && d.path) {
             $('docgen-template-path').value = d.path;
             await loadTemplate();
         }
-    } catch (e) { logError('Template pick failed', e); }
+    } catch (e) { logError('Template pick failed', e); _status(e.message, true); }
 }
 
 export async function pickOutDir() {
     try {
         const r = await secureFetch('/api/docgen/native-pick-folder', { method: 'POST' });
         const d = await safeJson(r);
+        if (!r.ok) throw new Error((d?.error || 'Native picker unavailable.') + ' Use the desktop window or enter the path manually.');
         if (d && d.path) $('docgen-out-dir').value = d.path;
-    } catch (e) { logError('Output folder pick failed', e); }
+    } catch (e) { logError('Output folder pick failed', e); _status(e.message, true); }
 }
 
 export async function loadTemplate() {
@@ -189,6 +230,7 @@ export async function generate() {
     };
 
     _generating = true;
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('docgen-generate', 'Generating document');
     _setBusy(true);
     _clear($('docgen-activity'));
@@ -208,28 +250,34 @@ export async function generate() {
                 if (evt.iteration) _addActivity(`· iteration ${evt.iteration}`, true);
                 else if (evt.tool_call) _addActivity(`· ${evt.tool_call.name}()`, true);
                 else if (evt.tool_result) _addActivity(`· tool result${evt.tool_result.is_error ? ' [error]' : ''}`, true);
-                else if (evt.doc) _renderDoc(evt.doc);
+                else if (evt.doc) {
+                    outcome = evt.doc.scaffold_error ? 'partial' : evt.doc.tex_path ? 'completed' : 'unknown';
+                    _renderDoc(evt.doc);
+                }
             },
             onError: (err) => {
+                outcome = _wasCancelled() ? 'cancelled' : 'failed';
                 // A user Cancel surfaces through the same path (the aborted
                 // fetch rejects inside consumeSSE) — not an error.
-                if (_wasCancelled()) { _status('Cancelled. A checkpointed run resumes on the next Generate.'); return; }
+                if (_wasCancelled()) { _status('Cancellation requested. Inspect the output folder for published files before retrying. Saved sections can be resumed.'); return; }
                 _status(err, true);
                 _addActivity('ERROR: ' + err);
                 _showRetryBoundary($('docgen-result'), err, generate);
             },
         });
     } catch (e) {
-        if (_wasCancelled()) { _status('Cancelled. A checkpointed run resumes on the next Generate.'); return; }
+        outcome = _wasCancelled() ? 'cancelled' : 'failed';
+        if (_wasCancelled()) { _status('Cancellation requested. Inspect the output folder for published files before retrying. Saved sections can be resumed.'); return; }
         logError('Document generation failed', e);
         _status('Document generation failed (see console).', true);
         _showRetryBoundary($('docgen-result'), 'Document generation failed.', generate);
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'unknown';
         if (cancelBtn) cancelBtn.remove();
         _abortCtrl = null;
         _generating = false;
         _setBusy(false);
-        taskEnd('docgen-generate');
+        taskEnd('docgen-generate', outcome);
     }
 }
 
@@ -246,6 +294,7 @@ function _setBusy(busy) {
 // --- Markdown note (writes into the vault) ----------------------------------
 
 function _mdStatus(msg, isError = false) {
+    taskNote('docgen-md', msg, isError ? 'failed' : null);
     const el = $('docgen-md-status');
     if (!el) return;
     el.style.display = msg ? 'block' : 'none';
@@ -270,19 +319,22 @@ function _addMdActivity(text, muted = false) {
 export function generateMarkdown() {
     if (_docOpBusy()) return;
     const topic = ($('docgen-topic').value || '').trim();
-    if (!topic) { _mdStatus('Enter a topic (in the article card above) first.', true); return; }
+    if (!topic) { _mdStatus('Enter a topic first.', true); return; }
 
     const btn = $('docgen-md-generate-btn');
     const scope = ($('docgen-md-scope').value || '').trim();
+    const forceFresh = !!$('docgen-force-fresh')?.checked;
+    const message = `Generate this Markdown document and write it into your vault${scope ? ` under “${scope}”` : ''}? ` +
+        'It never overwrites an existing note, and you can undo it from Settings → History and Restore.' +
+        (forceFresh ? ' This run will start without reusing saved progress.' : '');
     confirmInline(btn, {
-        message: `Generate a Markdown note and write it into your vault${scope ? ` under “${scope}”` : ''}? ` +
-            'It never overwrites an existing note, and you can undo it from Note Refactor → Restore.',
+        message,
         confirmLabel: 'Generate & write',
-        onConfirm: () => _runMarkdown(topic, scope),
+        onConfirm: () => _runMarkdown(topic, scope, forceFresh),
     });
 }
 
-async function _runMarkdown(topic, scope) {
+async function _runMarkdown(topic, scope, forceFresh) {
     // C3/#15 (2026-07-13): re-check the busy gate HERE. generateMarkdown()
     // checks _docOpBusy() before showing the confirm strip, but the strip's
     // "Generate & write" fires later — by then an article generation may have
@@ -298,10 +350,13 @@ async function _runMarkdown(topic, scope) {
         doc_title: ($('docgen-title').value || '').trim() || topic,
         doc_name: ($('docgen-md-name').value || '').trim(),
         scope_subdir: scope,
+        output_kind: document.getElementById('studio-kind')?.value || 'report',
+        force_fresh: forceFresh,
         confirm: true,
     };
 
     _generating = true;
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('docgen-md', 'Generating note');
     _setBusy(true);
     _clear($('docgen-md-activity'));
@@ -310,6 +365,7 @@ async function _runMarkdown(topic, scope) {
     _abortCtrl = new AbortController();
     const cancelBtn = _mkCancelButton($('docgen-md-activity'));
 
+    let publicationUncertain = false;
     try {
         await consumeSSE('/api/docgen/generate-md', {
             method: 'POST',
@@ -321,10 +377,16 @@ async function _runMarkdown(topic, scope) {
                 if (evt.iteration) _addMdActivity(`· iteration ${evt.iteration}`, true);
                 else if (evt.tool_call) _addMdActivity(`· ${evt.tool_call.name}()`, true);
                 else if (evt.tool_result) _addMdActivity(`· tool result${evt.tool_result.is_error ? ' [error]' : ''}`, true);
-                else if (evt.doc_md) _renderMd(evt.doc_md);
+                else if (evt.doc_md) {
+                    publicationUncertain = !!evt.doc_md.publication_uncertain;
+                    outcome = publicationUncertain ? 'unknown' : evt.doc_md.rel ? 'completed' : 'unknown';
+                    _renderMd(evt.doc_md);
+                }
             },
             onError: (err) => {
-                if (_wasCancelled()) { _mdStatus('Cancelled — nothing was written to the vault.'); return; }
+                outcome = _wasCancelled() ? 'cancelled' : 'failed';
+                if (_wasCancelled()) { _showMdUncertain(); return; }
+                if (publicationUncertain) { outcome = 'unknown'; _showMdUncertain(err); return; }
                 _mdStatus(err, true);
                 _addMdActivity('ERROR: ' + err);
                 // Retry goes through generateMarkdown (the confirm ceremony),
@@ -333,17 +395,35 @@ async function _runMarkdown(topic, scope) {
             },
         });
     } catch (e) {
-        if (_wasCancelled()) { _mdStatus('Cancelled — nothing was written to the vault.'); return; }
+        outcome = _wasCancelled() ? 'cancelled' : 'failed';
+        if (_wasCancelled()) { _showMdUncertain(); return; }
+        if (publicationUncertain) { outcome = 'unknown'; _showMdUncertain(e.message); return; }
         logError('Note generation failed', e);
         _mdStatus('Note generation failed (see console).', true);
         _showRetryBoundary($('docgen-md-result'), 'Note generation failed.', generateMarkdown);
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'unknown';
         if (cancelBtn) cancelBtn.remove();
         _abortCtrl = null;
         _generating = false;
         _setBusy(false);
-        taskEnd('docgen-md');
+        taskEnd('docgen-md', outcome);
     }
+}
+
+function _showMdUncertain(message = 'Stop requested — a note may already have been written. Check the result below or Settings → History and Restore before generating again.') {
+    _mdStatus(message, true);
+    const root = $('docgen-md-result');
+    if (!root || root.querySelector('[data-md-recovery]')) return;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-outline';
+    button.dataset.mdRecovery = '';
+    button.textContent = 'Open History and Restore';
+    button.addEventListener('click', () => {
+        window.historyOpenRestore?.();
+    });
+    root.appendChild(button);
 }
 
 function _renderMd(doc) {
@@ -353,11 +433,17 @@ function _renderMd(doc) {
     ok.className = 'deck-summary';
     const n = doc.section_count || 0;
     const ph = doc.placeholder_count || 0;
+    if (doc.publication_uncertain) {
+        ok.textContent = `Publication uncertain — ${doc.rel}${doc.op_id ? ` (operation ${doc.op_id})` : ''}.`;
+        root.appendChild(ok);
+        _showMdUncertain('Publication uncertain — check Settings → History and Restore and the target note before generating again.');
+        return;
+    }
     ok.textContent = `Wrote ${doc.rel} — ${n} section(s)${ph ? `, ${ph} placeholder` : ''}.`;
     root.appendChild(ok);
     const hint = document.createElement('div');
     hint.className = 'muted';
-    hint.textContent = 'Reversible: undo it from Note Refactor → Restore.';
+    hint.textContent = 'Reversible: undo it from Settings → History and Restore.';
     root.appendChild(hint);
     _mdStatus(`Done — wrote ${doc.rel}.`);
 }
@@ -385,8 +471,9 @@ export async function pickAugmentDoc() {
     try {
         const r = await secureFetch('/api/docgen/native-pick-file', { method: 'POST' });
         const d = await safeJson(r);
+        if (!r.ok) throw new Error((d?.error || 'Native picker unavailable.') + ' Use the desktop window or enter the path manually.');
         if (d && d.path) { $('docgen-aug-path').value = d.path; await loadDocSections(); }
-    } catch (e) { logError('Article pick failed', e); }
+    } catch (e) { logError('Article pick failed', e); _augStatus(e.message, true); }
 }
 
 export async function loadDocSections() {
@@ -442,6 +529,7 @@ export async function augmentPreview(piecewise) {
     if (piecewise === true) payload.piecewise = true;
 
     _generating = true;
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('docgen-augment', 'Augmenting article');
     _setBusy(true);
     _clear($('docgen-aug-activity'));
@@ -459,9 +547,10 @@ export async function augmentPreview(piecewise) {
             onOther: (evt) => {
                 if (evt.iteration) _addAugActivity(`· iteration ${evt.iteration}`, true);
                 else if (evt.tool_call) _addAugActivity(`· ${evt.tool_call.name}()`, true);
-                else if (evt.augment) _renderAugment(evt.augment);
+                else if (evt.augment) { outcome = evt.augment.rejected_reason ? 'failed' : 'completed'; _renderAugment(evt.augment); }
             },
             onError: (err, frame) => {
+                outcome = _wasCancelled() ? 'cancelled' : 'failed';
                 if (_wasCancelled()) { _augStatus('Cancelled — nothing was staged or written.'); return; }
                 _augStatus(err, true);
                 _addAugActivity('ERROR: ' + err);
@@ -476,15 +565,17 @@ export async function augmentPreview(piecewise) {
             },
         });
     } catch (e) {
+        outcome = _wasCancelled() ? 'cancelled' : 'failed';
         if (_wasCancelled()) { _augStatus('Cancelled — nothing was staged or written.'); return; }
         logError('Article augment failed', e);
         _augStatus('Augment failed (see console).', true);
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'cancelled';
         if (cancelBtn) cancelBtn.remove();
         _abortCtrl = null;
         _generating = false;
         _setBusy(false);
-        taskEnd('docgen-augment');
+        taskEnd('docgen-augment', outcome);
     }
 }
 
@@ -527,7 +618,16 @@ function _renderAugment(aug) {
     }
 
     if (!aug.changed) {
-        _augStatus(aug.rejected_reason || 'No applicable change was produced.', true);
+        // A genuinely rejected proposal is an error; "the model produced no
+        // change" is a benign outcome — deck.js renders it as muted guidance
+        // and styling it red here misread it as a failure (2026-08-18).
+        if (aug.rejected_reason) {
+            _augStatus(aug.rejected_reason, true);
+        } else {
+            _augStatus('No change was produced — the model returned content '
+                + 'identical to the article. Try rephrasing the instruction.',
+                false);
+        }
         return;
     }
 
@@ -695,6 +795,17 @@ function _renderDoc(doc) {
             previewBtn.addEventListener('click', () => runDocPreview(doc.tex_path, previewBtn, host));
             root.appendChild(previewBtn);
             root.appendChild(host);
+        } else if (doc.tex_path) {
+            // Say WHY the compile actions are absent (deck.js's explicit
+            // "latexmk: not available" precedent, 2026-08-18): silently
+            // hiding them is indistinguishable from a bug, and the probe
+            // runs once at boot so the state is stable.
+            const m = document.createElement('div');
+            m.className = 'muted';
+            m.textContent = 'LaTeX compiler (latexmk): not available on PATH — '
+                + 'Preview PDF and Compile & Auto-Fix are disabled. '
+                + 'Compile with `make` instead.';
+            root.appendChild(m);
         }
     }
 }
@@ -716,6 +827,7 @@ export async function runDocCompileFix(docPath, shaRef, btn) {
     if (act) { _clear(act); act.style.display = 'block'; }
     _status('Starting LaTeX compilation & repair loop…');
     _addActivity('Initializing latexmk…');
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('docgen-compile-fix', 'Compiling article');
     // Client-side abort (P6.2, 2026-07-30) — the article mirror of deck.js.
     // compile-fix is the longest doc operation and had no Cancel; aborting
@@ -734,6 +846,7 @@ export async function runDocCompileFix(docPath, shaRef, btn) {
             onOther: (evt) => {
                 if (!evt.compile) return;
                 const c = evt.compile;
+                outcome = c.success ? 'completed' : 'failed';
                 if (c.tex_sha256) shaRef.sha = c.tex_sha256;
                 if (c.success) {
                     _status('Compilation succeeded!', false);
@@ -746,9 +859,13 @@ export async function runDocCompileFix(docPath, shaRef, btn) {
                     (c.log_excerpt || '').split('\n').forEach((l) => _addActivity(l));
                 }
             },
-            onError: (err) => { _status(err, true); _addActivity('Error: ' + err); },
+            onError: (err) => {
+                outcome = _wasCancelled() ? 'cancelled' : 'failed';
+                _status(err, true); _addActivity('Error: ' + err);
+            },
         });
     } catch (e) {
+        outcome = _wasCancelled() ? 'cancelled' : 'failed';
         if (_wasCancelled()) {
             _status('Compile & auto-fix cancelled.');
             _addActivity('Cancelled by user.', true);
@@ -757,12 +874,13 @@ export async function runDocCompileFix(docPath, shaRef, btn) {
             _status('Compile-fix request failed (see console).', true);
         }
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'cancelled';
         _compileFixing = false;
         _setBusy(false);
         btn.disabled = false;
         _abortCtrl = null;
         if (cancelBtn) cancelBtn.remove();
-        taskEnd('docgen-compile-fix');
+        taskEnd('docgen-compile-fix', outcome);
     }
 }
 
@@ -782,6 +900,7 @@ export async function runDocPreview(docPath, btn, host) {
     const original = btn.textContent;
     btn.textContent = 'Compiling…';
     _status('Compiling article for preview…');
+    let outcome = 'unknown'; // Only an authoritative result can establish completion.
     taskBegin('docgen-preview', 'Compiling article');
     // Abort frees the UI only — compile-preview is a SYNCHRONOUS route, so the
     // server's latexmk pass runs out its own cap and then releases the op lock.
@@ -804,8 +923,11 @@ export async function runDocPreview(docPath, btn, host) {
             signal: _abortCtrl.signal,
         });
         const d = await safeJson(r);
-        if (!r.ok) { _status(d.error || `Preview failed (${r.status})`, true); return; }
+        if (!r.ok) { outcome = 'failed'; _status(d.error || `Preview failed (${r.status})`, true); return; }
         _clear(host);
+        // The iframe just went; release whatever blob it was showing before
+        // any early return below can strand it (2026-09-02).
+        _previewTeardown();
         if (d.success && d.has_pdf) {
             // Same signal as the compile call: without it, Cancel during the
             // (potentially large) PDF download was inert — the blob completed
@@ -814,13 +936,14 @@ export async function runDocPreview(docPath, btn, host) {
                 `/api/docgen/preview-pdf?deck_path=${encodeURIComponent(docPath)}`,
                 { signal: _abortCtrl.signal });
             if (!pdfResp.ok) {
+                outcome = 'failed';
                 const pd = await safeJson(pdfResp);
                 _status(pd.error || `PDF fetch failed (${pdfResp.status})`, true);
                 return;
             }
             const blob = await pdfResp.blob();
-            if (_previewObjectUrl) URL.revokeObjectURL(_previewObjectUrl);
             _previewObjectUrl = URL.createObjectURL(blob);
+            outcome = 'completed';
             _status('Preview compiled.', false);
             const frame = document.createElement('iframe');
             frame.className = 'deck-preview-frame';
@@ -849,6 +972,7 @@ export async function runDocPreview(docPath, btn, host) {
             });
             host.appendChild(openBtn);
         } else {
+            outcome = 'failed';
             _status('Compilation failed — see the log below.', true);
             const pre = document.createElement('pre');
             pre.className = 'deck-preview-log';
@@ -859,6 +983,7 @@ export async function runDocPreview(docPath, btn, host) {
             host.appendChild(pre);
         }
     } catch (e) {
+        outcome = _wasCancelled() ? 'unknown' : 'failed';
         if (_wasCancelled()) {
             _status('Stopped waiting for the preview (the server compile finishes on its own).');
         } else {
@@ -866,12 +991,13 @@ export async function runDocPreview(docPath, btn, host) {
             _status('Preview request failed (see console).', true);
         }
     } finally {
+        if (_wasCancelled() && outcome !== 'completed') outcome = 'unknown';
         _previewing = false;
         _setBusy(false);
         btn.disabled = false;
         btn.textContent = original;
         _abortCtrl = null;
         if (cancelBtn) cancelBtn.remove();
-        taskEnd('docgen-preview');
+        taskEnd('docgen-preview', outcome);
     }
 }

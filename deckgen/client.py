@@ -1,8 +1,8 @@
-"""HTTP + SSE client for the running ChatEKLD app.
+"""HTTP + SSE client for the running CHERQAiN app.
 
 Talks to the local API only (``GET /api/obsidian/status``,
 ``GET /api/obsidian/materials``, ``POST /api/obsidian/chat``). The chat endpoint
-streams Server-Sent Events; :meth:`ChatEKLDClient.chat` consumes the stream and
+streams Server-Sent Events; :meth:`CHERQAiNClient.chat` consumes the stream and
 returns an accumulated :class:`ChatResult`.
 
 Security: every endpoint requires the ``X-Requested-With: ChatEKLD`` header and,
@@ -38,8 +38,8 @@ class DeckgenClientError(RuntimeError):
     """Raised for transport-level or contract-level failures talking to the app."""
 
 
-class ChatEKLDClient:
-    """HTTP/SSE driver for a *running* ChatEKLD instance (the CLI's transport).
+class CHERQAiNClient:
+    """HTTP/SSE driver for a *running* CHERQAiN instance (the CLI's transport).
 
     Holds one ``requests.Session`` pre-seeded with the required
     ``X-Requested-With: ChatEKLD`` header (and deliberately no ``Origin``/
@@ -90,7 +90,7 @@ class ChatEKLDClient:
         if resp.status_code == 403:
             raise DeckgenClientError(
                 f"GET {path} returned 403 Forbidden — is the base URL pointing at the "
-                "local ChatEKLD instance? (the request must originate from loopback)"
+                "local CHERQAiN instance? (the request must originate from loopback)"
             )
         if resp.status_code != 200:
             raise DeckgenClientError(f"GET {path} returned HTTP {resp.status_code}")
@@ -122,7 +122,7 @@ class ChatEKLDClient:
         """
         if len(system_prompt) > SYSTEM_PROMPT_LIMIT:
             raise DeckgenClientError(
-                f"system_prompt is {len(system_prompt)} chars; ChatEKLD caps it at "
+                f"system_prompt is {len(system_prompt)} chars; CHERQAiN caps it at "
                 f"{SYSTEM_PROMPT_LIMIT}."
             )
 
@@ -158,7 +158,7 @@ class ChatEKLDClient:
         if resp.status_code == 403:
             raise DeckgenClientError(
                 "POST /api/obsidian/chat returned 403 Forbidden — check the base URL "
-                "points at the local ChatEKLD instance."
+                "points at the local CHERQAiN instance."
             )
         if resp.status_code != 200:
             raise DeckgenClientError(
@@ -231,7 +231,8 @@ def _default_base_dir() -> str:
     data dir. We deliberately do NOT import core.constants — deckgen stays
     decoupled from the app.
     """
-    override = os.environ.get("CHATEKLD_BASE_DIR", "").strip()
+    override = os.environ.get("CHERQAIN_BASE_DIR",
+                              os.environ.get("CHATEKLD_BASE_DIR", "")).strip()
     if override:
         return override
     return os.path.expanduser("~/Library/Application Support/ChatEKLD")
@@ -263,7 +264,11 @@ def resolve_base_url(*, base_url: Optional[str], port: Optional[int]) -> str:
     if discovered:
         return f"http://127.0.0.1:{discovered}"
     raise DeckgenClientError(
-        "Could not determine the ChatEKLD port. Pass --port N (shown in the app's "
+        "Could not determine the CHERQAiN port. Pass --port N (shown in the app's "
         "window/log) or --base-url http://127.0.0.1:N. The dynamic port is logged "
         "as 'Starting Flask on port N' in chatekld.log."
     )
+
+
+# Public legacy import retained for callers outside this repository.
+ChatEKLDClient = CHERQAiNClient

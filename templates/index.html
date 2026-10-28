@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ChatEKLD</title>
+    <title>CHERQAiN</title>
     <!-- Theme bootstrap. Resolves the persisted System/Light/Dark preference and
          stamps a concrete data-theme on <html> BEFORE the stylesheet paints, so a
          Light user never sees a flash-of-dark on load. Mirrors ui.js::applyTheme;
@@ -22,7 +22,7 @@
         }
       })();
     </script>
-    <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/daphne.png') }}">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/cherqain-cat.png') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
     <!-- Vendored (marked v15.0.12, MIT). Served locally so chat rendering
          never depends on CDN reachability inside the PyWebView renderer. -->
@@ -41,8 +41,8 @@
     <!-- Sidebar -->
     <div class="sidebar" id="app-sidebar">
         <div class="brand">
-            <img src="{{ url_for('static', filename='img/daphne.png') }}" class="brand-icon" alt="ChatEKLD Logo">
-            <h1>ChatEKLD</h1>
+            <img src="{{ url_for('static', filename='img/cherqain-cat.png') }}" class="brand-icon" alt="CHERQAiN Logo">
+            <h1>CHERQAiN</h1>
         </div>
 
         <div class="sidebar-section">
@@ -67,18 +67,6 @@
             <div class="control-group">
                 <label for="model-select">Active Model</label>
                 <select id="model-select"></select>
-            </div>
-            <div class="control-group">
-                <label for="embed-provider-select">Embedding Provider</label>
-                <select id="embed-provider-select">
-                    <option value="ollama">Ollama</option>
-                    <option value="lm_studio">LM Studio</option>
-                </select>
-                <small class="control-hint">Local provider used for embeddings when the chat provider is online.</small>
-            </div>
-            <div class="control-group">
-                <label for="embed-select">Embedding Model</label>
-                <select id="embed-select"></select>
             </div>
             
             <div id="provider-badge" class="badge">
@@ -113,26 +101,25 @@
             <button type="button" class="theme-option" data-theme-option="light" role="radio" aria-checked="false" tabindex="-1" onclick="setTheme('light')">Light</button>
             <button type="button" class="theme-option" data-theme-option="dark" role="radio" aria-checked="false" tabindex="-1" onclick="setTheme('dark')">Dark</button>
         </div>
-        <button class="btn btn-outline" onclick="openModal('settings-modal')"><span aria-hidden="true">&#9881;</span> LLM Settings</button>
+        <button id="app-settings-btn" class="btn btn-outline" onclick="openModal('settings-modal')"><span aria-hidden="true">&#9881;</span> Settings</button>
         <button class="btn btn-outline" onclick="openHowTo()">How to Use</button>
-        <button class="btn btn-danger" onclick="openModal('reset-modal')">Reset App Data</button>
 
-        <div id="activity-bar">
-            <span class="activity-dot"></span>
-            <span id="activity-label-text"></span>
-        </div>
+
     </div>
 
     <!-- Main Content -->
     <main class="main" id="main-content">
         <div class="header">
             <div class="tabs" role="tablist" aria-label="Main views">
-                <button id="tab-obsidian" class="tab active" role="tab" aria-selected="true" aria-controls="obsidian-tab" tabindex="0" onclick="showTab('obsidian')">Obsidian Agent</button>
-                <button id="tab-document" class="tab" role="tab" aria-selected="false" aria-controls="document-tab" tabindex="-1" onclick="showTab('document')">Single Paper</button>
-                <button id="tab-audit" class="tab" role="tab" aria-selected="false" aria-controls="audit-tab" tabindex="-1" onclick="showTab('audit')">Library Audit</button>
-                <button id="tab-deck" class="tab" role="tab" aria-selected="false" aria-controls="deck-tab" tabindex="-1" onclick="showTab('deck')">Deck Generator</button>
-                <button id="tab-docgen" class="tab" role="tab" aria-selected="false" aria-controls="docgen-tab" tabindex="-1" onclick="showTab('docgen')">Report / Article</button>
-                <button id="tab-refactor" class="tab" role="tab" aria-selected="false" aria-controls="refactor-tab" tabindex="-1" onclick="showTab('refactor')">Note Refactor</button>
+                <button id="tab-obsidian" class="tab active" role="tab" aria-selected="true" aria-controls="obsidian-tab" tabindex="0" onclick="showTab('obsidian')">Ask</button>
+                <button id="tab-document" class="tab" role="tab" aria-selected="false" aria-controls="document-tab" tabindex="-1" onclick="showTab('document')">Read</button>
+                <button id="tab-audit" class="tab" role="tab" aria-selected="false" aria-controls="audit-tab" tabindex="-1" onclick="showTab('audit')">Library</button>
+                <!-- Private-only build feature (STRIP STEP 4): stays hidden unless
+                     app.js's GET /api/maintenance/steps probe answers 200 and
+                     static/js/maintenance.js (stripped publicly) unhides it. -->
+                <button id="tab-maintenance" class="tab" role="tab" aria-selected="false" aria-controls="maintenance-tab" tabindex="-1" onclick="showTab('maintenance')" hidden>Maintenance</button>
+                <button id="tab-deck" class="tab" role="tab" aria-selected="false" aria-controls="deck-tab" tabindex="-1" onclick="showTab('deck')">Create</button>
+                <button id="tab-docgen" hidden class="tab" role="tab" aria-selected="false" aria-controls="docgen-tab" tabindex="-1" onclick="showTab('docgen')">Report / Article</button>
                 <button id="tab-chat" class="tab" role="tab" aria-selected="false" aria-controls="chat-tab" tabindex="-1" onclick="showTab('chat')">Plain Chat</button>
                 <button id="tab-prompts" class="tab" role="tab" aria-selected="false" aria-controls="prompts-tab" tabindex="-1" onclick="showTab('prompts')">Prompt Hub</button>
                 <button id="tab-help" class="tab" role="tab" aria-selected="false" aria-controls="help-tab" tabindex="-1" onclick="showTab('help')">Help</button>
@@ -146,12 +133,10 @@
                     <div class="header">
                         <h2 class="card-title">Obsidian Agent</h2>
                         <div class="actions">
-                            <button id="vault-index-btn"  class="btn btn-primary" onclick="indexVault()">Index Vault</button>
+                            <button id="vault-index-btn" class="btn btn-primary" title="Re-scan the vault and index new, renamed, or modified files" onclick="indexVault()">Update Index</button>
                             <button id="vault-pause-btn"  class="btn btn-outline" onclick="pauseVaultIndex()"  style="display:none">Pause</button>
                             <button id="vault-resume-btn" class="btn btn-outline" onclick="resumeVaultIndex()" style="display:none">Resume</button>
                             <button id="vault-cancel-btn" class="btn btn-outline" onclick="cancelVaultIndex()" style="display:none">Cancel</button>
-                            <button class="btn btn-outline" onclick="openModal('excl-modal')">Exclusions</button>
-                            <button class="btn btn-outline" onclick="openImageExtsModal()">Image Extensions</button>
                         </div>
                     </div>
                     <div class="vault-info">
@@ -159,6 +144,15 @@
                         <span id="vault-path-display">Not configured</span>
                         <button class="btn btn-sm" onclick="pickVaultFolder()">Change…</button>
                     </div>
+                    <p id="vault-index-hint" class="control-hint">After adding, renaming, or modifying files in your vault, click “Update Index” to synchronize search.</p>
+                    <p id="daily-index-mode" class="control-hint"></p>
+                    <p id="daily-index-status" role="status"></p>
+                    <div id="daily-resource-actions" hidden>
+                        <button type="button" class="btn btn-outline" onclick="checkExtractionMemory(this)">Check memory</button>
+                        <button type="button" class="btn btn-outline" onclick="openModal('index-settings-modal')">Review unfinished preparation</button>
+                        <p id="daily-memory-status" role="status" aria-live="polite"></p>
+                    </div>
+
                     <div class="materials-panel">
                         <div class="materials-panel-header">
                             <h3 class="panel-subtitle">Indexed Materials</h3>
@@ -174,11 +168,15 @@
                         <summary>System Prompt Override</summary>
                         <div class="control-group">
                             <textarea id="vault-system-prompt" aria-label="System prompt override for vault chat" rows="4" maxlength="4000" placeholder="Optional. Prepended to the selected Answer Mode template; the retrieval safety preamble and context block remain in place."></textarea>
-                            <small class="control-hint">Retrieval &amp; generation knobs (Top K, reranker, agent mode, temperature…) live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong> in the sidebar.</small>
+                            <small class="control-hint">Retrieval &amp; generation knobs (Top K, reranker, agent mode, temperature…) live in <strong><span aria-hidden="true">&#9881;</span> Settings</strong> in the sidebar.</small>
                         </div>
                     </details>
                     <div id="obsidian-chat" class="chat-history"></div>
-                    <div id="obsidian-status-msg"></div>
+                    <!-- Static role (2026-08-18): setStatusA11y used to mint it at
+                         write time, textContent first — the same-tick WebKit hazard
+                         liveRegions.test.js exists to prevent, and the region was
+                         absent from that pin list so deleting the role passed. -->
+                    <div id="obsidian-status-msg" role="status" aria-live="polite"></div>
                     <!-- Indeterminate activity bar shown while an index run is in
                          flight. The status payload carries no total/processed
                          counts, so this is an honest "working" signal paired with
@@ -196,6 +194,7 @@
                     <div class="input-bar">
                         <input type="text" id="obsidian-input" aria-label="Ask about your vault" placeholder="Ask about your vault..." onkeydown="if(event.key==='Enter') chatWithVault()">
                         <button id="vault-send-btn" class="btn btn-primary" onclick="chatWithVault()">Send</button>
+                        <button id="vault-stop-btn" class="btn btn-outline" onclick="stopVaultChat()" hidden>Stop</button>
                         <button id="vault-clear-chat-btn" class="btn btn-outline" onclick="clearVaultChat()" title="Clear the chat window">Clear</button>
                         <button class="btn btn-outline" onclick="exportVaultConversation('md')" title="Export the conversation to Downloads as Markdown">Export MD</button>
                         <button class="btn btn-outline" onclick="exportVaultConversation('txt')" title="Export the conversation to Downloads as plain text">Export TXT</button>
@@ -211,17 +210,50 @@
                     <div class="header">
                         <h2 class="card-title">Plain Chat</h2>
                         <div class="actions">
-                            <button class="btn btn-outline" onclick="plainchatNew()" title="Start a new conversation">New chat</button>
+                            <button id="plainchat-new-btn" class="btn btn-outline" onclick="plainchatNew()" title="Start a new conversation">New chat</button>
                             <button class="btn btn-outline" onclick="exportPlainConversation('md', this)" title="Export the conversation to Downloads as Markdown">Export MD</button>
                             <button class="btn btn-outline" onclick="exportPlainConversation('txt', this)" title="Export the conversation to Downloads as plain text">Export TXT</button>
                         </div>
                     </div>
-                    <small class="control-hint">A direct, multi-turn conversation with the configured provider/model &mdash; no vault retrieval. Conversation is ephemeral (lost on reload). System prompt &amp; temperature live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong>.</small>
+                    <small class="control-hint">A direct, multi-turn conversation with the configured provider/model &mdash; no vault retrieval. Conversation is ephemeral (lost on reload). System prompt &amp; temperature live in <strong><span aria-hidden="true">&#9881;</span> Settings</strong>.</small>
                     <div id="plainchat-history" class="chat-history"></div>
                     <div id="plainchat-error-boundary" class="task-error-boundary"></div>
                     <div id="plainchat-examples"></div>
+                    <!-- Attachment chips for the turn being composed.
+                         DELIBERATELY NOT a live region (2026-08-30). It holds
+                         interactive controls — each chip carries a Remove
+                         button — and a live region containing focusable
+                         controls is an established anti-pattern: assistive tech
+                         is not required to expose them reliably, and every
+                         repaint re-announced the WHOLE strip ("paper.pdf 43k
+                         chars Remove paper.pdf, notes.md ..."). plainchat.js
+                         also calls announceStatus() for the same events, so
+                         each attach was announced twice. The static
+                         #sr-status-announcer is the one announcement channel;
+                         this is a labelled group. -->
+                    <div id="plainchat-attachments" class="chat-attachments" role="group" aria-label="Attached files"></div>
                     <div class="input-bar">
+                        <!-- Wired in plainchat.js with addEventListener, NOT an
+                             inline handler: the CSP already carries a large
+                             hash allowlist under 'unsafe-hashes', and each new
+                             one authorises that exact handler string on ANY
+                             element. The count is computed at process start by
+                             api.security.build_content_security_policy, so it
+                             is measured rather than maintained here — a figure
+                             written into this comment goes stale the next time
+                             a handler is added (it said 111 while the policy
+                             carried 114). -->
+                        <!-- .sr-only, not aria-hidden: the input is focusable, and hiding a
+                             focusable node from the a11y tree is its own violation.
+                             It therefore needs a name of its own — axe reported it
+                             CRITICAL "label" (2026-09-03), invisible to the previous
+                             shell-only axe run because this panel is not the shell. -->
+                        <input type="file" id="plainchat-file" class="sr-only" multiple
+                               aria-label="Attach a PDF, image, Markdown or text file to this message"
+                               accept=".pdf,.png,.jpg,.jpeg,.md,.txt">
+                        <button type="button" id="plainchat-attach-btn" class="btn btn-outline" title="Attach a PDF, image, Markdown or text file to this message">Attach</button>
                         <input type="text" id="plainchat-input" aria-label="Chat message" placeholder="Message the model..." onkeydown="if(event.key==='Enter') chatPlain()">
+                        <button id="plainchat-stop-btn" class="btn btn-outline" onclick="stopPlainChat()" hidden>Stop</button>
                         <button id="plainchat-send-btn" class="btn btn-primary" onclick="chatPlain()">Send</button>
                     </div>
                 </div>
@@ -273,7 +305,7 @@
                     <summary>System Prompt Override</summary>
                     <div class="control-group">
                         <textarea id="doc-system-prompt" aria-label="System prompt override for the paper summary" rows="4" placeholder="Leave blank to use the selected document type."></textarea>
-                        <small class="control-hint">Temperature, context, max tokens, Top P and repeat penalty live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong> in the sidebar.</small>
+                        <small class="control-hint">Temperature, context, max tokens, Top P and repeat penalty live in <strong><span aria-hidden="true">&#9881;</span> Settings</strong> in the sidebar.</small>
                     </div>
                 </details>
                 <div class="paper-actions">
@@ -318,24 +350,25 @@
             <div class="pane-view">
                 <div class="card">
                     <div class="header">
-                        <h2 class="card-title">Library Audit</h2>
+                        <h2 class="card-title">Vault audit &amp; maintenance</h2>
                         <div class="actions">
                             <button id="audit-run-btn" class="btn btn-primary" onclick="runAuditScan()">Run Scan</button>
                             <button id="audit-cancel-btn" class="btn btn-outline" onclick="cancelAuditScan()" style="display:none">Cancel</button>
                             <button id="audit-widget-refresh-btn" class="btn btn-outline" onclick="refreshWidgetSnapshot()" title="Rewrite the desktop-widget snapshot (widget.json) from the last scan">Refresh widget</button>
+                            <span id="audit-paper-index-age" class="control-hint"></span>
                             <button class="btn btn-outline" onclick="openModal('audit-settings-modal')">Settings</button>
                         </div>
                     </div>
                     <div class="vault-info">
                         <span>Vault:</span>
-                        <span id="audit-vault-path-display">Set the Obsidian vault path on the Obsidian Agent tab first.</span>
+                        <span id="audit-vault-path-display">Set the Obsidian vault path on the Ask tab first.</span>
                     </div>
                     <div id="audit-init-error" class="task-error-boundary"></div>
                     <div id="audit-status-banner" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
                     <div id="audit-empty-state" class="modal-copy" style="padding:16px;">
                         No scan yet — click <strong>Run Scan</strong> to audit your vault against Zotero, BibTeX, PDFs and Finder tags.
-                        The scan itself only reads — it runs when you click Run Scan, never at app startup. (Afterwards, the triage
-                        and Tagging views offer confirmed, reversible write actions.)
+                        Scans read external data and update local observations. Associations require explicit review. External writes require separate review; undo depends on the operation.
+                        <button type="button" class="btn btn-outline btn-sm" onclick="selectAuditReport('library_documents:identity')">Open saved PDF workspace</button>
                     </div>
                     <div id="audit-summary" class="audit-summary" style="display:none;"></div>
                     <!-- Card Catalog (2026-07-20): "On this report" grouped index — the
@@ -343,34 +376,71 @@
                          methodology-page "On this page" device). The buttons keep their
                          ids / roles / roving tabindex, so audit.js::selectAuditReport and
                          ui.js::wireTablistKeys are untouched; wrappers are presentational. -->
+                    <span id="library-maintenance-bridge" hidden></span>
+                    <nav aria-label="Library sections" class="audit-report-tabs">
+                        <!-- No inline handler (the CSP migration direction): wired by audit.js::_wireLibraryUpdateButton. -->
+                        <button type="button" class="btn audit-section-btn" id="audit-library-update-btn" data-section="library_update" title="Review imports, PDF names, Finder/Zotero tags and the Obsidian note mirror. Region rewrites recover from Git; creations and tags use their journals.">Update my library</button>
+                        <button type="button" class="btn audit-section-btn" data-section="library_overview" title="The whole library at a glance: states, counts and what needs attention." onclick="selectAuditReport('library_overview')">Overview</button>
+                        <button type="button" class="btn audit-section-btn" data-section="library_documents" title="Every document with its PDF, Zotero and note relationships; filter by what needs review." onclick="selectAuditReport('library_documents')">Documents</button>
+                        <button type="button" class="btn audit-section-btn" data-section="note_sync" title="Reference notes compared with their Zotero reading notes (same view as the Zotero Notes Sync tab)." onclick="selectAuditReport('note_sync')">Notes</button>
+                        <button type="button" class="btn audit-section-btn" id="audit-library-checks-btn" data-section="library_checks" title="Deterministic checks and reviewed bibliography campaigns." onclick="selectAuditReport('library_checks')">Checks &amp; campaigns</button>
+                        <button type="button" class="btn audit-section-btn" data-section="library_history" title="Past operations, what can be undone, and anything that needs inspection." onclick="selectAuditReport('library_history')">History &amp; recovery</button>
+                    </nav>
                     <div id="audit-report-tabs" class="audit-report-tabs" role="tablist" aria-label="Audit reports" style="display:none;">
                         <div class="audit-tab-group" role="presentation">
-                            <span class="audit-tab-group-label"><span class="dot cat-finder" aria-hidden="true"></span>Reconciliation</span>
+                            <span class="audit-tab-group-label"><span class="dot group-reconciliation" aria-hidden="true"></span>Reconciliation</span>
                             <button class="audit-report-tab active" role="tab" aria-selected="true" aria-controls="audit-report-body" tabindex="0" id="audit-rtab-inventory" data-report="inventory" onclick="selectAuditReport('inventory')">Inventory</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-note_tag_drift" data-report="note_tag_drift" onclick="selectAuditReport('note_tag_drift')">Tag Drift</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-finder_tag_drift" data-report="finder_tag_drift" onclick="selectAuditReport('finder_tag_drift')">Finder Tag Drift</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-duplicates" data-report="duplicates" onclick="selectAuditReport('duplicates')">Duplicate PDFs</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-near_duplicates" data-report="near_duplicates" onclick="selectAuditReport('near_duplicates')">Possible Duplicates</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-note_tag_drift" title="Tags on the Zotero reading note (optionally the item too) that the reference note lacks, compared by spelling fingerprint." data-report="note_tag_drift" onclick="selectAuditReport('note_tag_drift')">Zotero vs Note Tags</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-finder_tag_drift" title="Finder tags on a PDF compared with its reference note’s tags. Only papers with at least one Finder tag." data-report="finder_tag_drift" onclick="selectAuditReport('finder_tag_drift')">Finder vs Note Tags</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-duplicates" title="Byte-identical PDF files (same sha256) stored more than once." data-report="duplicates" onclick="selectAuditReport('duplicates')">Duplicate PDFs</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-near_duplicates" title="Byte-different PDFs that look like the same paper: same first-page text, DOI, title, or similar content." data-report="near_duplicates" onclick="selectAuditReport('near_duplicates')">Possible Duplicates</button>
+                            <!-- 2026-09-06: one citation key owning several byte-different
+                                 PDFs, with the rung that claimed each file. The only
+                                 earlier surface was the Possible Duplicates multi_pdf
+                                 tier, which could not tell two versions of one paper
+                                 from two papers absorbed by one key. -->
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-multi_pdf" title="Records that own two or more byte-different PDFs, with the rule that matched each file." data-report="multi_pdf" onclick="selectAuditReport('multi_pdf')">Entries With Several PDFs</button>
                         </div>
                         <div class="audit-tab-group" role="presentation">
-                            <span class="audit-tab-group-label"><span class="dot cat-zotero" aria-hidden="true"></span>Gaps</span>
+                            <span class="audit-tab-group-label"><span class="dot group-gaps" aria-hidden="true"></span>Gaps</span>
                             <!-- read_unzoterod is the COMPLETE set of un-Zotero'd PDFs and
                                  unread_unzoterod is a filtered SUBSET of it, so they sit
                                  adjacent, superset first, and the subset's label is
                                  indented. The old names ("Unread PDFs" / "Read PDFs
                                  Missing Zotero") read as a partition and hid the full
                                  list from the user entirely. -->
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-read_unzoterod" data-report="read_unzoterod" onclick="selectAuditReport('read_unzoterod')">PDFs Without Zotero</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-unread_unzoterod" data-report="unread_unzoterod" aria-label="PDFs Without Zotero · Unread Only" onclick="selectAuditReport('unread_unzoterod')"><span aria-hidden="true">↳</span> Unread Only</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-zotero_unread" data-report="zotero_unread" onclick="selectAuditReport('zotero_unread')">Zotero Queue</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-zotero_no_pdf" data-report="zotero_no_pdf" onclick="selectAuditReport('zotero_no_pdf')">Bib Entries Without PDFs</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-read_unzoterod" title="PDFs in the bibliography folder matched to no citation key, most annotated first." data-report="read_unzoterod" onclick="selectAuditReport('read_unzoterod')">Unmapped PDFs</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-unread_unzoterod" title="The Unmapped PDFs with fewer annotations than the read threshold." data-report="unread_unzoterod" aria-label="Unmapped PDFs · Unread Only" onclick="selectAuditReport('unread_unzoterod')"><span aria-hidden="true">↳</span> Unread Only</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-zotero_unread" title="Records with a bib entry and a Zotero item but no Zotero reading note — a proxy for “not read yet”." data-report="zotero_unread" onclick="selectAuditReport('zotero_unread')">Zotero Queue</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-zotero_no_pdf" title="Bib entries with no matched PDF, minus the ones you marked as needing none." data-report="zotero_no_pdf" onclick="selectAuditReport('zotero_no_pdf')">Bib Entries Without PDFs</button>
+                            <!-- 2026-09-06: the PDFs curated "not in bib" (mapping.json
+                                 no_match), which left every other queue on the next scan
+                                 and survived only as a count. -->
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-not_in_zotero" title="Every PDF in the bibliography folder with its reconciliation state: preview it, confirm or reject its identity, change its curation, copy confirmed DOIs." data-report="not_in_zotero" onclick="selectAuditReport('not_in_zotero')">PDF workspace</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-pdf_review" title="PDFs whose identity (which paper this file is) has not been confirmed yet." data-report="library_documents:identity" onclick="selectAuditReport('library_documents:identity')">PDF identification review</button>
+                            <!-- The two orphan buckets (2026-08-13). Everything else in
+                                 this tablist is a view over the per-citation-key records;
+                                 these two are what falls OUTSIDE that join and therefore
+                                 appears in no other report — a reference note whose
+                                 filename matches no key, and a Zotero item no record
+                                 claimed. Both used to be discarded in local variables
+                                 during the scan, so they were not merely unrendered:
+                                 they were uncounted. -->
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-note_sync" data-report="note_sync" onclick="selectAuditReport('note_sync')">Zotero Notes Sync</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-orphan_notes" title="Notes in the Zotero-notes folder whose filename matches no citation key." data-report="orphan_notes" onclick="selectAuditReport('orphan_notes')">Notes Without a Record</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-orphan_zotero_items" title="Zotero items that no record claimed (no Better BibTeX key, duplicated key, or refused title match)." data-report="orphan_zotero_items" onclick="selectAuditReport('orphan_zotero_items')">Zotero Items Without a Record</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-zotero_attachments" data-report="zotero_attachments" onclick="selectAuditReport('zotero_attachments')">Zotero Attachments</button>
                         </div>
                         <div class="audit-tab-group" role="presentation">
-                            <span class="audit-tab-group-label"><span class="dot cat-note" aria-hidden="true"></span>Curation</span>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-tagging" data-report="tagging" onclick="selectAuditReport('tagging')">Tagging</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-tag_hygiene" data-report="tag_hygiene" onclick="selectAuditReport('tag_hygiene')">Tag Hygiene</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-ambiguous_pdfs" data-report="ambiguous_pdfs" onclick="selectAuditReport('ambiguous_pdfs')">Ambiguous PDFs</button>
-                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-skipped_pdfs" data-report="skipped_pdfs" onclick="selectAuditReport('skipped_pdfs')">Skipped PDFs</button>
+                            <span class="audit-tab-group-label"><span class="dot group-curation" aria-hidden="true"></span>Curation</span>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-tagging" title="Propose and apply tags from your _tags.md vocabulary to the note, the PDF and the Zotero item." data-report="tagging" onclick="selectAuditReport('tagging')">Tagging</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-tag_harmony" title="Per record, the tags one writable surface (note, Finder, Zotero item) has and another lacks." data-report="tag_harmony" onclick="selectAuditReport('tag_harmony')">Note vs Finder vs Zotero Tags</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-tag_hygiene" title="Every tag spelling across all stores, grouped by fingerprint, with its vocabulary status." data-report="tag_hygiene" onclick="selectAuditReport('tag_hygiene')">Tag Spellings &amp; Vocabulary</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-ambiguous_pdfs" title="Documents with more than one CHERQAiN association or several candidate Zotero references — review required." data-report="library_documents:ambiguous" onclick="selectAuditReport('library_documents:ambiguous')">Ambiguous PDFs</button>
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-skipped_pdfs" title="PDFs whose filename starts with the skip prefix; ignored by every other report." data-report="skipped_pdfs" onclick="selectAuditReport('skipped_pdfs')">Skipped PDFs</button>
+                            <!-- 2026-09-06: mapping.json entries pointing at a file or a
+                                 citation key that no longer exists. -->
+                            <button class="audit-report-tab" role="tab" aria-selected="false" aria-controls="audit-report-body" tabindex="-1" id="audit-rtab-dead_curation" title="Manual decisions in mapping.json whose PDF is gone or whose citation key no longer exists." data-report="dead_curation" onclick="selectAuditReport('dead_curation')">Dead Curation</button>
                         </div>
                     </div>
                     <!-- Cross-report search: the reports are views of ONE scan, so
@@ -401,12 +471,22 @@
                     <div id="audit-search-results" class="audit-search-results" role="region"
                          aria-label="Search results" style="display:none;"></div>
                     <div id="audit-report-body" class="audit-report-body" role="tabpanel" aria-labelledby="audit-rtab-inventory" tabindex="0"></div>
+                    <!-- Static announcers for Library status lines rendered inside the report body (which is re-rendered). -->
+                    <p id="library-note-status" class="sr-only" role="status"></p>
+                    <p id="library-campaign-plan-status" class="sr-only" role="status"></p>
+                    <p id="library-campaign-review-status" class="sr-only" role="status"></p>
                 </div>
             </div>
         </div>
 
         <!-- Deck Generator Tab -->
         <div id="deck-tab" class="content-area" role="tabpanel" aria-labelledby="tab-deck" tabindex="0">
+            <section id="studio-controls" class="workspace-controls" aria-label="Studio choices">
+                <div><h2>Studio</h2><p>Create or improve a document grounded in your vault.</p></div>
+                <label>Document<select id="studio-kind"><option value="deck">Slide deck</option><option value="report">Report / article</option></select></label>
+                <label>Action<select id="studio-action"><option value="generate">Generate</option><option value="augment">Augment</option></select></label>
+                <label>Format<select id="studio-format"><option value="tex">LaTeX (.tex)</option><option value="md">Markdown (.md)</option></select></label>
+            </section>
             <div class="pane-view">
                 <div class="card">
                     <div class="header">
@@ -483,9 +563,9 @@
                             <label class="checkbox-row"><input type="checkbox" id="deck-force-fresh"> Start fresh (ignore any saved progress from an interrupted run)</label>
                         </div>
 
-                        <small class="control-hint">Max sections, agent iterations and temperature for deck generation live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong> in the sidebar.</small>
+                        <small class="control-hint">Max sections, agent iterations and temperature for deck generation live in <strong><span aria-hidden="true">&#9881;</span> Settings</strong> in the sidebar.</small>
 
-                        <div id="deck-activity" class="deck-activity" aria-live="polite"></div>
+                        <div id="deck-activity" class="deck-activity"></div>
                         <div id="deck-result" class="deck-result"></div>
                     </div>
                 </div>
@@ -496,7 +576,7 @@
                         <h2 class="card-title">Augment an existing deck</h2>
                         <div class="actions">
                             <button id="deck-aug-pdf-btn" class="btn btn-outline" onclick="deckAugPreviewPdf()" title="Compile the deck as-is and view the PDF in-app (never modifies the .tex)">Preview PDF</button>
-                            <button id="deck-aug-preview-btn" class="btn btn-primary" onclick="deckAugmentPreview()">Preview change</button>
+                            <button id="deck-aug-preview-btn" class="btn btn-outline" onclick="deckAugmentPreview()">Preview change</button>
                         </div>
                     </div>
                     <div class="vault-info">
@@ -544,9 +624,9 @@
                             <textarea id="deck-aug-instruction" rows="3" maxlength="4000" placeholder="e.g. 'Deepen the treatment section: add second-line options and their evidence' or 'Add a table comparing first- vs second-generation antipsychotics'."></textarea>
                         </div>
 
-                        <small class="control-hint">Uses the deck's own custom macros + bibliography when present, and the Audience/citation settings above. Agent iterations and temperature come from <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong>.</small>
+                        <small class="control-hint">Uses the deck's own custom macros + bibliography when present, and the Audience/citation settings above. Agent iterations and temperature come from <strong><span aria-hidden="true">&#9881;</span> Settings</strong>.</small>
 
-                        <div id="deck-aug-activity" class="deck-activity" aria-live="polite"></div>
+                        <div id="deck-aug-activity" class="deck-activity"></div>
                         <div id="deck-aug-result" class="deck-result"></div>
                         <div id="deck-aug-pdf-host" class="deck-preview-host"></div>
                     </div>
@@ -631,9 +711,9 @@
                             <label class="checkbox-row"><input type="checkbox" id="docgen-force-fresh"> Start fresh (ignore any saved progress from an interrupted run)</label>
                         </div>
 
-                        <small class="control-hint">Max sections, agent iterations and temperature for document generation live in <strong><span aria-hidden="true">&#9881;</span> LLM Settings</strong> in the sidebar.</small>
+                        <small class="control-hint">Max sections, agent iterations and temperature for document generation live in <strong><span aria-hidden="true">&#9881;</span> Settings</strong> in the sidebar.</small>
 
-                        <div id="docgen-activity" class="deck-activity" aria-live="polite"></div>
+                        <div id="docgen-activity" class="deck-activity"></div>
                         <div id="docgen-result" class="deck-result"></div>
                     </div>
                 </div>
@@ -643,16 +723,11 @@
                     <div class="header">
                         <h2 class="card-title">Or: a Markdown note in your vault</h2>
                         <div class="actions">
-                            <button id="docgen-md-generate-btn" class="btn btn-primary" onclick="docgenGenerateMarkdown()">Generate note</button>
+                            <button id="docgen-md-generate-btn" class="btn btn-outline" onclick="docgenGenerateMarkdown()">Generate &amp; save Markdown</button>
                         </div>
                     </div>
                     <div class="vault-info">
-                        <span>Writes a structured long-form <code>.md</code> note (<code># Title</code> + <code>##</code> sections) <strong>into your vault</strong>, grounded in what it says — using the
-                            <!-- E14 (2026-07-22 audit): the required inputs live in the card ABOVE;
-                                 a user who scrolls straight here found a Generate button whose Topic
-                                 field is elsewhere, with error-on-empty as the only guide. -->
-                            <button type="button" class="btn-link" onclick="document.getElementById('docgen-topic').focus(); document.getElementById('docgen-topic').scrollIntoView({block:'center'});"><em>Topic / Instructions / Audience</em> fields above ↑</button>.
-                            Journalled and reversible from <strong>Note Refactor → Restore</strong>. It never overwrites an existing note.</span>
+                        <span>Creates a new Markdown file in your vault from the brief above. Reports use prose sections; decks use slide headings separated by <code>---</code>. Review the destination before confirming. Existing files are never overwritten.</span>
                     </div>
                     <div id="docgen-md-status" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
 
@@ -667,7 +742,7 @@
                             <input type="text" id="docgen-md-name" placeholder="Defaults to a slug of the topic — a .md is added">
                         </div>
 
-                        <div id="docgen-md-activity" class="deck-activity" aria-live="polite"></div>
+                        <div id="docgen-md-activity" class="deck-activity"></div>
                         <div id="docgen-md-result" class="deck-result"></div>
                     </div>
                 </div>
@@ -677,7 +752,7 @@
                     <div class="header">
                         <h2 class="card-title">Augment an existing article</h2>
                         <div class="actions">
-                            <button id="docgen-aug-preview-btn" class="btn btn-primary" onclick="docgenAugmentPreview()">Preview change</button>
+                            <button id="docgen-aug-preview-btn" class="btn btn-outline" onclick="docgenAugmentPreview()">Preview change</button>
                         </div>
                     </div>
                     <div class="vault-info">
@@ -724,55 +799,8 @@
                             <textarea id="docgen-aug-instruction" rows="3" maxlength="4000" placeholder="e.g. 'Deepen the methods section: add the inclusion criteria and the analysis plan' or 'Add a table comparing the two cohorts'."></textarea>
                         </div>
 
-                        <div id="docgen-aug-activity" class="deck-activity" aria-live="polite"></div>
+                        <div id="docgen-aug-activity" class="deck-activity"></div>
                         <div id="docgen-aug-result" class="deck-result"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Note Refactor Tab (Phase 1 — read-only analyzer) -->
-        <div id="refactor-tab" class="content-area" role="tabpanel" aria-labelledby="tab-refactor" tabindex="0">
-            <div class="pane-view">
-                <div class="card">
-                    <div class="header">
-                        <h2 class="card-title">Note Refactor</h2>
-                        <div class="actions">
-                            <button id="refactor-run-btn" class="btn btn-primary" onclick="refactorRunPlan()">Run Plan</button>
-                            <button id="refactor-apply-btn" class="btn btn-outline" onclick="refactorOpenApply()" disabled>Apply approved (0)</button>
-                            <button id="refactor-normalize-btn" class="btn btn-outline" onclick="refactorOpenNormalize()" disabled>Fix formatting (0)</button>
-                            <button id="refactor-restore-btn" class="btn btn-outline" onclick="refactorOpenRestore()">Restore…</button>
-                        </div>
-                    </div>
-                    <div class="vault-info">
-                        <span><strong>⚠ Writes to your vault.</strong> Phase 1 previews are read-only, but <strong>Apply</strong> inlines the approved callouts into your notes, and per-image <strong>Archive</strong> moves a full-res original out of the vault (to a recoverable archive folder) leaving a small thumbnail. Every change is atomic, logged, and reversible from <strong>Restore</strong>. Nothing is written until you explicitly confirm.</span>
-                    </div>
-                    <div id="refactor-status" class="warning-banner" role="status" aria-live="polite" style="display:none;"></div>
-
-                    <div class="deck-body">
-                        <div class="control-group">
-                            <label for="refactor-scope">Scope sub-folder (vault-relative)</label>
-                            <div class="input-row">
-                                <input type="text" id="refactor-scope" placeholder="your_subfolder">
-                                <button class="btn btn-outline" onclick="refactorPickScopeFolder()">Browse…</button>
-                            </div>
-                            <small class="control-hint">Only this sub-folder's <code>.md</code> notes are analyzed. Attachments are resolved across the whole vault.</small>
-                        </div>
-                        <div class="control-group">
-                            <label class="checkbox-row">
-                                <input type="checkbox" id="refactor-strip-preamble" onchange="refactorToggleStripDefault()">
-                                Strip the OCR-callout preamble for every image
-                            </label>
-                            <small class="control-hint">Drops the “This image is…/Transcribed Text:” lead-in from every inlined callout (keeps the transcription). Saved to settings; re-runs the plan. Additive to the per-image Strip button.</small>
-                        </div>
-
-                        <div id="refactor-summary" class="deck-summary" style="display:none;"></div>
-                        <div id="refactor-discrepancies" class="refactor-discrepancies"></div>
-                        <div id="refactor-activity" class="deck-activity" aria-live="polite"></div>
-                        <div class="refactor-layout">
-                            <div id="refactor-note-list" class="refactor-note-list" role="listbox" aria-label="Analyzed notes"></div>
-                            <div id="refactor-detail" class="refactor-detail"></div>
-                        </div>
                     </div>
                 </div>
             </div>
@@ -812,15 +840,159 @@
                 </small>
                 <!-- role="region": aria-label on a role-less div is invalid ARIA;
                      region is the valid landmark for a labelled scroll container. -->
-                <div id="help-guide-body" class="help-guide" role="region" aria-label="User guide"></div>
+                <!-- tabindex="0": .help-guide is an overflow-y:auto region, so without it a
+                     keyboard-only user cannot scroll the guide at all (axe SERIOUS
+                     "scrollable-region-focusable", 2026-09-03). role+aria-label were
+                     already here; tabindex completes that pattern. -->
+                <div id="help-guide-body" class="help-guide" role="region"
+                     aria-label="User guide" tabindex="0"></div>
+            </div>
+        </div>
+
+        <!-- Maintenance Tab (private-only build feature, STRIP STEP 4).
+             The SKELETON ships: liveRegions.test.js pins that anything AT must
+             hear gets role="status" at markup time, not at write time — so the
+             announcer and panel scaffolding are static here, and only the JS
+             that fills them (static/js/maintenance.js) is stripped. Without it
+             the tab button above stays hidden, so none of this is reachable. -->
+        <div id="maintenance-tab" class="content-area" role="tabpanel" aria-labelledby="tab-maintenance" tabindex="0">
+            <div class="pane-view">
+                <div class="card">
+                    <div class="header">
+                        <h2 class="card-title">Vault Maintenance</h2>
+                        <div class="actions">
+                            <button id="maint-run-btn" class="btn btn-primary" type="button">Run selected</button>
+                            <button id="maint-stop-btn" class="btn btn-outline" type="button" hidden>Stop</button>
+                        </div>
+                    </div>
+                    <div class="maint-body">
+                        <small class="control-hint">
+                            The maintain.sh suite, in-app. The default selection is read-only integrity
+                            checks (PDF naming, links, attachments, library thresholds, doc/LaTeX/tag
+                            audits); a failing step names what it found. Compilation (external tools)
+                            and steps that write or reach the network are opt-in and confirmed per run.
+                        </small>
+                        <div class="maint-status-row">
+                            <div id="maintenance-status" role="status" aria-live="polite" aria-atomic="true"></div>
+                            <span id="maintenance-elapsed" role="timer" aria-live="off"></span>
+                        </div>
+                        <progress id="maint-progress" class="maint-progress" hidden
+                                  aria-label="Maintenance steps completed"></progress>
+                        <!-- role="alert" at markup time (the liveRegions ratchet): after the
+                             AU-03 fix removed the global announcer echo this box was the
+                             only Maintenance surface with no announcement path at all. The
+                             former aria-describedby pointed a role-less div at another
+                             region, which exposes nothing. -->
+                        <div id="maint-error" class="task-error" role="alert"></div>
+                        <fieldset class="maint-step-group">
+                            <legend>Maintenance steps</legend>
+                            <div id="maint-steps" class="maint-steps"></div>
+                        </fieldset>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="header">
+                        <h2 class="card-title">Results</h2>
+                    </div>
+                    <div class="maint-body">
+                        <div id="maint-results" class="maint-results" aria-busy="false">
+                            <p class="maint-empty">No run yet — pick steps above and press Run selected.</p>
+                        </div>
+                        <!-- Bounded log pane (MAX_LOG_LINES in maintenance.js). Deliberately
+                             NOT a live region: per-file progress would monopolize the SR
+                             queue (the deck-activity precedent); milestones announce via
+                             #maintenance-status instead. -->
+                        <div id="maint-log-tools" class="maint-log-tools" hidden>
+                            <span id="maint-log-label">Maintenance log</span>
+                            <button id="maint-log-copy" class="btn btn-outline btn-sm" type="button">Copy log</button>
+                            <button id="maint-log-download" class="btn btn-outline btn-sm" type="button">Download log</button>
+                        </div>
+                        <pre id="maint-log" class="maint-log" role="region"
+                             aria-labelledby="maint-log-label" tabindex="0" hidden></pre>
+                    </div>
+                </div>
             </div>
         </div>
     </main>
 
-    <!-- LLM Settings Modal -->
+    <aside id="activity-bar" class="activity-console" aria-label="Activity console">
+        <details id="activity-console-details">
+            <summary><span class="activity-dot" aria-hidden="true"></span><strong>Activity</strong><span id="activity-label-text">No active operations</span><span class="console-disclosure">Details</span></summary>
+            <div id="activity-tasks" role="region" aria-label="Operations" tabindex="0"></div>
+            <div id="activity-events" role="region" aria-label="Recent activity" tabindex="0"></div>
+        </details>
+    </aside>
+
+    <!-- Settings Modal -->
+    <div id="index-settings-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="index-settings-title">
+        <div class="modal" style="width:min(900px,95vw); max-height:86vh; overflow-y:auto;">
+            <h2 id="index-settings-title">Index tools and history</h2>
+            <p>Daily updates reuse unchanged text and index entries. Choose an advanced operation only when you need a different scope.</p>
+<p>Extraction preferences are in Settings → Extraction and indexing.</p>
+            <div class="actions"><button class="btn btn-outline" onclick="openModal('excl-modal')">Exclusions</button><button class="btn btn-outline" onclick="openImageExtsModal()">Image Extensions</button></div>
+            <details class="advanced-controls">
+                <summary>Advanced update options</summary>
+                <button id="advanced-local-index-btn" class="btn btn-outline" onclick="advancedLocalIndex()">Prepare explicit local OCR update</button>
+                <p>Review the scope and effects before confirming. These choices apply only to the advanced operation.</p>
+                <details class="rebuild-operation"><summary>Rebuild the entire search index</summary><p>Archives the existing index and creates a replacement after extraction. Review the full scope before confirming.</p>
+                <label class="control-hint" for="vault-online-full-rebuild"><input id="vault-online-full-rebuild" type="checkbox"> Include full rebuild in the operation below</label></details>
+                <button id="advanced-index-btn" class="btn btn-outline" onclick="advancedOnlineIndex()">Review online update</button>
+            </details>
+                    <details class="advanced-controls" id="online-ocr-panel">
+                        <summary>Document extraction</summary>
+                        <p>Find a document to review its extraction. Targeted processing prepares text; updating search requires a separate confirmation. Online processing may incur costs.</p>
+                        <div class="control-group">
+                            <label for="online-ocr-scope">Run scope</label>
+                            <select id="online-ocr-scope">
+                                <option value="file">One PDF or image</option>
+                                <option value="session">Whole vault indexing session (up to 1000 pages/images)</option>
+                            </select>
+                            <label for="online-ocr-path">Vault-relative PDF or image path (one-file scope)</label>
+                            <input id="online-ocr-path" type="text" placeholder="attachments/document.pdf">
+                            <label for="online-page-start">First physical PDF page (one file)</label>
+                            <input id="online-page-start" type="number" min="1" value="1">
+                            <label for="online-page-end">Last physical PDF page (optional)</label>
+                            <input id="online-page-end" type="number" min="1">
+                            <p>Bounded ranges export for review. Index promotion requires complete document coverage; partial ranges cannot replace indexed content.</p>
+                            <label for="online-ocr-reextract"><input id="online-ocr-reextract" type="checkbox"> Re-extract even when text is already cached</label>
+                            <label for="online-ocr-retry-page">Retry failed PDF page (optional)</label>
+                            <input id="online-ocr-retry-page" type="number" min="1" step="1">
+                            <label><input id="online-ocr-retry-image" type="checkbox"> Retry failed image attempt</label>
+                            <div class="actions">
+                                <button class="btn btn-outline" onclick="previewOnlineOcr()">Preview eligibility</button>
+                                <button class="btn btn-primary" onclick="startOnlineOcr()">Send eligible images</button>
+                                <button class="btn btn-outline" onclick="cancelOnlineOcr()">Cancel</button>
+                                <button id="online-ocr-promote" class="btn btn-outline" onclick="promoteOnlineOcr()" hidden>Use completed text and index</button>
+                            </div>
+                            <button id="online-export-current" type="button" hidden>Review extraction export</button>
+                            <div id="online-ocr-status" aria-live="off"></div>
+                            <div id="online-ocr-announcement" class="sr-only" role="status" aria-live="polite"></div>
+                            <p id="index-library-freshness">Search updates do not refresh Library Audit or paper labels. Their freshness is unknown until explicitly observed. Audit skips configured z_item files; search uses its own exclusions and referenced images.</p>
+                            <label for="online-source-search">Find extraction sources</label>
+                            <input id="online-source-search" type="search">
+                            <button type="button" onclick="chooseOnlineSources()">Browse sources</button>
+                            <div id="online-source-picker"></div>
+                            <button type="button" onclick="refreshOnlineHistory()">Refresh run history</button>
+                            <div id="online-run-history" aria-label="Saved online runs"></div>
+                            <ul id="online-ocr-preview-list" aria-label="Sources in online OCR preview"></ul>
+                        </div>
+                    </details>
+            <div class="modal-actions"><button class="btn btn-primary" onclick="closeModal('index-settings-modal')">Close</button></div>
+        </div>
+    </div>
+
     <div id="settings-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
         <div class="modal" style="width:min(760px,95vw); max-height:86vh; overflow-y:auto;">
-            <h2 id="settings-modal-title">LLM Settings</h2>
+            <h2 id="settings-modal-title">Settings</h2>
+            <nav class="actions" aria-label="Settings and recovery">
+                <button type="button" id="index-settings-btn" class="btn btn-outline" onclick="openModal('index-settings-modal')">Index tools and history</button>
+                <button type="button" class="btn btn-outline" onclick="openModal('audit-settings-modal')">Library paths and audit settings</button>
+            </nav>
+            <details class="advanced-controls">
+                <summary>Advanced data controls</summary>
+                <p>Review the reset scope and confirmation before deleting application data.</p>
+                <button type="button" class="btn btn-danger" onclick="openModal('reset-modal')">Reset App Data</button>
+            </details>
             <p class="modal-copy">
                 Every LLM / RAG parameter in one place, grouped by function. Prompts and
                 instructions stay on their own tabs. Provider, model and embeddings are in the
@@ -836,6 +1008,19 @@
                        aria-label="Filter settings by name or description">
                 <span id="settings-filter-count" class="control-hint" aria-hidden="true"></span>
             </div>
+            <!-- 2026-09-03 UI review: a query matching nothing used to empty the
+                 modal and leave "0 match(es)" — a dead end on the one surface a
+                 user searches when a setting is missing. This app has THREE
+                 settings surfaces, so a zero-result query is exactly where to
+                 say so. Static markup (the liveRegions rule) and deliberately
+                 NOT a live region: _wireSettingsFilter's announceStatus already
+                 speaks the count, and a second announcer would double it. -->
+            <p id="settings-filter-empty" class="control-hint settings-filter-empty" hidden>
+                No setting here matches. Vault paths, Zotero paths and the audit
+                thresholds (including the Possible-Duplicates similarity cutoff)
+                live in <strong>Library &rarr; Settings</strong>; live
+                per-query toggles live on the panel they affect.
+            </p>
 
             <details class="settings-section" open>
             <summary>Global · request limits &amp; fallback</summary>
@@ -854,6 +1039,15 @@
                     <label for="set-online-max-tokens">Max output tokens</label>
                     <input type="number" id="set-online-max-tokens" min="64" max="32768" step="64" value="4096">
                     <small class="control-hint">Caps each reply for vault chat &amp; deck generation.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-online-reasoning-effort">Online reasoning effort</label>
+                    <select id="set-online-reasoning-effort">
+                        <option value="provider_default">Provider default</option>
+                        <option value="low">Low</option>
+                        <option value="minimal">Minimal</option>
+                    </select>
+                    <small class="control-hint">Optional lower reasoning depth for supported online models. Provider default preserves current behavior.</small>
                 </div>
                 <div class="control-group">
                     <label for="set-agent-wall-clock">Agent wall-clock cap (seconds)</label>
@@ -905,7 +1099,48 @@
 
             </details>
             <details class="settings-section">
-            <summary>Global · OCR &amp; Vision</summary>
+            <summary>Global · Extraction and indexing</summary>
+            <div class="control-group">
+                <label for="embed-provider-select">Embedding Provider</label>
+                <select id="embed-provider-select">
+                    <option value="ollama">Ollama</option>
+                    <option value="lm_studio">LM Studio</option>
+                </select>
+                <small class="control-hint">Local provider used for embeddings when the chat provider is online.</small>
+            </div>
+            <div class="control-group">
+                <label for="embed-select">Embedding Model</label>
+                <select id="embed-select"></select>
+            </div>
+
+            <label class="control-hint" for="vault-online-visual"><input id="vault-online-visual" type="checkbox"> Use online OCR and vision for updates</label>
+            <p>This choice is saved. Online OCR calls may incur provider charges after confirmation; embeddings remain local.</p>
+<p>Native PDF text and embeddings stay local. Existing embedding settings are preserved. Local OCR below is an explicit advanced mode, never a fallback after declining online calls.</p>
+<div class="control-grid">
+                <div class="control-group">
+                            <label for="online-ocr-provider">Online OCR provider</label>
+                            <select id="online-ocr-provider" onchange="onlineOcrProviderChanged()">
+                                <option value="deepseek">DeepSeek</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="google">Gemini</option>
+                                <option value="openrouter">OpenRouter</option>
+                            </select>
+                </div><div class="control-group">
+                            <label for="online-ocr-model">Online OCR model</label>
+                            <select id="online-ocr-model"><option value="deepseek-flash">deepseek-flash</option></select>
+                </div><div class="control-group">
+                            <label for="online-vision-provider">Online vision provider</label>
+                            <select id="online-vision-provider" onchange="onlineVisionProviderChanged()">
+                                <option value="deepseek">DeepSeek</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="google">Gemini</option>
+                                <option value="openrouter">OpenRouter</option>
+                            </select>
+                </div><div class="control-group">
+                            <label for="online-vision-model">Online vision model</label>
+                            <select id="online-vision-model"><option value="deepseek-flash">deepseek-flash</option></select>
+</div></div>
+            <details class="advanced-controls"><summary>Advanced · local OCR and vision</summary>
             <div class="control-grid">
                 <div class="control-group">
                     <label for="ocr-provider-select">OCR Provider</label>
@@ -954,6 +1189,7 @@
                 </div>
             </div>
 
+            </details>
             </details>
             <details class="settings-section" open>
             <summary>Vault Chat · retrieval &amp; generation</summary>
@@ -1017,17 +1253,23 @@
                     <small class="control-hint">Retrieve synonym/abbreviation variants of your query, using the vault's <code>_abreviations.md</code> / <code>_tags.md</code>. Bridges FR/EN shorthand. No re-index.</small>
                 </div>
                 <div class="control-group">
+                    <label class="checkbox-row"><input type="checkbox" id="set-paper-labels-enabled" checked> Paper labels in retrieved sources</label>
+                    <small class="control-hint">Show a retrieved chunk to the model as "Author et al., year, title [key]" using the last Library Audit scan. Config-only; no re-index.</small>
+                </div>
+                <div class="control-group">
                     <label class="checkbox-row"><input type="checkbox" id="vault-primer-enabled"> Abbreviation primer</label>
                     <small class="control-hint">Add a compact glossary to the system prompt so the model can read the vault's shorthand. No re-index.</small>
                 </div>
                 <div class="control-group">
                     <label for="set-thesaurus-abbrev-path">Thesaurus · abbreviations file</label>
                     <input type="text" id="set-thesaurus-abbrev-path" placeholder="_abreviations.md">
+                    <button type="button" class="btn btn-outline" id="set-thesaurus-abbrev-path-browse" aria-label="Browse for abbreviations glossary">Browse…</button>
                     <small class="control-hint">Vault-relative path to the abbreviations glossary (default <code>_abreviations.md</code>). Empty = disable this file. Config-only; no re-index.</small>
                 </div>
                 <div class="control-group">
                     <label for="set-thesaurus-tags-path">Thesaurus · tags file</label>
                     <input type="text" id="set-thesaurus-tags-path" placeholder="_tags.md">
+                    <button type="button" class="btn btn-outline" id="set-thesaurus-tags-path-browse" aria-label="Browse for tags glossary">Browse…</button>
                     <small class="control-hint">Vault-relative path to the tags glossary (default <code>_tags.md</code>). Empty = disable this file.</small>
                 </div>
                 <div class="control-group">
@@ -1138,7 +1380,7 @@
                     <small class="control-hint">Output budget per section. Lower = shorter slides, less RAM pressure on a local model (fewer out-of-memory failures), faster turns.</small>
                 </div>
                 <div class="control-group">
-                    <label for="deck-section-attempts">Retries per section</label>
+                    <label for="deck-section-attempts">Attempts per section</label>
                     <input type="number" id="deck-section-attempts" min="1" max="5" step="1" value="3">
                     <small class="control-hint">Total tries per outline/section before it degrades to a placeholder. Covers a transient local-backend failure (memory hiccup, model reload, timeout).</small>
                 </div>
@@ -1175,7 +1417,7 @@
                     <small class="control-hint">Output budget per section. Higher than the deck's default because a prose section is longer than a slide.</small>
                 </div>
                 <div class="control-group">
-                    <label for="docgen-section-attempts">Retries per section</label>
+                    <label for="docgen-section-attempts">Attempts per section</label>
                     <input type="number" id="docgen-section-attempts" min="1" max="5" step="1" value="3">
                     <small class="control-hint">Total tries per outline/section before it degrades to a placeholder. Covers a transient local-backend failure.</small>
                 </div>
@@ -1199,53 +1441,29 @@
                 <textarea id="set-chat-system-prompt" rows="3" maxlength="4000" placeholder="You are a helpful assistant."></textarea>
                 <small class="control-hint">Used as the full system prompt for the Plain Chat panel (no vault grounding). Leave blank for no system prompt.</small>
             </div>
+            <div class="control-group">
+                <label for="set-chat-attachment-max-chars">Attachment text limit (characters)</label>
+                <input type="number" id="set-chat-attachment-max-chars" min="1000" max="400000" step="1000" value="120000">
+                <small class="control-hint">How much of each attached file is sent to the model. A longer file is cut here and the cut is stated on the attachment and to the model. 120&nbsp;000 covers about nine papers in ten whole; raise it for long reports, lower it for a small-context local model.</small>
+            </div>
 
             </details>
             <details class="settings-section">
-            <summary>Note Refactor · models, LLM edits &amp; archiving</summary>
-            <div class="control-grid">
-                <div class="control-group">
-                    <label for="set-refactor-extract-model">Image OCR/extract model</label>
-                    <input type="text" id="set-refactor-extract-model" placeholder="leave blank = use the Vision model">
-                    <small class="control-hint">Vision model used by the on-demand image extraction (table / describe / classify) passes. Blank falls back to the global Vision model.</small>
-                </div>
-                <div class="control-group">
-                    <label for="set-refactor-review-model">LLM edit / review model</label>
-                    <input type="text" id="set-refactor-review-model" placeholder="leave blank = use the chat model">
-                    <small class="control-hint">Model for the opt-in prose review and the LLM edit actions (Improve formatting, Summarise a PDF, free-prompt, Generate diagram). Blank falls back to the active chat model.</small>
-                </div>
-                <div class="control-group">
-                    <label class="checkbox-row"><input type="checkbox" id="set-refactor-table-double-read"> Double-read tables (no downscale)</label>
-                    <small class="control-hint">Re-reads likely-table images at full resolution for a cleaner transcription. Slower per image.</small>
-                </div>
-            </div>
-            <div class="control-grid">
-                <div class="control-group">
-                    <label for="set-refactor-review-max-tokens">Review / summary max tokens</label>
-                    <input type="number" id="set-refactor-review-max-tokens" min="64" max="8192" step="64" value="1024">
-                    <small class="control-hint">Caps the prose-review, PDF-summary and Mermaid-chart replies.</small>
-                </div>
-                <div class="control-group">
-                    <label for="set-refactor-rewrite-max-tokens">Rewrite max tokens</label>
-                    <input type="number" id="set-refactor-rewrite-max-tokens" min="256" max="16384" step="64" value="4096">
-                    <small class="control-hint">Caps the applyable formatting-rewrite / free-prompt edits (re-emits the whole note or section).</small>
-                </div>
-                <div class="control-group">
-                    <label for="set-refactor-thumb-max-side">Archived-image thumbnail max side (px)</label>
-                    <input type="number" id="set-refactor-thumb-max-side" min="96" max="1024" step="16" value="384">
-                    <small class="control-hint">Longest side of the in-vault thumbnail left behind when an image is archived out.</small>
-                </div>
-            </div>
+            <summary>History and Restore</summary>
+            <button class="btn btn-outline" onclick="historyOpenRestore()">History and Restore…</button>
             <div class="control-group">
-                <label for="set-refactor-archive-dir">Archive directory (absolute path)</label>
-                <input type="text" id="set-refactor-archive-dir" placeholder="leave blank = default app-data location">
-                <small class="control-hint">Where archived original images are moved. Must resolve <strong>outside</strong> the vault (re-checked at apply time). Blank = a default location under the app-data folder.</small>
+                <label for="set-history-archive-dir">Archive directory (absolute path)</label>
+                <div class="input-row">
+                    <input type="text" id="set-history-archive-dir" placeholder="leave blank = default app-data location">
+                    <button type="button" class="btn btn-outline" id="set-history-archive-dir-browse">Browse…</button>
+                </div>
+                <small class="control-hint">Where existing vault history and archived originals are stored. Must resolve <strong>outside</strong> the vault (re-checked at apply time). Blank = a default location under the app-data folder.</small>
             </div>
 
             </details>
             <details class="settings-section" id="tagging-settings-section">
             <summary>Biblio Tagging</summary>
-            <p class="control-hint">Tag <code>biblio_articles/</code> papers from the <strong>Library Audit → Tagging</strong> tab. Writes go to the Obsidian note, the PDF's macOS Finder tags, and Zotero (via its local API) — all confirm-gated, vocabulary-validated, and reversible.</p>
+            <p class="control-hint">Tag <code>biblio_articles/</code> papers from the <strong>Library → Tagging</strong> tab. Writes go to the Obsidian note, the PDF's macOS Finder tags, and Zotero (via its local API) — all confirm-gated, vocabulary-validated, and reversible.</p>
             <div class="control-grid">
                 <div class="control-group">
                     <label for="set-tagging-propose-model">Propose model (blank = chat model)</label>
@@ -1290,9 +1508,130 @@
             </div>
             <div class="control-group">
                 <label for="set-tagging-archive-dir">Tagging archive directory (absolute path)</label>
-                <input type="text" id="set-tagging-archive-dir" placeholder="leave blank = default app-data location">
+                <div class="input-row">
+                    <input type="text" id="set-tagging-archive-dir" placeholder="leave blank = default app-data location">
+                    <button type="button" class="btn btn-outline" id="set-tagging-archive-dir-browse">Browse…</button>
+                </div>
                 <small class="control-hint">Holds the tagging Restore manifest + pre-write note snapshots. Must resolve <strong>outside</strong> the vault. Blank = default under the app-data folder.</small>
             </div>
+            <details class="advanced-controls">
+                <summary>Zotero → Obsidian note sync</summary>
+                <p class="control-hint">When Zotero is authoritative is off, the <strong>Library → Zotero Notes Sync</strong> tab compares each Zotero reading note against the Obsidian note exported from it, per note and per direction: <strong>[take Zotero's]</strong> rewrites <strong>only</strong> the marked Zotero region of your note (frontmatter, tags and header stay byte-for-byte; undo from <strong>Settings → History and Restore</strong>), <strong>[keep mine]</strong> writes your region to the Zotero note through the web API (undo from <strong>Tagging → Restore</strong>), and <strong>[merge…]</strong> lets you edit a three-way merge for both notes, with separate destination results. Images and content outside the comparable region require review. A write that would delete words the other side added asks a second, explicit time after you have read the diff. Missing notes can be created from the same tab (vault note → Settings → History and Restore; Zotero note → Tagging → Restore, which trashes it).</p>
+                <div class="control-group control-group-check">
+                    <input type="checkbox" id="set-notesync-zotero-authoritative">
+                    <label for="set-notesync-zotero-authoritative">Zotero is authoritative (reading notes are edited only in Zotero)</label>
+                    <small class="control-hint">On, the Zotero Notes Sync tab hides <strong>[keep mine]</strong> and <strong>[merge…]</strong> and offers <strong>[mirror from Zotero]</strong> — create the missing notes, rewrite every marked region that differs from Zotero (whatever it held), record sync points — with <strong>[refresh all from Zotero]</strong> kept as the narrower rewrite-only sweep. Rewrites are not journalled: every note they replace must be committed in the vault's git, which is the undo; creations are journalled and need no git. Notes deleted in Zotero are listed, never removed.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-notesync-containment">Containment (legacy one-way compare)</label>
+                    <input type="number" id="set-notesync-containment" min="0.1" max="1" step="0.05" value="0.85">
+                    <small class="control-hint">Unused on the two-way tab. The fraction of the Zotero note's distinct words that must still appear in the Obsidian note for the retired one-way “drifted” listing. CLI <code>notesync status</code> still reports it.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-notesync-template">Note template (blank = built-in)</label>
+                    <textarea id="set-notesync-template" rows="10" spellcheck="false" placeholder="leave blank to use the built-in layout"></textarea>
+                    <small class="control-hint">Placeholders: <code>{{title}}</code> <code>{{citekey}}</code> <code>{{author}}</code> <code>{{year}}</code> <code>{{container}}</code> <code>{{doi}}</code> <code>{{notes}}</code>. A line whose placeholders are all empty is dropped rather than left as punctuation. Anything unrecognised is left verbatim, so a typo is visible instead of silent.</small>
+                </div>
+            </details>
+            <details class="advanced-controls">
+                <summary>Restore-journal retention</summary>
+                <p class="control-hint">Every tag write is journalled so it can be undone. Finder and Zotero operations keep their previous tags <strong>inside</strong> the record — there is no separate snapshot file — so they are never trimmed automatically and the journal grows for the life of the library. Turning retention on <strong>permanently deletes</strong> the undo for operations past your threshold. Note history is never affected. See the current size under <strong>Library → Tagging → Restore…</strong>, which also offers a one-off Compact.</p>
+                <div class="checkbox-row">
+                    <input type="checkbox" id="set-tagging-journal-retention-enabled">
+                    <label for="set-tagging-journal-retention-enabled">Trim old Finder/Zotero undo records automatically</label>
+                </div>
+                <div class="control-grid">
+                    <div class="control-group">
+                        <label for="set-tagging-journal-retention-policy">Policy</label>
+                        <select id="set-tagging-journal-retention-policy">
+                            <option value="age_days">Drop operations older than…</option>
+                            <option value="keep_newest">Keep only the newest…</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label for="set-tagging-journal-retention-days">Age limit (days)</label>
+                        <input type="number" id="set-tagging-journal-retention-days" min="1" max="3650" step="1" value="365">
+                    </div>
+                    <div class="control-group">
+                        <label for="set-tagging-journal-retention-keep">Keep newest (operations)</label>
+                        <input type="number" id="set-tagging-journal-retention-keep" min="100" max="100000" step="100" value="5000">
+                    </div>
+                </div>
+            </details>
+            </details>
+            <details class="settings-section" id="accession-settings-section">
+            <summary>Accession · online identification</summary>
+            <p class="control-hint">Identifies orphan PDFs against keyless public catalogues from the <strong>Library → Unmapped PDFs</strong> report. The on/off switch lives on that report next to its egress disclosure — these are the knobs behind it. Your own bibliography is always checked first, offline.</p>
+            <fieldset class="control-group checkbox-fieldset">
+                <legend>Catalogues to query</legend>
+                <label class="checkbox-row"><input type="checkbox" id="set-accession-src-crossref" checked> Crossref</label>
+                <label class="checkbox-row"><input type="checkbox" id="set-accession-src-europepmc" checked> Europe PMC</label>
+                <label class="checkbox-row"><input type="checkbox" id="set-accession-src-arxiv" checked> arXiv</label>
+                <label class="checkbox-row"><input type="checkbox" id="set-accession-src-hal" checked> HAL</label>
+                <label class="checkbox-row"><input type="checkbox" id="set-accession-src-thesesfr" checked> theses.fr</label>
+                <label class="checkbox-row"><input type="checkbox" id="set-accession-src-openlibrary"> Open Library <span class="control-hint">— ISBN only; books and chapters, which no other source here can resolve</span></label>
+                <label class="checkbox-row"><input type="checkbox" id="set-accession-src-googlebooks"> Google Books <span class="control-hint">— ISBN only; broader coverage, but a <strong>Google</strong> endpoint: the request discloses that you hold a book with this ISBN</span></label>
+                <small class="control-hint">arXiv, HAL and theses.fr are rescue sources — asked only when the first two come up dry. At least one must stay ticked; unticking all keeps the previous set.</small>
+            </fieldset>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="set-accession-contact-email">Contact email (Crossref polite pool)</label>
+                    <input type="text" id="set-accession-contact-email" placeholder="optional — rides the Crossref User-Agent">
+                    <small class="control-hint">A courtesy, not a key: Crossref routes identified requests into its polite pool. Disclosed on the report's toggle label when set.</small>
+                </div>
+                <div class="control-group">
+                    <label for="set-accession-max-candidates">Candidates per lookup</label>
+                    <input type="number" id="set-accession-max-candidates" min="1" max="10" step="1" value="5">
+                </div>
+                <div class="control-group">
+                    <label for="set-accession-timeout">Per-source timeout (s)</label>
+                    <input type="number" id="set-accession-timeout" min="5" max="60" step="1" value="15">
+                </div>
+                <div class="control-group">
+                    <label for="set-accession-batch-max">Batch size cap</label>
+                    <input type="number" id="set-accession-batch-max" min="1" max="500" step="1" value="50">
+                </div>
+            </div>
+            </details>
+            <!-- Private-only build feature (STRIP STEP 4): hidden unless
+                 maintenance.js (stripped publicly) unhides and wires it after
+                 the /api/maintenance/steps probe succeeds. settings.js does NOT
+                 own these controls — the whole section is maintenance.js's. -->
+            <details class="settings-section" id="maintenance-settings-section" hidden data-gated="1">
+            <summary>Vault maintenance</summary>
+            <p class="control-hint">Thresholds for the Maintenance tab's <strong>Library thresholds</strong> step and the folder the <strong>Links &amp; index</strong> step checks. One source for both the tab and <code>cherqain maintain</code>.</p>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="set-maint-links-subdir">Index folder (links step)</label>
+                    <input type="text" id="set-maint-links-subdir" placeholder="(built-in default)">
+                </div>
+                <div class="control-group">
+                    <label for="set-maint-links-note">Index note (links step)</label>
+                    <input type="text" id="set-maint-links-note" placeholder="(built-in default)">
+                </div>
+                <div class="control-group">
+                    <label for="set-maint-max-drift">Max tag-drift rows</label>
+                    <input type="number" id="set-maint-max-drift" min="0" max="100000" step="1">
+                </div>
+                <div class="control-group">
+                    <label for="set-maint-max-no-pdf">Max bib entries without a PDF</label>
+                    <input type="number" id="set-maint-max-no-pdf" min="0" max="100000" step="1">
+                </div>
+                <div class="control-group">
+                    <label for="set-maint-max-dupes">Max duplicate PDF sets</label>
+                    <input type="number" id="set-maint-max-dupes" min="0" max="100000" step="1">
+                </div>
+                <div class="control-group">
+                    <label for="set-maint-max-hygiene">Max tag-hygiene findings</label>
+                    <input type="number" id="set-maint-max-hygiene" min="0" max="100000" step="1">
+                </div>
+                <div class="control-group">
+                    <label for="set-maint-max-hygiene-unmapped">Max hygiene findings (unmapped PDFs)</label>
+                    <input type="number" id="set-maint-max-hygiene-unmapped" min="0" max="100000" step="1">
+                </div>
+            </div>
+            <div id="maint-settings-status" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div id="maint-settings-error" class="task-error"></div>
             </details>
             <details class="settings-section" id="log-viewer-section">
             <summary>Application log</summary>
@@ -1332,28 +1671,38 @@
                 conventional kb_harmonizer layout.
             </p>
             <div class="control-group">
-                <label for="audit-attachments-subdir">Attachments subdirectory</label>
+                <label for="audit-attachments-subdir">Attachments subdirectory (vault-relative)</label>
                 <input type="text" id="audit-attachments-subdir" placeholder="Z_attachments">
+                    <button type="button" class="btn btn-outline" id="audit-attachments-subdir-browse" aria-label="Browse for attachments folder">Browse…</button>
             </div>
             <div class="control-group">
-                <label for="audit-biblio-articles-subdir">Biblio articles subdirectory (under attachments)</label>
+                <label for="audit-biblio-articles-subdir">Biblio articles subdirectory (under saved attachments folder)</label>
                 <input type="text" id="audit-biblio-articles-subdir" placeholder="biblio_articles">
+                    <button type="button" class="btn btn-outline" id="audit-biblio-articles-subdir-browse" aria-label="Browse for bibliographic PDF folder">Browse…</button>
             </div>
             <div class="control-group">
-                <label for="audit-zotero-notes-subdir">Zotero notes subdirectory</label>
+                <label for="audit-zotero-notes-subdir">Zotero notes subdirectory (vault-relative)</label>
                 <input type="text" id="audit-zotero-notes-subdir" placeholder="Z_Zotero_Notes">
+                    <button type="button" class="btn btn-outline" id="audit-zotero-notes-subdir-browse" aria-label="Browse for Zotero notes folder">Browse…</button>
             </div>
             <div class="control-group">
                 <label for="audit-master-bib-path">Master BibTeX path (vault-relative)</label>
                 <input type="text" id="audit-master-bib-path" placeholder="_master.bib">
+                    <button type="button" class="btn btn-outline" id="audit-master-bib-path-browse" aria-label="Browse for BibTeX file">Browse…</button>
             </div>
             <div class="control-group">
                 <label for="audit-zotero-sqlite">Zotero SQLite database (absolute)</label>
-                <input type="text" id="audit-zotero-sqlite" placeholder="~/Zotero/zotero.sqlite">
+                <div class="input-row">
+                    <input type="text" id="audit-zotero-sqlite" placeholder="~/Zotero/zotero.sqlite">
+                    <button type="button" class="btn btn-outline" id="audit-zotero-sqlite-browse">Browse…</button>
+                </div>
             </div>
             <div class="control-group">
                 <label for="audit-zotero-storage">Zotero storage directory (absolute)</label>
-                <input type="text" id="audit-zotero-storage" placeholder="~/Zotero/storage">
+                <div class="input-row">
+                    <input type="text" id="audit-zotero-storage" placeholder="~/Zotero/storage">
+                    <button type="button" class="btn btn-outline" id="audit-zotero-storage-browse">Browse…</button>
+                </div>
             </div>
             <div class="control-group">
                 <label for="audit-biblio-skip-prefix">PDF filename prefix to skip (e.g. z_item)</label>
@@ -1368,6 +1717,11 @@
                 <input type="number" id="audit-near-dup-ratio" min="60" max="100" value="88">
             </div>
             <small class="control-hint">rapidfuzz ratio for the content-similarity sweep (88 ≈ likely, 92 ≈ very likely, 97 ≈ near-certain — the paperless-ngx ladder). Lower = more candidates, more noise. Applies on the next scan.</small>
+            <div class="control-group">
+                <label for="audit-no-pdf-types">Item types that need no local PDF</label>
+                <input type="text" id="audit-no-pdf-types" placeholder="webpage,blogPost,videoRecording">
+            </div>
+            <small class="control-hint">Comma-separated Zotero item types. <strong>Bib Entries Without PDFs</strong> offers a one-click bulk dismissal for each of these, so a class that never has a PDF stops filling the queue. <code>book</code> and <code>bookSection</code> are deliberately absent by default — many of those you would in fact want a PDF for. Applies on the next report load.</small>
             <div class="checkbox-row">
                 <input type="checkbox" id="audit-drift-include-parent-tags">
                 <label for="audit-drift-include-parent-tags">Tag Drift: include the Zotero item's own tags</label>
@@ -1412,59 +1766,22 @@
         </div>
     </div>
 
-    <!-- Note Refactor: Apply confirmation Modal (writes to the vault) -->
-    <div id="refactor-apply-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="refactor-apply-modal-title">
-        <div class="modal" style="width:min(560px,95vw); max-height:80vh; overflow-y:auto;">
-            <h2 id="refactor-apply-modal-title">Apply to your vault?</h2>
-            <p class="modal-copy">
-                This writes the approved callouts into the following note(s).
-                Original embeds are kept; nothing is moved. Each note is written
-                atomically and snapshotted so it can be reverted from
-                <strong>Restore</strong>.
-            </p>
-            <ul id="refactor-apply-list" class="refactor-confirm-list"></ul>
-            <div id="refactor-apply-modal-status" class="modal-copy" role="status" aria-live="polite"></div>
-            <div class="modal-footer">
-                <button class="btn btn-outline" onclick="closeModal('refactor-apply-modal')">Cancel</button>
-                <button id="refactor-apply-confirm" class="btn btn-primary" onclick="refactorConfirmApply()">Write to vault</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Note Refactor: Fix-formatting confirmation Modal (writes to the vault) -->
-    <div id="refactor-normalize-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="refactor-normalize-modal-title">
-        <div class="modal" style="width:min(560px,95vw); max-height:80vh; overflow-y:auto;">
-            <h2 id="refactor-normalize-modal-title">Fix formatting in your vault?</h2>
-            <p class="modal-copy">
-                This applies deterministic, reversible formatting fixes (blank
-                lines before headings/lists, blanks around code fences, trailing
-                whitespace, single final newline) to the following note(s). No
-                wording is changed. Each note is written atomically and
-                snapshotted so it can be reverted from <strong>Restore</strong>.
-            </p>
-            <ul id="refactor-normalize-list" class="refactor-confirm-list"></ul>
-            <div id="refactor-normalize-modal-status" class="modal-copy" role="status" aria-live="polite"></div>
-            <div class="modal-footer">
-                <button class="btn btn-outline" onclick="closeModal('refactor-normalize-modal')">Cancel</button>
-                <button id="refactor-normalize-confirm" class="btn btn-primary" onclick="refactorConfirmNormalize()">Write to vault</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Note Refactor: Restore Modal -->
-    <div id="refactor-restore-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="refactor-restore-modal-title">
+    <!-- History and Restore Modal -->
+    <div id="history-restore-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="history-restore-modal-title">
         <div class="modal" style="width:min(640px,95vw); max-height:82vh; overflow-y:auto;">
-            <h2 id="refactor-restore-modal-title">Restore vault changes</h2>
+            <h2 id="history-restore-modal-title">History and Restore</h2>
             <p class="modal-copy">
-                Every apply / archive is recorded here. Reverting restores the
-                note from its snapshot and moves an archived original back into
-                the vault.
+                Recorded edits use snapshots; reverting a created note deletes it
+                if unchanged. Recorded renames and supported links are reversed,
+                and archived originals move back into the vault. Note mirror
+                rewrites that require Git are recovered from the named Git commit,
+                not from this journal. Tags have their own Restore in Tagging.
             </p>
-            <div id="refactor-restore-list" class="refactor-restore-list"></div>
-            <div id="refactor-restore-status" class="modal-copy" role="status" aria-live="polite"></div>
+            <div id="history-restore-list" class="history-restore-list"></div>
+            <div id="history-restore-status" class="modal-copy" role="status" aria-live="polite"></div>
             <div class="modal-footer">
-                <button class="btn btn-outline" onclick="closeModal('refactor-restore-modal')">Close</button>
-                <button id="refactor-restore-all" class="btn btn-outline" onclick="refactorRevertAll()">Revert all</button>
+                <button class="btn btn-outline" onclick="closeModal('history-restore-modal')">Close</button>
+                <button id="history-restore-all" class="btn btn-outline" onclick="historyRevertAll()">Revert all</button>
             </div>
         </div>
     </div>
@@ -1473,6 +1790,7 @@
     <div id="pull-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="pull-modal-title">
         <div class="modal">
             <h2 id="pull-modal-title">Pull Model</h2>
+            <p class="modal-copy">Ollama model name with its tag, e.g. <code>qwen2.5:14b</code>.</p>
             <input type="text" id="pull-model-input" aria-label="Model name and tag to pull" placeholder="model:tag">
             <div id="pull-status"></div>
             <div id="pull-progress-wrap" class="progress-bar-wrap" role="progressbar"

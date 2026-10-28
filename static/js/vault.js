@@ -7,17 +7,540 @@
  * Key non-obvious points (see inline comments):
  *  - the live query-knob values are sent in EVERY /api/obsidian/chat body, so a
  *    save failure never changes what the next Send uses;
- *  - the fetch-abort budget is computed LIVE at send time in _chatAbortMs() from
- *    the wall-clock control, never cached at init, so a Settings change applies
- *    on the next Send without reload (it is the outermost link of the timeout
- *    chain: agent deadline ≤ server consumer stall ≤ this abort);
+ *  - the silence budget is supplied by the SSE response; provider policy stays server-side.
  *  - _renderAnswer falls back to plain text when the vendored `marked` is absent;
  *  - all user-controlled strings (paths, folder names, answers) go through
  *    createElement/textContent or sanitiseHtml — never raw innerHTML.
  */
 import { secureFetch, consumeSSE, safeJson, logError } from './api.js';
-import { taskBegin, taskEnd, setStatusA11y, announceStatus, openModal, closeModal, sanitiseHtml, copyToClipboard, enhanceCodeBlocks, showTaskError, clearTaskError, makeAnswerRenderer, buildConversationExport, confirmInline } from './ui.js';
+import { taskBegin, taskEnd, taskUpdate, setStatusA11y, announceStatus, openModal, closeModal, sanitiseHtml, copyToClipboard, enhanceCodeBlocks, showTaskError, clearTaskError, makeAnswerRenderer, buildConversationExport, confirmInline } from './ui.js';
 import { getActiveProvider, getSelectedEmbed, getSelectedModel, saveSelectedModels } from './config.js';
+
+let _onlineOcrPreview = null;
+let _onlineOcrPoll = null;
+let _onlinePollDelay = null;
+let _onlineSubmitting = false;
+let _onlineBusy = false;
+let _onlineAnnouncedPhase = null;
+let _onlineMounted = false;
+const _onlineSelection = new Set();
+const _onlineOcrModels = {
+    deepseek: ['deepseek-flash'],
+    openai: ['gpt-5-mini'],
+    google: ['gemini-2.5-flash-lite', 'gemini-3.8-flash'],
+    openrouter: ['google/gemini-3.8-flash']
+};
+let _onlineSettingsSave = Promise.resolve();
+
+function publishExtractionBusy() {
+    document.dispatchEvent(new CustomEvent('library-extraction-busy', {
+        detail: {busy: _onlineSubmitting || _onlineBusy}
+    }));
+}
+
+function busyRejection(response, body) {
+    return response.status === 409 && /active|running|owns/i.test(body?.error || '');
+}
+
+// Bound the whole JSON read, including the response body. No automatic replay.
+async function onlineJson(url, options = {}, timeoutMs = 30000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await secureFetch(url, {...options, signal: controller.signal});
+        const body = await safeJson(response);
+        if (controller.signal.aborted) throw new DOMException('Request timed out', 'AbortError');
+        return {response, body};
+    } finally { clearTimeout(timer); }
+}
+
+export function applyOnlineVisualSettings(config) {
+    if (!_onlineMounted) {
+        _onlineMounted = true;
+        refreshOnlineHistory();
+        refreshIndexLibraryFreshness();
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) void pollOnlineOcr(); });
+        window.addEventListener('online', () => void pollOnlineOcr());
+        window.addEventListener('focus', () => void pollOnlineOcr());
+        pollOnlineOcr();
+    }
+    const showMode = () => {
+        const mode = document.getElementById('daily-index-mode');
+        if (mode) mode.textContent = document.getElementById('vault-online-visual')?.checked
+            ? 'Online OCR enabled — scanned or complex pages will be sent to the configured cloud provider.'
+            : 'Local extraction; online OCR disabled.';
+    };
+    const enabled = document.getElementById('vault-online-visual');
+    if (enabled) {
+        enabled.checked = config.vault_online_visual_enabled === true;
+        showMode();
+        enabled.onchange = async () => {
+            try {
+                const response = await secureFetch('/api/config', {
+                    method: 'POST', body: JSON.stringify({
+                        vault_online_visual_enabled: enabled.checked
+                    })
+                });
+                if (!response.ok) throw new Error('Could not save online index mode');
+            } catch (error) {
+                enabled.checked = !enabled.checked;
+                _onlineOcrMessage(error.message);
+            }
+            showMode();
+        };
+    }
+    for (const [prefix, providerKey, modelKey] of [
+        ['online-ocr', 'online_ocr_provider', 'online_ocr_model'],
+        ['online-vision', 'online_vision_provider', 'online_vision_model']
+    ]) {
+        const provider = document.getElementById(`${prefix}-provider`);
+        const model = document.getElementById(`${prefix}-model`);
+        if (!provider || !model) continue;
+        provider.value = config[providerKey] || 'deepseek';
+        model.replaceChildren();
+        for (const name of _onlineOcrModels[provider.value] || []) {
+            const option = document.createElement('option');
+            option.value = name;
+            option.textContent = name;
+            model.appendChild(option);
+        }
+        model.value = config[modelKey] || model.options[0]?.value || '';
+        model.onchange = () => {
+            saveOnlineVisualSettings().catch(error => _onlineOcrMessage(error.message));
+        };
+    }
+}
+
+export function saveOnlineVisualSettings() {
+    const payload = {
+        online_ocr_provider: document.getElementById('online-ocr-provider')?.value,
+        online_ocr_model: document.getElementById('online-ocr-model')?.value,
+        online_vision_provider: document.getElementById('online-vision-provider')?.value,
+        online_vision_model: document.getElementById('online-vision-model')?.value
+    };
+    _onlineSettingsSave = _onlineSettingsSave.catch(() => {}).then(async () => {
+        const {response} = await onlineJson('/api/config', {
+            method: 'POST', body: JSON.stringify(payload)
+        });
+        if (!response.ok) throw new Error('Could not save online OCR/vision models');
+    });
+    return _onlineSettingsSave;
+}
+
+export function onlineOcrProviderChanged() {
+    const provider = document.getElementById('online-ocr-provider')?.value;
+    const select = document.getElementById('online-ocr-model');
+    if (!select) return;
+    select.replaceChildren();
+    for (const model of _onlineOcrModels[provider] || []) {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = model;
+        select.appendChild(option);
+    }
+    saveOnlineVisualSettings().catch(error => _onlineOcrMessage(error.message));
+}
+
+export function onlineVisionProviderChanged() {
+    const provider = document.getElementById('online-vision-provider')?.value;
+    const select = document.getElementById('online-vision-model');
+    if (!select) return;
+    select.replaceChildren();
+    for (const model of _onlineOcrModels[provider] || []) {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = model;
+        select.appendChild(option);
+    }
+    saveOnlineVisualSettings().catch(error => _onlineOcrMessage(error.message));
+}
+
+export async function advancedOnlineIndex() {
+    return startOnlineIndex(false);
+}
+
+async function startOnlineIndex(daily = true, noExternal = false, entryAnchor = null, prepareOnly = false, onPreview = null, onlineChoice = null, retryPaths = null, action = undefined) {
+    const anchor = entryAnchor || document.getElementById(daily ? 'vault-index-btn' : 'advanced-index-btn');
+    if (!anchor || _onlineSubmitting) return;
+    if (_onlineBusy) { _onlineOcrMessage("An extraction or index update is already active."); return; }
+    _onlineSubmitting = true;
+    publishExtractionBusy();
+    _onlineOcrMessage('Preparing extraction preview… Please wait.');
+    if (onlineChoice !== null) noExternal = !onlineChoice;
+    const models = {
+        provider: document.getElementById('online-ocr-provider')?.value,
+        model: document.getElementById('online-ocr-model')?.value,
+        vision_provider: document.getElementById('online-vision-provider')?.value,
+        vision_model: document.getElementById('online-vision-model')?.value
+    };
+    const panel = document.getElementById('online-ocr-panel');
+    const fullRebuild = !daily && document.getElementById('vault-online-full-rebuild')?.checked === true;
+    const reextract = !!retryPaths || (!daily && document.getElementById('online-ocr-reextract')?.checked === true);
+    const operationMode = daily ? (prepareOnly ? 'prepare_text' : 'update_search') : undefined;
+    const initiatingAction = retryPaths ? 'targeted_retry' : action;
+    const paths = retryPaths || (!daily && _onlineSelection.size ? [..._onlineSelection].sort() : undefined);
+    if (panel && !daily) panel.open = true;
+    try {
+        await saveOnlineVisualSettings();
+        const {response, body: preview} = await onlineJson('/api/online-ocr/session/preview', {
+            method: 'POST', body: JSON.stringify({ run_index: true, reextract, paths, operation_mode: operationMode, initiating_action: initiatingAction })
+        }, 130000);
+        if (!response.ok) throw new Error(preview?.error || 'Online index preview failed');
+        if (!anchor.isConnected) return;
+        if (onPreview) onPreview(preview);
+        const externalEligible = daily && !retryPaths ? (preview.external_eligible ?? preview.eligible) : preview.eligible;
+        _onlineOcrPreview = { ...preview, scope: 'session', run_index: true };
+        _onlineOcrMessage(`${preview.source_count} documents to check; ${preview.reused_count || 0} caches reused; ` +
+            `${preview.pending_count || 0} previously deferred, not retried. ` +
+            (noExternal || !externalEligible ? 'No external calls. Documents needing online processing remain pending.' :
+                `${externalEligible} eligible images/pages. At most ${preview.maximum_attempts ?? preview.eligible * 2} attempts; cost unknown. Review before authorizing.`));
+        const start = async (withoutExternal) => {
+                if (_onlineSubmitting || _onlineBusy) return;
+                _onlineSubmitting = true;
+                publishExtractionBusy();
+                _onlineOcrMessage(prepareOnly
+                    ? 'Starting the confirmed preparation…'
+                    : 'Starting the confirmed search update…');
+                let startResponseKnown = false;
+                let busyRejected = false;
+                try {
+                    const {response: result, body} = await onlineJson('/api/online-ocr/session/start', {
+                        method: 'POST', body: JSON.stringify({
+                            run_index: true, reextract, paths, operation_mode: operationMode, initiating_action: initiatingAction, prepare_only: prepareOnly, confirm_external: !withoutExternal,
+                            no_external: withoutExternal,
+                            confirm_index: !prepareOnly, full_rebuild: fullRebuild,
+                            confirm_full_rebuild: fullRebuild, retry_failed: !!retryPaths || !daily,
+                            session_token: preview.session_token,
+                            provider: models.provider,
+                            model: models.model,
+                            vision_provider: models.vision_provider,
+                            vision_model: models.vision_model
+                        })
+                    }, 130000);
+                    startResponseKnown = true;
+                    if (!result.ok) {
+                        busyRejected = busyRejection(result, body);
+                        throw new Error(body?.error || 'Index could not start');
+                    }
+                    rememberOnlineRun(body.run_id);
+                    if (_onlineOcrPoll) clearInterval(_onlineOcrPoll);
+                    _onlineOcrPoll = setInterval(pollOnlineOcr, 1000);
+                    await pollOnlineOcr();
+                } catch (error) {
+                    if (!startResponseKnown) {
+                        _onlineBusy = true;
+                        _onlineOcrNotice('Start response unavailable; the operation may have started. Status is checked without repeating the launch.');
+                        await pollOnlineOcr();
+                    } else if (busyRejected) {
+                        announceStatus(error.message + ' Checking the active operation; launch was not retried.');
+                        await pollOnlineOcr();
+                    } else _onlineOcrMessage(error.message);
+                } finally { _onlineSubmitting = false; publishExtractionBusy(); }
+        };
+        const strip = confirmInline(anchor, {
+            message: `${reextract ? "Re-extract selected text" : "Extract new/changed sources and reuse successful caches"}. ` +
+                (prepareOnly ? 'Save complete extraction caches for review; the search index stays unchanged. ' :
+                    `${fullRebuild ? 'Archive and rebuild' : 'Update'} the index using local ${getSelectedEmbed()} embeddings. `) +
+                `${preview.reused_count || 0} caches reused; ${preview.pending_count || 0} unchanged failures deferred. ` +
+                (noExternal || !externalEligible ? (retryPaths && externalEligible ? `Optional online retry uses ${models.provider} / ${models.model} for OCR and ${models.vision_provider} / ${models.vision_model} for figures, up to ${preview.maximum_attempts ?? preview.eligible * 2} attempts; cost unknown. Choose explicitly below. ` : '') + 'No external calls. Sources requiring OCR remain pending; existing indexed passages are retained when compatible.' :
+                    `OCR: ${models.provider} / ${models.model}. Vision: ${models.vision_provider} / ${models.vision_model}. Up to ${preview.maximum_attempts ?? preview.eligible * 2} attempts; cost unknown.`),
+            confirmLabel: fullRebuild ? 'Start full online rebuild' : prepareOnly ? (noExternal || !externalEligible ? 'Prepare available text' : 'Authorize and prepare text') : noExternal || !externalEligible ? 'Update using available text' : 'Authorize and update', tone: 'confirm',
+            onConfirm: () => start(noExternal || !externalEligible)
+
+        });
+        if (daily && externalEligible && (!noExternal || retryPaths) && strip) {
+            const offline = document.createElement('button');
+            offline.type = 'button';
+            offline.className = 'btn btn-outline btn-sm';
+            if (anchor.closest('.audit-daily-active')) offline.tabIndex = 0;
+            offline.textContent = noExternal ? 'Authorize OCR and prepare text' : 'Continue without online calls';
+            offline.addEventListener('click', () => { strip.remove(); anchor.focus(); start(!noExternal); });
+            strip.querySelector('.inline-confirm-actions').appendChild(offline);
+        }
+
+    } catch (error) {
+        _onlineOcrNotice(error.name === 'AbortError' ? 'Preview timed out. No extraction was started; review status before trying again.' : error.message);
+    } finally {
+        _onlineSubmitting = false;
+        publishExtractionBusy();
+    }
+}
+
+// Kept separately from live status: reconnecting must not erase launch evidence.
+function _onlineOcrNotice(message) {
+    const anchor = document.getElementById('library-preparation-status') || document.getElementById('online-ocr-status');
+    if (anchor) {
+        let notice = document.getElementById('library-operation-notice');
+        if (!notice) {
+            notice = document.createElement('p');
+            notice.id = 'library-operation-notice';
+            notice.className = 'control-hint';
+            notice.setAttribute('role', 'status');
+            anchor.after(notice);
+        }
+        notice.textContent = message;
+    }
+    _onlineOcrMessage(message);
+}
+
+function _onlineOcrMessage(message, announce = true) {
+    const libraryStatus = document.getElementById('library-index-status') || document.getElementById('library-preparation-status');
+    if (libraryStatus) libraryStatus.textContent = message;
+    const dailyStatus = document.getElementById('daily-index-status');
+    if (dailyStatus) dailyStatus.textContent = message;
+    const target = document.getElementById('online-ocr-status');
+    if (target && target.textContent !== message) target.textContent = message;
+    const announcer = document.getElementById('online-ocr-announcement');
+    if (announce && announcer && announcer.textContent !== message) announcer.textContent = message;
+}
+
+export async function checkExtractionMemory(button) {
+    const target = document.getElementById('daily-memory-status');
+    if (!target || !button) return;
+    button.disabled = true;
+    target.textContent = 'Checking memory…';
+    try {
+        const {response, body} = await onlineJson('/api/online-ocr/resources', {}, 5000);
+        if (!response.ok) throw new Error('Memory check unavailable');
+        target.textContent = (body.message || 'Memory status unavailable.') + ' No operation was started.';
+    } catch (_) { target.textContent = 'Memory check unavailable. No operation was started.'; }
+    finally { button.disabled = false; }
+}
+
+export async function previewOnlineOcr() {
+    _onlineOcrPreview = null;
+    const scope = document.getElementById('online-ocr-scope')?.value || 'file';
+    const path = document.getElementById('online-ocr-path')?.value.trim();
+    const list = document.getElementById('online-ocr-preview-list');
+    if (list) list.replaceChildren();
+    _onlineOcrMessage('Checking native text and existing extraction…');
+    try {
+        const response = await secureFetch(scope === 'session' ?
+            '/api/online-ocr/session/preview' : '/api/online-ocr/preview', {
+            method: 'POST', body: JSON.stringify({ path,
+                reextract: document.getElementById('online-ocr-reextract')?.checked === true,
+                provider: document.getElementById('online-ocr-provider')?.value,
+                model: document.getElementById('online-ocr-model')?.value,
+                page_start: Number(document.getElementById('online-page-start')?.value || 1),
+                page_end: Number(document.getElementById('online-page-end')?.value) || undefined })
+        });
+        const result = await safeJson(response);
+        if (!response.ok) throw new Error(result?.error || 'Preview failed');
+        _onlineOcrPreview = { ...result, scope };
+        if (list) for (const row of result.sources || [result]) {
+            const item = document.createElement('li');
+            item.textContent = `${row.source}: ${row.eligible} eligible` +
+                (row.eligible_pages?.length ? ` (pages ${row.eligible_pages.join(', ')})` : '') +
+                (row.has_cached_text ? ' (cached text retained)' : '');
+            list.appendChild(item);
+        }
+        _onlineOcrMessage(`${result.eligible} eligible of ${result.pages} page(s)/image(s)` +
+            (scope === 'session' ? ` across ${result.source_count} sources. ` : '. ') +
+            (result.has_cached_text ? 'Existing cached text found; select re-extraction to send.' :
+                'Only eligible image content will be sent.'));
+    } catch (error) {
+        _onlineOcrMessage(error.message);
+    }
+}
+
+export async function startOnlineOcr() {
+    const scope = document.getElementById('online-ocr-scope')?.value || 'file';
+    const path = document.getElementById('online-ocr-path')?.value.trim();
+    if (!_onlineOcrPreview || _onlineOcrPreview.scope !== scope ||
+        (scope === 'file' && _onlineOcrPreview.source !== path)) {
+        _onlineOcrMessage('Preview this source before sending it.');
+        return;
+    }
+    const provider = document.getElementById('online-ocr-provider')?.value;
+    const model = document.getElementById('online-ocr-model')?.value.trim();
+    const reextract = !!document.getElementById('online-ocr-reextract')?.checked;
+    if (scope === 'file' && _onlineOcrPreview.has_cached_text && !reextract) {
+        _onlineOcrMessage('Existing text is retained. Select re-extraction to send this source.');
+        return;
+    }
+    const retryValue = document.getElementById('online-ocr-retry-page')?.value;
+    const retryPage = retryValue ? Number(retryValue) : null;
+    const retry = !!document.getElementById('online-ocr-retry-image')?.checked;
+    try {
+        const response = await secureFetch(scope === 'session' ?
+            '/api/online-ocr/session/start' : '/api/online-ocr/start', {
+            method: 'POST', body: JSON.stringify({ path, provider, model, reextract,
+                retry_page: retryPage, retry, confirm_external: true,
+                preview_token: _onlineOcrPreview.preview_token,
+                page_start: _onlineOcrPreview.page_range?.[0], page_end: _onlineOcrPreview.page_range?.[1],
+                source_sha256: _onlineOcrPreview.source_sha256,
+                session_token: _onlineOcrPreview.session_token })
+        });
+        const result = await safeJson(response);
+        if (!response.ok) {
+            if (busyRejection(response, result)) {
+                announceStatus(result.error + ' Following the active operation; launch was not retried.');
+                await pollOnlineOcr();
+                return;
+            }
+            throw new Error(result?.error || 'Could not start extraction');
+        }
+        rememberOnlineRun(result.run_id);
+        _onlineOcrMessage('Sending eligible image content externally. Cancel stops further calls.');
+        if (_onlineOcrPoll) clearInterval(_onlineOcrPoll);
+        _onlineOcrPoll = setInterval(pollOnlineOcr, 1000);
+        await pollOnlineOcr();
+    } catch (error) {
+        _onlineOcrMessage(error.message);
+    }
+}
+
+let _onlineExpectedRun = null;
+try { _onlineExpectedRun = localStorage.getItem('papermind-extraction-run'); } catch (_) { /* optional */ }
+let _onlineTask = null;
+let _onlinePollInFlight = false;
+
+function rememberOnlineRun(runId) {
+    _onlineExpectedRun = runId || null;
+    try {
+        if (_onlineExpectedRun) localStorage.setItem('papermind-extraction-run', _onlineExpectedRun);
+        else localStorage.removeItem('papermind-extraction-run');
+    } catch (_) { /* optional recovery preference */ }
+}
+
+export async function pollOnlineOcr() {
+    if (_onlinePollInFlight) return;
+    _onlinePollInFlight = true;
+    try {
+        const {response, body: result} = await onlineJson('/api/online-ocr/status');
+        const states = new Set(['idle', 'evidence_unavailable', 'interrupted', 'status_unrecorded',
+            'running', 'promoting', 'indexing', 'text_prepared', 'indexed', 'completed_with_omissions',
+            'cancelled', 'promotion_or_index_incomplete', 'index_incomplete', 'time_limit',
+            'extraction_incomplete', 'failed', 'done']);
+        if (!response.ok || !result || !states.has(result.state)) throw new Error('Status unavailable');
+        _onlineBusy = ['running', 'promoting', 'indexing'].includes(result.state)
+            || (['indexed', 'completed_with_omissions'].includes(result.state) && result.bm25_status === 'preparing');
+        const delay = _onlineBusy ? 1500 : 5000;
+        if (!_onlineOcrPoll || _onlinePollDelay !== delay) {
+            clearInterval(_onlineOcrPoll);
+            _onlinePollDelay = delay;
+            _onlineOcrPoll = setInterval(pollOnlineOcr, delay);
+        }
+        if (result.source && !_onlineOcrPreview) _onlineOcrPreview = { scope: 'file', source: result.source };
+        if (result.scope === 'vault_session' && !_onlineOcrPreview) _onlineOcrPreview = { scope: 'session' };
+        publishExtractionBusy();
+        const labels = {idle: 'No extraction active', evidence_unavailable: 'Saved run evidence unavailable — inspect history',
+            interrupted: 'Interrupted — inspect before retrying', status_unrecorded: 'Final status not recorded', running: 'Preparing text and figures',
+            promoting: 'Saving complete extraction', indexing: 'Updating search',
+            text_prepared: 'Preparation complete — review proposals', indexed: 'Vector index updated',
+            completed_with_omissions: 'Vector index updated with exceptions', cancelled: 'Interrupted',
+            promotion_or_index_incomplete: 'Cache publication interrupted — inspect recovery evidence',
+            index_incomplete: 'Search update incomplete — inspect recovery evidence',
+            time_limit: 'Time limit reached', extraction_incomplete: 'Preparation stopped — review failed documents',
+            failed: 'Operation failed', done: 'Extraction complete'};
+        const elapsed = result.started_at ? Math.max(0, Math.floor((result.finished_at || Date.now() / 1000) - result.started_at)) : null;
+        const age = result.last_activity_at ? Math.max(0, Math.floor(Date.now() / 1000 - result.last_activity_at)) : null;
+        const failureMessage = result.failure?.error_detail || result.error_detail || result.error || '';
+        const resourceStop = ['initial_memory_pressure', 'critical_memory_pressure',
+            'swap_growth_over_512_mib', 'memory_monitor_unavailable', 'text_memory_budget']
+            .includes(result.failure?.stop_reason || result.stop_reason);
+        const recovery = document.getElementById('daily-resource-actions');
+        if (recovery) recovery.hidden = !resourceStop || _onlineBusy;
+        if (result.state === 'extraction_incomplete' && resourceStop) {
+            labels.extraction_incomplete = 'Preparation stopped — resource limit';
+        } else if (result.state === 'extraction_incomplete' && (result.failure?.failure_scope || result.failure_scope) === 'global') {
+            labels.extraction_incomplete = 'Preparation stopped — operation error';
+        }
+        const errorPreview = failureMessage.length > 160 ? failureMessage.slice(0, 160) + '… See error details.' : failureMessage;
+        const allDeferred = result.source_count > 0 && result.deferred_count >= result.source_count;
+        if (result.state === 'text_prepared' && allDeferred) labels.text_prepared = 'No new source text prepared — review exceptions';
+        const progress = [labels[result.state] || result.state,
+            ['indexed', 'completed_with_omissions'].includes(result.state) ? ({preparing: 'Preparing and saving lexical search…', ready: 'Lexical search ready and saved', disabled: 'Lexical search disabled', unknown: 'Lexical search readiness unknown'}[result.bm25_status] || 'Lexical search readiness unknown') : '',
+            result.source_count > 0 && result.result_count != null ? `${result.result_count}/${result.source_count} documents examined for extraction` : '',
+            result.state === 'running' ? result.current_source : '',
+            result.state === 'indexing' ? result.index_progress?.message || result.index_progress?.phase || 'Indexing available text…' : '',
+            _onlineBusy && elapsed !== null ? `${elapsed}s elapsed` : '',
+            result.state === 'running' && age !== null ? `last activity ${age}s ago` : '',
+            result.deferred_count ? `${result.deferred_count} deferred — existing passages retained when compatible` : '',
+            result.promoted_count ? `${result.promoted_count} cache(s) replaced` : '',
+            result.not_attempted_count ? `${result.not_attempted_count} not attempted` : '',
+            result.global_failure || (result.failure && result.state === 'extraction_incomplete') ? 'Search update not started. Review the error below before retrying.' : '',
+            errorPreview,
+            resourceStop ? result.failure?.next_step || result.next_step || 'Review resource details before retrying. Unattempted documents are not defective.' : ''].filter(Boolean).join(' · ');
+        const task = 'online-' + (result.run_id || 'current');
+        if (_onlineTask && _onlineTask !== task) taskEnd(_onlineTask);
+        if (_onlineBusy) {
+            _onlineTask = task; taskBegin(task, [labels[result.state] || 'Processing documents', result.state === 'running' ? result.current_source?.split('/').pop() : null].filter(Boolean).join(' · '));
+            taskUpdate(task, {message: progress, completed: result.state === 'running' ? result.result_count : null,
+                total: result.state === 'running' ? result.source_count : null, indeterminate: result.state !== 'running'});
+        } else if (_onlineTask) {
+            taskUpdate(_onlineTask, {label: labels[result.state] || result.state, message: progress,
+                completed: null, total: null, indeterminate: false});
+            const outcome = ['indexed', 'completed_with_omissions'].includes(result.state) && !['ready', 'disabled'].includes(result.bm25_status) ? 'unknown'
+                : ['indexed', 'text_prepared', 'done'].includes(result.state) && !result.deferred_count ? 'completed'
+                : ['text_prepared', 'done'].includes(result.state) && result.deferred_count ? 'partial'
+                : ['completed_with_omissions', 'promotion_or_index_incomplete', 'index_incomplete'].includes(result.state) ? 'partial'
+                : result.state === 'cancelled' ? 'cancelled'
+                : ['failed', 'extraction_incomplete', 'time_limit'].includes(result.state) ? 'failed' : 'unknown';
+            taskEnd(_onlineTask, outcome); _onlineTask = null;
+        }
+        _onlineOcrMessage(progress, result.state !== _onlineAnnouncedPhase);
+        document.dispatchEvent(new CustomEvent('library-extraction-status', {detail: {...result, busy: _onlineSubmitting || _onlineBusy, summary: progress}}));
+        _onlineAnnouncedPhase = result.state;
+        const exportButton = document.getElementById('online-export-current');
+        if (exportButton) {
+            exportButton.hidden = !result.export;
+            exportButton.onclick = () => downloadOnlineExport('/api/online-ocr/export/current');
+        }
+        const promote = document.getElementById('online-ocr-promote');
+        if (promote) promote.hidden = !!result.run_index || !(result.state === 'done' && (
+            (result.coverage === 'processed_unverified' && result.export) ||
+            (result.scope === 'vault_session' && result.completed_count > 0)));
+
+    } catch (error) {
+        const summary = 'Status unknown — connection lost. The operation may still be running. Reconnecting…';
+        _onlineBusy = true;
+        _onlineTask ||= 'online-status';
+        taskBegin(_onlineTask, 'Status unknown');
+        taskUpdate(_onlineTask, {message: summary, indeterminate: true});
+        _onlineOcrMessage(summary);
+        publishExtractionBusy();
+        document.dispatchEvent(new CustomEvent('library-extraction-status', {detail: {state: 'unknown', busy: true, summary}}));
+        if (!_onlineOcrPoll) _onlineOcrPoll = setInterval(pollOnlineOcr, 1500);
+    } finally { _onlinePollInFlight = false; }
+}
+
+export function promoteOnlineOcr() {
+    const anchor = document.getElementById('online-ocr-promote');
+    if (!anchor || anchor.hidden || !_onlineOcrPreview) return;
+    const session = _onlineOcrPreview.scope === 'session';
+    confirmInline(anchor, {
+        message: 'Use this completed transcription for the source and run an incremental vault index update? The previous cache is saved in a promotion receipt.',
+        confirmLabel: 'Use text and index', tone: 'confirm',
+        onConfirm: async () => {
+            try {
+                const response = await secureFetch(session ?
+                    '/api/online-ocr/session/promote' : '/api/online-ocr/promote', {
+                    method: 'POST', body: JSON.stringify({
+                        path: _onlineOcrPreview.source, confirm_index: true })
+                });
+                const result = await safeJson(response);
+                if (!response.ok) throw new Error(result?.error || 'Promotion refused');
+                anchor.hidden = true;
+                _onlineOcrMessage('Updating the text cache and incremental index…');
+                if (_onlineOcrPoll) clearInterval(_onlineOcrPoll);
+                _onlineOcrPoll = setInterval(pollOnlineOcr, 1000);
+            } catch (error) {
+                _onlineOcrMessage(error.message);
+            }
+        }
+    });
+}
+
+export async function cancelOnlineOcr() {
+    const response = await secureFetch('/api/online-ocr/cancel', { method: 'POST' });
+    const result = await safeJson(response);
+    _onlineOcrMessage(result?.phase === 'indexing'
+        ? 'Index cancellation requested.'
+        : result?.phase === 'promotion'
+        ? 'Cache publication cancellation requested. Completed replacements remain recorded; inspect History before continuing.'
+        : 'Cancellation requested. The current provider call may finish or time out.');
+}
 
 // Item 3.1 (improvement plan 2026-07-04): TWO flags, one per state machine.
 // A single shared in-flight flag used to serve both chat-in-flight AND the
@@ -30,9 +553,39 @@ import { getActiveProvider, getSelectedEmbed, getSelectedModel, saveSelectedMode
 // machine are unchanged. Invariant (pinned by tests/js/vaultFlags.test.js):
 // an in-flight index run never refuses a chat, and cancelling an index run
 // never clears the chat guard.
+let _chatController = null;
+let _stopRequested = false;
+
+export function stopChat() {
+    if (!_chatController) return;
+    _stopRequested = true;
+    const button = document.getElementById('vault-stop-btn');
+    if (button) {
+        if (document.activeElement === button) document.getElementById('obsidian-input')?.focus();
+        button.disabled = true; button.textContent = 'Stop requested…';
+    }
+    announceStatus('Stop requested. The provider may still be finishing its current operation.');
+    _chatController.abort();
+}
+
 let _isChatting = false;
 let _isIndexing = false;
 let _pollFailures = 0;
+// Run-started latch (2026-08-12). The server now publishes a non-terminal state
+// before /api/obsidian/index returns, so a terminal state on the first poll is
+// no longer expected — but this poll loop is also re-armed against servers we
+// don't control the timing of (a slow thread hand-off, an older build), and a
+// terminal state read BEFORE the run is observed running is indistinguishable
+// from the *previous* run's leftovers. Until a non-terminal state is seen, a
+// terminal one is treated as "not started yet" and the poll is rescheduled,
+// bounded by _MAX_PRESTART_POLLS so a genuinely instant run still terminates.
+// The pre-start repoll is faster than the steady-state 2 s one: the whole
+// allowance is worst-case latency for a run that really did fail before the
+// first poll (a vault-path gate, say), so 5 × 400 ms bounds that at ~2 s.
+let _indexRunObserved = false;
+let _prestartPolls = 0;
+const _MAX_PRESTART_POLLS = 5;
+const _PRESTART_POLL_MS = 400;
 // Client-side transcript for the "export conversation" action (axis iv). The
 // server holds no vault-chat history (each POST is independent), so this array
 // is the only place a full conversation exists — recorded here, exported by
@@ -73,6 +626,7 @@ const _PREWARM_STAGE_LABELS = {
     loading_index: 'Loading vault index…',
     building_bm25: 'Building lexical (BM25) retriever…',
     loading_reranker: 'Loading cross-encoder reranker…',
+    building_wikilinks: 'Preparing note-link graph…',
 };
 
 const _CHAT_PARAM_DEFAULTS = {
@@ -152,7 +706,12 @@ function _ensureAgentTrace(traceCtx, botMsg, chat) {
 // LIST — footnote number, source link + kind label, relevance bar + score —
 // instead of the old inline-styled bullet dump with a raw float and an emoji
 // image marker. Class-driven (styles.css .retrieval-*), createElement-only.
-function _renderRetrievalTrace(retrieval, botMsg, chat) {
+//
+// Paper labels (2026-09-23): a chunk the audit's join knows carries an additive
+// ``paper: {key, label}``; the row then shows "Smith et al., 2020, Title" with
+// the vault path in the tooltip. textContent only — the label is bibliography
+// data, never markup. Exported for tests/js/retrievalTrace.test.js.
+export function _renderRetrievalTrace(retrieval, botMsg, chat) {
     if (!Array.isArray(retrieval) || retrieval.length === 0) return;
     const details = document.createElement('details');
     details.className = 'retrieval-trace';
@@ -183,9 +742,20 @@ function _renderRetrievalTrace(retrieval, botMsg, chat) {
             // itself never navigates.
             const link = document.createElement('a');
             link.href = item.source;
-            link.textContent = item.source;
             link.title = 'Reveal in Finder';
+            const label = (item.paper && typeof item.paper.label === 'string')
+                ? item.paper.label.trim() : '';
+            link.textContent = label || item.source;
             src.appendChild(link);
+            if (label) {
+                // The path is VISIBLE text under the label, never only a
+                // tooltip: VoiceOver does not reliably read `title` and a
+                // tooltip never reaches touch (review 2026-09-23).
+                const path = document.createElement('span');
+                path.className = 'retrieval-path';
+                path.textContent = item.source;
+                src.appendChild(path);
+            }
         } else {
             const unk = document.createElement('span');
             unk.textContent = 'unknown source';
@@ -576,13 +1146,43 @@ export async function pickVaultFolder() {
 // "Rebuild from scratch" action offered on an `embed_backend_mismatch` error
 // — it discards the vector index (archived server-side, not deleted) and
 // re-embeds the whole vault, so no other caller may pass it.
-export async function indexVault(forceFresh) {
-    if (_isIndexing) return;
+export async function previewLocalIndex(anchor = null, prepareOnly = false, onPreview = null, onlineChoice = null, initiatingAction = undefined) {
+    return startOnlineIndex(true, !document.getElementById('vault-online-visual')?.checked, anchor instanceof HTMLElement ? anchor : null, prepareOnly, onPreview, onlineChoice, null, initiatingAction);
+
+}
+
+export async function advancedLocalIndex() {
+    const anchor = document.getElementById('advanced-local-index-btn');
+    try {
+        await saveSelectedModels();
+        const response = await secureFetch('/api/obsidian/index-preview', {method: 'POST',
+            body: JSON.stringify({provider: getActiveProvider(), embed: getSelectedEmbed()})});
+        const result = await safeJson(response);
+        if (!response.ok) throw new Error(result.error || 'Local index preview refused');
+        if (!result.ready) {
+            _showVaultIndexError({error_code: result.reason, error_detail: `Update refused: ${result.reason}. Existing index is unchanged.`});
+            return;
+        }
+        confirmInline(anchor, {message: 'Explicit local OCR/vision update using the configured local models. ' + result.scope,
+            confirmLabel: 'Update with local OCR', tone: 'confirm',
+            onConfirm: () => indexVault(false, result.update_token, true)});
+    } catch (error) { _onlineOcrMessage(error.message); }
+}
+
+export async function indexVault(forceFresh, updateToken, localVisual = false) {
+    if (_isIndexing || _onlineBusy) return;
+    if (!localVisual && document.getElementById('vault-online-visual')?.checked) {
+        await startOnlineIndex();
+        return;
+    }
 
     const statusDiv = document.getElementById('obsidian-status-msg');
     _isIndexing = true;
+    _indexRunObserved = false;
+    _prestartPolls = 0;
     clearTaskError(document.getElementById('vault-error-boundary'));
     taskBegin('vault-index', 'Indexing vault…');
+    announceStatus('Vault indexing started.');
 
     try {
         await saveSelectedModels();
@@ -592,6 +1192,7 @@ export async function indexVault(forceFresh) {
                 provider: getActiveProvider(),
                 llm: getSelectedModel(),
                 embed: getSelectedEmbed(),
+                visual_mode: 'offline', update_token: updateToken,
                 // Strict-boolean so a stray event object from an onclick
                 // handler (`indexVault` used directly as a listener receives
                 // the Event as its first arg) can never read as "rebuild".
@@ -655,19 +1256,67 @@ async function pollVaultStatus() {
         if (Array.isArray(data.messages) && data.messages.length > 0) {
             setStatusA11y(statusEl, data.messages[data.messages.length - 1], false);
         }
+        taskUpdate('vault-index', {message: data.error_detail || data.messages?.at(-1) || data.phase || data.state,
+            indeterminate: ['running', 'scanning', 'embedding'].includes(data.state)});
         renderVaultWarnings(Array.isArray(data.warnings) ? data.warnings : []);
+        // PERF (2026-09-02): one reader for the one-shot status feed.
+        //   Before:    pollPrewarmStatus (1.5 s) GET the same DRAINING endpoint
+        //              alongside this loop (2 s) and kept only two fields.
+        //              Measured in tests/js/vaultStatusDrain.test.js against the
+        //              pre-fix code: 9 GETs where 4 suffice, and 4 of 6 progress
+        //              messages consumed by the prewarm loop and rendered
+        //              nowhere — plus any warning raised in that window.
+        //   Change:    while a run is in flight this loop is the single reader
+        //              and paints the prewarm banner from its own payload; the
+        //              prewarm loop suspends (see pollPrewarmStatus).
+        //   Safe because:
+        //              the payload already carries prewarm_status/prewarm_message,
+        //              and the banner is only painted on behalf of a prewarm loop
+        //              that is actually alive (_prewarmPolling) — so a tick can
+        //              never re-enable Send for a panel no prewarm ever gated.
+        //   Preserves: never two concurrent readers of a draining endpoint (the
+        //              rule the widget plugin states and the app broke against
+        //              itself). The run-started latch and the 400 ms pre-start
+        //              repoll below are untouched.
+        //   Lock/thread contract: unchanged — same single browser task queue.
+        //   Pinned by: tests/js/vaultStatusDrain.test.js
+        if (_prewarmPolling) {
+            _renderPrewarmBanner(data.prewarm_status || 'idle',
+                                 data.prewarm_message || '');
+        }
+
+        // Run-started latch: a terminal state seen before this run was ever
+        // observed running is the PREVIOUS run's leftover, not this one's
+        // outcome — acting on it ends the lifecycle of a run that is still
+        // going (and, for 'error', renders the old error_detail against it).
+        // Wait for the real state rather than reporting a stale one.
+        if (data.state === 'running' || data.state === 'scanning' || data.state === 'embedding') {
+            _indexRunObserved = true;
+        } else if (!_indexRunObserved && _prestartPolls < _MAX_PRESTART_POLLS) {
+            _prestartPolls += 1;
+            setTimeout(pollVaultStatus, _PRESTART_POLL_MS);
+            _pollFailures = 0;
+            return;
+        }
 
         if (data.state === 'done') {
             _isIndexing = false;
-            taskEnd('vault-index'); _setIndexProgress(false);
+            taskEnd('vault-index', 'completed'); _setIndexProgress(false);
             _updateIndexButtons('done');
             setStatusA11y(document.getElementById('obsidian-status-msg'), '', false);
+            // The first-run hint said "not indexed yet" until this moment; flip
+            // it to the ask-a-question copy without waiting for a reload.
+            _renderVaultEmptyState(data);
             refreshVaultMaterials();
+            // The activity bar is NOT a live region (and must not become one:
+            // it hosts every long task's ambient text) — so a multi-hour
+            // index run used to end with zero SR feedback (2026-08-18).
+            announceStatus('Vault indexing complete.');
             flashSidebarStatus('Indexing complete.');
             return;
         } else if (data.state === 'error') {
             _isIndexing = false;
-            taskEnd('vault-index'); _setIndexProgress(false);
+            taskEnd('vault-index', 'failed'); _setIndexProgress(false);
             _updateIndexButtons('error');
             setStatusA11y(document.getElementById('obsidian-status-msg'), '', false);
             // 2026-07-29 audit 0.1: this branch used to blank the status line
@@ -725,7 +1374,8 @@ function _renderPrewarmBanner(status, message) {
     const inFlight =
         status === 'loading_index' ||
         status === 'building_bm25' ||
-        status === 'loading_reranker';
+        status === 'loading_reranker' ||
+        status === 'building_wikilinks';
     _prewarmInFlight = inFlight;
 
     if (inFlight) {
@@ -780,12 +1430,28 @@ export async function pollPrewarmStatus() {
     // its banner alive for the app's lifetime. 30 min comfortably covers a
     // cold multi-GB index + BM25 + reranker load; past it, surface an honest
     // terminal error instead of polling into the void.
-    const deadline = Date.now() + 30 * 60 * 1000;
+    const DEADLINE_MS = 30 * 60 * 1000;
+    let deadline = Date.now() + DEADLINE_MS;
     try {
         while (true) {
             if (Date.now() > deadline) {
                 _renderPrewarmBanner('error', 'Prewarm is not responding — relaunch the app or check the server.');
                 return;
+            }
+            // PERF (2026-09-02): suspend rather than double-drain. See the
+            // matching block in pollVaultStatus for the measurement. An index
+            // run makes that loop the single reader of /api/obsidian/status;
+            // a GET here would consume progress lines it never renders.
+            // _isIndexing is true exactly while that loop is alive (every
+            // terminal branch clears it, and its first line returns on false),
+            // so this cannot suspend against a poller that has stopped.
+            // The deadline is pushed out while suspended: prewarm state IS
+            // still being observed, through the other loop's payload, so
+            // accruing "not responding" here would be a false accusation.
+            if (_isIndexing) {
+                deadline = Date.now() + DEADLINE_MS;
+                await new Promise(r => setTimeout(r, POLL_MS));
+                continue;
             }
             let data;
             try {
@@ -869,27 +1535,7 @@ function flashSidebarStatus(message) {
     }, 7000);
 }
 
-// Frontend fetch-abort backstop. It must remain the OUTERMOST link of the
-// timeout chain (agent deadline ≤ server consumer stall ≤ this abort) so the
-// server's structured timeout event always arrives before the client gives up.
-// The server consumer waits max(cap, 300) + 30 s; this waits 30 s beyond that,
-// i.e. max(cap, 300) + 60 s. The floor (300) mirrors _SINGLE_SHOT_FLOOR_S in
-// api/routes/vault.py; the margin keeps the ordering.
-const _CHAT_TIMEOUT_MARGIN_S = 60;
-const _CHAT_STALL_FLOOR_S = 300;
-
-// Compute the abort budget LIVE from the agent-wall-clock control (kept in sync
-// with config by settings.js). Reading at send time — rather than caching a
-// value at init — is what lets a wall-clock change in the Settings modal take
-// effect immediately, since this module is never re-initialised mid-session.
-function _chatAbortMs() {
-    const el = document.getElementById('set-agent-wall-clock');
-    const wc = el ? Number(el.value) : NaN;
-    const base = (Number.isFinite(wc) && wc > 0)
-        ? Math.max(wc, _CHAT_STALL_FLOOR_S)
-        : _CHAT_STALL_FLOOR_S;
-    return (base + _CHAT_TIMEOUT_MARGIN_S) * 1000;
-}
+// Chat silence backstops are server-owned and consumed by api.js.
 
 function _attachCopyButton(messageEl, getText, ariaLabel) {
     // Idempotent: a re-render mid-stream should not stack buttons.
@@ -952,7 +1598,8 @@ function _showVaultIndexError(data) {
     const el = document.getElementById('vault-error-boundary');
     const message = (data && data.error_detail) || 'Indexing failed.';
     const code = (data && data.error_code) || '';
-    if (code !== 'embed_backend_mismatch') {
+    if (!['embed_backend_mismatch', 'embed_model_mismatch', 'missing_embedding_identity',
+        'missing_metadata', 'index_version_mismatch', 'vault_identity_mismatch', 'interrupted_store'].includes(code)) {
         _showVaultError(message, indexVault);
         return;
     }
@@ -984,7 +1631,7 @@ function _showVaultIndexError(data) {
  * into a collapsible <details>, and `{token}` answer chunks. On error the partial
  * bot bubble is replaced with a retryable error boundary that re-asks once.
  */
-export async function chatWithVault(retryQuestion) {
+export async function chatWithVault(retryQuestion, opts = {}) {
     if (_isChatting) {
         const statusDiv = document.getElementById('obsidian-status-msg');
         if (statusDiv) setStatusA11y(statusDiv, 'Please wait for the current response to complete.', false);
@@ -992,7 +1639,7 @@ export async function chatWithVault(retryQuestion) {
     }
     // Enter-key submissions bypass the disabled Send button, so guard
     // here too while prewarm is still walking through the in-flight
-    // stages (loading_index / building_bm25 / loading_reranker).
+    // stages (loading_index / building_bm25 / loading_reranker / building_wikilinks).
     if (_prewarmInFlight) {
         const statusDiv = document.getElementById('obsidian-status-msg');
         if (statusDiv) setStatusA11y(statusDiv, 'Vault is still warming up. Please wait a moment.', false);
@@ -1014,12 +1661,19 @@ export async function chatWithVault(retryQuestion) {
     _setVaultSendDisabled(true);
     clearTaskError(document.getElementById('vault-error-boundary'));
     const chat = document.getElementById('obsidian-chat');
+    _clearVaultEmptyState();
 
-    const userMsg = document.createElement('div');
-    userMsg.className = 'message message-user';
-    userMsg.textContent = question;
-    chat.appendChild(userMsg);
-    _attachCopyButton(userMsg, () => question, 'Copy question');
+    // Retry after a KEPT partial (2026-08-18): the question bubble is already
+    // on screen above the interrupted answer — re-rendering it doubled it.
+    const questionOnScreen = fromRetry && opts.questionOnScreen === true;
+    let userMsg = null;
+    if (!questionOnScreen) {
+        userMsg = document.createElement('div');
+        userMsg.className = 'message message-user';
+        userMsg.textContent = question;
+        chat.appendChild(userMsg);
+        _attachCopyButton(userMsg, () => question, 'Copy question');
+    }
     if (!fromRetry) input.value = '';   // a retry leaves the draft untouched
 
     const botMsg = document.createElement('div');
@@ -1036,8 +1690,15 @@ export async function chatWithVault(retryQuestion) {
     announceStatus('Generating response…');
 
     const controller = new AbortController();
-    const chatTimeout = setTimeout(() => controller.abort(), _chatAbortMs());
+    _chatController = controller;
+    _stopRequested = false;
 
+    const ownsTurn = () => _chatController === controller && !controller.signal.aborted;
+    const transientInfoNodes = new Set();
+    const clearTransientInfo = () => {
+        for (const node of transientInfoNodes) node.remove();
+        transientInfoNodes.clear();
+    };
     let fullAnswer = '';
     let turnSources = [];   // retrieval sources for the export transcript
     // Export provenance (2026-07-22): server-confirmed provider/model, real
@@ -1081,8 +1742,9 @@ export async function chatWithVault(retryQuestion) {
         let lastInfoNode = null;
         let lastInfoKey = '';
 
-        await consumeSSE('/api/obsidian/chat', { method: 'POST', signal: controller.signal, body: bodyStr }, {
+        await consumeSSE('/api/obsidian/chat', { method: 'POST', signal: controller.signal, body: bodyStr, serverBudget: true }, {
             onInfo: (info) => {
+                if (!ownsTurn()) return;
                 // Heartbeat dedupe (2026-07-29 audit 11): the reranker/BM25
                 // load tickers emit the SAME sentence every 30 s with only the
                 // elapsed-seconds figure changing — a 20-minute first-time
@@ -1114,6 +1776,9 @@ export async function chatWithVault(retryQuestion) {
                 // visual-only; the announcement goes through the static
                 // #sr-status-announcer region, which ships in the markup.
                 note.textContent = info;
+                // As in Read, ellipsis-terminated info is live progress, not
+                // a durable warning. Remove it when this turn terminates.
+                if (/(…|\.\.\.)\s*$/.test(String(info).trim())) transientInfoNodes.add(note);
                 chat.insertBefore(note, botMsg);
                 chat.scrollTop = chat.scrollHeight;
                 lastInfoNode = note;
@@ -1121,14 +1786,16 @@ export async function chatWithVault(retryQuestion) {
                 announceStatus(info);
             },
             onToken: (token) => {
+                if (!ownsTurn()) return;
                 if (fullAnswer === '') botMsg.innerHTML = '';
                 fullAnswer += token;
                 answerRenderer.update(fullAnswer);
             },
             onOther: (payload) => {
+                if (!ownsTurn()) return;
                 if (payload.retrieval) {
                     // Keep the full retrieval objects ({source, score,
-                    // is_image}) for the export transcript (lot 4.3 +
+                    // is_image, paper?}) for the export transcript (lot 4.3 +
                     // 2026-07-22): the Retrieval Context panel is DOM-only, so
                     // without this the export would lose the provenance —
                     // often the most valuable part of a vault answer.
@@ -1173,7 +1840,8 @@ export async function chatWithVault(retryQuestion) {
             });
             _recordedRetryQuestion = null;   // this question is fully answered
         }
-        announceStatus('Response ready.');
+        if (!fullAnswer) botMsg.textContent = '(No response from the model.)';
+        announceStatus(fullAnswer ? 'Response ready.' : 'No response from the model.');
     } catch (e) {
         // Item 3.5: KEEP a partial answer. A mid-stream {error} after real
         // tokens used to remove the whole bubble — discarding content the
@@ -1183,13 +1851,14 @@ export async function chatWithVault(retryQuestion) {
         // the ORIGINAL question directly (see retryQuestion above) instead
         // of stuffing it back into the input, so a draft typed after the
         // failure is never clobbered.
-        if (fullAnswer) {
+        if (fullAnswer || turnSources.length) {
             answerRenderer.flush();
+            if (!fullAnswer) botMsg.textContent = '(No response from the model.)';
             const note = document.createElement('div');
             note.className = 'muted';
             note.textContent = '⚠ Response interrupted — the text above is partial.';
             botMsg.appendChild(note);
-            _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
+            if (fullAnswer) _attachCopyButton(botMsg, () => fullAnswer, 'Copy answer');
             _pushUserTurnOnce(question, fromRetry);
             _pushVaultTurn({
                 role: 'assistant', content: fullAnswer + '\n[interrupted]',
@@ -1206,14 +1875,20 @@ export async function chatWithVault(retryQuestion) {
             botMsg.remove();
         }
         const msg = e.name === 'AbortError'
-            ? 'Response timed out. The model may be overloaded — please try again.'
+            ? (_stopRequested ? 'Stop requested — the response is interrupted. The provider may still be finishing its current operation.' : 'Response timed out. The model may be overloaded — please try again.')
             : ('Error: ' + e.message);
         _showVaultError(msg, () => {
-            if (!fullAnswer) userMsg.remove();   // keep the pair when a partial stays visible
-            chatWithVault(question);
+            // keep the pair when a partial stays visible
+            if (!fullAnswer && !turnSources.length && userMsg) userMsg.remove();
+            chatWithVault(question, {
+                questionOnScreen: !!fullAnswer || !!turnSources.length || questionOnScreen,
+            });
         });
     } finally {
-        clearTimeout(chatTimeout);
+        clearTransientInfo();
+        answerRenderer.cancel();
+        if (_chatController !== controller) return;
+        _chatController = null;
         _isChatting = false;
         _setVaultSendDisabled(false);
         taskEnd('vault-chat');
@@ -1223,14 +1898,34 @@ export async function chatWithVault(retryQuestion) {
 
 /** C5/#50: toggle the vault-chat Send button, unless prewarm already owns it. */
 function _setVaultSendDisabled(disabled) {
+    const stop = document.getElementById('vault-stop-btn');
+    if (stop) {
+        if (!_isChatting && document.activeElement === stop) document.getElementById('obsidian-input')?.focus();
+        stop.hidden = !_isChatting; stop.disabled = false; stop.textContent = 'Stop';
+    }
     const sendBtn = document.getElementById('vault-send-btn');
     if (!sendBtn) return;
     // Don't re-enable while prewarm is still in flight (it owns the button then).
     if (!disabled && _prewarmInFlight) return;
+    // Disabling the focused element drops focus to <body> (2026-08-18):
+    // park it on the input first so keyboard/SR position survives.
+    if (disabled && document.activeElement === sendBtn) {
+        const input = document.getElementById('obsidian-input');
+        if (input) input.focus();
+    }
     sendBtn.disabled = disabled;
 }
 
-export function clearVaultChat() {
+export function clearVaultChat(confirmed = false) {
+    const hasTranscript = _vaultHistory.length || document.querySelector('#obsidian-chat .message');
+    if (!_isChatting && hasTranscript && !confirmed) {
+        confirmInline(document.getElementById('vault-clear-chat-btn'), {
+            message: 'Discard this conversation? Export it first if you want to keep it.',
+            confirmLabel: 'Discard conversation',
+            onConfirm: () => clearVaultChat(true),
+        });
+        return;
+    }
     // Server holds no chat history (each /api/obsidian/chat call is independent),
     // so clearing is purely a DOM operation. We refuse while a query is in flight
     // so the in-progress bot message is not orphaned mid-stream.
@@ -1462,6 +2157,9 @@ export async function renderExclusions() {
                 btn.className = 'btn btn-outline btn-sm';
                 btn.dataset.path = path;
                 btn.textContent = 'Remove';
+                // Row context (2026-08-18): N identical "Remove" names are
+                // indistinguishable in Tab/forms mode.
+                btn.setAttribute('aria-label', `Remove the exclusion for ${path}`);
                 // Ceremony parity (Track 6e): removing an exclusion re-includes
                 // the folder in the next index run — gate it like every other
                 // config-mutating action instead of firing on a single click.
@@ -1530,6 +2228,66 @@ export async function saveImageExts() {
  * finished before the UI mounted), handing off to pollPrewarmStatus only when a
  * non-terminal prewarm stage is still in flight.
  */
+/* ---------------------------------------------------------------------------
+ * First-run empty state for the vault transcript (2026-09-03 UI review).
+ *
+ * Defect: `#obsidian-chat` was an empty <div> on first run. This is the tab the
+ * app opens on, and the Library Audit tab's own (good) empty state points a new
+ * user straight here — so the first thing they saw was an empty box beside a
+ * Send button, with nothing saying that answers come only from an index they
+ * have not built.
+ *
+ * Decided from what /api/obsidian/status ALREADY carries (`vault_path` +
+ * `state`) — no new server field, and no extra request. It is a HINT, not a
+ * message: no `role`, so the two live regions on this panel (the status line
+ * and the error boundary) stay the only things that announce; removed before
+ * the first turn is appended; and never painted over a transcript that already
+ * holds messages. Nothing is painted while a run is in flight — there the
+ * progress bar and the status line are already speaking.
+ * ------------------------------------------------------------------------- */
+const _VAULT_RUN_STATES = ['running', 'scanning', 'embedding'];
+
+function _renderVaultEmptyState(data) {
+    const chat = document.getElementById('obsidian-chat');
+    if (!chat) return;
+    const existing = chat.querySelector('.chat-empty-state');
+    // A real transcript wins: never paint over (or beside) actual messages.
+    if (chat.querySelector('.message')) {
+        if (existing) existing.remove();
+        return;
+    }
+    const state = (data && data.state) || '';
+    // Mid-run, and error, have their own dedicated surfaces on this panel.
+    if (_VAULT_RUN_STATES.includes(state) || state === 'error') {
+        if (existing) existing.remove();
+        return;
+    }
+    const hasVault = !!(data && data.vault_path);
+    const indexed = state === 'done' || state === 'paused_partial';
+    let text;
+    if (!hasVault) {
+        text = 'No vault yet. Pick your Obsidian folder with Change… above, '
+             + 'then click “Update Index”. Answers on this tab come only from '
+             + 'what the index contains.';
+    } else if (!indexed) {
+        text = 'This vault is not indexed yet — click “Update Index”. Indexing is '
+             + 'incremental, and you can pause or cancel a long first run.';
+    } else {
+        text = 'Ask a question about your notes. Each answer lists the notes it '
+             + 'came from; retrieval and agent settings live in ⚙ Settings.';
+    }
+    const el = existing || document.createElement('div');
+    el.className = 'chat-empty-state';
+    el.textContent = text;
+    if (!existing) chat.appendChild(el);
+}
+
+/** Drop the first-run hint the moment a real turn starts. */
+function _clearVaultEmptyState() {
+    const el = document.querySelector('#obsidian-chat .chat-empty-state');
+    if (el) el.remove();
+}
+
 export async function refreshIndexState() {
     try {
         const resp = await secureFetch('/api/obsidian/status');
@@ -1539,6 +2297,7 @@ export async function refreshIndexState() {
             if (displayEl) displayEl.textContent = data.vault_path;
         }
         _updateIndexButtons(data.state);
+        _renderVaultEmptyState(data);
         // A run already in flight (e.g. the page was reloaded mid-index, or the
         // run was started by a prior session) won't have gone through
         // indexVault(), so the activity bar + status polling were never armed.
@@ -1546,6 +2305,11 @@ export async function refreshIndexState() {
         // messages keep flowing until a terminal state.
         if ((data.state === 'running' || data.state === 'scanning' || data.state === 'embedding') && !_isIndexing) {
             _isIndexing = true;
+            // This branch only fires on a state that IS running, so the run is
+            // observed by construction — the poll loop it arms must not spend
+            // its pre-start allowance waiting for what we just saw.
+            _indexRunObserved = true;
+            _prestartPolls = 0;
             _setIndexProgress(true);
             _vaultPollDeadline = Date.now() + 24 * 60 * 60 * 1000;
             taskBegin('vault-index', 'Indexing vault…');
@@ -1553,6 +2317,13 @@ export async function refreshIndexState() {
         }
         if (Array.isArray(data.warnings) && data.warnings.length) {
             renderVaultWarnings(data.warnings);
+        }
+        // This one-shot GET drains the same one-shot feed, so anything it
+        // takes is gone for the poll loop it may be about to arm. Render the
+        // latest line rather than dropping the batch (2026-09-02).
+        if (Array.isArray(data.messages) && data.messages.length > 0) {
+            setStatusA11y(document.getElementById('obsidian-status-msg'),
+                          data.messages[data.messages.length - 1], false);
         }
         // A run that errored before this tab mounted (or before a reload) left
         // its reason only in the persistent error_detail field — the live poll
@@ -1572,4 +2343,274 @@ export async function refreshIndexState() {
     } catch (e) {
         console.error('Initial vault state fetch failed:', e);
     }
+}
+
+
+export async function chooseOnlineSources(offset = 0) {
+    const host = document.getElementById('online-source-picker');
+    if (!host) return;
+    try {
+        const query = document.getElementById('online-source-search')?.value || '';
+        const response = await secureFetch(`/api/online-ocr/sources?offset=${offset}&q=${encodeURIComponent(query)}`);
+        const data = await safeJson(response);
+        if (!response.ok) throw new Error(data.error);
+        host.replaceChildren();
+        for (const source of data.sources) {
+            const label = document.createElement('label');
+            const input = document.createElement('input');
+            input.type = 'checkbox'; input.checked = _onlineSelection.has(source);
+            input.addEventListener('change', () => input.checked ? _onlineSelection.add(source) : _onlineSelection.delete(source));
+            label.append(input, document.createTextNode(source));
+            host.append(label, document.createElement('br'));
+        }
+        if (data.next_offset != null) {
+            const next = document.createElement('button'); next.textContent = 'Next 50 sources';
+            next.addEventListener('click', () => chooseOnlineSources(data.next_offset)); host.append(next);
+        }
+    } catch (error) { _onlineOcrMessage(error.message); }
+}
+
+let _historyRequest = 0;
+
+export async function refreshOnlineHistory(offset = 0, focus = false) {
+    const host = document.getElementById('online-run-history');
+    if (!host) return;
+    const generation = ++_historyRequest;
+    try {
+        const {response, body: data} = await onlineJson('/api/online-ocr/runs' + (offset ? `?offset=${offset}` : ''));
+        if (!response.ok) throw new Error(data.error);
+        if (generation !== _historyRequest) return;
+        host.replaceChildren();
+        for (const run of data.runs) {
+            const row = document.createElement('article'); row.className = 'run-card';
+            const state = run.worker_state || run.state;
+            const labels = {indexed: 'Search updated', completed_with_omissions: 'Completed with exceptions', extraction_incomplete: 'Text preparation incomplete', index_incomplete: 'Search update incomplete', promotion_or_index_incomplete: 'Cache publication interrupted — inspect recovery evidence', status_unrecorded: 'Final outcome unknown', done: 'Text ready', text_prepared: 'Text prepared', running: 'Running', failed: 'Needs attention', cancelled: 'Interrupted'};
+            const label = labels[state] || 'Review outcome';
+            const title = document.createElement('h4');
+            title.textContent = `${run.prepare_only ? 'Text preparation' : run.full_rebuild ? 'Search index rebuild' : run.kind === 'file' ? 'Document extraction' : 'Search update'} · ${run.recorded_at ? new Date(run.recorded_at * 1000).toLocaleString() : 'Date unavailable'}`;
+            const badge = document.createElement('span'); badge.className = 'operation-state'; badge.textContent = label;
+            const summary = document.createElement('p');
+            summary.textContent = `${run.source_count ?? 'Unknown number of'} documents selected.` +
+                (run.deferred_count ? ` ${run.deferred_count} deferred. Previous passages are retained where available and compatible.` : '') +
+                (run.status_note ? ` ${run.status_note}` : '');
+            const technical = document.createElement('details');
+            const technicalLabel = document.createElement('summary'); technicalLabel.textContent = 'Operation reference';
+            const reference = document.createElement('p'); reference.textContent = `Run ${run.run_id} · ${state}`;
+            technical.append(technicalLabel, reference);
+            row.append(title, badge, summary);
+            const inspect = document.createElement('button'); inspect.textContent = 'Review documents'; inspect.className = 'btn btn-primary';
+            const detailHost = document.createElement('div');
+            let detailRequest = 0;
+            const showDetail = async (detailOffset = 0) => {
+                const generation = ++detailRequest;
+                inspect.disabled = true;
+                inspect.textContent = 'Loading documents…';
+                try {
+                    const {response: res, body: detail} = await onlineJson(`/api/online-ocr/runs/${run.run_id}?offset=${detailOffset}&limit=50`);
+                    if (!res.ok) throw new Error(detail.error);
+                    if (generation !== detailRequest) return;
+                    detailHost.replaceChildren();
+                    const evidence = document.createElement('div');
+                    evidence.tabIndex = -1;
+                    evidence.textContent = `${detail.sources?.length || 0} documents shown. ${detail.source_count ?? 'Unknown'} documents in this operation.`;
+                    const sourceRows = new Map();
+                    for (const source of detail.sources || []) {
+                        const sourceRow = document.createElement('div'); sourceRow.className = 'source-result';
+                        const name = document.createElement('strong'); name.textContent = source.source;
+                        const outcome = document.createElement('p');
+                        const context = [source.provider, source.model, source.http_status ? `HTTP ${source.http_status}` : '', source.provider_code].filter(Boolean).join(' · ');
+                        const error = source.error_detail || source.error || (source.status === 'request_failed' ? 'The provider error details were not recorded for this older attempt.' : '');
+                        outcome.textContent = [context, (source.status || 'Status unavailable').replaceAll('_', ' '), error].filter(Boolean).join(' — ');
+                        const next = document.createElement('p'); next.textContent = source.next_step || (source.status === 'request_failed' ? 'Check provider settings, then explicitly retry this document to obtain a current error. No retry runs automatically.' : '');
+                        sourceRow.append(name, outcome, next); evidence.append(sourceRow); sourceRows.set(source.source, sourceRow);
+                    }
+                    detailHost.append(evidence);
+                    const technical = document.createElement('details');
+                    const technicalLabel = document.createElement('summary');
+                    technicalLabel.textContent = 'Technical recovery evidence';
+                    const raw = document.createElement('pre');
+                    raw.textContent = JSON.stringify(detail, null, 2);
+                    technical.append(technicalLabel, raw); detailHost.append(technical);
+                    for (const source of detail.sources || []) if (source.export_url) {
+                        const download = document.createElement('button'); download.textContent = `Review ${source.source}`;
+                        download.addEventListener('click', () => downloadOnlineExport(source.export_url)); (sourceRows.get(source.source) || detailHost).append(download);
+                    }
+                    for (const source of detail.sources || []) {
+                        if (!source.source_sha256) continue;
+                        const report = document.createElement('button');
+                        report.textContent = `Report bad extraction: ${source.source}`;
+                        report.addEventListener('click', () => confirmInline(report, {
+                            message: 'Defer this document until an explicit retry? Existing indexed passages and caches are retained. This records your assessment, not an automatic accuracy check.',
+                            confirmLabel: 'Defer document', tone: 'confirm', onConfirm: async () => {
+                                try {
+                                    const response = await secureFetch('/api/online-ocr/report-bad', {method: 'POST',
+                                        body: JSON.stringify({path: source.source, source_sha256: source.source_sha256, confirm: true})});
+                                    const body = await safeJson(response);
+                                    if (!response.ok) throw new Error(body.error || 'Decision refused');
+                                    _onlineOcrMessage('Document deferred until explicit retry. Existing passages retained.');
+                                    report.disabled = true;
+                                } catch (error) { _onlineOcrMessage(error.message); }
+                            }
+                        }));
+                        const retryOne = document.createElement('button');
+                        retryOne.textContent = `Review targeted retry: ${source.source}`;
+                        retryOne.addEventListener('click', () => startOnlineIndex(true,
+                            true, retryOne, true, null, null, [source.source]));
+                        (sourceRows.get(source.source) || detailHost).append(report, retryOne);
+                    }
+                    const nextOffset = detail.next_offset ?? detail.promotion_next_offset;
+                    for (const [label, target] of [
+                        ['Previous evidence page', detailOffset > 0 ? Math.max(0, detailOffset - 50) : null],
+                        ['Next evidence page', nextOffset]
+                    ]) if (target != null) {
+                        const button = document.createElement('button'); button.textContent = label;
+                        button.addEventListener('click', () => showDetail(target)); detailHost.append(button);
+                    }
+                    evidence.focus();
+                } catch (error) { _onlineOcrMessage(error.name === 'AbortError' ? 'Document history timed out. Try loading it again; no extraction was started.' : error.message); }
+                finally { if (generation === detailRequest) { inspect.disabled = false; inspect.textContent = 'Review documents'; } }
+            };
+            inspect.addEventListener('click', () => showDetail());
+            row.append(inspect, detailHost);
+            if (run.retry_allowed && run.state !== 'indexed') {
+                const retry = document.createElement('button'); retry.textContent = 'Retry unfinished extraction';
+                retry.addEventListener('click', () => confirmInline(retry, {
+                    message: `Retry unfinished extraction using the same attempt bounds, then ${run.prepare_only ? 'prepare text without indexing' : run.kind !== 'session' ? 'export for review' : run.full_rebuild ? 'archive and rebuild the entire index' : 'update the index'}? Unknown previous calls may have been billed. Settings and sources must still match.`,
+                    confirmLabel: 'Retry this run', tone: 'confirm', onConfirm: async () => {
+                        retry.disabled = true;
+                        try {
+                            const response = await secureFetch(run.kind === 'file' ? '/api/online-ocr/start' : '/api/online-ocr/session/start', {method: 'POST', body: JSON.stringify({
+                                run_index: run.kind !== 'extraction_session', resume_run_id: run.run_id, session_token: run.session_token,
+                                reextract: run.kind === 'file' ? run.reextract : !run.routine, paths: run.paths, retry_failed: true,
+                                path: run.source, source_sha256: run.source_sha256, preview_token: run.preview_token,
+                                page_start: run.page_range?.[0], page_end: run.page_range?.[1],
+                                confirm_external: !run.no_external, no_external: !!run.no_external, prepare_only: !!run.prepare_only,
+                                operation_mode: run.initiating_action !== 'legacy_session' ? run.operation_mode : undefined,
+                                initiating_action: run.initiating_action !== 'legacy_session' ? run.initiating_action : undefined,
+                                confirm_index: run.initiating_action !== 'legacy_session' && run.operation_mode === 'prepare_text' ? false : true, full_rebuild: run.full_rebuild,
+                                confirm_full_rebuild: run.full_rebuild,
+                                provider: run.ocr?.provider, model: run.ocr?.model,
+                                vision_provider: run.vision?.provider, vision_model: run.vision?.model
+                            })});
+                            const data = await safeJson(response);
+                            if (!response.ok) throw new Error(data.error);
+                            rememberOnlineRun(data.run_id || run.run_id);
+                            await pollOnlineOcr();
+                        } catch (error) { _onlineOcrMessage(error.message); }
+                        finally { retry.disabled = false; }
+                    }
+                }));
+                row.append(retry);
+            }
+            if (['file', 'extraction_session'].includes(run.kind) && run.state === 'done' && !run.promotion_barrier) {
+                const promote = document.createElement('button'); promote.textContent = 'Use completed file text';
+                promote.addEventListener('click', () => confirmInline(promote, {
+                    message: 'Verify complete document coverage and promote this file, then update the index once? Other uncached binaries remain deferred.',
+                    confirmLabel: 'Promote and index', tone: 'confirm',
+                    onConfirm: () => recoverOnlineRun(promote, run.kind === 'file' ? '/api/online-ocr/promote' : '/api/online-ocr/session/promote', {run_id: run.run_id, path: run.source, confirm_index: true})
+                }));
+                row.append(promote);
+            }
+            if (run.index_continuation_available && !['indexed', 'completed_with_omissions'].includes(run.state)) {
+                const resume = document.createElement('button'); resume.textContent = 'Finish interrupted search update';
+                resume.addEventListener('click', () => confirmInline(resume, {
+                    message: 'Finish the search update using the text already saved? No images are sent again. The app first verifies that the saved text and index settings still match; otherwise it stops without starting the update.',
+                    confirmLabel: 'Finish search update', tone: 'confirm',
+                    onConfirm: () => recoverOnlineRun(resume, '/api/online-ocr/session/continue-index', {run_id: run.run_id, confirm_index: true})
+                }));
+                row.append(resume);
+            }
+            if ((!run.kind || run.kind === 'session') && run.retry_allowed && run.state !== 'indexed') {
+                const omit = document.createElement('button'); omit.textContent = 'Review exact omissions';
+                omit.addEventListener('click', async () => {
+                    omit.disabled = true;
+                    try {
+                        const omitted = [];
+                        let offset = 0;
+                        do {
+                            const response = await secureFetch(`/api/online-ocr/runs/${run.run_id}?offset=${offset}&limit=100`);
+                            const detail = await safeJson(response);
+                            if (!response.ok) throw new Error(detail.error);
+                            for (const source of detail.sources) if (!['processed_unverified', 'ocr'].includes(source.status)) omitted.push(source.source);
+                            offset = detail.next_offset;
+                        } while (offset != null);
+                        if (!omitted.length) throw new Error('No unfinished sources are recorded.');
+                        const list = document.createElement('pre'); list.textContent = omitted.sort().join('\n'); row.append(list);
+                        confirmInline(omit, {
+                            message: `Continue with exactly these ${omitted.length} deferred sources? ${run.prepare_only ? 'Save complete text for review; the search index stays unchanged.' : run.full_rebuild ? 'The previous index is archived; these sources are omitted from the new index.' : 'Existing chunks for these sources are retained if present; new content is not inserted.'}`,
+                            confirmLabel: 'Accept these omissions', tone: 'confirm',
+                            onConfirm: () => recoverOnlineRun(omit, '/api/online-ocr/session/continue-incomplete', {
+                                run_id: run.run_id, session_token: run.session_token, omit_sources: omitted,
+                                operation_mode: run.initiating_action !== 'legacy_session' ? run.operation_mode : undefined,
+                                initiating_action: run.initiating_action !== 'legacy_session' ? run.initiating_action : undefined,
+                                confirm_preparation: run.operation_mode === 'prepare_text',
+                                confirm_index: run.initiating_action !== 'legacy_session' && run.operation_mode === 'prepare_text' ? false : true,
+                                confirm_omissions: true, confirm_full_rebuild: run.full_rebuild
+                            })
+                        });
+                    } catch (error) { _onlineOcrMessage(error.message); }
+                    finally { omit.disabled = false; }
+                });
+                row.append(omit);
+            }
+            row.append(technical);
+            for (const button of row.querySelectorAll('button')) if (!button.className) button.className = 'btn btn-outline';
+            host.append(row);
+        }
+        if (!data.runs?.length) host.textContent = 'No saved operations yet.';
+        for (const [label, target] of [
+            ['Newer runs', offset > 0 ? Math.max(0, offset - 20) : null],
+            ['Older runs', data.next_offset]
+        ]) if (target != null) {
+            const button = document.createElement('button'); button.textContent = label;
+            button.addEventListener('click', () => refreshOnlineHistory(target, true)); host.append(button);
+        }
+        if (focus) { host.tabIndex = -1; host.focus(); }
+    } catch (error) {
+        if (generation === _historyRequest) host.textContent = error.message;
+    }
+}
+
+async function recoverOnlineRun(button, endpoint, body) {
+    if (_onlineSubmitting) return;
+    _onlineSubmitting = true; button.disabled = true;
+    try {
+        const response = await secureFetch(endpoint, {method: 'POST', body: JSON.stringify(body)});
+        const result = await safeJson(response);
+        if (!response.ok) {
+            if (busyRejection(response, result)) {
+                announceStatus(result.error + ' Following the active operation; recovery was not replayed.');
+                await pollOnlineOcr();
+                return;
+            }
+            throw new Error(result.error);
+        }
+        rememberOnlineRun(result.run_id || body.run_id);
+        await pollOnlineOcr();
+    } catch (error) { _onlineOcrMessage(error.message); }
+    finally { _onlineSubmitting = false; button.disabled = false; }
+}
+
+async function downloadOnlineExport(url) {
+    try {
+        const response = await secureFetch(url);
+        if (!response.ok) throw new Error('Export unavailable');
+        const blobUrl = URL.createObjectURL(await response.blob());
+        const link = document.createElement('a'); link.href = blobUrl; link.download = 'extraction-review.md';
+        document.body.append(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    } catch (error) { _onlineOcrMessage(error.message); }
+}
+
+async function refreshIndexLibraryFreshness() {
+    const host = document.getElementById('index-library-freshness');
+    if (!host) return;
+    try {
+        const response = await secureFetch('/api/audit/summary');
+        const result = await safeJson(response);
+        if (!response.ok) return;
+        host.textContent = `Last Audit: ${result.scanned_at ? new Date(result.scanned_at * 1000).toLocaleString() : 'unknown'}. ` +
+            `Labels generated: ${result.paper_index_built_at || 'unknown'}. ` +
+            'Current filesystem freshness is unknown. Indexing does not run Audit. Audit skip-prefix and search exclusions/reference-image scopes differ.';
+    } catch { /* Keep the honest unknown-freshness text. */ }
 }

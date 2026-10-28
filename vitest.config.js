@@ -6,6 +6,8 @@
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
+    // Unit tests must never load developer/provider credentials from .env files.
+    envDir: false,
     test: {
         environment: 'jsdom',
         include: ['tests/js/**/*.test.js'],

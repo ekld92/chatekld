@@ -382,7 +382,9 @@ def test_generate_second_run_returns_409_while_locked(tmp_path):
     import api.routes.docgen as route
 
     client = app.test_client()
-    assert route._DOCGEN_OP_LOCK.acquire(blocking=False)
+    target = tmp_path / "t" / "t.tex"
+    lease = route._DOCGEN_OP_LOCK.acquire(target, blocking=False)
+    assert lease is not None
     try:
         r = client.post(
             "/api/docgen/generate",
@@ -391,4 +393,4 @@ def test_generate_second_run_returns_409_while_locked(tmp_path):
         )
         assert r.status_code == 409
     finally:
-        route._DOCGEN_OP_LOCK.release()
+        lease.release()

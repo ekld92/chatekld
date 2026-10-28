@@ -1,4 +1,4 @@
-"""Convenience script to install and register PaperMind MCP server for Claude Code, Cursor, and OpenClaw.
+"""Convenience script to install and register CHERQAiN MCP server for Claude Code, Cursor, and OpenClaw.
 
 Per-client behaviour mirrors what each client offers: Claude Code has a CLI
 (`claude mcp add`), so we call it; Cursor has no registration CLI — its MCP
@@ -48,8 +48,8 @@ def merge_cursor_config(existing: dict) -> dict:
 
 
 def register_claude_code():
-    """Register PaperMind MCP server with Claude Code via `claude mcp add`."""
-    print("--> Registering PaperMind MCP server with Claude Code...")
+    """Register CHERQAiN MCP server with Claude Code via `claude mcp add`."""
+    print("--> Registering CHERQAiN MCP server with Claude Code...")
     cmd = [
         "claude",
         "mcp",
@@ -84,7 +84,7 @@ def register_cursor(config_path: str | None = None) -> bool:
     # detaching the config from the dotfiles repo. Resolve first so the atomic
     # replace targets the real file (2026-08-08 review B4).
     path = os.path.realpath(path)
-    print(f"--> Registering PaperMind MCP server with Cursor ({path})...")
+    print(f"--> Registering CHERQAiN MCP server with Cursor ({path})...")
     existing: dict = {}
     if os.path.exists(path):
         try:
@@ -145,7 +145,7 @@ def check_interpreter():
 
 
 def main():
-    print(f"PaperMind Repo Root: {REPO_ROOT}")
+    print(f"CHERQAiN Repo Root: {REPO_ROOT}")
     print(f"Python Interpreter: {PYTHON_EXEC}")
     print(f"MCP Server Path:    {MCP_SERVER_PATH}\n")
     check_interpreter()

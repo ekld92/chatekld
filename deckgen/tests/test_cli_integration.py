@@ -2,7 +2,7 @@
 
 This exercises the full orchestration wiring (preflight -> outline -> per-section
 -> sanitize -> assemble -> validate -> write) without a running server or any
-network I/O, by monkeypatching the ``ChatEKLDClient`` symbol the CLI uses with a
+network I/O, by monkeypatching the ``CHERQAiNClient`` symbol the CLI uses with a
 fake that returns canned :class:`~deckgen.client.ChatResult` objects.
 
 Unlike ``test_deckgen.py`` this transitively imports ``deckgen.client`` (and thus
@@ -17,7 +17,7 @@ from deckgen.client import ChatResult
 
 
 class _FakeClient:
-    """Stand-in for ChatEKLDClient. Records calls; canned outline + sections."""
+    """Stand-in for CHERQAiNClient. Records calls; canned outline + sections."""
 
     def __init__(self, base_url, **_kwargs):
         self.base_url = base_url
@@ -60,7 +60,7 @@ def test_main_writes_valid_deck(tmp_path, monkeypatch):
         captured["client"] = client
         return client
 
-    monkeypatch.setattr(cli, "ChatEKLDClient", _factory)
+    monkeypatch.setattr(cli, "CHERQAiNClient", _factory)
 
     out = tmp_path / "deck.tex"
     rc = cli.main([
@@ -84,10 +84,21 @@ def test_main_writes_valid_deck(tmp_path, monkeypatch):
     assert "\\title{Schizophrenia}" in tex
     assert "\\author{Dr X}" in tex
 
-    # Both outline sections made it through, with their citations.
+    # Both outline sections made it through, with their citations. The model's
+    # inline "(source: note.md)" is no longer expected verbatim: since
+    # 2026-08-13 the CLI runs the same deterministic citation pass as the app,
+    # so a source with no matching bib key moves into the frame's grouped
+    # footer. Asserting the footer proves BOTH that the content survived and
+    # that the post-pass ran. A NO-TEMPLATE deck must use the macro-free vfill
+    # form: assemble() defines no \refline (only assemble_with_template injects
+    # the \providecommand), so a \refline here is an undefined control sequence
+    # and the deck cannot compile — the pre-2026-08-18 suite pinned exactly
+    # that broken output.
     assert "\\section{Definition}" in tex
     assert "\\section{Management}" in tex
-    assert "(source: note.md)" in tex
+    assert "\\vfill{\\tiny\\textcolor{gray}{Source : note.md}}" in tex
+    assert "\\refline" not in tex
+    assert "(source: note.md)" not in tex
 
     # Sanitize stripped the fences and the leaked preamble + prose.
     assert "```" not in tex
@@ -141,7 +152,7 @@ def _run(monkeypatch, client_cls, out):
         captured["client"] = client_cls(base_url, **kwargs)
         return captured["client"]
 
-    monkeypatch.setattr(cli, "ChatEKLDClient", _factory)
+    monkeypatch.setattr(cli, "CHERQAiNClient", _factory)
     rc = cli.main([
         "--topic", "Schizophrenia",
         "--provider", "ollama", "--model", "qwen2.5",
@@ -165,7 +176,11 @@ def test_main_partial_placeholders_exits_1(tmp_path, monkeypatch):
     rc, _ = _run(monkeypatch, _PartialClient, out)
     assert rc == 1  # one of two sections was a placeholder
     tex = out.read_text(encoding="utf-8")
-    assert "(source: n.md)" in tex                                  # real section survived
+    # The real section survived — its source now sits in the frame footer, in
+    # the macro-free form (no template => assemble() defines no \refline; see
+    # the citation-pass note in test_main_writes_valid_deck above).
+    assert "\\vfill{\\tiny\\textcolor{gray}{Source : n.md}}" in tex
+    assert "\\refline" not in tex
     assert "(no content generated for this section)" in tex        # placeholder for the other
 
 
@@ -177,7 +192,7 @@ def test_main_dry_run_stops_after_outline(tmp_path, monkeypatch):
         captured["client"] = client
         return client
 
-    monkeypatch.setattr(cli, "ChatEKLDClient", _factory)
+    monkeypatch.setattr(cli, "CHERQAiNClient", _factory)
     out = tmp_path / "deck.tex"
     rc = cli.main([
         "--topic", "Schizophrenia",

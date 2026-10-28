@@ -80,6 +80,40 @@ describe('audit cross-report search', () => {
         expect(document.getElementById('audit-report-body').style.display).toBe('none');
     });
 
+    it('opens a search identity in Documents without losing the historical report action', async () => {
+        fetchMock.mockImplementation(async url => {
+            if (String(url).includes('/api/audit/library/documents')) return jsonOk({freshness: {}, populations: {references: 1, files: 0}, documents: [
+                {id: 'r', kind: 'reference', citation_key: 'dupont2019', title: 'Étude', attachments: []},
+            ]});
+            return jsonOk({q: 'dupont', total: 1, shown: 1, groups: [{report: 'inventory', count: 1, rows: [{label: 'Étude', citation_key: 'dupont2019'}]}]});
+        });
+        await type('dupont');
+        expect(document.querySelector('.audit-search-hit')).toBeTruthy();
+        document.querySelector('.audit-search-documents').click();
+        await vi.advanceTimersByTimeAsync(50);
+        expect(document.querySelector('#audit-report-body input').value).toBe('dupont2019');
+        expect(document.querySelector('#audit-report-body').textContent).toContain('1 entries shown');
+        expect(document.getElementById('audit-search-input').value).toBe('dupont');
+        expect(document.activeElement.textContent).toBe('reference: Étude');
+    });
+
+    it('opens the exact native document despite a colliding citation key', async () => {
+        fetchMock.mockImplementation(async url => {
+            if (String(url).includes('/api/audit/library/documents')) return jsonOk({freshness: {}, populations: {references: 2, files: 0}, documents: [
+                {id: 'native:one', kind: 'reference', citation_key: 'same', title: 'First', attachments: []},
+                {id: 'native:two', kind: 'reference', citation_key: 'same', title: 'Second', attachments: []},
+            ]});
+            return jsonOk({q: 'same', total: 1, shown: 1, groups: [{report: 'library_documents', count: 1,
+                rows: [{label: 'Second', citation_key: 'same', document_id: 'native:two'}]}]});
+        });
+        await type('same');
+        document.querySelector('.audit-search-hit').click();
+        await vi.advanceTimersByTimeAsync(50);
+        expect(document.querySelector('.library-documents-list').textContent).toBe('reference: Second');
+        [...document.querySelectorAll('button')].find(b => b.textContent === 'Clear document selection').click();
+        expect(document.querySelector('.library-documents-list').textContent).toContain('reference: First');
+    });
+
     it('does not query below the minimum length, but KEEPS what was typed', async () => {
         // Regression: the short-query path used to route through _clearSearch,
         // which empties the input — so pausing mid-word past the debounce

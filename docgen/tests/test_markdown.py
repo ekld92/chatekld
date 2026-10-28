@@ -70,13 +70,13 @@ def test_assemble_frontmatter_stamps_provenance():
     empty values skipped; the default (no frontmatter) stays byte-identical."""
     secs = [SectionOutput(title="Intro", body="## Intro\nA.")]
     md = assemble_markdown("T", secs, frontmatter={
-        "generated_by": "ChatEKLD docgen",
+        "generated_by": "CHERQAiN docgen",
         "model": 'weird"model\\name',
         "empty": "",
         "topic": "line one\nline two",
     })
     assert md.startswith("---\n")
-    assert 'generated_by: "ChatEKLD docgen"' in md
+    assert 'generated_by: "CHERQAiN docgen"' in md
     # Quotes/backslashes escaped, newlines folded to one line.
     assert 'model: "weird\\"model\\\\name"' in md
     assert 'topic: "line one line two"' in md
@@ -140,3 +140,22 @@ def test_request_outline_binds_markdown_prompt():
     )
     assert [s.title for s in sections] == ["Background"]
     assert "note" in client.calls[0]["system_prompt"].lower()
+
+
+def test_slide_prompts_preserve_author_content_verbatim():
+    from docgen import markdown_slides
+    topic = 'Cesarean sections: the section\'s prose'
+    instructions = "Compare cross-sections; retain the section's prose and note outline."
+    outline = markdown_slides.build_outline_message(topic, instructions, 5)
+    assert f'Topic: {topic}' in outline
+    assert f'Instructions from the author:\n{instructions}' in outline
+    assert 'Design a slide deck outline' in outline
+    assert 'between 3 and 5 slides' in outline
+    title = "Cross-sections and the section's prose"
+    points = ["Explain the section's prose; keep sections intact"]
+    section = markdown_slides.build_section_message(
+        topic=topic, instructions=instructions, full_outline=[Section(title, points)],
+        index=1, title=title, points=points)
+    for original in (topic, instructions, title, points[0]):
+        assert original in section
+    assert 'then concise slide content.' in section

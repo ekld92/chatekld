@@ -71,9 +71,12 @@ function parseRgba(s) {
 }
 // Composite an rgba tint over an opaque hex background (what the eye sees for
 // badge fills like accent-glow / accent-soft-bg).
-function over(rgbaStr, bgHex) {
+function over(rgbaStr, bg0) {
     const [r, g, b, a] = parseRgba(rgbaStr);
-    const bg = srgb(bgHex);
+    // `bg0` may already be a composited rgb array, not a hex string: the
+    // side-by-side diff stacks a WORD tint on top of a LINE tint on top of the
+    // surface, and only the doubly-composited colour is what the eye sees.
+    const bg = typeof bg0 === 'string' ? srgb(bg0) : bg0;
     return [r * a + bg[0] * (1 - a), g * a + bg[1] * (1 - a), b * a + bg[2] * (1 - a)];
 }
 
@@ -126,6 +129,44 @@ const PAIRS = [
         (t) => t['--text-primary'], (t) => t['--bg-elevated'], 4.5],
     ['--text-secondary on card (.control-hint)',
         (t) => t['--text-secondary'], (t) => t['--bg-card'], 4.5],
+    // Audit dashboard (2026-08-13). The tiles' own text was already covered by
+    // the --bg-elevated pairs, but the group labels and the coverage caveat
+    // note sit on the CARD surface, whose opaque token is `--card-bg` — a
+    // different token from `--bg-card` and, until these rows, one no pair in
+    // this list referenced. The `-sub` denominator sits inside a tile, so it
+    // is on elevated; it is named separately anyway because a denominator that
+    // silently drops below contrast turns a coverage figure back into the
+    // undenominated number the dashboard exists to replace.
+    // Tag Harmony's "not in vocab" badge sits on the elevated chip fill, not
+    // on the warn tint the warning banner uses — a different pair, and the one
+    // that tells the user a listed tag will NOT be written.
+    ['--warn-fg on elevated (.harmony-badge)',
+        (t) => t['--warn-fg'], (t) => t['--bg-elevated'], 4.5],
+    // Audit UX pass (2026-08-19). The evidence chip reuses tokens already in
+    // this list on surfaces they already sit on — named separately per the
+    // house rule ("when reusing a token on a new surface, add the pair
+    // there"), because these chips are what a bulk WRITE decision is read
+    // off: chip-id says "an identifier resolved this and may be bulk-linked".
+    ['--text-secondary on elevated (.audit-chip)',
+        (t) => t['--text-secondary'], (t) => t['--bg-elevated'], 4.5],
+    ['--accent-soft-fg on soft tint (.audit-chip.chip-id)',
+        (t) => t['--accent-soft-fg'], (t) => over(t['--accent-soft-bg'], t['--bg-card']), 4.5],
+    ['--accent-soft-fg on card (.audit-acc-disclosure summary)',
+        (t) => t['--accent-soft-fg'], (t) => t['--bg-card'], 4.5],
+    ['--text-secondary on card (.audit-inv-dl dt)',
+        (t) => t['--text-secondary'], (t) => t['--bg-card'], 4.5],
+    // Manual link picker (2026-08-19): the SELECTED option composites over the
+    // accent tint, where --text-tertiary would fail — the .audit-ambig-num
+    // lesson, re-pinned on its own surface so a future retint of the picker
+    // cannot quietly drop it.
+    ['--text-secondary on soft tint (.acc-keypicker-opt.is-sel meta/title)',
+        (t) => t['--text-secondary'], (t) => over(t['--accent-soft-bg'], t['--bg-card']), 4.5],
+    ['--text-primary on soft tint (.acc-keypicker-opt.is-sel key)',
+        (t) => t['--text-primary'], (t) => over(t['--accent-soft-bg'], t['--bg-card']), 4.5],
+    ['--text-secondary on card-bg (.audit-summary-group-label / -note)',
+        (t) => t['--text-secondary'], (t) => t['--card-bg'], 4.5],
+    ['--text-secondary on elevated (.audit-summary-sub denominator)',
+        (t) => t['--text-secondary'], (t) => t['--bg-elevated'], 4.5],
     // Inline "not saved" marker under a refused settings field
     // (settings.js::_flagDropped → .settings-field-error).
     ['--danger on card (.settings-field-error)',
@@ -153,6 +194,51 @@ const PAIRS = [
         (t) => t['--warn-fg'], (t) => over(t['--warn-bg'], t['--bg-card']), 4.5],
     ['--ok-fg on card (.refactor-diff .diff-add, milestone strip)',
         (t) => t['--ok-fg'], (t) => t['--bg-card'], 4.5],
+    // The one OUTCOME line (2026-09-20, ui.js::statusLine). The tone GLYPH is
+    // real text at 12px carrying the tone, and the audit scan banner paints
+    // itself on --bg-elevated, so each tone owes a pair on that surface too —
+    // a tone nobody can read is a tone conveyed by nothing at all.
+    ['--ok-fg on card (.status-line.tone-ok glyph)',
+        (t) => t['--ok-fg'], (t) => t['--bg-card'], 4.5],
+    ['--danger on card (.status-line.tone-error)',
+        (t) => t['--danger'], (t) => t['--bg-card'], 4.5],
+    ['--text-tertiary on card (.status-at stamp)',
+        (t) => t['--text-tertiary'], (t) => t['--bg-card'], 4.5],
+    ['--ok-fg on card (.maint-state-chip[data-state=ok])',
+        (t) => t['--ok-fg'], (t) => t['--bg-card'], 4.5],
+    // Shared side-by-side diff (2026-08-29, ui.js::renderSideBySideDiff). The
+    // container sets `color: var(--text-primary)` and `background:
+    // var(--bg-app)` explicitly, so these pairs are what is actually rendered
+    // in BOTH call sites (a report-table cell and the refactor detail pane) —
+    // that explicitness is the reason a single pair can speak for both.
+    // The WORD tints composite over the LINE tint, which composites over the
+    // surface; pinning only the line tier would miss the tighter of the two.
+    ['--text-primary on diff del line (.diff-sxs-cell.is-del)',
+        (t) => t['--text-primary'], (t) => over(t['--diff-del-bg'], t['--bg-app']), 4.5],
+    ['--text-primary on diff add line (.diff-sxs-cell.is-add)',
+        (t) => t['--text-primary'], (t) => over(t['--diff-add-bg'], t['--bg-app']), 4.5],
+    ['--text-primary on diff del WORD (.is-del .diff-sxs-word)',
+        (t) => t['--text-primary'],
+        (t) => over(t['--diff-del-word'], over(t['--diff-del-bg'], t['--bg-app'])), 4.5],
+    ['--text-primary on diff add WORD (.is-add .diff-sxs-word)',
+        (t) => t['--text-primary'],
+        (t) => over(t['--diff-add-word'], over(t['--diff-add-bg'], t['--bg-app'])), 4.5],
+    // The gutter carries the line number and the -/+ sign — the sign is the
+    // NON-COLOUR channel for the diff state, so it has to be readable.
+    ['--text-tertiary on app bg (.diff-sxs-ln / .diff-sxs-sign)',
+        (t) => t['--text-tertiary'], (t) => t['--bg-app'], 4.5],
+    ['--accent-hover on elevated (.diff-sxs-fold)',
+        (t) => t['--accent-hover'], (t) => t['--bg-elevated'], 4.5],
+    // Plain Chat attachment chips (2026-08-29). Same tokens as neighbouring
+    // chips on the same surface, named separately per the house rule — the
+    // `chip-trunc` warning is what tells the user the model is seeing only
+    // part of their file, so it must not degrade silently.
+    ['--text-primary on elevated (.chat-attachment-chip)',
+        (t) => t['--text-primary'], (t) => t['--bg-elevated'], 4.5],
+    ['--text-secondary on elevated (.chat-attachment-chip .chip-meta / remove)',
+        (t) => t['--text-secondary'], (t) => t['--bg-elevated'], 4.5],
+    ['--warn-fg on elevated (.chat-attachment-chip .chip-trunc)',
+        (t) => t['--warn-fg'], (t) => t['--bg-elevated'], 4.5],
     ['--danger on card (.audit-error-tag, .btn-danger text)',
         (t) => t['--danger'], (t) => t['--bg-card'], 4.5],
     // N/F/Z legend badges: --on-cat letter on each category fill.

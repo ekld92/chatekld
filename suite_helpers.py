@@ -19,9 +19,16 @@ def join_post_index_daemons(timeout: float = 15.0) -> None:
     """Wait for the background threads ``index_vault`` leaves running.
 
     ``index_vault`` ends by kicking a fire-and-forget daemon
-    (``bm25-postindex-rebuild``) that rebuilds BM25 off the chat path — it is
-    still ALIVE when ``index_vault`` returns. That is correct in production
-    (the index dir is stable), but in a test it outlives the enclosing
+    (``bm25-postindex-rebuild``) that rebuilds BM25 off the chat path, and a
+    fresh rebuild additionally kicks ``index-archive-sweep`` (the archive size
+    walk + stale-archive prune, moved off the rw write lock 2026-09-02) — it is
+    still ALIVE when ``index_vault`` returns. ``widget-snapshot`` (the audit
+    result listener's coalescing rebuild, moved off the scan thread 2026-09-02)
+    is joined here for the same reason; ``api.routes.widget.join_snapshot_refresh``
+    is the targeted joiner a widget test should use inside its patch scope.
+
+    Leaving them running is correct in production (the index dir is stable),
+    but in a test such a daemon outlives the enclosing
     ``patch("rag.vault.OBSIDIAN_INDEX_DIR", tmp)`` and the
     ``TemporaryDirectory`` itself, so the daemon's sidecar write can race
     ``TemporaryDirectory.__exit__``'s ``shutil.rmtree`` and fail the test from
@@ -40,5 +47,7 @@ def join_post_index_daemons(timeout: float = 15.0) -> None:
     import threading
     deadline = time.monotonic() + timeout
     for t in list(threading.enumerate()):
-        if t.name.startswith("bm25-postindex-rebuild") and t.is_alive():
+        if (t.name.startswith(("bm25-postindex-rebuild", "index-archive-sweep",
+                               "widget-snapshot"))
+                and t.is_alive()):
             t.join(timeout=max(0.0, deadline - time.monotonic()))

@@ -145,7 +145,7 @@ export async function loadPrompts() {
 
     if (data && data.enabled === false) {
         frag.appendChild(_el('p', 'prompt-row-note',
-            'Prompt capture is disabled in LLM Settings — rows will not fill in until it is re-enabled.'));
+            'Prompt capture is disabled in Settings — rows will not fill in until it is re-enabled.'));
     }
     if (!workflows.length) {
         frag.appendChild(_el('p', 'prompt-row-placeholder', 'No workflows to display.'));

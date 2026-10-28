@@ -259,6 +259,112 @@ class TestProviderToolPayloadContract(unittest.TestCase):
     _ANTHROPIC_NAME_RE = r"^[a-zA-Z0-9_-]{1,128}$"
     _GEMINI_NAME_RE = r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
 
+    def test_deepseek_reasoning_content_replayed_only_to_origin(self):
+        from core.llm.tool_schema import build_openai_messages
+        from core.llm.types import LLMRequest, ToolCall, ToolResult, ToolTurn
+        state = {"provider": "deepseek", "model": "deepseek-v4-flash",
+                 "reasoning_content": "opaque reason"}
+        turn = ToolTurn(calls=[ToolCall(id="c1", name="lookup", arguments={})],
+                        results=[ToolResult(tool_call_id="c1", content="42")],
+                        provider_state=state)
+        req = LLMRequest(model="deepseek-v4-flash", tool_history=[turn])
+        self.assertEqual(build_openai_messages(req, provider_name="deepseek")[0]["reasoning_content"],
+                         "opaque reason")
+        self.assertNotIn("reasoning_content",
+                         build_openai_messages(req, provider_name="openrouter")[0])
+        req.model = "deepseek-v4-pro"
+        self.assertNotIn("reasoning_content",
+                         build_openai_messages(req, provider_name="deepseek")[0])
+
+    def test_openrouter_reasoning_details_replayed_verbatim(self):
+        from core.llm.tool_schema import build_openai_messages
+        from core.llm.types import LLMRequest, ToolCall, ToolResult, ToolTurn
+        details = [{"type": "reasoning.encrypted", "data": "opaque"}]
+        state = {"provider": "openrouter", "model": "google/gemini-3.6-flash",
+                 "reasoning_details": details}
+        req = LLMRequest(model="google/gemini-3.6-flash", tool_history=[ToolTurn(
+            calls=[ToolCall(id="c1", name="lookup", arguments={})],
+            results=[ToolResult(tool_call_id="c1", content="42")], provider_state=state)])
+        self.assertIs(build_openai_messages(req, provider_name="openrouter")[0]["reasoning_details"],
+                      details)
+
+    def test_anthropic_full_blocks_replayed_in_order(self):
+        from core.llm.tool_schema import build_anthropic_messages
+        from core.llm.types import LLMRequest, ToolCall, ToolResult, ToolTurn
+        blocks = [
+            {"type": "thinking", "thinking": "", "signature": "sig"},
+            {"type": "text", "text": "Checking"},
+            {"type": "tool_use", "id": "c1", "name": "lookup", "input": {}},
+        ]
+        state = {"provider": "anthropic", "model": "claude-sonnet-5", "content": blocks}
+        req = LLMRequest(model="claude-sonnet-5", tool_history=[ToolTurn(
+            calls=[ToolCall(id="c1", name="lookup", arguments={})],
+            results=[ToolResult(tool_call_id="c1", content="42")], provider_state=state)])
+        self.assertIs(build_anthropic_messages(req)[0]["content"], blocks)
+        req.model = "claude-opus-5"
+        self.assertEqual(build_anthropic_messages(req)[0]["content"],
+                         [{"type": "tool_use", "id": "c1", "name": "lookup", "input": {}}])
+
+    def test_gemini_call_id_round_trips(self):
+        from core.llm.adapters.google import _extract_text_finish_and_calls
+        from core.llm.tool_schema import build_gemini_contents
+        from core.llm.types import LLMRequest, ToolResult, ToolTurn
+        body = {"candidates": [{"content": {"parts": [{
+            "functionCall": {"id": "call_real", "name": "lookup", "args": {}},
+            "thoughtSignature": "sig",
+        }]}, "finishReason": "STOP"}]}
+        _text, _finish, calls = _extract_text_finish_and_calls(body)
+        self.assertEqual(calls[0].id, "call_real")
+        req = LLMRequest(model="gemini-3.6-flash", tool_history=[ToolTurn(
+            calls=calls, results=[ToolResult(tool_call_id="call_real", content="42")])])
+        contents = build_gemini_contents(req)
+        self.assertEqual(contents[0]["parts"][0]["functionCall"]["id"], "call_real")
+        self.assertEqual(contents[1]["parts"][0]["functionResponse"]["id"], "call_real")
+
+    def test_stream_factory_reports_final_length(self):
+        from unittest.mock import patch
+        from core.llm.base import StreamingResponse
+        from core.llm.factory import stream_with_fallback
+        from core.llm.policy import FallbackPolicy
+        from core.llm.types import FinishReason, LLMRequest, LLMResponse
+        final = LLMResponse(provider="google", model="gemini-2.5-pro",
+                            finish_reason=FinishReason.LENGTH)
+        provider = type("Provider", (), {
+            "stream": lambda self, req: StreamingResponse(iter(["partial"]), final)
+        })()
+        notices = []
+        with patch("core.llm.factory.get_llm_provider", return_value=provider):
+            tokens = list(stream_with_fallback(
+                "google", LLMRequest(model="gemini-2.5-pro", max_tokens=1024),
+                FallbackPolicy(primary="google"), cfg={}, on_truncation=notices.append,
+            ))
+        self.assertEqual(tokens, ["partial"])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("1024", notices[0])
+
+    def test_reasoning_effort_payloads_are_opt_in(self):
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.adapters.openai_compat import DeepSeekProvider
+        from core.llm.adapters.anthropic import AnthropicProvider
+        from core.llm.adapters.google import GoogleProvider
+        from core.llm.types import LLMRequest
+        request = LLMRequest(model="gpt-5-mini", messages=[{"role": "user", "content": "x"}])
+        self.assertNotIn("reasoning_effort", OpenAIProvider()._common_params(request))
+        request.reasoning_effort = "low"
+        self.assertEqual(OpenAIProvider()._common_params(request)["reasoning_effort"], "low")
+        request.model = "deepseek-v4-flash"
+        request.reasoning_effort = "minimal"
+        self.assertEqual(DeepSeekProvider()._common_params(request)["reasoning_effort"], "low")
+        request.model = "claude-sonnet-5"
+        self.assertEqual(AnthropicProvider()._build_payload(request, stream=False)
+                         ["output_config"]["effort"], "low")
+        request.model = "gemini-2.5-pro"
+        self.assertEqual(GoogleProvider()._build_payload(request)
+                         ["generationConfig"]["thinkingConfig"]["thinkingBudget"], 128)
+        request.model = "gemini-3.6-flash"
+        self.assertEqual(GoogleProvider()._build_payload(request)
+                         ["generationConfig"]["thinkingConfig"]["thinkingLevel"], "minimal")
+
     def _builtin_schemas(self):
         from unittest.mock import MagicMock
         from core.agent.vault_tools import VaultToolContext, build_vault_tools
@@ -340,6 +446,86 @@ class TestProviderToolPayloadContract(unittest.TestCase):
         call_part = contents[1]["parts"][0]
         self.assertEqual(call_part["functionCall"]["name"], "vault_search")
         self.assertEqual(call_part["thoughtSignature"], "sig-abc123")
+
+    def test_gemini38_parallel_function_response_ids_and_signatures_match(self):
+        from core.llm.adapters.google import _extract_text_finish_and_calls
+        from core.llm.tool_schema import build_gemini_contents
+        from core.llm.types import LLMRequest, ToolResult, ToolTurn
+        body = {"candidates": [{"content": {"parts": [
+            {"functionCall": {"id": "call-a", "name": "first", "args": {}},
+             "thoughtSignature": "opaque-a"},
+            {"functionCall": {"id": "call-b", "name": "second", "args": {}}},
+        ]}, "finishReason": "STOP"}]}
+        _, _, calls = _extract_text_finish_and_calls(body)
+        request = LLMRequest(model="gemini-3.8-flash",
+                             messages=[{"role": "user", "content": "hi"}],
+                             tool_history=[ToolTurn(calls=calls, results=[
+                                 ToolResult(tool_call_id="call-a", content="one"),
+                                 ToolResult(tool_call_id="call-b", content="two"),
+                             ])])
+        contents = build_gemini_contents(request)
+        self.assertEqual([p["functionCall"]["id"] for p in contents[1]["parts"]],
+                         ["call-a", "call-b"])
+        self.assertEqual(contents[1]["parts"][0]["thoughtSignature"], "opaque-a")
+        self.assertNotIn("thoughtSignature", contents[1]["parts"][1])
+        self.assertEqual([(p["functionResponse"]["id"],
+                           p["functionResponse"]["name"])
+                          for p in contents[2]["parts"]],
+                         [("call-a", "first"), ("call-b", "second")])
+
+    def test_gemini38_http_tool_turn_replays_first_parallel_signature(self):
+        import httpx
+
+        from core.llm.adapters.google import GoogleProvider
+        from core.llm.types import LLMRequest, ToolResult, ToolSchema, ToolTurn
+
+        sent = []
+
+        def handle(http_request):
+            sent.append(json.loads(http_request.content))
+            if len(sent) == 1:
+                parts = [
+                    {"functionCall": {"id": "call-a", "name": "first", "args": {}},
+                     "thoughtSignature": "opaque-a"},
+                    {"functionCall": {"id": "call-b", "name": "second", "args": {}}},
+                ]
+            else:
+                parts = [{"text": "OK"}]
+            return httpx.Response(200, json={"candidates": [{
+                "content": {"parts": parts}, "finishReason": "STOP",
+            }]})
+
+        provider = GoogleProvider(api_key="fixture", base_url="https://gemini-fixture.invalid")
+        client = httpx.Client(transport=httpx.MockTransport(handle))
+        first_request = LLMRequest(
+            model="gemini-3.8-flash", messages=[{"role": "user", "content": "hi"}],
+            tools=[ToolSchema(name="first", description="d"),
+                   ToolSchema(name="second", description="d")],
+            reasoning_effort="minimal", temperature=0.2, top_p=0.6,
+        )
+        with patch.object(provider, "_client", return_value=client):
+            first_response = provider.generate(first_request)
+            second_request = LLMRequest(
+                model=first_request.model, messages=first_request.messages,
+                tools=first_request.tools,
+                tool_history=[ToolTurn(
+                    calls=first_response.tool_calls,
+                    results=[ToolResult(tool_call_id="call-a", content="one"),
+                             ToolResult(tool_call_id="call-b", content="two")],
+                )],
+            )
+            self.assertEqual(provider.generate(second_request).text, "OK")
+        self.assertEqual(len(sent), 2)
+        self.assertNotIn("temperature", sent[0]["generationConfig"])
+        self.assertNotIn("topP", sent[0]["generationConfig"])
+        self.assertEqual(sent[0]["generationConfig"]["thinkingConfig"],
+                         {"thinkingLevel": "low"})
+        call_parts = sent[1]["contents"][1]["parts"]
+        self.assertEqual(call_parts[0]["thoughtSignature"], "opaque-a")
+        self.assertNotIn("thoughtSignature", call_parts[1])
+        self.assertEqual([p["functionResponse"]["id"]
+                          for p in sent[1]["contents"][2]["parts"]],
+                         ["call-a", "call-b"])
 
     def test_gemini_no_signature_emits_no_key(self):
         # Older Gemini models never set it — the key must stay absent (an
@@ -493,7 +679,233 @@ class TestProviderToolPayloadContract(unittest.TestCase):
         self.assertNotIn("deepseek-chat", DEEPSEEK_CURATED_MODELS)
         self.assertNotIn("deepseek-reasoner", DEEPSEEK_CURATED_MODELS)
         self.assertEqual(DEEPSEEK_CURATED_MODELS[:2],
-                         ["deepseek-v4-flash", "deepseek-v4-pro"])
+                         ["deepseek-flash", "deepseek-v4-pro"])
+
+    def test_verified_current_models_are_curated_and_priced(self):
+        from core.llm.adapters.openai import CURATED_MODELS as openai
+        from core.llm.adapters.anthropic import CURATED_MODELS as anthropic
+        from core.llm.adapters.google import CURATED_MODELS as google
+        from core.llm.adapters.openai_compat import ZAI_CURATED_MODELS as zai
+        from core.llm.usage import PRICING_TABLE
+
+        for retired in ("o1-preview", "o1-mini"):
+            self.assertNotIn(retired, openai)
+        for retired in ("gemini-1.5-pro", "gemini-1.5-flash",
+                        "gemini-2.0-flash", "gemini-2.0-flash-exp"):
+            self.assertNotIn(retired, google)
+        for family, models in ((openai, ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")),
+                               (anthropic, ("claude-fable-5-1", "claude-opus-5-5", "claude-opus-5")),
+                               (google, ("gemini-3.8-flash", "gemini-3.6-flash")),
+                               (zai, ("glm-5.3",))):
+            for model in models:
+                self.assertIn(model, family)
+                self.assertIn(model, PRICING_TABLE)
+
+    def test_rejected_openai_sampling_is_omitted_on_next_request(self):
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.types import LLMRequest
+        provider = OpenAIProvider(base_url="https://audit.example/v1")
+        request = LLMRequest(model="gpt-5-audit-cache", messages=[{"role": "user", "content": "hi"}],
+                             temperature=0.3, top_p=0.9)
+        payload = provider._common_params(request)
+        self.assertIn("temperature", payload)
+        class Rejected(Exception):
+            body = {"param": "temperature"}
+        self.assertEqual(provider._heal_unsupported_param(payload, Rejected(), set()),
+                         "dropped unsupported temperature")
+        self.assertNotIn("temperature", provider._common_params(request))
+        self.assertIn("top_p", provider._common_params(request))
+
+    def test_verified_gpt56_models_omit_rejected_sampling_up_front(self):
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.types import LLMRequest
+        provider = OpenAIProvider()
+        for model in ("gpt-5", "gpt-5-mini", "gpt-5-nano",
+                      "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            request = LLMRequest(model=model, messages=[{"role": "user", "content": "hi"}],
+                                 temperature=0.3, top_p=0.9)
+            payload = provider._common_params(request)
+            self.assertNotIn("temperature", payload)
+            self.assertNotIn("top_p", payload)
+        variant = LLMRequest(model="gpt-5-chat", messages=[{"role": "user", "content": "hi"}],
+                             temperature=0.3, top_p=0.9)
+        self.assertEqual(provider._common_params(variant)["temperature"], 0.3)
+
+    def test_anthropic_opus_sampling_and_haiku_combination(self):
+        from core.llm.adapters.anthropic import AnthropicProvider
+        from core.llm.types import LLMRequest
+        provider = AnthropicProvider()
+        def payload(model):
+            return provider._build_payload(
+                LLMRequest(model=model, messages=[{"role": "user", "content": "hi"}],
+                           temperature=0.3, top_p=0.9), stream=False)
+        for model in ("claude-opus-5", "claude-opus-5-5"):
+            self.assertNotIn("temperature", payload(model))
+            self.assertNotIn("top_p", payload(model))
+        self.assertEqual(payload("claude-haiku-4-5")["temperature"], 0.3)
+        self.assertNotIn("top_p", payload("claude-haiku-4-5"))
+
+    def test_zai_sampling_is_clamped_to_published_range(self):
+        from core.llm.adapters.openai_compat import ZAIProvider
+        from core.llm.types import LLMRequest
+        provider = ZAIProvider()
+        request = LLMRequest(model="glm-5.3", messages=[{"role": "user", "content": "hi"}],
+                             temperature=2.0, top_p=0.001)
+        payload = provider._common_params(request)
+        self.assertEqual(payload["temperature"], 1.0)
+        self.assertEqual(payload["top_p"], 0.01)
+
+    def test_deepseek_thinking_sampling_and_glm53_effort(self):
+        from core.llm.adapters.openai_compat import DeepSeekProvider, ZAIProvider
+        from core.llm.types import LLMRequest
+        def request(model, **kwargs):
+            return LLMRequest(model=model, messages=[{"role": "user", "content": "hi"}],
+                              **kwargs)
+        ds = DeepSeekProvider()
+        params = ds._common_params(request("deepseek-v4-pro", temperature=0.3,
+                                           top_p=0.8, reasoning_effort="minimal"))
+        self.assertNotIn("temperature", params)
+        self.assertNotIn("top_p", params)
+        self.assertEqual(params["reasoning_effort"], "low")
+        self.assertEqual(ds._common_params(request("deepseek-flash", top_p=0.97))["top_p"], 0.97)
+        zai = ZAIProvider()
+        for requested, expected in (("minimal", "low"), ("low", "low"),
+                                    ("medium", "high"), ("max", "max")):
+            params = zai._common_params(request("glm-5.3", reasoning_effort=requested))
+            self.assertEqual(params["extra_body"], {
+                "thinking": {"type": "enabled"}, "reasoning_effort": expected,
+            })
+        self.assertNotIn("extra_body", zai._common_params(
+            request("glm-4.7", reasoning_effort="low")))
+
+    def test_new_provider_finish_reasons_are_classified(self):
+        from core.llm.adapters.anthropic import _STOP_REASON_MAP
+        from core.llm.adapters.google import _extract_text_finish_and_calls
+        from core.llm.types import FinishReason
+        self.assertEqual(_STOP_REASON_MAP["refusal"], FinishReason.CONTENT_FILTER)
+        self.assertEqual(_STOP_REASON_MAP["model_context_window_exceeded"], FinishReason.LENGTH)
+        self.assertEqual(_STOP_REASON_MAP["pause_turn"], FinishReason.OTHER)
+        for raw in ("PROHIBITED_CONTENT", "BLOCKLIST", "SPII"):
+            _, finish, _ = _extract_text_finish_and_calls({
+                "candidates": [{"finishReason": raw}],
+            })
+            self.assertEqual(finish, FinishReason.CONTENT_FILTER)
+        for raw in ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS"):
+            with self.assertLogs("core.llm.adapters.google", level="WARNING"):
+                _, finish, _ = _extract_text_finish_and_calls({
+                    "candidates": [{"finishReason": raw}],
+                })
+            self.assertEqual(finish, FinishReason.OTHER)
+
+    def test_gemini_invalid_key_detail_is_auth(self):
+        from core.llm.adapters.google import _http_error_to_llm_error
+        from core.llm.types import ErrorCategory
+        class FakeResponse:
+            status_code = 400
+            text = '{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"API key not valid","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID"}]}}'
+            headers = {}
+        self.assertEqual(_http_error_to_llm_error(FakeResponse(), "google", "gemini-3.6-flash").category,
+                         ErrorCategory.AUTH)
+
+    def test_unaffected_online_adapter_payloads_are_unchanged(self):
+        from core.llm.adapters.openai import OpenAIProvider
+        from core.llm.adapters.anthropic import AnthropicProvider
+        from core.llm.adapters.google import GoogleProvider
+        from core.llm.adapters.openai_compat import DeepSeekProvider, ZAIProvider, OpenRouterProvider
+        from core.llm.types import LLMRequest
+
+        def request(model):
+            return LLMRequest(model=model, messages=[{"role": "user", "content": "hello"}],
+                              temperature=0.4, max_tokens=64)
+        self.assertEqual(OpenAIProvider()._common_params(request("gpt-4o-mini")), {
+            "model": "gpt-4o-mini", "temperature": 0.4, "max_completion_tokens": 64,
+        })
+        self.assertEqual(AnthropicProvider()._build_payload(
+            request("claude-sonnet-4-6"), stream=False), {
+                "model": "claude-sonnet-4-6", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False, "temperature": 0.4,
+            })
+        self.assertEqual(GoogleProvider()._build_payload(request("gemini-2.5-flash")), {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 64},
+        })
+        for provider, model in ((ZAIProvider(), "glm-4.7"),
+                                (OpenRouterProvider(), "anthropic/claude-haiku-4.5")):
+            self.assertEqual(provider._common_params(request(model)), {
+                "model": model, "temperature": 0.4, "max_tokens": 64,
+            })
+        self.assertEqual(DeepSeekProvider()._common_params(request("deepseek-v4-pro")), {
+            "model": "deepseek-v4-pro", "max_tokens": 64,
+        })
+
+    def test_gemini_named_temperature_400_heals_and_is_remembered(self):
+        import copy
+        from core.llm.adapters.google import GoogleProvider
+        from core.llm.types import LLMRequest
+        provider = GoogleProvider(api_key="test-key", base_url="https://audit.example")
+        request = LLMRequest(model="gemini-audit-heal", messages=[{"role": "user", "content": "hi"}],
+                             temperature=0.4, max_tokens=64)
+        bad = MagicMock(status_code=400, headers={})
+        bad.text = '{"error":{"message":"Invalid temperature"}}'
+        good = MagicMock(status_code=200)
+        good.json.return_value = {"candidates": [{"content": {"parts": [{"text": "OK"}]},
+                                                    "finishReason": "STOP"}]}
+        client = MagicMock()
+        sent = []
+        def fake_post(*args, **kwargs):
+            sent.append(copy.deepcopy(kwargs["json"]))
+            return bad if len(sent) == 1 else good
+        client.post.side_effect = fake_post
+        with patch.object(provider, "_client", return_value=client):
+            self.assertEqual(provider.generate(request).text, "OK")
+        self.assertEqual(len(sent), 2)
+        self.assertIn("temperature", sent[0]["generationConfig"])
+        self.assertNotIn("temperature", sent[1]["generationConfig"])
+        self.assertNotIn("temperature", provider._build_payload(request)["generationConfig"])
+
+    def test_gemini_3_payload_omits_sampling_and_uses_supported_thinking(self):
+        from core.llm.adapters.google import GoogleProvider
+        from core.llm.types import LLMRequest
+        provider = GoogleProvider()
+        for model in ("gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"):
+            request = LLMRequest(model=model, messages=[{"role": "user", "content": "hi"}],
+                                 temperature=0.2, top_p=0.6, max_tokens=64,
+                                 reasoning_effort="minimal")
+            config = provider._build_payload(request)["generationConfig"]
+            self.assertNotIn("temperature", config)
+            self.assertNotIn("topP", config)
+            self.assertNotIn("topK", config)
+            self.assertEqual(config["maxOutputTokens"], 64)
+            expected = "minimal" if model == "gemini-3.6-flash" else "low"
+            self.assertEqual(config["thinkingConfig"], {"thinkingLevel": expected})
+        request = LLMRequest(model="gemini-2.5-flash",
+                             messages=[{"role": "user", "content": "hi"}],
+                             temperature=0.2, top_p=0.6, reasoning_effort="minimal")
+        config = provider._build_payload(request)["generationConfig"]
+        self.assertEqual(config["temperature"], 0.2)
+        self.assertEqual(config["topP"], 0.6)
+        self.assertEqual(config["thinkingConfig"], {"thinkingBudget": 0})
+
+    def test_gemini38_generate_sends_model_specific_payload(self):
+        from core.llm.adapters.google import GoogleProvider
+        from core.llm.types import LLMRequest
+        provider = GoogleProvider(api_key="fixture", base_url="https://gemini.test")
+        request = LLMRequest(model="gemini-3.8-flash",
+                             messages=[{"role": "user", "content": "hi"}],
+                             temperature=0.2, top_p=0.6,
+                             reasoning_effort="minimal")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"candidates": [{"content": {"parts": [{"text": "OK"}]},
+                                                        "finishReason": "STOP"}]}
+        client = MagicMock()
+        client.post.return_value = response
+        with patch.object(provider, "_client", return_value=client):
+            self.assertEqual(provider.generate(request).text, "OK")
+        sent = client.post.call_args.kwargs["json"]["generationConfig"]
+        self.assertEqual(sent["thinkingConfig"], {"thinkingLevel": "low"})
+        self.assertNotIn("temperature", sent)
+        self.assertNotIn("topP", sent)
 
     def test_online_model_keys_are_shape_validated(self):
         """Audit #25: the per-provider *_model keys (the routing target of the
@@ -527,7 +939,7 @@ class TestProviderToolPayloadContract(unittest.TestCase):
         from core.config import resolve_chat_model, is_online_provider
         from core.llm.factory import get_llm_provider, is_online
         for name, default in (
-            ("deepseek", "deepseek-v4-flash"),
+            ("deepseek", "deepseek-flash"),
             ("zai", "glm-4.7"),
             ("openrouter", "anthropic/claude-haiku-4.5"),
         ):
@@ -589,15 +1001,170 @@ class TestProviderToolPayloadContract(unittest.TestCase):
         self.assertEqual(params["max_tokens"], 100)
         self.assertNotIn("max_completion_tokens", params)
 
-    def test_openrouter_tools_routing_503_heals_to_plain_answer(self):
-        """M1, 2026-08-08 review: OpenRouter signals "this model has no
-        tool-capable endpoint" as a 503/404 ROUTING error ("There is no
-        available model provider that meets your routing requirements" /
-        "No endpoints found…"), never a param-named 400 — so the inherited
-        heal could not see it and a live-listed no-tools model in agent/deck
-        mode burned every retry as SERVER_ERROR, then triggered provider
-        fallback. The capability-routing heal must strip tools for ONE retry
-        and degrade to a plain answer, like the tools-400 heal."""
+    def test_openrouter_family_payloads_do_not_inherit_direct_openai_rules(self):
+        from core.llm.adapters.openai_compat import OpenRouterProvider
+        from core.llm.types import LLMRequest
+
+        provider = OpenRouterProvider()
+        for model in ("google/gemini-3.6-flash", "openai/gpt-5.4",
+                      "anthropic/claude-sonnet-5"):
+            request = LLMRequest(model=model, messages=[{"role": "user", "content": "hi"}],
+                                 temperature=0.2, top_p=0.6, max_tokens=64,
+                                 reasoning_effort="low")
+            client = MagicMock()
+            client.chat.completions.create.return_value = "fixture"
+            self.assertEqual(provider._create_with_heal(client, request), "fixture")
+            params = client.chat.completions.create.call_args.kwargs
+            self.assertNotIn("temperature", params)
+            self.assertNotIn("top_p", params)
+            self.assertEqual(params["max_tokens"], 64)
+            self.assertEqual(params["extra_body"], {
+                "reasoning": {"effort": "low"},
+                "provider": {"require_parameters": True},
+            })
+
+    def test_openrouter_catalog_metadata_is_advisory_and_keeps_codex_chat(self):
+        from core.llm.adapters.openai_compat import OpenRouterProvider
+        from core.llm.types import LLMRequest
+        provider = OpenRouterProvider(api_key="test", base_url="https://catalog.test/v1")
+        rows = [
+            {"id": "openai/gpt-5-codex", "architecture": {"output_modalities": ["text"]},
+             "supported_parameters": ["tools", "max_tokens", "reasoning"]},
+            {"id": "test/vision", "architecture": {"output_modalities": ["image"]},
+             "supported_parameters": ["temperature"]},
+            {"id": "deepseek/deepseek-v4-flash",
+             "architecture": {"output_modalities": ["text"]},
+             "supported_parameters": ["reasoning", "tools", "max_tokens"],
+             "reasoning": {"supported_efforts": ["high", "xhigh"]}},
+        ]
+        fake = MagicMock()
+        fake.models.list.return_value = rows
+        with patch.object(provider, "_client", return_value=fake):
+            self.assertEqual(provider._fetch_live_models(),
+                             ["openai/gpt-5-codex", "deepseek/deepseek-v4-flash"])
+        request = LLMRequest(model="openai/gpt-5-codex",
+                             messages=[{"role": "user", "content": "hi"}],
+                             temperature=0.2, reasoning_effort="low")
+        params = provider._common_params(request)
+        self.assertNotIn("temperature", params)
+        self.assertEqual(params["extra_body"], {
+            "reasoning": {"effort": "low"},
+            "provider": {"require_parameters": True},
+        })
+        from core.llm.types import LLMError, ErrorCategory
+        unsupported = LLMRequest(model="deepseek/deepseek-v4-flash",
+                                 messages=[{"role": "user", "content": "hi"}],
+                                 reasoning_effort="low")
+        with self.assertRaises(LLMError) as ctx:
+            provider._common_params(unsupported)
+        self.assertEqual(ctx.exception.category, ErrorCategory.INVALID_REQUEST)
+
+    def test_openrouter_unknown_reasoning_without_metadata_requires_capable_route(self):
+        from core.llm.adapters.openai_compat import OpenRouterProvider
+        from core.llm.types import LLMRequest
+        provider = OpenRouterProvider(api_key="test", base_url="https://missing-catalog.test/v1")
+        request = LLMRequest(model="new/reasoner", messages=[{"role": "user", "content": "hi"}],
+                             reasoning_effort="low")
+        self.assertEqual(provider._common_params(request)["extra_body"], {
+            "reasoning": {"effort": "low"},
+            "provider": {"require_parameters": True},
+        })
+
+    def test_openrouter_sdk_replays_required_routing_and_missing_catalog(self):
+        import httpx
+        import openai
+
+        from core.llm.adapters.openai_compat import OpenRouterProvider
+        from core.llm.types import ErrorCategory, LLMError, LLMRequest, ToolSchema
+
+        sent = []
+
+        def handle(http_request):
+            payload = json.loads(http_request.content)
+            sent.append(payload)
+            if payload["model"] == "new/no-tools":
+                return httpx.Response(503, json={"error": {
+                    "message": "There is no available model provider that meets your routing requirements",
+                    "code": 503,
+                }})
+            return httpx.Response(200, json={
+                "id": "fixture", "object": "chat.completion", "model": payload["model"],
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "OK"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1,
+                          "total_tokens": 3},
+            })
+
+        base_url = "https://openrouter-fixture.invalid/api/v1"
+        client = openai.OpenAI(
+            api_key="fixture", base_url=base_url, max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+        )
+        provider = OpenRouterProvider(api_key="fixture", base_url=base_url)
+        with patch.object(provider, "_client", return_value=client):
+            reasoning = LLMRequest(
+                model="new/reasoner", messages=[{"role": "user", "content": "hi"}],
+                reasoning_effort="low", max_tokens=64,
+            )
+            self.assertEqual(provider.generate(reasoning).text, "OK")
+            tools = LLMRequest(
+                model="new/no-tools", messages=[{"role": "user", "content": "hi"}],
+                tools=[ToolSchema(name="lookup", description="d")],
+            )
+            with self.assertRaises(LLMError) as ctx:
+                provider.generate(tools)
+        self.assertEqual(ctx.exception.category, ErrorCategory.INVALID_REQUEST)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0]["reasoning"], {"effort": "low"})
+        self.assertEqual(sent[0]["max_tokens"], 64)
+        self.assertNotIn("tool_choice", sent[1])
+        self.assertIn("tools", sent[1])
+        self.assertTrue(all(p["provider"] == {"require_parameters": True}
+                            for p in sent))
+
+    def test_openrouter_stream_sends_required_reasoning_route(self):
+        import httpx
+        import openai
+
+        from core.llm.adapters.openai_compat import OpenRouterProvider
+        from core.llm.types import LLMRequest
+
+        sent = []
+
+        def handle(http_request):
+            sent.append(json.loads(http_request.content))
+            events = (
+                'data: {"id":"fixture","object":"chat.completion.chunk",'
+                '"model":"new/reasoner","choices":[{"index":0,'
+                '"delta":{"content":"OK"},"finish_reason":null}]}\n\n'
+                'data: {"id":"fixture","object":"chat.completion.chunk",'
+                '"model":"new/reasoner","choices":[{"index":0,'
+                '"delta":{},"finish_reason":"stop"}]}\n\n'
+                'data: [DONE]\n\n'
+            )
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  text=events)
+
+        base_url = "https://openrouter-stream-fixture.invalid/api/v1"
+        client = openai.OpenAI(
+            api_key="fixture", base_url=base_url, max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+        )
+        provider = OpenRouterProvider(api_key="fixture", base_url=base_url)
+        request = LLMRequest(
+            model="new/reasoner", messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort="low",
+        )
+        with patch.object(provider, "_client", return_value=client):
+            response = provider.stream(request)
+            self.assertEqual(list(response.response_gen), ["OK"])
+        self.assertEqual(response.final.text, "OK")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["provider"], {"require_parameters": True})
+        self.assertEqual(sent[0]["reasoning"], {"effort": "low"})
+
+    def test_openrouter_tools_routing_503_surfaces_capability_error(self):
+        """A tool routing rejection must surface without a tool-less retry."""
         from core.llm.adapters.openai_compat import OpenRouterProvider
         from core.llm.types import LLMRequest, ToolSchema
 
@@ -626,12 +1193,31 @@ class TestProviderToolPayloadContract(unittest.TestCase):
             class chat:
                 completions = _Completions()
 
-        result = p._create_with_heal(_Client(), req)
-        self.assertEqual(result, "ok")
-        self.assertEqual(len(seen_params), 2)  # one strip, one retry — bounded
+        from core.llm.types import ErrorCategory, LLMError
+        with self.assertRaises(LLMError) as ctx:
+            p._create_with_heal(_Client(), req)
+        self.assertEqual(ctx.exception.category, ErrorCategory.INVALID_REQUEST)
+        self.assertEqual(len(seen_params), 1)
         self.assertIn("tools", seen_params[0])
-        self.assertNotIn("tools", seen_params[1])
-        self.assertNotIn("tool_choice", seen_params[1])
+        self.assertEqual(seen_params[0]["extra_body"],
+                         {"provider": {"require_parameters": True}})
+
+    def test_openrouter_named_tool_control_400_does_not_retry_without_it(self):
+        from core.llm.adapters.openai_compat import OpenRouterProvider
+        from core.llm.types import ToolSchema, LLMRequest, LLMError, ErrorCategory
+        provider = OpenRouterProvider(api_key="fixture")
+        request = LLMRequest(model="test/model", messages=[{"role": "user", "content": "hi"}],
+                             tools=[ToolSchema(name="lookup", description="d")],
+                             tool_choice="none")
+        class Rejected(Exception):
+            status_code = 400
+            body = {"param": "tool_choice"}
+        client = MagicMock()
+        client.chat.completions.create.side_effect = Rejected("unsupported tool_choice")
+        with self.assertRaises(LLMError) as ctx:
+            provider._create_with_heal(client, request)
+        self.assertEqual(ctx.exception.category, ErrorCategory.INVALID_REQUEST)
+        self.assertEqual(client.chat.completions.create.call_count, 1)
 
     def test_routing_heal_is_openrouter_scoped_and_phrase_gated(self):
         """The negative space of the routing heal: the predicate matches ONLY
@@ -1490,7 +2076,7 @@ class TestRetry(unittest.TestCase):
                 fn, max_attempts=5, base_delay_s=10.0,
                 deadline_monotonic_s=_time.monotonic() - 1.0,  # already expired
             )
-        self.assertEqual(attempts["count"], 1)   # no second attempt
+        self.assertEqual(attempts["count"], 0)   # no dispatch after expiry
         slept.assert_not_called()
 
     def test_deadline_truncates_backoff_sleep(self):
@@ -1822,7 +2408,7 @@ class TestLocalAdapter(unittest.TestCase):
         from core.llm.types import LLMRequest
         chunks = [
             MagicMock(message=MagicMock(content="hel")),
-            MagicMock(message=MagicMock(content="lo")),
+            MagicMock(message=MagicMock(content="lo"), done=True),
         ]
         mock_provider = MagicMock()
         mock_provider.stream_chat.return_value = iter(chunks)
@@ -1999,7 +2585,7 @@ class TestOllamaThinkSuppression(unittest.TestCase):
         from core.llm.adapters.local import LocalLLMProvider
         from core.llm.types import LLMRequest
         mock_provider = MagicMock()
-        mock_provider.stream_chat.return_value = iter([])
+        mock_provider.stream_chat.return_value = iter([{"message": {"content": ""}, "done": True}])
         p = LocalLLMProvider("ollama")
         with patch.object(p, "_provider", return_value=mock_provider):
             stream = p.stream(LLMRequest(
@@ -2329,7 +2915,7 @@ class TestStreamCancellationAccounting(unittest.TestCase):
 
         mock_provider = MagicMock()
         mock_provider.stream_chat.return_value = iter([
-            MagicMock(message=MagicMock(content="a")),
+            MagicMock(message=MagicMock(content="a"), done=True),
         ])
         p = LocalLLMProvider("ollama")
         with patch.object(p, "_provider", return_value=mock_provider):
@@ -2716,7 +3302,7 @@ class TestAdapterToolUse(unittest.TestCase):
 
         mock_provider = MagicMock()
         mock_provider.stream_chat.return_value = iter([
-            MagicMock(message=MagicMock(content="hi")),
+            MagicMock(message=MagicMock(content="hi"), done=True),
         ])
 
         p = LocalLLMProvider("ollama")
@@ -3026,13 +3612,15 @@ class TestEngineOnlineBranch(unittest.TestCase):
         # Capture the online branch hand-off
         captured = {}
 
-        def fake_query_online(self, *, message, retriever, postprocessors, qa_template, cfg, primer=""):
+        def fake_query_online(
+            self, *, message, chunks, qa_template, cfg, primer=""
+        ):
             captured["called"] = True
-            captured["retriever"] = retriever
+            captured["chunks"] = chunks
             return MagicMock(response_gen=iter([]))
 
         with patch("rag.engine.VectorIndexRetriever") as mock_retriever, \
-             patch.object(SimpleQueryEngine, "_query_online", fake_query_online), \
+             patch.object(SimpleQueryEngine, "_query_online_from_chunks", fake_query_online), \
              patch("rag.engine.get_provider") as mock_get_provider:
             # Mock embed provider call
             embed_provider = MagicMock()
@@ -3266,10 +3854,12 @@ class TestEngineCustomSystemPrompt(unittest.TestCase):
             return MagicMock(response_gen=iter([]))
 
         # Stub retrieval so we exercise only the prompt-routing logic.
-        fake_node = MagicMock()
-        fake_node.text = "snippet"
-        fake_node.metadata = {"source": "note.md"}
-        fake_node.score = 0.9
+        from llama_index.core.schema import NodeWithScore, TextNode
+
+        fake_node = NodeWithScore(
+            node=TextNode(text="snippet", metadata={"source": "note.md"}),
+            score=0.9,
+        )
         fake_retriever = MagicMock()
         fake_retriever.retrieve.return_value = [fake_node]
 
@@ -3762,7 +4352,7 @@ class TestAutoNumCtx(unittest.TestCase):
         from core.llm.types import LLMRequest
 
         mock_provider = MagicMock()
-        mock_provider.stream_chat.return_value = iter([])
+        mock_provider.stream_chat.return_value = iter([{"message": {"content": ""}, "done": True}])
         p = LocalLLMProvider("ollama")
         with patch.object(p, "_provider", return_value=mock_provider):
             stream = p.stream(LLMRequest(
@@ -3777,7 +4367,7 @@ class TestAutoNumCtx(unittest.TestCase):
         from core.llm.types import LLMRequest
 
         mock_provider = MagicMock()
-        mock_provider.stream_chat.return_value = iter([])
+        mock_provider.stream_chat.return_value = iter([{"message": {"content": ""}, "done": True}])
         p = LocalLLMProvider("ollama")
         req = LLMRequest(
             model="llama3.2", messages=[{"role": "user", "content": "hi"}],
@@ -3896,3 +4486,153 @@ class TestUsageLogRotation(unittest.TestCase):
                 patch("core.llm.usage.os.replace", side_effect=OSError("nope")):
             self._rec()   # must not raise
         self.assertTrue(os.path.exists(self.log))
+
+
+class TestUsageFold(unittest.TestCase):
+    """PERF (2026-09-02): the on-disk usage window is folded incrementally.
+
+    Parsing is counted at ``UsageRecord`` construction — the level both the
+    pre- and post-change code reach — never at the new helper.
+    """
+
+    def setUp(self):
+        from core.llm.usage import UsageTracker
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.log = os.path.join(self.tmp, "llm_usage.jsonl")
+        self.tracker = UsageTracker()
+        self.tracker.configure(self.log)
+
+    def _rec(self, n=1):
+        from core.llm.types import LLMUsage
+        for _ in range(n):
+            self.tracker.record(provider="p", model="m", usage=LLMUsage(
+                input_tokens=2, output_tokens=3), latency_ms=1, stream=False)
+
+    def _counted_summary(self, since=None):
+        """summary() plus how many records it parsed off disk."""
+        from core.llm import usage as usage_mod
+        real = usage_mod.UsageRecord
+        made = []
+
+        def _counting(**kwargs):
+            made.append(1)
+            return real(**kwargs)
+
+        with patch.object(usage_mod, "UsageRecord", _counting):
+            out = self.tracker.summary(since)
+        return out, len(made)
+
+    def test_a_poll_after_an_append_parses_only_the_new_records(self):
+        self._rec(300)
+        first, parsed_first = self._counted_summary()
+        self.assertEqual(parsed_first, 300)
+        self._rec(3)
+        second, parsed_second = self._counted_summary()
+        self.assertEqual(parsed_second, 3,
+                         f"{parsed_second} records parsed by the second poll")
+        self.assertEqual(second.total_requests, 303)
+        self.assertEqual(second.total_input_tokens, 303 * 2)
+
+    def test_an_unchanged_log_parses_nothing(self):
+        self._rec(50)
+        self._counted_summary()
+        _summary, parsed = self._counted_summary()
+        self.assertEqual(parsed, 0)
+
+    def test_the_fold_agrees_with_a_cold_tracker(self):
+        """The incremental path must accumulate exactly what a full pass does."""
+        from core.llm.usage import UsageTracker
+        self._rec(20)
+        self.tracker.summary()
+        self._rec(7)
+        warm = self.tracker.summary()
+
+        cold_tracker = UsageTracker()
+        cold_tracker.configure(self.log)
+        cold = cold_tracker.summary()
+        self.assertEqual(warm.as_dict(), cold.as_dict())
+
+    def test_a_rotation_resets_the_fold_instead_of_skipping_records(self):
+        """The read-BOTH-generations window (the 2026-08-09 fix) is preserved."""
+        from core.llm import usage as usage_mod
+        self._rec(4)
+        self.tracker.summary()
+        with patch.object(usage_mod, "_MAX_LOG_BYTES", 10):
+            self._rec()          # rotates the 5 records into <log>.1
+        self._rec(2)
+        after = self.tracker.summary()
+        self.assertEqual(after.total_requests, 7)
+
+    def test_the_ring_is_still_de_duplicated_against_disk(self):
+        self._rec(5)
+        summary = self.tracker.summary()
+        # 5 records exist in BOTH the ring and the JSONL; counting them twice
+        # is exactly what the uid de-dup prevents.
+        self.assertEqual(summary.total_requests, 5)
+
+    def test_a_partial_trailing_line_is_re_read_when_it_completes(self):
+        """A crash mid-append leaves a fragment; the offset must stay before it."""
+        self._rec(3)
+        self.tracker.summary()
+        with open(self.log, "a", encoding="utf-8") as fh:
+            fh.write('{"timestamp": "2026-09-02T00:00:00", "provider": "p"')
+        partial, _ = self._counted_summary()
+        self.assertEqual(partial.total_requests, 3)
+        with open(self.log, "a", encoding="utf-8") as fh:
+            fh.write(', "model": "m", "input_tokens": 1, "output_tokens": 1,'
+                     ' "cached_input_tokens": 0, "cost_usd": 0.0,'
+                     ' "latency_ms": 1, "stream": false, "uid": "late"}\n')
+        completed = self.tracker.summary()
+        self.assertEqual(completed.total_requests, 4)
+
+    def test_windows_are_folded_independently(self):
+        self._rec(3)
+        everything = self.tracker.summary()
+        nothing = self.tracker.summary("2999-01-01T00:00:00")
+        self.assertEqual(everything.total_requests, 3)
+        self.assertEqual(nothing.total_requests, 0)
+        self.assertEqual(self.tracker.summary().total_requests, 3)
+
+    def test_a_returned_summary_cannot_poison_the_fold(self):
+        self._rec(2)
+        first = self.tracker.summary()
+        first.total_requests = 999
+        first.by_provider.setdefault("p", {})["requests"] = 999
+        self.assertEqual(self.tracker.summary().total_requests, 2)
+
+
+class TestUsageRotationRace(unittest.TestCase):
+    """DURABILITY (2026-09-02): two recorders crossing the cap together each
+    ran os.replace(log, log.1) — the second moved the NEW, nearly-empty live
+    log over the generation the first had just preserved."""
+
+    def setUp(self):
+        from core.llm.usage import UsageTracker
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.log = os.path.join(self.tmp, "llm_usage.jsonl")
+        self.tracker = UsageTracker()
+        self.tracker.configure(self.log)
+
+    def test_a_second_rotation_of_the_same_generation_is_skipped(self):
+        from core.llm import usage as usage_mod
+        from core.llm.types import LLMUsage
+        for _ in range(5):
+            self.tracker.record(provider="p", model="m",
+                                usage=LLMUsage(input_tokens=1, output_tokens=1),
+                                latency_ms=1, stream=False)
+        with patch.object(usage_mod, "_MAX_LOG_BYTES", 10):
+            self.tracker.record(provider="p", model="m",
+                                usage=LLMUsage(input_tokens=1, output_tokens=1),
+                                latency_ms=1, stream=False)
+            rotated = self.log + ".1"
+            self.assertTrue(os.path.exists(rotated))
+            kept = len(open(rotated, encoding="utf-8").read().splitlines())
+            self.assertEqual(kept, 6)
+            # The racing recorder: same call, same stale `size`, on a live log
+            # that has already been rotated away.
+            self.tracker._rotate_log_if_large(self.log, 10 ** 9)
+            still = len(open(rotated, encoding="utf-8").read().splitlines())
+        self.assertEqual(still, 6,
+                         "the second rotation clobbered the kept generation")

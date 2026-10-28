@@ -43,19 +43,29 @@ const MODULES = readdirSync(JS_DIR).filter(
 const ALLOWED = {
     'api.js': [],
     'ui.js': ['api.js'],
+    'audit.js': ['api.js', 'ui.js', 'pendingReview.js', 'pdfPreview.js', 'pdfManagement.js', 'libraryRun.js'],
+    'pendingReview.js': ['api.js', 'ui.js', 'pdfPreview.js'],
+    'pdfPreview.js': ['api.js'],
+    'pdfManagement.js': ['api.js', 'ui.js', 'pdfPreview.js'],
     'vault.js': ['api.js', 'ui.js', 'config.js'],
     'summarizer.js': ['api.js', 'ui.js', 'config.js'],
 };
 const FEATURE_ALLOWED = ['api.js', 'ui.js'];
 
+// Present on the private build, stripped from the public mirror (Maintenance,
+// STRIP STEP 4). This lint ships publicly, so the module must be OPTIONAL in
+// the set check; when present it is an ordinary feature module (ui.js+api.js
+// only — FEATURE_ALLOWED applies).
+const OPTIONAL_MODULES = ['maintenance.js'];
+
 describe('JS module hierarchy (ratchet lint, Track 7.3)', () => {
     it('found the expected module set', () => {
         // A rename/addition should be a conscious event for this lint, not a
         // silent scope change — update this list alongside CLAUDE.md.
-        expect(MODULES.sort()).toEqual([
+        expect(MODULES.filter((m) => !OPTIONAL_MODULES.includes(m)).sort()).toEqual([
             'api.js', 'app.js', 'audit.js', 'config.js', 'deck.js',
-            'docgen.js', 'help.js', 'plainchat.js', 'prompts.js',
-            'refactor.js', 'settings.js', 'summarizer.js', 'tagging.js',
+            'docgen.js', 'help.js', 'history.js', 'libraryRun.js', 'pdfManagement.js', 'pdfPreview.js', 'pendingReview.js', 'plainchat.js', 'prompts.js',
+            'settings.js', 'studio.js', 'summarizer.js', 'tagging.js',
             'ui.js', 'vault.js',
         ]);
     });
@@ -84,10 +94,34 @@ describe('JS module hierarchy (ratchet lint, Track 7.3)', () => {
     });
 
     it('no dynamic import() or bare side-effect imports sneak past the regex', () => {
+        // ONE allowed dynamic edge: app.js → maintenance.js, gated on the
+        // /api/maintenance/steps capability probe. It MUST stay dynamic — a
+        // static import would break the whole module graph on the public
+        // mirror, where maintenance.js is stripped. Any other dynamic import
+        // (in app.js or elsewhere) is still a violation.
         for (const mod of MODULES) {
             const src = readFileSync(join(JS_DIR, mod), 'utf8');
+            if (mod === 'app.js') {
+                const dyn = [...src.matchAll(/import\(\s*['"]\.\/([A-Za-z0-9_.-]+\.js)['"]\s*\)/g)]
+                    .map((m) => m[1]);
+                expect(dyn, 'app.js dynamic imports').toEqual(['maintenance.js']);
+                // No dynamic imports the specifier regex can't see.
+                expect(src.split('import(').length - 1).toBe(dyn.length);
+                continue;
+            }
             expect(src.includes('import('), `${mod} uses dynamic import()`).toBe(false);
             expect(/^import\s+['"]/m.test(src), `${mod} uses a bare side-effect import`).toBe(false);
+        }
+    });
+
+    it('app.js reaches maintenance.js ONLY through the probe-gated dynamic edge', () => {
+        // A static `import … from './maintenance.js'` anywhere would 404 the
+        // module graph on the public mirror. importsOf() sees only static
+        // imports, so maintenance.js must never appear in any module's static
+        // import list — app.js included.
+        for (const mod of MODULES) {
+            expect(importsOf(mod), `${mod} statically imports maintenance.js`)
+                .not.toContain('maintenance.js');
         }
     });
 });

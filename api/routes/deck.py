@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -24,7 +23,8 @@ from pathlib import Path
 from flask import Blueprint, jsonify, request, send_file
 
 from api.security import sanitise_error_msg
-from api.sse import run_sse_worker
+from api.sse import consumer_stall_s, run_sse_worker
+from api.routes.open import run_open
 from api.validators import (
     coerce_bool,
     coerce_enum,
@@ -33,18 +33,13 @@ from api.validators import (
     coerce_non_empty_string,
     coerce_string_max_len,
 )
-from core.config import load_config, resolve_chat_model
+from core.config import load_config, resolve_chat_model, resolve_embed_provider
 from core.paths import resolve_under_root
 from core.llm.chat import stream_chat_messages
 from core.constants import (
-    BASE_DIR,
+    BASE_DIR, OBSIDIAN_INDEX_DIR,
     DEFAULT_EMBED,
     VAULT_IMAGE_EXTS,
-    # Shared SSE stall-guard timing (single source of truth in core/constants.py;
-    # aliased to the historical private names used below). Rationale at the
-    # definition site.
-    SSE_STALL_MARGIN_S as _STALL_MARGIN_S,
-    SSE_SINGLE_SHOT_FLOOR_S as _SINGLE_SHOT_FLOOR_S,
 )
 from core.utils import write_text_atomic
 from rag.vault import obsidian_manager
@@ -52,11 +47,13 @@ from rag.vault import obsidian_manager
 # index (basename -> vault-relative paths) backs deck figure resolution; a
 # fresh per-call rglob of the whole vault is exactly what the cache exists
 # to avoid.
-from refactor.resolver import get_file_index
+from core.vault_resolver import get_file_index
 
 from deckgen import checkpoint
 from deckgen.assemble import (
+    BEAMER,
     assemble_with_template,
+    rewrite_source_tags,
     sanitize_section,
     substitute_title,
     validate,
@@ -164,8 +161,7 @@ def _under_deny_prefix(expanded: str) -> bool:
     return any(hay == p or hay.startswith(p + os.sep) for p in prefixes)
 
 _CHAT_TOKEN_TIMEOUT_S = 300  # default per-turn wall-clock cap (config: agent_wall_clock_s)
-# _STALL_MARGIN_S / _SINGLE_SHOT_FLOOR_S are imported from core/constants.py so
-# the vault, deck, and plain-chat SSE routes share one stall model. Each deck
+# consumer_stall_s shares the online-aware silence policy with other SSE routes. Each deck
 # turn is still bounded by turn_timeout_s inside the agent loop; the floor only
 # guards total event silence (e.g. a hung local call when local_request_timeout_s
 # is 0). Full rationale at the definition site.
@@ -498,6 +494,43 @@ _CHECKPOINTS_DIRNAME = os.path.join("deckgen", "checkpoints")
 _STAGING_TTL_S = 7 * 24 * 3600
 
 
+def _source_rewriter(bib_index: dict, *, footer_mode: str = "refline"):
+    """Bind :func:`rewrite_source_tags` for one deck operation.
+
+    The section prompt asks the model to attribute claims inline as
+    ``(source: note.md)``; this converts those into ``\\citefoot{key}`` when the
+    filename IS a bibliography key and groups the rest into one per-frame footer,
+    so the generated deck no longer carries raw filenames in its bullets.
+
+    *bib_index* must be EMPTY when the user turned citations off — the rewrite
+    then only tidies (groups the sources into a footer) and never emits a
+    ``\\citefoot``, which is exactly what that toggle promises.
+
+    *footer_mode* is ``"refline"`` on the generate path (we assemble the document,
+    so :func:`assemble_with_template` can add the matching ``\\providecommand``)
+    and ``"vfill"`` on the augment path, which writes back into a deck whose
+    preamble belongs to the user and must not be edited.
+    """
+    paper_index = load_paper_index()
+
+    def _rewrite(body: str) -> str:
+        return rewrite_source_tags(
+            body, bib_index,
+            cite_macro=BEAMER.cite_macro,
+            footer_mode=footer_mode,
+            paper_index=paper_index,
+        )
+    return _rewrite
+
+
+def _augment_footer_mode(deck_tex: str) -> str:
+    """``refline`` only if the deck ALREADY provides the macro, else ``vfill``.
+
+    Augment overwrites a file the user owns, so we never extend its preamble.
+    """
+    return "refline" if "\\refline" in deck_tex else "vfill"
+
+
 def _checkpoints_dir() -> str:
     """Per-section deck-generation checkpoints (NOT beside the user's deck)."""
     return os.path.join(BASE_DIR, _CHECKPOINTS_DIRNAME)
@@ -609,17 +642,12 @@ def _backup_deck(deck_path: str) -> str:
 
 # --- Deck-operation mutual exclusion ----------------------------------------
 #
-# generate and augment each drive a heavy in-process agent loop against the single
-# obsidian_manager / local model. Allowing two at once (e.g. a user starts an
-# augment while a generate streams) would contend on the model and double the load
-# for no benefit. A non-blocking try-acquire here lets exactly one run at a time;
-# the loser gets a clean 409 instead of silently competing.
-#
-# 2026-07-20 audit H1: this is now an ALIAS of the shared LATEX_OP_LOCK in
-# _latexdoc.py — docgen accepts the same absolute .tex paths, so a per-panel
-# lock let a docgen write interleave with a deck write on the same file. The
-# name is kept for existing test patch targets.
+# The shared registry canonicalizes deck/docgen targets: same-file operations
+# remain serialized across panels, while two unrelated paths may progress under
+# the registry's global resource cap. Non-blocking acquisition retains clean 409
+# contention responses. The historical alias remains for test patch targets.
 from api.routes._latexdoc import LATEX_OP_LOCK as _DECK_OP_LOCK  # noqa: E402
+from api.routes._latexdoc import load_paper_index  # noqa: E402
 
 
 def _index_preflight_msgs(in_progress_msg: str, no_index_msg: str) -> list[str]:
@@ -806,7 +834,7 @@ def api_deck_repair_piecewise():
     model = (cfg.get("deck_review_model") or "").strip() or resolve_chat_model(cfg, provider)
     max_tokens = coerce_int_in_range(cfg.get("deck_review_max_tokens"), 256, 16384) or 4096
     wall_clock_s = coerce_int_in_range(cfg.get("agent_wall_clock_s"), 30, 1800) or _CHAT_TOKEN_TIMEOUT_S
-    consumer_timeout_s = max(wall_clock_s, _SINGLE_SHOT_FLOOR_S) + _STALL_MARGIN_S
+    consumer_timeout_s = consumer_stall_s(cfg, wall_clock_s)
 
     def _worker(put, cancel):
         def _info(text):
@@ -919,12 +947,14 @@ def api_deck_repair_piecewise():
             "skipped_sections": skipped,
         }})
 
-    if not _DECK_OP_LOCK.acquire(blocking=False):
+    lease = _DECK_OP_LOCK.acquire(deck_path, blocking=False)
+    if lease is None:
         return jsonify({"error": "Another deck operation is already running. Please wait for it to finish."}), 409
     return run_sse_worker(
         _worker,
         consumer_timeout_s=consumer_timeout_s,
-        release=_DECK_OP_LOCK.release,
+        release=lease.release,
+        heartbeat=lease.heartbeat,
     )
 
 
@@ -1038,9 +1068,9 @@ def api_deck_generate():
     # Defensive resolve: coerce_int_in_range rejects NaN/Inf/strings and clamps,
     # so a hand-edited config.json can't crash the route or yield a bad deadline.
     wall_clock_s = coerce_int_in_range(cfg.get("agent_wall_clock_s"), 30, 1800) or _CHAT_TOKEN_TIMEOUT_S
-    # Floored stall backstop (see _SINGLE_SHOT_FLOOR_S); each turn is still
+    # Online-aware silence backstop; each turn is still
     # bounded by turn_timeout_s=wall_clock_s inside the in-process runner.
-    consumer_timeout_s = max(wall_clock_s, _SINGLE_SHOT_FLOOR_S) + _STALL_MARGIN_S
+    consumer_timeout_s = consumer_stall_s(cfg, wall_clock_s)
     # Per-turn resilience: a transient local-backend failure (LM Studio memory
     # hiccup / JIT reload / momentary timeout) is retried in-process before a
     # section degrades to a placeholder. SDK-level retries are off (lms.py), so
@@ -1060,7 +1090,25 @@ def api_deck_generate():
     if cfg.get("deck_resume_enabled") is None:
         resume_enabled = True
     force_fresh = bool(coerce_bool(data.get("force_fresh")))
+    context = checkpoint.generation_context(
+        obsidian_manager.get_vault_path() or "", embed=embed,
+        embed_provider=resolve_embed_provider(cfg, provider),
+        generation=getattr(obsidian_manager, "_index_generation", 0),
+        index_dir=OBSIDIAN_INDEX_DIR,
+    )
     job_key = checkpoint.compute_job_key(
+        context=context,
+        topic=topic, instructions=instructions, template_tex=template_tex,
+        provider=provider, model=model, max_sections=max_sections,
+        audience=audience, citations_enabled=citations_enabled,
+        slug=slug, out_dir=out_dir,
+        # Image policy shapes the section prompt, so it's content-determining
+        # (2026-07-20 audit L1) — a resume must not reuse sections generated
+        # under the opposite \includegraphics policy.
+        images_enabled=bool(cfg.get("vault_image_exts")),
+    )
+    legacy_job_key = checkpoint.compute_legacy_job_keys(
+        context=context,
         topic=topic, instructions=instructions, template_tex=template_tex,
         provider=provider, model=model, max_sections=max_sections,
         audience=audience, citations_enabled=citations_enabled,
@@ -1071,7 +1119,21 @@ def api_deck_generate():
         images_enabled=bool(cfg.get("vault_image_exts")),
     )
 
+    def _check_context():
+        if context != checkpoint.generation_context(
+            obsidian_manager.get_vault_path() or "", embed=embed,
+            embed_provider=resolve_embed_provider(load_config(), provider),
+            generation=getattr(obsidian_manager, "_index_generation", 0),
+            index_dir=OBSIDIAN_INDEX_DIR,
+        ):
+            raise ValueError(
+                "Generation interrupted: vault or corpus context changed. "
+                "Any saved sections were retained. Wait for indexing to finish, "
+                "then review the checkpoint before retrying; reuse requires a compatible context."
+            )
+
     def _worker(put, cancel):
+        _check_context()
         # The slow, blocking deckgen pipeline. Runs in a daemon thread inside
         # run_sse_worker, pushing SSE-shaped dicts via `put`; each agent turn is
         # bounded by turn_timeout_s while the consumer's stall floor is the backstop.
@@ -1117,7 +1179,7 @@ def api_deck_generate():
         ckpt_dir = _checkpoints_dir()
         if force_fresh and resume_enabled:
             checkpoint.delete(ckpt_dir, job_key)
-        manifest = checkpoint.load(ckpt_dir, job_key) if (resume_enabled and not force_fresh) else None
+        manifest = checkpoint.load(ckpt_dir, job_key, context=context, legacy_job_key=legacy_job_key) if (resume_enabled and not force_fresh) else None
         # `reused` counts only genuinely reusable sections — placeholder (failed)
         # sections are NOT counted, NOT reused, and were never persisted (see the
         # generation loop below), so a transiently-failed section is retried on
@@ -1157,6 +1219,7 @@ def api_deck_generate():
                 return
             if cancel.is_set():
                 return
+            _check_context()
             _info(f"Outline ready: {len(sections)} section(s).")
             # Persist the outline immediately so even an outline-then-crash run
             # resumes without re-designing it. Best-effort: a checkpoint-write
@@ -1164,7 +1227,7 @@ def api_deck_generate():
             if resume_enabled:
                 manifest = checkpoint.new_manifest(
                     job_key=job_key, topic=topic, slug=slug, out_dir=out_dir,
-                    sections=sections,
+                    sections=sections, context=context,
                 )
                 try:
                     checkpoint.save(ckpt_dir, manifest)
@@ -1177,6 +1240,7 @@ def api_deck_generate():
         for i, sec in enumerate(sections, start=1):
             if cancel.is_set():
                 return
+            _check_context()
             saved = checkpoint.get_section(manifest, i) if manifest else None
             # Reuse a saved section ONLY if it carried real content. A placeholder
             # is a recorded *failure*, not a generated section: reusing it would
@@ -1212,6 +1276,10 @@ def api_deck_generate():
                 macros_block=macros_block,
                 cite_mode=cite_mode,
                 candidate_bib_block=candidate_block,
+                # Deterministic citation pass over the sanitized body: the
+                # model's "(source: note.md)" attributions become \citefoot{key}
+                # (filename == bib key) or one grouped footer per frame.
+                post_process=_source_rewriter(parts.bib_index if use_bib else {}),
                 # Only invite \includegraphics when image indexing is on —
                 # otherwise no is_image results can exist to ground a figure.
                 images_enabled=bool(cfg.get("vault_image_exts")),
@@ -1220,6 +1288,7 @@ def api_deck_generate():
                 retry_backoff_s=retry_backoff_s,
                 should_cancel=cancel.is_set,
             )
+            _check_context()
             section_outputs.append(out)
             # Persist ONLY real sections. A placeholder (every retry failed) is left
             # out of the checkpoint so a re-submitted/resumed run regenerates it
@@ -1302,26 +1371,52 @@ def api_deck_generate():
         if cancel.is_set():
             return
 
-        # Perform the figure copies deferred by copy=False above. The pairs
-        # come straight from the in-memory resolver (same trust as the old
-        # copy=True path); never-clobber + warn-on-failure semantics match it.
-        for _src, _dst in pending_figs:
-            try:
-                os.makedirs(os.path.dirname(_dst), exist_ok=True)
-                if not os.path.exists(_dst):
-                    shutil.copy2(_src, _dst)
-            except OSError as exc:
-                warnings = list(warnings) + [
-                    f"Figure {os.path.basename(_dst)}: copy from the vault "
-                    f"failed ({exc})."
-                ]
+        # Serialize the short publication with configuration switches/index writes.
+        publication_epoch = obsidian_manager.try_acquire_lock(ttl=3600)
+        if not publication_epoch:
+            put({"error": "Vault is busy; generated sections were not published. Try again when the operation finishes."})
+            return
+        def publication_ready():
+            # Checks are between filesystem units, not a transaction/rollback.
+            if cancel.is_set():
+                put({"info": "Generation stopped before document publication. Copied figures may remain; inspect the output folder before retrying."})
+                return False
+            if not lease.heartbeat() or not obsidian_manager.heartbeat(publication_epoch):
+                put({"error": "Operation ownership lost before document publication. Copied figures may remain; inspect the output folder before retrying."})
+                return False
+            return True
 
-        scaffold_error = None
-        paths = {}
         try:
-            paths = scaffold_deck(out_dir, slug, tex, overwrite=overwrite)
-        except ScaffoldError as exc:
-            scaffold_error = str(exc)
+            if not publication_ready():
+                return
+            _check_context()
+
+            # Perform the figure copies deferred by copy=False above. The pairs
+            # come straight from the in-memory resolver (same trust as the old
+            # copy=True path); never-clobber + warn-on-failure semantics match it.
+            for _src, _dst in pending_figs:
+                if not publication_ready():
+                    return
+                try:
+                    os.makedirs(os.path.dirname(_dst), exist_ok=True)
+                    if not os.path.exists(_dst):
+                        shutil.copy2(_src, _dst)
+                except OSError as exc:
+                    warnings = list(warnings) + [
+                        f"Figure {os.path.basename(_dst)}: copy from the vault "
+                        f"failed ({exc})."
+                    ]
+
+            if not publication_ready():
+                return
+            scaffold_error = None
+            paths = {}
+            try:
+                paths = scaffold_deck(out_dir, slug, tex, overwrite=overwrite)
+            except ScaffoldError as exc:
+                scaffold_error = str(exc)
+        finally:
+            obsidian_manager.release_lock(publication_epoch)
 
         # The deck is on disk — the checkpoint has done its job. Drop it (and
         # prune old ones) so a clean success leaves no resumable state. A scaffold
@@ -1391,18 +1486,22 @@ def api_deck_generate():
             "scaffold_error": scaffold_error,
         }})
 
-    # One deck operation at a time: acquire after validation (so a 400 never holds
-    # the lock); run_sse_worker releases it when the stream ends.
-    if not _DECK_OP_LOCK.acquire(blocking=False):
+    # Canonical target locking begins after validation (so a 400 never holds a
+    # lease); the SSE lifecycle owns exactly-once release.
+    planned_tex_path = os.path.join(out_dir, slug, f"{slug}.tex")
+    lease = _DECK_OP_LOCK.acquire(planned_tex_path, blocking=False)
+    if lease is None:
         return jsonify({"error": "Another deck operation is already running. Please wait for it to finish."}), 409
     return run_sse_worker(
         _worker,
         consumer_timeout_s=consumer_timeout_s,
         preflight_msgs=_index_preflight_msgs(
-            "Indexing is still in progress — the deck may miss recently-added content.",
+            "Indexing is still in progress — corpus changes can interrupt generation. "
+            "Stop and wait for indexing to finish before starting a new deck.",
             "No fully-built vault index detected — generation may return little content. Index your vault first for best results.",
         ),
-        release=_DECK_OP_LOCK.release,
+        release=lease.release,
+        heartbeat=lease.heartbeat,
     )
 
 
@@ -1453,11 +1552,12 @@ def api_deck_apply_repair():
     if not os.path.isfile(tex_path):
         return jsonify({"error": "No generated deck found to repair; generate it first."}), 400
 
-    # One deck operation at a time: take the process-wide lock for the
+    # Take this deck's canonical-path lease for the
     # read→screen→write so this writer can't race a streaming generate/augment
     # (or a concurrent apply) and clobber a deck mid-flight. Acquired here (after
     # validation, so a 400 never holds the lock) and released in `finally`.
-    if not _DECK_OP_LOCK.acquire(blocking=False):
+    lease = _DECK_OP_LOCK.acquire(tex_path, blocking=False)
+    if lease is None:
         return jsonify({"error": "Another deck operation is already running. Please wait for it to finish."}), 409
     try:
         # Stale-diff guard: the on-disk deck must still be the one that was reviewed.
@@ -1508,7 +1608,7 @@ def api_deck_apply_repair():
             "warnings": screen_warnings,
         })
     finally:
-        _DECK_OP_LOCK.release()
+        lease.release()
 
 
 @deck_bp.route("/api/deck/deck-sections", methods=["POST"])
@@ -1607,7 +1707,13 @@ def _run_piecewise_augment(*, put, cancel, parts, deck_tex, deck_path, deck_sha,
         )
         if cancel.is_set():
             return
-        body = sanitize_section(result.text)
+        # Same citation pass as the generate path. footer_mode is derived from
+        # the deck we are writing back into: we must not add a \providecommand
+        # to a preamble the user owns.
+        body = _source_rewriter(
+            bib_index if use_bib else {},
+            footer_mode=_augment_footer_mode(deck_tex),
+        )(sanitize_section(result.text))
         if not body:
             skipped.append(sec.title)
             info(f"Section '{sec.title}' produced no usable content — left unchanged.")
@@ -1735,7 +1841,7 @@ def api_deck_augment():
     model = coerce_string_max_len(data.get("model"), 120) or resolve_chat_model(cfg, provider)
     embed = coerce_string_max_len(data.get("embed"), 120) or cfg.get("embed", DEFAULT_EMBED)
     wall_clock_s = coerce_int_in_range(cfg.get("agent_wall_clock_s"), 30, 1800) or _CHAT_TOKEN_TIMEOUT_S
-    consumer_timeout_s = max(wall_clock_s, _SINGLE_SHOT_FLOOR_S) + _STALL_MARGIN_S
+    consumer_timeout_s = consumer_stall_s(cfg, wall_clock_s)
 
     def _worker(put, cancel):
         # One vault-grounded agent turn that revises a section / the whole region /
@@ -1868,7 +1974,12 @@ def api_deck_augment():
         if cancel.is_set():
             return
 
-        body = sanitize_section(result.text)
+        # Same citation pass as the generate path; footer_mode derived from the
+        # deck being edited so its (user-owned) preamble is never extended.
+        body = _source_rewriter(
+            bib_index if use_bib else {},
+            footer_mode=_augment_footer_mode(deck_tex),
+        )(sanitize_section(result.text))
         if not body:
             put({"error": result.error or (
                 "The model returned no usable Beamer content to apply. Try "
@@ -1973,7 +2084,8 @@ def api_deck_augment():
             "section_index": section_index,
         }})
 
-    if not _DECK_OP_LOCK.acquire(blocking=False):
+    lease = _DECK_OP_LOCK.acquire(deck_path, blocking=False)
+    if lease is None:
         return jsonify({"error": "Another deck operation is already running. Please wait for it to finish."}), 409
     return run_sse_worker(
         _worker,
@@ -1982,7 +2094,8 @@ def api_deck_augment():
             "Indexing is still in progress — the augmentation may miss recently-added content.",
             "No fully-built vault index detected — the augmentation may add little grounded content.",
         ),
-        release=_DECK_OP_LOCK.release,
+        release=lease.release,
+        heartbeat=lease.heartbeat,
     )
 
 
@@ -2031,12 +2144,13 @@ def api_deck_apply_augment():
     if not proposed_sha256:
         return jsonify({"error": "proposed_sha256 is required (preview-binding guard)."}), 400
 
-    # One deck operation at a time: hold the process-wide lock across the whole
+    # Hold this deck's canonical-path lease across the whole
     # read→screen→backup→write so this writer can't race a streaming generate/
     # augment or a concurrent apply (TOCTOU between the stale-diff read and the
     # overwrite). Acquired after validation (a 400 never holds it); released in
     # `finally`.
-    if not _DECK_OP_LOCK.acquire(blocking=False):
+    lease = _DECK_OP_LOCK.acquire(deck_path, blocking=False)
+    if lease is None:
         return jsonify({"error": "Another deck operation is already running. Please wait for it to finish."}), 409
     try:
         # The proposal comes from staging (server-owned), not the request body.
@@ -2139,7 +2253,7 @@ def api_deck_apply_augment():
             "warnings": list(screen_warnings) + fig_apply_warnings,
         })
     finally:
-        _DECK_OP_LOCK.release()
+        lease.release()
 
 
 @deck_bp.route("/api/deck/native-pick-file", methods=["POST"])
@@ -2213,7 +2327,8 @@ def api_deck_compile_preview():
     if engine is None:
         engine = coerce_enum(cfg.get("deck_compile_engine"), _COMPILE_ENGINES) or "pdflatex"
 
-    if not _DECK_OP_LOCK.acquire(blocking=False):
+    lease = _DECK_OP_LOCK.acquire(deck_path, blocking=False)
+    if lease is None:
         return jsonify({"error": "Another deck operation is already running. Please wait for it to finish."}), 409
     try:
         success, log_contents = compile_latex(deck_path, engine=engine, timeout=timeout_s)
@@ -2230,7 +2345,7 @@ def api_deck_compile_preview():
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     finally:
-        _DECK_OP_LOCK.release()
+        lease.release()
 
 
 def _resolve_deck_pdf(raw) -> str | None:
@@ -2285,7 +2400,7 @@ def api_deck_open_pdf():
     inline, so the preview panel offers a one-click open of the SAME validated
     file (``_resolve_deck_pdf`` — no new path surface vs preview-pdf). macOS
     only (501 elsewhere), mirroring ``/api/audit/reveal``'s platform posture;
-    ``subprocess.Popen`` with an argv list, never a shell.
+    ``run_open`` reaps the child (no zombie ``open`` processes).
     """
     if sys.platform != "darwin":
         return jsonify({"error": "Opening files is only supported on macOS."}), 501
@@ -2296,7 +2411,7 @@ def api_deck_open_pdf():
     if not pdf_path:
         return jsonify({"error": "No compiled PDF yet. Run Preview first."}), 404
     try:
-        subprocess.Popen(["open", pdf_path])
+        run_open(["open", pdf_path])
     except OSError as exc:
         return jsonify({"error": sanitise_error_msg(exc)}), 500
     return jsonify({"ok": True})
@@ -2410,17 +2525,18 @@ def api_deck_compile_fix():
     # everything that READS the deck happens under the lock so the stale-diff
     # check and the compile loop see the same bytes — checking before
     # acquisition left a window for a concurrent apply to rewrite the deck.
-    if not _DECK_OP_LOCK.acquire(blocking=False):
+    lease = _DECK_OP_LOCK.acquire(deck_path, blocking=False)
+    if lease is None:
         return jsonify({"error": "Another deck operation is already running. Please wait for it to finish."}), 409
 
     try:
         deck_tex, deck_sha = _read_deck_strict(deck_path)
     except _DeckReadError as exc:
-        _DECK_OP_LOCK.release()
+        lease.release()
         return jsonify({"error": str(exc)}), 400
 
     if deck_sha != base_sha256.strip():
-        _DECK_OP_LOCK.release()
+        lease.release()
         return jsonify({
             "error": "The deck on disk changed since the last request; not compile-fixing. "
                      "Re-read or refresh to sync."
@@ -2431,8 +2547,37 @@ def api_deck_compile_fix():
     # so a slow repair tripped the stall guard mid-loop — which released the
     # deck-op lock while the worker thread was still about to WRITE the deck
     # (the zombie-writer race).
+    # PERF (2026-09-02): the TOTAL budget was installed as the PER-FRAME stall
+    # window.
+    #   Before:    consumer_timeout_s = (2*max_repairs+1) * timeout_s, i.e. up
+    #              to (2*3+1)*600 = 4 200 s at the knob ceilings, and 1 830 s at
+    #              the plan's measured setting. That is the window the SSE
+    #              consumer waits for ONE frame, so a worker wedged before its
+    #              first frame sat silent for the whole of it with the LaTeX
+    #              lease held.
+    #   Change:    the window is the longest honest SILENT stage, not the run.
+    #              Frames are emitted before each compile and each repair, but
+    #              a repair that produces nothing is followed straight by the
+    #              next compile, so two stages can elapse between frames — the
+    #              window is 2*timeout_s, and the TOTAL run is bounded in the
+    #              worker instead (`_total_deadline` below), which is where a
+    #              total budget belongs.
+    #   Safe because:
+    #              the guard still outlasts one honest compile AND one honest
+    #              repair back to back, which is the plan's stated floor; the
+    #              structural bound was never the consumer's job (the loop can
+    #              only run max_repairs+1 compiles and max_repairs repairs, each
+    #              already capped at timeout_s).
+    #   Preserves: "The guard must still outlast one honest compile and one
+    #              honest repair."
+    #   Lock/thread contract:
+    #              unchanged. The narrower window means a genuinely wedged
+    #              worker is noticed sooner, and the LaTeX lease is released by
+    #              the SSE guard exactly as before — only after the worker exits.
+    #   Pinned by: test_compile.py::TestCompileFixBudgets
     total_time_s = (2 * max_repairs + 1) * timeout_s
-    consumer_timeout_s = max(total_time_s, _SINGLE_SHOT_FLOOR_S) + _STALL_MARGIN_S
+    stall_window_s = 2 * timeout_s
+    consumer_timeout_s = consumer_stall_s(cfg, stall_window_s)
 
     def _worker(put, cancel):
         def _info(text):
@@ -2449,6 +2594,7 @@ def api_deck_compile_fix():
         changed = False
         last_log_excerpt = ""
         success = False
+        _total_deadline = time.monotonic() + total_time_s
 
         # Loop shape: every WRITTEN repair is followed by another compile
         # pass, so the loop can only end on (a) success, (b) a repair-budget /
@@ -2460,9 +2606,22 @@ def api_deck_compile_fix():
                 return
             compile_passes += 1
             _info(f"Running compilation pass {compile_passes} using {engine}…")
-            success, log_contents = compile_latex(deck_path, engine=engine, timeout=timeout_s)
+            # should_cancel: Stop now reaches latexmk's process group mid-pass
+            # instead of being invisible for up to `timeout_s` (2026-09-02).
+            success, log_contents = compile_latex(
+                deck_path, engine=engine, timeout=timeout_s,
+                should_cancel=cancel.is_set)
             if success:
                 _info(f"Compilation succeeded on pass {compile_passes}.")
+                break
+            if cancel.is_set():
+                return
+            if time.monotonic() >= _total_deadline:
+                # The total budget lives HERE now, not in the consumer's
+                # per-frame window. Stop after a VERIFIED state, never mid-write.
+                _info("Compile-fix budget exhausted; stopping after the last "
+                      "verified compile.")
+                last_log_excerpt = "\n".join(parse_latex_log(log_contents))
                 break
 
             errors = parse_latex_log(log_contents)
@@ -2593,5 +2752,6 @@ def api_deck_compile_fix():
         _worker,
         consumer_timeout_s=consumer_timeout_s,
         preflight_msgs=[],
-        release=_DECK_OP_LOCK.release,
+        release=lease.release,
+        heartbeat=lease.heartbeat,
     )

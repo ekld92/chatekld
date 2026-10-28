@@ -23,3 +23,7 @@ On the LAST permitted iteration (`max_iterations >= 2`), the loop sends `tool_ch
 ## Penultimate budget warning (WP-A1, 2026-07-10)
 
 One iteration BEFORE the forced final (`iteration_idx == max_iterations - 1`, requires `max_iterations >= 3` so the warning and the forcing never share an iteration), the system prompt gets the soft `_PENULTIMATE_SUFFIX` ("only one more iteration after this one, and it will not allow tool calls — answer now if you can, else make exactly one targeted call") with tools still enabled (`tool_choice="auto"`). The forced final is the hard guarantee; this lets the model plan its endgame instead of discovering the cut-off when the tools vanish (the openai-agents-python #844 lesson: the prompt alone is unreliable — `tool_choice="none"` on the final turn stays the enforcement). Pinned by `test_agent.py::TestPenultimateBudgetWarning`.
+
+After a fallback produces tool calls, the loop keeps its responding provider and
+model for subsequent turns. Opaque tool-history state cannot be transplanted back
+to the former primary. See the targeted Responses contract in `core/llm/CLAUDE.md`.

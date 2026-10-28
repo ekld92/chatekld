@@ -125,7 +125,7 @@ def api_about():
     
     # Example about text
     about_md = """
-# ChatEKLD 2026
+# CHERQAiN 2026
 Local RAG application for PDF summarization and Obsidian vault interaction.
     """
     parser = MarkdownParser()

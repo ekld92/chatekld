@@ -57,7 +57,8 @@ def _inherit_dest_mode(dest: str, tmp: str) -> None:
         pass  # destination absent (normal for a create) or mode unreadable
 
 
-def write_text_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
+def write_text_atomic(path: str, text: str, encoding: str = "utf-8",
+                      *, fsync: bool = True) -> None:
     """Write *text* to *path* atomically via a sibling temp file + rename.
 
     A direct ``open(path, "w")`` truncates the destination first, so a crash
@@ -70,6 +71,10 @@ def write_text_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
 
     Text twin of ``rag/vault.py::_write_json_atomic``; same fd-ownership
     pattern as ``core/config.py::save_config``.
+
+    ``fsync=False`` keeps the atomicity and drops the durability flush, for a
+    REGENERABLE file whose loss costs a rebuild, never correctness (the
+    paper-label index, ``rag/paper_index.py``).
     """
     dir_ = os.path.dirname(path) or "."
     os.makedirs(dir_, exist_ok=True)
@@ -99,7 +104,8 @@ def write_text_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
             # the per-write fsync cost is negligible. (Hot-path, regenerable
             # caches use their own non-fsync writers by design.)
             f.flush()
-            os.fsync(f.fileno())
+            if fsync:
+                os.fsync(f.fileno())
         _inherit_dest_mode(path, tmp)
         os.replace(tmp, path)
     except Exception:
@@ -108,6 +114,42 @@ def write_text_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
         except OSError:
             pass
         raise
+
+
+class CreatePublicationUncertainError(OSError):
+    """Complete bytes were published, but directory durability was unconfirmed."""
+
+
+def create_text_atomic(path: str, text: str) -> None:
+    """Publish complete UTF-8 bytes without ever replacing an existing entry."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        # A same-filesystem hard link is atomic and fails even for dangling
+        # symlinks. Unlike exists()+replace it cannot clobber a racing writer.
+        os.link(temporary, path)
+        try:
+            directory_fd = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            raise CreatePublicationUncertainError(
+                "Note published, but directory durability could not be confirmed"
+            ) from exc
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            # Publication may already have succeeded; a leftover temporary
+            # sibling must not be reported as a failed create.
+            logger.warning("Could not remove create-only temporary file", exc_info=True)
 
 
 def write_bytes_atomic(path: str, data: bytes) -> None:

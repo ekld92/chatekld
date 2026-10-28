@@ -257,6 +257,98 @@ def test_relevant_bib_keys_and_candidates_block(suite):
     assert "smith2020depression" in block
 
 
+# --- consortium-author bound (2026-08-13) ----------------------------------
+#
+# A Global-Burden-of-Disease style entry: ~1,000 collaborator names in one
+# author field. Measured live, one such entry selected into a 12-key candidate
+# block made that block 42,871 chars (~10.7k tokens), 94% of it surnames — and
+# the agent loop re-sends that message every iteration of every section.
+
+_MEGA_AUTHORS = " and ".join(f"Surname{i}, Ratiomaire" for i in range(1000))
+_MEGA_BIB = (
+    "@article{gbdcollab2024burden,\n"
+    f"  author = {{{_MEGA_AUTHORS}}},\n"
+    "  year = {2024},\n"
+    "  title = {" + ("Global burden of very many things " * 20) + "},\n"
+    "}\n"
+) + _BIB
+
+
+@pytest.fixture()
+def mega_idx(tmp_path):
+    """A bib index whose first entry has a consortium-sized author list."""
+    bib = tmp_path / "mega.bib"
+    bib.write_text(_MEGA_BIB, encoding="utf-8")
+    pre = "\\documentclass{beamer}\n\\addbibresource{mega.bib}\n"
+    return resolve_bib(pre, str(tmp_path))
+
+
+def test_consortium_author_list_is_shortened_at_parse_time(mega_idx):
+    """The parsed value is bounded, so BOTH the haystack and the prompt shrink."""
+    author, year, title = mega_idx["gbdcollab2024burden"]
+    assert author == "Surname0, Ratiomaire et al."
+    assert len(author) < 40, "1,000 names must not survive into the index"
+    assert len(title) <= 201, "title is capped too (200 + ellipsis)"
+    # A short list is passed through untouched — the common case is unchanged.
+    assert mega_idx["smith2020depression"][0] == "Smith, Jane and Doe, John"
+
+
+def test_candidate_block_line_is_bounded_for_a_consortium_entry(mega_idx):
+    block = bib_candidates_block(mega_idx, ["gbdcollab2024burden"])
+    assert "gbdcollab2024burden" in block
+    assert "et al." in block
+    assert len(block) < 400, f"candidate line still unbounded: {len(block)} chars"
+
+
+def test_token_buried_inside_a_surname_does_not_score_a_hit(mega_idx):
+    """The live false positive: 'aire' matched *inside* a surname, nothing else.
+
+    The prose match is PREFIX-anchored, not whole-word — deliberately, so a
+    query token still matches an inflected form ('regression' -> 'regressions',
+    'logistique' -> 'logistiques'). A surname that merely *contains* the token
+    mid-word is what must be rejected; a surname that *starts* with it is a
+    legitimate hit and is left alone.
+    """
+    # 'aire' sits mid-word inside 'Ratiomaire' — the shape of the live false hit.
+    assert "aire" in mega_idx["gbdcollab2024burden"][0].lower(), "fixture guard"
+    assert "gbdcollab2024burden" not in relevant_bib_keys(mega_idx, "aire clinique")
+
+
+def test_camelcase_citation_key_still_matches_by_substring(tmp_path):
+    """Key matching stays unanchored — a BBT key is a run-together compound.
+
+    Anchoring the key too would lose every legitimate hit: there is no word
+    boundary before 'regression' inside 'bouyerRegressionLogistique2024'.
+    """
+    bib = tmp_path / "bbt.bib"
+    bib.write_text(
+        "@book{bouyerRegressionLogistiqueEpidemiologie2024,\n"
+        "  author = {Bouyer, Jean},\n  year = {2024},\n"
+        "  title = {Introduction},\n}\n",
+        encoding="utf-8",
+    )
+    idx = resolve_bib(
+        "\\documentclass{beamer}\n\\addbibresource{bbt.bib}\n", str(tmp_path)
+    )
+    assert "bouyerRegressionLogistiqueEpidemiologie2024" in relevant_bib_keys(
+        idx, "regression logistique"
+    )
+
+
+def test_accented_french_query_matches_accented_title():
+    """FR/DE regression (2026-08-18): the ASCII tokenizer split 'dépression'
+    into 'pression', which the word-boundary anchor then rightly rejected
+    inside 'dépression' — a French query matched nothing. Both sides are now
+    accent-folded before tokenizing, so the token stays whole AND matching is
+    accent-insensitive in both directions."""
+    idx = {"dupontDepression2020": ("Dupont, Anne", "2020", "La dépression majeure")}
+    assert relevant_bib_keys(idx, "dépression et traitement") == ["dupontDepression2020"]
+    # Cross-spelling both ways: unaccented query vs accented title and back.
+    assert relevant_bib_keys(idx, "depression severe") == ["dupontDepression2020"]
+    idx2 = {"k": ("Muller", "2021", "Depression screening")}
+    assert relevant_bib_keys(idx2, "dépression") == ["k"]
+
+
 # --- suite root ------------------------------------------------------------
 
 def test_find_suite_root(suite):
@@ -564,3 +656,62 @@ def test_scan_annotations_positional_does_not_bleed_across_code():
     )
     ann = _scan_annotations(src)
     assert "later" not in ann
+
+
+class TestBibFoldMemo:
+    """Perf plan Phase 3.3: the per-entry accent fold is memoised across
+    sections. Counted at ``unicodedata.normalize`` — the level both the pre-
+    and post-change code reach — never at the memo helper itself."""
+
+    @staticmethod
+    def _index(n=200):
+        return {
+            f"key{i}Compound": (f"dépression auteur{i}", "2024",
+                                f"étude {i} sur la régression logistique")
+            for i in range(n)
+        }
+
+    def _fold_calls(self, monkeypatch):
+        import deckgen.template as template_mod
+        calls = []
+        real = template_mod.unicodedata.normalize
+
+        def _counting(form, value):
+            calls.append(value)
+            return real(form, value)
+
+        monkeypatch.setattr(template_mod.unicodedata, "normalize", _counting)
+        return calls
+
+    def test_a_second_section_folds_nothing(self, monkeypatch):
+        import deckgen.template as template_mod
+        cached = getattr(template_mod, "_fold_cached", None)
+        if cached is not None:
+            cached.cache_clear()
+        index = self._index()
+        text = "régression logistique dépression cohorte"
+        calls = self._fold_calls(monkeypatch)
+        template_mod.relevant_bib_keys(index, text)
+        first = len(calls)
+        assert first >= 2 * len(index)
+        calls.clear()
+        # A different query, the same library: the query is folded once, and
+        # not one entry is re-folded.
+        template_mod.relevant_bib_keys(index, text + " imagerie")
+        assert len(calls) == 1, f"entry folds on the second section: {len(calls) - 1}"
+
+    def test_the_result_is_identical_with_a_cold_and_a_warm_memo(self, monkeypatch):
+        import deckgen.template as template_mod
+        cached = getattr(template_mod, "_fold_cached", None)
+        index = self._index()
+        text = "régression dépression"
+        if cached is not None:
+            cached.cache_clear()
+        cold = template_mod.relevant_bib_keys(index, text)
+        warm = template_mod.relevant_bib_keys(index, text)
+        assert cold == warm
+        # And identical to the un-memoised recipe, entry for entry. getattr
+        # with a fallback so the ASSERTION carries the red against pre-change
+        # code rather than an AttributeError on a name that is merely new.
+        fold = getattr(template_mod, "_fold_cached", template_mod._fold_accents)
+        assert all(template_mod._fold_accents(k) == fold(k) for k in index)

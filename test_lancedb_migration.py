@@ -254,6 +254,9 @@ class TestBackendAwareIndexVault(unittest.TestCase):
         from llama_index.core.embeddings import MockEmbedding
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed"], None
+
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=8)
 
@@ -299,10 +302,10 @@ class TestBackendAwareIndexVault(unittest.TestCase):
             self.assertIn("0 embedded", joined, joined)
             self.assertEqual(lancedb_table_count(index_dir), rows)
 
-    def test_index_with_no_recorded_embed_rebuilds(self):
+    def test_index_with_no_recorded_embed_refuses_without_rebuild_confirmation(self):
         """An existing index whose meta records NO embed model cannot be safely
         extended (we can't prove its vectors match the current model), so the
-        indexer must rebuild instead of silently going incremental (L2)."""
+        indexer must refuse until an explicit rebuild is confirmed."""
         from rag.vault import ObsidianVaultManager
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as vault_dir, \
              tempfile.TemporaryDirectory() as index_dir:
@@ -317,13 +320,15 @@ class TestBackendAwareIndexVault(unittest.TestCase):
             meta.pop("embed", None)
             meta_path.write_text(json.dumps(meta))
 
+            before = {p.relative_to(index_dir): p.read_bytes()
+                      for p in Path(index_dir).rglob("*") if p.is_file()}
             manager2 = ObsidianVaultManager()
             manager2.restore_vault_path(vault_dir)
             msgs = self._index(manager2, index_dir)
-            self.assertEqual(manager2.get_status(), "done", msgs)
-            self.assertTrue(
-                any("did not record its embedding model" in m for m in msgs), msgs
-            )
+            self.assertEqual(manager2.get_status(), "error", msgs)
+            self.assertTrue(any("missing_embedding_identity" in m for m in msgs), msgs)
+            self.assertEqual(before, {p.relative_to(index_dir): p.read_bytes()
+                                     for p in Path(index_dir).rglob("*") if p.is_file()})
 
     def test_lancedb_index_not_clobbered_when_backend_unavailable(self):
         """Regression: an existing LanceDB index must NOT be overwritten by a
@@ -338,6 +343,9 @@ class TestBackendAwareIndexVault(unittest.TestCase):
         from llama_index.core.embeddings import MockEmbedding
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed"], None
+
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=8)
 
@@ -577,11 +585,9 @@ class TestClientSideMMR(unittest.TestCase):
             )
             with patch("rag.engine.load_config", return_value={"context_window": 8192}), \
                  patch("rag.engine.VectorIndexRetriever") as dense_cls, \
-                 patch("rag.engine.RetrieverQueryEngine") as qe, \
                  patch("rag.engine.get_provider"):
                 dense_cls.return_value = object()
-                qe.from_args.return_value.query.return_value = "ok"
-                engine.query("hello")
+                engine._build_retrieval_pipeline({"context_window": 8192})
                 return dense_cls.call_args.kwargs
 
         with tempfile.TemporaryDirectory() as d:

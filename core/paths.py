@@ -1,6 +1,7 @@
 import os
+from collections.abc import Collection
 from pathlib import Path
-from typing import Union, Set, List, Tuple
+from typing import Union
 
 def resolve_under_root(
     raw: str, 
@@ -9,7 +10,7 @@ def resolve_under_root(
     must_exist: bool = False,
     must_be_dir: bool = False,
     must_be_file: bool = False,
-    exts: Union[Set[str], List[str], Tuple[str, ...], None] = None,
+    exts: Collection[str] | None = None,
     deny_root: bool = False,
     max_len: int = 1024
 ) -> Union[str, None]:

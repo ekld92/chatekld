@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request, Response
 from core.config import load_config, save_config, load_report_types
 from core.constants import (
+    ACCESSION_BATCH_MAX_CEILING,
     CONFIG_FILE,
     EXACT_BLOCKED,
     FEEDBACK_FILE,
@@ -83,6 +84,40 @@ def _coerce_fallback_provider(value):
         if s == "" or s in _PROVIDER_NAMES:
             return s
     return None
+
+
+#: The accession source registry names (`accession/sources.py::default_sources`
+#: order). Kept as a literal here rather than imported so loading the config
+#: route never imports the network module; `test_accession_route.py` pins the
+#: two lists against each other.
+ACCESSION_SOURCE_NAMES = ("crossref", "europepmc", "arxiv", "hal", "thesesfr",
+                          "openlibrary", "googlebooks")
+
+
+def _coerce_accession_sources(value):
+    """Filter to known source names, preserving order; empty/invalid ⇒ drop.
+
+    Unlike ``fallback_on``, an empty list is NOT meaningful here — resolving
+    against no sources is never a choice, so it drops like any garbage value.
+    """
+    if not isinstance(value, list):
+        return None
+    filtered = [x for x in value if isinstance(x, str) and x in ACCESSION_SOURCE_NAMES]
+    # de-dup, order-preserving
+    filtered = list(dict.fromkeys(filtered))
+    return filtered or None
+
+
+def _coerce_contact_email(value):
+    """Loose e-mail shape (it only rides a User-Agent header); "" kept."""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s == "":
+        return ""
+    if len(s) > 200 or any(c in s for c in "\x00\n\r\t "):
+        return None
+    return s if re.fullmatch(r"[^@]+@[^@]+\.[^@]+", s) else None
 
 
 def _coerce_fallback_on(value):
@@ -212,8 +247,7 @@ def _coerce_https_url(value):
 def _coerce_vault_rel_subdir(value):
     """Shape-validate a vault-relative sub-folder (no traversal/abs/NUL).
 
-    Existence + under-root checks happen at request time in
-    ``api/routes/refactor.py`` (the vault may be unset when config is saved), so
+    Existence + under-root checks happen at request time;
     this only guards the stored *shape* — the same posture as the ``audit_*``
     subdir keys. Empty ⇒ None (drop; keep the prior default).
     """
@@ -286,10 +320,8 @@ def _coerce_online_model(value):
 def _coerce_abs_dir_or_empty(value):
     """Allow "" (use the default archive dir) or an ABSOLUTE, control-char-free path.
 
-    Shape-only: a relative path is rejected here, but "is this dir inside the
-    vault?" is re-checked at apply time in api/routes/refactor.py (the vault may
-    be unset when config is saved, mirroring the audit_* / refactor_scope_subdir
-    posture). ``~`` is allowed (expanded at use). Empty ⇒ "" (kept, not dropped)
+    Shape-only: relative paths are rejected here; containment is checked
+    by the history writer at request time. ``~`` is allowed (expanded at use). Empty ⇒ "" (kept, not dropped)
     so a user can clear the override back to the default.
     """
     if not isinstance(value, str):
@@ -358,6 +390,7 @@ _CONFIG_VALIDATORS = {
     "online_timeout_s": lambda v: coerce_int_in_range(v, 5, 600),
     "online_max_retries": lambda v: coerce_int_in_range(v, 0, 10),
     "online_max_tokens": lambda v: coerce_int_in_range(v, 64, 32768),
+    "online_reasoning_effort": lambda v: v if v in ("provider_default", "low", "minimal") else None,
     # Online single-paper document bound (map-reduce trigger). Config-only, no
     # Settings control; floor 4000 keeps a garbage value from forcing every
     # paper through map-reduce.
@@ -397,11 +430,16 @@ _CONFIG_VALIDATORS = {
     "provider": lambda v: coerce_enum(v, _PROVIDER_NAMES),
     "ocr_provider": lambda v: coerce_enum(v, ("ollama", "lm_studio")),
     "vision_provider": lambda v: coerce_enum(v, ("ollama", "lm_studio")),
+    "online_ocr_provider": lambda v: coerce_enum(v, ("deepseek", "openai", "google", "openrouter")),
+    "online_vision_provider": lambda v: coerce_enum(v, ("deepseek", "openai", "google", "openrouter")),
     "llm": _coerce_model_name,
     "embed": _coerce_model_name,
     "embed_provider": lambda v: coerce_enum(v, ("ollama", "lm_studio")),
     "ocr_model": _coerce_model_name,
     "vision_model": _coerce_model_name,
+    "online_ocr_model": _coerce_model_name,
+    "online_vision_model": _coerce_model_name,
+    "vault_online_visual_enabled": coerce_bool,
     # Vault chat generation / retrieval knobs.
     "vault_top_k": lambda v: coerce_int_in_range(v, 1, 32),
     "vault_similarity_cutoff": lambda v: coerce_float_in_range(v, 0.0, 1.0),
@@ -436,6 +474,7 @@ _CONFIG_VALIDATORS = {
     # Track 5.6: indexer embed-batch size; 1 = legacy per-chunk inserts.
     "vault_embed_batch_size": lambda v: coerce_int_in_range(v, 1, 256),
     "vault_wikilink_expansion": coerce_bool,
+    "vault_paper_labels": coerce_bool,
     # Agent web_search tool (2026-07-22): the knob is a bool; the key stays
     # env-only (TAVILY_API_KEY) and is never accepted or returned here.
     "vault_web_search_enabled": coerce_bool,
@@ -507,28 +546,15 @@ _CONFIG_VALIDATORS = {
     # prompt" and is persisted as-is, matching coerce_string_max_len semantics.
     "chat_temperature": lambda v: coerce_float_in_range(v, 0.0, 2.0),
     "chat_system_prompt": lambda v: coerce_string_max_len(v, SYSTEM_PROMPT_LIMIT),
+    # Per-attachment extracted-text cap. The FLOOR is not cosmetic: the value
+    # decides how much of a document the model is shown, and a hand-edited 0
+    # would attach an empty file while the UI still said a file was attached.
+    "chat_attachment_max_chars": lambda v: coerce_int_in_range(v, 1_000, 400_000),
     # Prompt Hub capture toggle (read-only transparency panel). Bool-coerced;
     # a malformed value is dropped so the prior persisted value survives.
     "prompt_capture_enabled": coerce_bool,
-    # Note Refactor. Scope shape only; existence checked at request time.
-    # refactor_extract_model "" ⇒ fall back to vision_model.
-    "refactor_scope_subdir": _coerce_vault_rel_subdir,
-    "refactor_extract_model": _coerce_model_name,
-    "refactor_table_double_read": coerce_bool,
-    # Scope-wide "strip the OCR-callout preamble" default (additive to the
-    # per-image strip flag); read by both the plan and the apply writer.
-    "refactor_strip_preamble_default": coerce_bool,
-    # Opt-in per-note LLM prose review knobs (HF-repo-id-shaped model override +
-    # token cap, both Settings-window / /api/config-set, neither a body override).
-    "refactor_review_model": _coerce_model_name,
-    "refactor_review_max_tokens": lambda v: coerce_int_in_range(v, 64, 8192),
-    # Applyable LLM formatting-rewrite token cap (re-emits the whole note/section).
-    "refactor_rewrite_max_tokens": lambda v: coerce_int_in_range(v, 256, 16384),
-    # Phase 2 vault-write knobs. archive_dir is shape-only (abs or ""); the
-    # not-inside-vault check is re-applied at apply time. thumb_max_side bounds
-    # the in-vault thumbnail's longest side.
+    # Legacy recovery location; containment is checked by the journal on use.
     "refactor_archive_dir": _coerce_abs_dir_or_empty,
-    "refactor_thumb_max_side": lambda v: coerce_int_in_range(v, 96, 1024),
     # Biblio Tagging archive dir — shape-only (abs or ""); the not-inside-vault
     # check is re-applied at apply time by tagging/journal.py::archive_dir.
     "tagging_archive_dir": _coerce_abs_dir_or_empty,
@@ -543,12 +569,53 @@ _CONFIG_VALIDATORS = {
     "tagging_text_max_chars": lambda v: coerce_int_in_range(v, 500, 40000),
     "tagging_candidate_tags": lambda v: coerce_int_in_range(v, 0, 200),
     "tagging_fewshot_k": lambda v: coerce_int_in_range(v, 0, 10),
+    # Restore-journal retention. `policy` selects which records get DELETED, so
+    # an unknown value must be dropped rather than stored — the same reasoning
+    # as tagging_zotero_transport, where a bad enum would pick a network
+    # destination; here it would pick what to destroy.
+    # The note template is vault CONTENT the user authors; cap its length and
+    # otherwise keep it verbatim (empty = the built-in default).
+    "notesync_template": lambda v: coerce_string_max_len(v, 8000),
+    "notesync_containment": lambda v: coerce_float_in_range(v, 0.1, 1.0),
+    "notesync_zotero_authoritative": coerce_bool,
+    "tagging_journal_retention_enabled": coerce_bool,
+    "tagging_journal_retention_policy":
+        lambda v: coerce_enum(v, ("age_days", "keep_newest")),
+    "tagging_journal_retention_days": lambda v: coerce_int_in_range(v, 1, 3650),
+    "tagging_journal_retention_keep":
+        lambda v: coerce_int_in_range(v, 100, 100_000),
     # Zotero local-API base — validated as an http(s) URL (it carries a path,
     # ``/api``), not a bare length cap (2026-07-20 audit M3): this is a stored
     # dial target (SSRF surface). Empty is kept (built-in local-API default).
     "tagging_zotero_api_base": _coerce_http_url,
     "tagging_zotero_web_api_base": _coerce_https_url,
     "tagging_zotero_transport": lambda v: coerce_enum(v, ("auto", "local", "web")),
+    # Accession (keyless bibliographic resolution). Plain keys, deliberately
+    # NOT audit_* — POST /api/config strips those. The sources list filters
+    # to the known registry names and an empty result is a DROP (unlike
+    # fallback_on, "resolve against no sources" is never a meaningful
+    # choice). The contact e-mail is shape-checked loosely (it only ever
+    # rides a User-Agent header, never an auth flow) and empty is kept.
+    "accession_enabled": coerce_bool,
+    "accession_contact_email": _coerce_contact_email,
+    "accession_sources": _coerce_accession_sources,
+    "accession_max_candidates": lambda v: coerce_int_in_range(v, 1, 10),
+    "accession_timeout_s": lambda v: coerce_int_in_range(v, 5, 60),
+    "accession_batch_max":
+        lambda v: coerce_int_in_range(v, 1, ACCESSION_BATCH_MAX_CEILING),
+    # Vault Maintenance thresholds + the links-step index folder/note. Plain
+    # keys, deliberately NOT audit_* (POST /api/config strips those). The
+    # subsystem itself is private-only (STRIP STEP 4) — publicly these keys
+    # validate and persist but nothing reads them. The two path keys reuse the
+    # thesaurus shape check ("" ⇒ the private built-in default; no
+    # traversal/abs/NUL); thresholds are ceilings, 0 legitimate.
+    "maintenance_links_index_subdir": _coerce_vault_rel_file,
+    "maintenance_links_index_note": _coerce_vault_rel_file,
+    "maintenance_max_drift": lambda v: coerce_int_in_range(v, 0, 1_000_000),
+    "maintenance_max_no_pdf": lambda v: coerce_int_in_range(v, 0, 1_000_000),
+    "maintenance_max_dupes": lambda v: coerce_int_in_range(v, 0, 1_000_000),
+    "maintenance_max_hygiene": lambda v: coerce_int_in_range(v, 0, 1_000_000),
+    "maintenance_max_hygiene_unmapped": lambda v: coerce_int_in_range(v, 0, 1_000_000),
     # fallback_on handled separately (list-valued).
 }
 
@@ -591,6 +658,8 @@ def api_get_config():
     """
     return jsonify(load_config())
 
+_CONFIG_APPLY_LOCK = threading.Lock()
+
 @config_bp.route("/api/config", methods=["POST"])
 def api_save_config():
     """Persist a partial config update after layered validation.
@@ -605,12 +674,12 @@ def api_save_config():
     3. Provider-warning clearing when any provider/model field changes.
     4. The ``llm`` → per-provider-key routing for online providers (then ``llm``
        is dropped so an online model name can't overwrite the local selection).
-    5. OCR/vision manager singleton updates (so a model change applies live).
-    6. ``audit_*`` key stripping (those go through ``/api/audit/config``).
-    7. ``_validate_llm_config_keys`` — clamp/drop the numeric/enum/bool knobs.
+    5. ``audit_*`` key stripping (those go through ``/api/audit/config``).
+    6. ``_validate_llm_config_keys`` — clamp/drop the numeric/enum/bool knobs.
+    7. Persist, then apply accepted OCR/vision settings to the singletons.
 
     Responds ``{"ok": true, "dropped": [key, …]}``. ``dropped`` names the keys
-    step 7 refused (prior value kept) so the Settings window can flag the exact
+    step 6 refused (prior value kept) so the Settings window can flag the exact
     field instead of failing silently; it is additive and always present.
 
     Local-origin gated; 400 on non-JSON or an invalid vault path.
@@ -638,7 +707,7 @@ def api_save_config():
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         # A1 (2026-07-13): a vault SWITCH must drop the loaded index and every
-        # retrieval cache (BM25/wikilink/thesaurus sidecars, prewarm state) —
+        # in-memory retrieval cache (BM25/wikilink/thesaurus, prewarm state) —
         # otherwise the next chat answers from the previous vault's in-memory
         # index and a reindex runs incrementally against it (cross-vault mix).
         # The switch itself is DEFERRED until after save_config succeeds
@@ -677,16 +746,6 @@ def api_save_config():
             key = ONLINE_MODEL_KEYS[active]
             data.setdefault(key, data["llm"])
             data.pop("llm")
-    if any(key in data for key in ("ocr_provider", "ocr_model", "vision_provider", "vision_model")):
-        from services.vision import glm_ocr_manager, vision_manager
-        if data.get("ocr_provider"):
-            glm_ocr_manager.set_provider(str(data["ocr_provider"]))
-        if data.get("ocr_model"):
-            glm_ocr_manager.set_model(str(data["ocr_model"]))
-        if data.get("vision_provider"):
-            vision_manager.set_provider(str(data["vision_provider"]))
-        if data.get("vision_model"):
-            vision_manager.set_model(str(data["vision_model"]))
     # Library Audit settings have a dedicated, validated endpoint
     # (POST /api/audit/config — path-traversal and absolute-path checks).
     # Strip them here so the generic save path cannot be used to bypass
@@ -716,7 +775,19 @@ def api_save_config():
     # user WHICH field did not persist instead of leaving a rejected value
     # sitting in the input all session.
     dropped = _validate_llm_config_keys(data)
-    save_config(data)
+    with _CONFIG_APPLY_LOCK:
+        save_config(data)
+        # Runtime changes follow successful validation and durable persistence.
+        if any(key in data for key in ("ocr_provider", "ocr_model", "vision_provider", "vision_model")):
+            from services.vision import glm_ocr_manager, vision_manager
+            if data.get("ocr_provider"):
+                glm_ocr_manager.set_provider(str(data["ocr_provider"]))
+            if "ocr_model" in data:
+                glm_ocr_manager.set_model(str(data["ocr_model"]))
+            if data.get("vision_provider"):
+                vision_manager.set_provider(str(data["vision_provider"]))
+            if "vision_model" in data:
+                vision_manager.set_model(str(data["vision_model"]))
     # Vault switch AFTER the successful persist (see the deferral comment
     # above): compare normalised forms and only clear on a real change so a
     # no-op re-save stays cheap. cleanup() drops the in-memory index + caches
@@ -727,6 +798,8 @@ def api_save_config():
         obsidian_manager.restore_vault_path(_vault_switch_to)
         if obsidian_manager.get_vault_path() != _prev_vault:
             obsidian_manager.cleanup()
+            from audit.manager import audit_manager
+            audit_manager.reset_to_idle()
     # ADDITIVE field (2026-07-26 UX audit): status stays 200 and ``ok`` stays
     # True — a drop is a partial success, not a request failure, and existing
     # callers/tests that only read ``ok`` are unaffected. ``dropped`` is always
@@ -851,6 +924,90 @@ def _normalise_vault_image_exts(entries) -> list[str]:
             break
     return normalised
 
+
+_SQLITE_FILE_EXTS = (".sqlite", ".sqlite3", ".db")
+
+
+def _picker_selection(chosen, data, *, is_file=False):
+    """Project native selections into the existing config path conventions."""
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object"}), 400
+    kind = data.get("kind", "sqlite" if is_file else "absolute")
+    extensions = {"sqlite": _SQLITE_FILE_EXTS, "bib": (".bib",), "markdown": (".md",)}
+    if is_file and (not isinstance(kind, str) or kind not in extensions):
+        return jsonify({"error": "Unsupported file selection kind"}), 400
+    if is_file and not str(chosen).lower().endswith(extensions[kind]):
+        return jsonify({"error": "Selected file must use " + ", ".join(extensions[kind])}), 400
+    relative = None
+    if data.get("relative_to_vault"):
+        cfg = load_config()
+        vault = cfg.get("obsidian_vault_path")
+        if not vault or not Path(vault).is_dir():
+            return jsonify({"error": "Choose an existing Obsidian vault on Ask before selecting this path."}), 400
+        base = Path(vault).resolve()
+        if data.get("under_attachments"):
+            subdir = cfg.get("audit_attachments_subdir", "Z_attachments")
+            base = (base / subdir).resolve()
+            if not base.is_relative_to(Path(vault).resolve()):
+                return jsonify({"error": "Configured attachments folder is outside the vault."}), 400
+        try:
+            relative = Path(chosen).resolve().relative_to(base).as_posix()
+        except ValueError:
+            return jsonify({"error": "Select a path inside " + str(base)}), 400
+        if relative == ".":
+            return jsonify({"error": "Select a path below " + str(base)}), 400
+    return jsonify({"ok": True, "path": str(Path(chosen).resolve()), "relative_path": relative})
+
+
+@config_bp.route("/api/config/native-pick-folder", methods=["POST"])
+def api_config_native_pick_folder():
+    """Open a native folder picker for archive or Zotero storage directories."""
+    try:
+        import webview
+    except Exception:  # noqa: BLE001
+        return jsonify({"error": "Native picker requires the CHERQAiN desktop window. Enter the path manually when using a browser."}), 503
+    if not getattr(webview, "windows", None):
+        return jsonify({"error": "Native picker requires the CHERQAiN desktop window. Enter the path manually when using a browser."}), 503
+    try:
+        result = webview.windows[0].create_file_dialog(
+            webview.FOLDER_DIALOG,
+            allow_multiple=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": sanitise_error_msg(exc)}), 500
+    if not result:
+        return jsonify({"cancelled": True, "path": None})
+    chosen = result[0] if isinstance(result, (list, tuple)) else result
+    if not chosen or not os.path.isdir(chosen):
+        return jsonify({"error": "Selected path is not a directory"}), 400
+    return _picker_selection(chosen, request.get_json(silent=True) or {})
+
+
+@config_bp.route("/api/config/native-pick-file", methods=["POST"])
+def api_config_native_pick_file():
+    """Open a native file picker for SQLite database files."""
+    try:
+        import webview
+    except Exception:  # noqa: BLE001
+        return jsonify({"error": "Native picker requires the CHERQAiN desktop window. Enter the path manually when using a browser."}), 503
+    if not getattr(webview, "windows", None):
+        return jsonify({"error": "Native picker requires the CHERQAiN desktop window. Enter the path manually when using a browser."}), 503
+    try:
+        result = webview.windows[0].create_file_dialog(
+            webview.OPEN_DIALOG,
+            allow_multiple=False,
+            file_types=("Supported files (*.sqlite;*.sqlite3;*.db;*.bib;*.md)", "All files (*.*)"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": sanitise_error_msg(exc)}), 500
+    if not result:
+        return jsonify({"cancelled": True, "path": None})
+    chosen = result[0] if isinstance(result, (list, tuple)) else result
+    if not chosen or not os.path.isfile(chosen):
+        return jsonify({"error": "Selected path is not a file"}), 400
+    return _picker_selection(chosen, request.get_json(silent=True) or {}, is_file=True)
+
+
 @config_bp.route("/api/report_types")
 @config_bp.route("/api/report-types")
 def api_get_report_types():
@@ -893,8 +1050,31 @@ def api_pull():
 
     def generate():
         try:
-            import ollama
-            for chunk in ollama.pull(model, stream=True):
+            # PERF/correctness (2026-09-02): host-bind the pull.
+            #   Before:    `ollama.pull` on the MODULE-level client, which
+            #              resolves OLLAMA_HOST independently of the app's
+            #              resolved host — the same split-brain the status probe
+            #              was fixed for (core/providers/ollama.py::check_running):
+            #              a pull could land on one server while generation and
+            #              embedding used another, so the model appeared to
+            #              download and then "was not installed".
+            #   Change:    the app's own resolved host, through the shared
+            #              (host, timeout) client cache. `timeout=None` is
+            #              deliberate and NOT a bound worth adding: a pull
+            #              legitimately streams for many minutes, and the
+            #              SDK's own read timeout applies per chunk.
+            #   Safe because:
+            #              the streamed chunk shape is the SDK's, unchanged;
+            #              only which server is asked changes, to the one every
+            #              other call in the app already uses.
+            #   Preserves: the "probe and generation share one host" rule the
+            #              status adapters state.
+            #   Lock/thread contract: unchanged; no lock.
+            #   Pinned by: test_status_routes.py::TestPullUsesTheResolvedHost
+            from core.providers.base import resolve_ollama_host
+            from core.providers.ollama import _ollama_client
+            client = _ollama_client(resolve_ollama_host(), None)
+            for chunk in client.pull(model, stream=True):
                 # ollama SDK yields Pydantic model instances; json.dumps() cannot
                 # serialize them directly — use model_dump() (Pydantic v2) with a
                 # fallback to dict() for older SDK versions.
@@ -917,7 +1097,7 @@ def api_reset():
     Requires ``{"confirm": "reset"}`` (a literal token, not just truthiness) so
     a stray POST cannot wipe data. Sequence: stop the indexer and *wait* for its
     final persist (refuse with 503 on timeout rather than race a stray persist
-    that would re-create the storage dir with partial state), release its lock,
+    that would re-create the storage dir with partial state), acquire a teardown lock,
     reset the audit subsystem to idle, clear the ``uploads`` table,
     ``rmtree`` the Obsidian storage dir (logged via ``log_storage_deletion``),
     and ``rmtree`` the Obsidian cache dir (descriptions + OCR text — the bulk of
@@ -944,59 +1124,71 @@ def api_reset():
                 "press Cancel on the Obsidian tab and wait for it to settle."
             ),
         }), 503
-    obsidian_manager.cleanup()
-    obsidian_manager.force_release()
-    obsidian_manager.clear_status_messages()
-
-    # Audit subsystem: atomic reset — signal any in-flight scan to
-    # abort, bump the run-id so a worker finishing mid-reset cannot
-    # repopulate the inventory, drop cached results, return to ``idle``.
-    # /api/audit/inventory then returns 404, matching the post-reset
-    # "no scan yet" empty state on the Library Audit tab.  Local import
-    # so a packaging error in the audit module cannot break the core
-    # reset flow.
+    epoch = obsidian_manager.try_acquire_lock(ttl=600)
+    if not epoch:
+        return jsonify(error="A vault operation is active. Retry after it finishes.",
+                       reason="vault_context_busy"), 409
     try:
-        from audit.manager import audit_manager
-        audit_manager.reset_to_idle()
-    except Exception as exc:  # pragma: no cover - defensive
-        import logging as _logging
-        _logging.getLogger(__name__).warning(
-            "audit_manager reset skipped: %s", exc
-        )
+        obsidian_manager.cleanup()
+        obsidian_manager.clear_status_messages()
 
-    with DB_LOCK:
-        with get_db_connection() as conn:
-            conn.execute("DELETE FROM uploads")
-    deleted.append("uploads_db")
+        # Audit subsystem: atomic reset — signal any in-flight scan to
+        # abort, bump the run-id so a worker finishing mid-reset cannot
+        # repopulate the inventory, drop cached results, return to ``idle``.
+        # /api/audit/inventory then returns 404, matching the post-reset
+        # "no scan yet" empty state on the Library Audit tab.  Local import
+        # so a packaging error in the audit module cannot break the core
+        # reset flow.
+        try:
+            from audit.manager import audit_manager
+            audit_manager.reset_to_idle()
+        except Exception as exc:  # pragma: no cover - defensive
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "audit_manager reset skipped: %s", exc
+            )
 
-    if os.path.isdir(OBSIDIAN_INDEX_DIR):
-        log_storage_deletion("api_reset")
-        shutil.rmtree(OBSIDIAN_INDEX_DIR)
-        deleted.append("obsidian_storage")
+        with DB_LOCK:
+            with get_db_connection() as conn:
+                conn.execute("DELETE FROM uploads")
+        deleted.append("uploads_db")
 
-    # Also reclaim the description / OCR-text cache — the LARGEST on-disk
-    # footprint (cached vision descriptions + scanned-PDF OCR text, potentially
-    # many GB). It used to survive "reset", so a teardown freed little disk and
-    # left stale cached descriptions from the previous vault. Safe to delete: the
-    # cache is content-hash keyed, so it self-heals on the next index.
-    if os.path.isdir(OBSIDIAN_CACHE_DIR):
-        shutil.rmtree(OBSIDIAN_CACHE_DIR, ignore_errors=True)
-        deleted.append("obsidian_cache")
+        if os.path.isdir(OBSIDIAN_INDEX_DIR):
+            log_storage_deletion("api_reset")
+            shutil.rmtree(OBSIDIAN_INDEX_DIR)
+            deleted.append("obsidian_storage")
 
-    app_module = sys.modules.get("app")
-    feedback_file = getattr(app_module, "FEEDBACK_FILE", FEEDBACK_FILE)
-    config_file = getattr(app_module, "CONFIG_FILE", CONFIG_FILE)
+        # Also reclaim the description / OCR-text cache — the LARGEST on-disk
+        # footprint (cached vision descriptions + scanned-PDF OCR text, potentially
+        # many GB). It used to survive "reset", so a teardown freed little disk and
+        # left stale cached descriptions from the previous vault. Safe to delete: the
+        # cache is content-hash keyed, so it self-heals on the next index.
+        if os.path.isdir(OBSIDIAN_CACHE_DIR):
+            try:
+                shutil.rmtree(OBSIDIAN_CACHE_DIR)
+            except OSError as exc:
+                return jsonify(ok=False, deleted=deleted,
+                               error="Reset stopped while removing the extraction cache: "
+                               + sanitise_error_msg(exc)), 500
+            deleted.append("obsidian_cache")
 
-    if data.get("wipe_feedback") and os.path.exists(feedback_file):
-        os.remove(feedback_file)
-        deleted.append("feedback.jsonl")
+        app_module = sys.modules.get("app")
+        feedback_file = getattr(app_module, "FEEDBACK_FILE", FEEDBACK_FILE)
+        config_file = getattr(app_module, "CONFIG_FILE", CONFIG_FILE)
 
-    if data.get("wipe_config") and os.path.exists(config_file):
-        os.remove(config_file)
-        deleted.append("config.json")
+        if data.get("wipe_feedback") and os.path.exists(feedback_file):
+            os.remove(feedback_file)
+            deleted.append("feedback.jsonl")
 
-    init_db()
-    return jsonify({"ok": True, "deleted": deleted})
+        if data.get("wipe_config") and os.path.exists(config_file):
+            os.remove(config_file)
+            deleted.append("config.json")
+
+        init_db()
+        return jsonify({"ok": True, "deleted": deleted})
+    finally:
+        obsidian_manager.release_lock(epoch)
+
 
 _LOG_RATE_WINDOW_S = 60.0
 _LOG_RATE_MAX = 100

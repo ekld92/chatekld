@@ -32,6 +32,7 @@ import io
 import logging
 import threading
 import time
+from typing import Any
 
 from PIL import Image
 
@@ -453,6 +454,8 @@ class GLMOCRManager:
 
         Returns "" — never raises — so one bad page never aborts indexing.
         """
+        from core.extraction_status import OCRText
+
         with self._lock:
             current_provider = self.provider
             current_model = self.model
@@ -482,7 +485,7 @@ class GLMOCRManager:
                 return self._cache[img_hash]
 
         if failure_at is not None and (time.monotonic() - failure_at) < _failure_cooldown_s():
-            return ""
+            return OCRText("", failed=True)
 
         prompt = "Extract all text from this scanned document page. Return only the extracted text, preserving reading order and paragraph breaks. Ignore page numbers."
         # Bound the call so a runaway / stuck model cannot hang a long scanned
@@ -504,6 +507,7 @@ class GLMOCRManager:
         )
         result = ""
         got_response = False
+        response_meta: dict = {}
         _ocr_start = time.monotonic()
         for attempt in range(2):
             image_payload = base64_png if attempt == 0 else _downscale_base64_png(base64_png, 0.8)
@@ -513,12 +517,14 @@ class GLMOCRManager:
                 if current_provider == "lm_studio":
                     result = _chat_lm_studio_image(
                         current_model, prompt, image_payload,
-                        timeout=timeout, max_tokens=max_tokens,
+                        timeout=timeout, max_tokens=max_tokens, meta=response_meta,
+                        disable_reasoning=True,
                     )
                 else:
                     result = _chat_ollama_image(
                         current_model, prompt, image_payload,
-                        timeout=timeout, max_tokens=max_tokens,
+                        timeout=timeout, max_tokens=max_tokens, meta=response_meta,
+                        disable_reasoning=True,
                     )
                 got_response = True
                 break
@@ -537,7 +543,7 @@ class GLMOCRManager:
                     current_provider, current_model, prompt, "",
                     _ocr_start, success=False,
                 )
-                return ""
+                return OCRText("", failed=True)
 
         # B4 (2026-07-13): if NO attempt produced a response — e.g. attempt 0
         # overflowed and the smaller re-render came back empty, so attempt 1 was
@@ -556,8 +562,9 @@ class GLMOCRManager:
                 current_provider, current_model, prompt, "",
                 _ocr_start, success=False,
             )
-            return ""
+            return OCRText("", failed=True)
 
+        result = OCRText(result, truncated=bool(response_meta.get("truncated")))
         # Usage visibility (axis vi): OCR bypasses the core.llm adapter seam.
         _record_vision_usage(current_provider, current_model, prompt, result, _ocr_start)
         # An EMPTY result from a call that answered is still a success: the
@@ -571,11 +578,14 @@ class GLMOCRManager:
         # "" round-trips fine.
         with self._lock:
             self._call_failure_at = None
-        with self._cache_lock:
-            if len(self._cache) >= self._OCR_CACHE_MAX_SIZE:
-                oldest_key = next(iter(self._cache))
-                del self._cache[oldest_key]
-            self._cache[img_hash] = result
+        # A token-capped response is usable evidence for this call but must
+        # reach the model again on a later extraction attempt.
+        if not result.truncated:
+            with self._cache_lock:
+                if len(self._cache) >= self._OCR_CACHE_MAX_SIZE:
+                    oldest_key = next(iter(self._cache))
+                    del self._cache[oldest_key]
+                self._cache[img_hash] = result
         return result
 
 def _is_context_overflow_error(exc: Exception) -> bool:
@@ -674,6 +684,7 @@ def _chat_ollama_image(
     timeout: float | None = None,
     max_tokens: int | None = None,
     meta: dict | None = None,
+    disable_reasoning: bool = False,
 ) -> str:
     """Send one image+prompt to Ollama's vision chat and return the stripped text.
 
@@ -704,6 +715,7 @@ def _chat_ollama_image(
             "images": [base64_data],
         }],
         options=options,
+        **({"think": False} if disable_reasoning else {}),
     )
     if meta is not None:
         # Ollama reports the stop cause as done_reason ("length" == hit the cap).
@@ -721,6 +733,7 @@ def _chat_lm_studio_image(
     timeout: float | None = None,
     max_tokens: int | None = None,
     meta: dict | None = None,
+    disable_reasoning: bool = False,
 ) -> str:
     """Send one image+prompt to LM Studio's OpenAI-compatible vision endpoint.
 
@@ -745,6 +758,49 @@ def _chat_lm_studio_image(
     # forwards timeout=None. Passing timeout through unchanged preserves the
     # vision_timeout_s bound.
     client = get_lmstudio_client(f"{resolve_lm_studio_host()}/v1", timeout)
+    if disable_reasoning:
+        # OCR is transcription, not reasoning. The native endpoint provides an
+        # explicit switch; do not silently retry via a thinking-enabled route.
+        payload: dict[str, Any] = {
+            "model": model, "reasoning": "off", "store": False,
+            "temperature": 0.0,
+            "input": [
+                {"type": "text", "content": prompt},
+                {"type": "image", "data_url": f"data:image/png;base64,{base64_data}"},
+            ],
+        }
+        if max_tokens is not None:
+            payload["max_output_tokens"] = max_tokens
+        native_response = client.post(
+            f"{resolve_lm_studio_host()}/api/v1/chat", cast_to=dict[str, Any], body=payload,
+        )
+        stats = native_response.get("stats", {})
+        if not isinstance(stats, dict):
+            raise ValueError("LM Studio OCR returned invalid stats")
+        output = native_response.get("output")
+        generated = stats.get("total_output_tokens")
+        reasoning = stats.get("reasoning_output_tokens")
+        if (not isinstance(output, list) or isinstance(generated, bool)
+                or not isinstance(generated, int) or generated < 0
+                or isinstance(reasoning, bool) or not isinstance(reasoning, int)
+                or reasoning != 0):
+            raise ValueError("LM Studio OCR response lacks valid non-reasoning usage evidence")
+        messages = []
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                raise ValueError("LM Studio OCR returned unexpected output")
+            text = item.get("content")
+            if not isinstance(text, str):
+                raise ValueError("LM Studio OCR returned invalid text")
+            messages.append(text)
+        if not messages:
+            raise ValueError("LM Studio OCR returned no message")
+        if meta is not None:
+            # Native API has no finish_reason: reaching the bound is partial,
+            # even if the final token happened to coincide with a natural stop.
+            meta["truncated"] = max_tokens is not None and generated >= max_tokens
+            meta["reasoning_tokens"] = reasoning
+        return "\n".join(messages).strip()
     create_kwargs = {"temperature": 0.0}
     if max_tokens is not None:
         create_kwargs["max_tokens"] = max_tokens

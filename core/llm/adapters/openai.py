@@ -12,11 +12,12 @@ import hashlib
 import logging
 import os
 import threading
+from collections import OrderedDict
 import time
 from typing import Iterator, Optional
 
 from core.llm.base import LLMProvider, StreamingResponse, looks_like_quota
-from core.llm.retry import parse_retry_after_s, retry_with_backoff
+from core.llm.retry import check_request_dispatch, parse_retry_after_s, retry_with_backoff
 from core.llm.tool_schema import (
     build_openai_messages,
     jsonschema_to_openai_tool,
@@ -31,6 +32,7 @@ from core.llm.types import (
     LLMUsage,
 )
 from core.llm.usage import CANCELLED_ERROR_CATEGORY, estimate_tokens, usage_tracker
+from core.llm.parameter_cache import is_rejected, remember_rejected
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +53,23 @@ logger = logging.getLogger(__name__)
 # stale-auth client — a new key → new fingerprint → new client — while the key is
 # never stored in the cache. Keyspace is tiny (one host × the fixed online
 # timeout/retries × one key), so entries do not accumulate.
-_client_cache: dict = {}
+# PERF (2026-09-02): bounded LRU, mirroring core/providers/lms.py.
+# Before: a plain dict with no eviction. The keyspace is small in normal use,
+#   but a rotated API key mints a new entry whose predecessor is never
+#   dropped, stranding that client's idle httpx/openai connection pool for
+#   the process lifetime.
+# Change: an OrderedDict capped at _CLIENT_CACHE_MAX (8), LRU-evicted.
+# Safe because: an evicted client is not closed here — a concurrent call may
+#   still be streaming on it; dropping the reference lets GC close it once the
+#   in-flight call ends (the lms.py rule, quoted). A cache miss constructs
+#   exactly the client the miss path constructed before.
+# Preserves: key-rotation safety — the key composition is untouched, so a new
+#   key still yields a new client rather than reusing stale auth.
+# Lock/thread contract: unchanged; every read/write stays inside
+#   _client_cache_lock.
+# Pinned by: test_llm.py::TestOnlineClientCacheBound.
+_CLIENT_CACHE_MAX = 8
+_client_cache: OrderedDict = OrderedDict()
 _client_cache_lock = threading.Lock()
 
 
@@ -63,6 +81,10 @@ def _key_fingerprint(api_key: str) -> str:
 CURATED_MODELS: list[str] = [
     # Newest generation first (Track 5.5 — curated ids must have a
     # PRICING_TABLE entry; pinned by test_all_curated_models_are_priced).
+    "gpt-6.1-sol",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5",
     "gpt-5-mini",
     "gpt-5-nano",
@@ -74,10 +96,16 @@ CURATED_MODELS: list[str] = [
     "gpt-4.1-nano",
     "gpt-3.5-turbo",
     "o1",
-    "o1-mini",
-    "o1-preview",
     "o3-mini",
 ]
+
+# These exact reasoning model ids reject non-default temperature and top_p.
+# Do not prefix-match: gpt-5-chat and other chat variants accept sampling.
+_NO_SAMPLING_MODELS = frozenset({
+    "gpt-6.1-sol",
+    "gpt-5", "gpt-5-mini", "gpt-5-nano",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+})
 
 # Substrings marking a NON-chat OpenAI model id (embeddings, audio, image,
 # moderation, …) so the live merge doesn't pollute the chat picker. A denylist
@@ -171,7 +199,7 @@ class OpenAIProvider(LLMProvider):
                 category=ErrorCategory.AUTH,
                 message=(
                     "OPENAI_API_KEY is not set. Add it to the environment "
-                    "before launching ChatEKLD, or set it in your shell profile."
+                    "before launching CHERQAiN, or set it in your shell profile."
                 ),
                 provider=self.name,
             )
@@ -222,6 +250,10 @@ class OpenAIProvider(LLMProvider):
                     client_kwargs["organization"] = self._organization
                 client = openai.OpenAI(**client_kwargs)
                 _client_cache[key] = client
+                while len(_client_cache) > _CLIENT_CACHE_MAX:
+                    _client_cache.popitem(last=False)  # evict LRU; GC closes it
+            else:
+                _client_cache.move_to_end(key)
             return client
 
     def supports_embeddings(self) -> bool:
@@ -275,7 +307,7 @@ class OpenAIProvider(LLMProvider):
     def _build_messages(self, request: LLMRequest) -> list[dict]:
         """Translate the request (system prompt + messages + tool history) into
         OpenAI ``messages`` via the shared :func:`build_openai_messages`."""
-        return build_openai_messages(request)
+        return build_openai_messages(request, provider_name=self.name)
 
     @staticmethod
     def _is_reasoning_model(model: str) -> bool:
@@ -311,6 +343,10 @@ class OpenAIProvider(LLMProvider):
         and a compat server that *does* reject it is healed reactively by
         :meth:`_heal_unsupported_param`.
         """
+        if (model == "gpt-6.1-sol" and self.name == "openai"
+                and (self._base_url() or "https://api.openai.com/v1").rstrip("/")
+                == "https://api.openai.com/v1"):
+            return True
         if self._base_url():
             # Custom endpoint: legacy shape unless the model family is known
             # to reject it outright (someone proxying o-series/gpt-5 traffic).
@@ -331,7 +367,16 @@ class OpenAIProvider(LLMProvider):
         and ``tool_choice`` defaults to ``"auto"``.
         """
         params: dict = {"model": request.model}
-        if not self._is_reasoning_model(request.model):
+        if request.reasoning_effort and self.name in {"openai", "deepseek"}:
+            effort = request.reasoning_effort
+            if self.name == "openai" and request.model == "gpt-6.1-sol" and effort not in {"low", "medium", "high", "xhigh", "max"}:
+                raise LLMError(ErrorCategory.INVALID_REQUEST, "Unsupported GPT-6.1 Sol reasoning effort", provider=self.name, model=request.model)
+            if self.name == "deepseek" and effort == "minimal":
+                effort = "low"  # DeepSeek maps minimal to low.
+            elif self.name == "openai" and effort == "minimal" and request.model.startswith("gpt-5.6"):
+                effort = "none"  # GPT-5.6 offers none, not minimal.
+            params["reasoning_effort"] = effort
+        if not self._is_reasoning_model(request.model) and request.model not in _NO_SAMPLING_MODELS:
             if request.temperature is not None:
                 params["temperature"] = request.temperature
             if request.top_p is not None:
@@ -346,6 +391,13 @@ class OpenAIProvider(LLMProvider):
         if request.tools:
             params["tools"] = [jsonschema_to_openai_tool(t) for t in request.tools]
             params["tool_choice"] = request.tool_choice or "auto"
+        base = self._base_url() or "https://api.openai.com/v1"
+        for param in ("temperature", "top_p", "reasoning_effort", "stream_options",
+                      "tools", "tool_choice"):
+            if is_rejected(self.name, base, request.model, param):
+                params.pop(param, None)
+        if "tools" not in params:
+            params.pop("tool_choice", None)
         return params
 
     # Params the heal pass may rename/strip, at most once each per call.
@@ -366,6 +418,7 @@ class OpenAIProvider(LLMProvider):
     _HEALABLE_PARAMS = (
         "max_tokens", "max_completion_tokens", "temperature", "top_p",
         "stream_options", "tools", "tool_choice",
+        "reasoning_effort",
     )
 
     def _heal_unsupported_param(self, params: dict, exc: BaseException, healed: set) -> str:
@@ -403,6 +456,11 @@ class OpenAIProvider(LLMProvider):
                 offender = "tools"
         if offender is None:
             return ""
+        if (self.name == "openai" and params.get("model") == "gpt-6.1-sol"
+                and offender in {"tools", "tool_choice", "reasoning_effort"}):
+            return ""  # Never silently remove Sol tools or explicit reasoning.
+        if self.name == "openrouter" and offender in {"tools", "tool_choice"}:
+            return ""  # Required tool semantics must remain visible.
         healed.add(offender)
         if offender == "max_tokens":
             params["max_completion_tokens"] = params.pop("max_tokens")
@@ -415,22 +473,26 @@ class OpenAIProvider(LLMProvider):
             # tool_choice without tools is itself a 400 — drop both together.
             params.pop("tools", None)
             params.pop("tool_choice", None)
+            remember_rejected(self.name, self._base_url() or "https://api.openai.com/v1",
+                              str(params.get("model", "")), "tools")
             return "dropped tools (model lacks function calling; degrading to a plain answer)"
         params.pop(offender, None)
+        remember_rejected(self.name, self._base_url() or "https://api.openai.com/v1",
+                          str(params.get("model", "")), offender)
         return f"dropped unsupported {offender}"
 
     def _is_capability_routing_error(self, exc: BaseException) -> bool:
         """Whether *exc* is an aggregator "no endpoint supports this request
-        shape" rejection (see ``OpenRouterProvider``'s override). The official
-        endpoint signals capability problems as param-named 400s, which
-        :meth:`_heal_unsupported_param` already handles — so the base
-        implementation matches nothing.
+        shape" rejection (see ``OpenRouterProvider``'s override). Required
+        tool requests surface these rather than retrying without tools.
+        The official endpoint uses its own param-named 400 path.
         """
         return False
 
     def _create_with_heal(self, client, request: LLMRequest, *,
                           _params: Optional[dict] = None,
                           _healed: Optional[set] = None,
+                          _started: Optional[float] = None,
                           **create_kwargs):
         """``chat.completions.create`` with the parameter-400 heal loop.
 
@@ -446,8 +508,13 @@ class OpenAIProvider(LLMProvider):
         # retry_with_backoff attempts (see there); when absent (stream(),
         # which is never retried) the state is built fresh as before.
         params = _params if _params is not None else {**create_kwargs, **self._common_params(request)}
+        if is_rejected(self.name, self._base_url() or "https://api.openai.com/v1",
+                       request.model, "stream_options"):
+            params.pop("stream_options", None)
         healed: set = _healed if _healed is not None else set()
+        started = time.monotonic() if _started is None else _started
         while True:
+            check_request_dispatch(request, started)
             try:
                 return client.chat.completions.create(
                     messages=self._build_messages(request),
@@ -456,24 +523,16 @@ class OpenAIProvider(LLMProvider):
             except Exception as exc:
                 is_400 = getattr(exc, "status_code", None) == 400
                 fix = self._heal_unsupported_param(params, exc, healed) if is_400 else ""
-                if (not fix and "tools" in params and "tools" not in healed
+                if (not fix and "tools" in params
                         and self._is_capability_routing_error(exc)):
-                    # Aggregator capability mismatch (OpenRouter: 404/503 "No
-                    # endpoints found…" / "routing requirements") — not a 400
-                    # and the param name is never quoted, so the heal above
-                    # cannot see it, yet it is deterministic for this request
-                    # shape: classifying it SERVER_ERROR would burn every
-                    # retry on identical failures and then trigger provider
-                    # fallback. Same degradation as the tools 400 instead:
-                    # drop tools, answer plain. At most once ("tools" enters
-                    # `healed`), and only when tools are in the payload — a
-                    # genuinely transient 5xx without tools keeps its normal
-                    # retry semantics.
-                    healed.add("tools")
-                    params.pop("tools", None)
-                    params.pop("tool_choice", None)
-                    fix = ("dropped tools (no upstream endpoint supports tool "
-                           "use; degrading to a plain answer)")
+                    # A tool-dependent agent turn must not become a plain
+                    # answer when an aggregator has no tool-capable route.
+                    raise LLMError(
+                        category=ErrorCategory.INVALID_REQUEST,
+                        message="No upstream route supports this model with tools",
+                        provider=self.name, model=request.model,
+                        status_code=getattr(exc, "status_code", None),
+                    ) from exc
                 if not fix:
                     raise self._classify_error(exc, request.model)
                 logger.info(
@@ -491,6 +550,9 @@ class OpenAIProvider(LLMProvider):
         Provider exceptions are normalised to ``LLMError`` by
         :meth:`_classify_error` so the retry/fallback layers can pattern-match.
         """
+        from core.llm.adapters import openai_responses
+        if openai_responses.applies(self, request):
+            return openai_responses.generate(self, request)
         start = time.monotonic()
         client = self._client()
 
@@ -505,7 +567,7 @@ class OpenAIProvider(LLMProvider):
             # _create_with_heal classifies and raises LLMError itself (after
             # exhausting the parameter-400 heal pass).
             resp = self._create_with_heal(
-                client, request, _params=heal_params, _healed=healed_state)
+                client, request, _params=heal_params, _healed=healed_state, _started=start)
 
             choice = resp.choices[0] if resp.choices else None
             text = choice.message.content if choice and choice.message else ""
@@ -514,6 +576,7 @@ class OpenAIProvider(LLMProvider):
                 input_tokens=getattr(resp.usage, "prompt_tokens", 0) or 0,
                 output_tokens=getattr(resp.usage, "completion_tokens", 0) or 0,
                 cached_input_tokens=_cached_tokens_from_usage(resp.usage),
+                cache_creation_input_tokens=(getattr(getattr(resp.usage, "prompt_tokens_details", None), "cache_write_tokens", 0) or 0) if self.name == "openai" and request.model == "gpt-6.1-sol" else 0,
             )
             tool_calls = _extract_openai_tool_calls(choice)
             latency_ms = int((time.monotonic() - start) * 1000)
@@ -526,6 +589,14 @@ class OpenAIProvider(LLMProvider):
                 latency_ms=latency_ms,
                 tool_calls=tool_calls,
             )
+            if choice and choice.message and tool_calls and self.name in {"deepseek", "openrouter"}:
+                extra = getattr(choice.message, "model_extra", None) or {}
+                state = {"provider": self.name, "model": request.model}
+                field = "reasoning_details" if self.name == "openrouter" else "reasoning_content"
+                value = extra.get(field, getattr(choice.message, field, None))
+                if value is not None:
+                    state[field] = value
+                    response.provider_state = state
             usage_tracker.record(
                 provider=self.name,
                 model=request.model,
@@ -567,6 +638,9 @@ class OpenAIProvider(LLMProvider):
         structured SSE error rather than a silent re-stream of the whole answer.
         Usage is recorded in the ``finally`` so a failed stream still counts.
         """
+        from core.llm.adapters import openai_responses
+        if openai_responses.applies(self, request):
+            return openai_responses.stream(self, request)
         start = time.monotonic()
         client = self._client()
         final = LLMResponse(provider=self.name, model=request.model)
@@ -577,22 +651,26 @@ class OpenAIProvider(LLMProvider):
             # token), so the heal pass covers streaming too; it classifies
             # and raises LLMError itself when unhealable.
             stream = self._create_with_heal(
-                client, request,
+                client, request, _started=start,
                 stream=True,
                 stream_options={"include_usage": True},
             )
             usage_in: int = 0
             usage_out: int = 0
             cached_in: int = 0
+            cache_write_in: int = 0
             finish_reason: FinishReason = FinishReason.STOP
             stream_error: LLMError | None = None
             cancelled = False
+            terminal_seen = False
             try:
                 for chunk in stream:
                     if chunk.usage is not None:
                         usage_in = getattr(chunk.usage, "prompt_tokens", usage_in) or usage_in
                         usage_out = getattr(chunk.usage, "completion_tokens", usage_out) or usage_out
                         cached_in = _cached_tokens_from_usage(chunk.usage) or cached_in
+                        if self.name == "openai" and request.model == "gpt-6.1-sol":
+                            cache_write_in = getattr(getattr(chunk.usage, "prompt_tokens_details", None), "cache_write_tokens", 0) or cache_write_in
                     if not chunk.choices:
                         continue
                     choice = chunk.choices[0]
@@ -603,7 +681,12 @@ class OpenAIProvider(LLMProvider):
                             buf.append(content)
                             yield content
                     if choice.finish_reason:
+                        terminal_seen = True
                         finish_reason = _FINISH_REASONS.get(choice.finish_reason, FinishReason.STOP)
+                if not terminal_seen:
+                    raise LLMError(category=ErrorCategory.NETWORK,
+                                   message="Provider stream interrupted before its completion marker",
+                                   provider=self.name, model=request.model)
             except GeneratorExit:
                 # Consumer abandoned the stream (client disconnect). NOT an
                 # error — the provider generated and bills what it sent — so it
@@ -627,6 +710,7 @@ class OpenAIProvider(LLMProvider):
                     input_tokens=usage_in,
                     output_tokens=usage_out,
                     cached_input_tokens=cached_in,
+                    cache_creation_input_tokens=cache_write_in,
                 )
                 final.error = stream_error
                 usage_tracker.record(
@@ -683,7 +767,9 @@ class OpenAIProvider(LLMProvider):
             elif isinstance(exc, getattr(openai, "InternalServerError", ())):
                 category = ErrorCategory.SERVER_ERROR
         if category == ErrorCategory.UNKNOWN and isinstance(status, int):
-            if status == 401 or status == 403:
+            if status == 400:
+                category = ErrorCategory.INVALID_REQUEST
+            elif status == 401 or status == 403:
                 category = ErrorCategory.AUTH
             elif status == 404:
                 category = ErrorCategory.NOT_FOUND

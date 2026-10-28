@@ -2,7 +2,7 @@
 
 Covers:
 
-- the :func:`audit.config.load_settings` adapter (ChatEKLD keys ->
+- the :func:`audit.config.load_settings` adapter (CHERQAiN keys ->
   kb_harmonizer Settings, including the configurable subpaths)
 - the :class:`audit.manager.AuditManager` state machine
 - the critical regression that ``create_app()`` never starts a scan as
@@ -35,6 +35,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -65,7 +66,7 @@ def _patched_config_file(tmp_dir: Path) -> mock._patch:
 
 
 class TestSettingsAdapter(unittest.TestCase):
-    """``audit.config.load_settings`` reads ChatEKLD config and produces
+    """``audit.config.load_settings`` reads CHERQAiN config and produces
     a Settings dataclass whose paths reflect the configured subdirs."""
 
     def setUp(self):
@@ -213,7 +214,9 @@ class TestAuditManagerStateMachine(unittest.TestCase):
 
         cfg_path = str(self.tmp / "config.json")
         (self.tmp / "config.json").write_text(
-            json.dumps({"obsidian_vault_path": str(self.vault)}),
+            json.dumps({"obsidian_vault_path": str(self.vault),
+                        "audit_zotero_sqlite": str(self.tmp / "absent.sqlite"),
+                        "audit_zotero_storage": str(self.tmp / "absent-storage")}),
             encoding="utf-8",
         )
 
@@ -446,6 +449,78 @@ class TestAuditRoutesAuth(unittest.TestCase):
         self._no_xrw_returns_403("POST", "/api/audit/reveal")
         self._no_xrw_returns_403("POST", "/api/audit/apply-tag-drift")
 
+    def test_summary_scanned_at_is_the_served_snapshots_build_time(self):
+        """`scanned_at` is the served Inventory's OWN build stamp (2026-08-18).
+
+        The manager's get_scan_times() lies in exactly the two states where
+        staleness matters: start_scan zeroes _finished_at while deliberately
+        keeping the previous inventory live (mid-scan the old data read as
+        scanned_at 0), and _finalise stamps _finished_at even on an errored
+        scan with inv=None (a stale snapshot read as freshly scanned). Pinned
+        against REAL manager time state — the old test mocked get_scan_times,
+        which pinned the plumbing while the semantics were broken.
+        """
+        headers = {"X-Requested-With": "ChatEKLD"}
+        inv = mock.MagicMock()
+        inv.records = {}
+        inv.built_at = 2000.0
+        saved = (audit_manager._started_at, audit_manager._finished_at)
+        try:
+            with mock.patch.object(
+                audit_manager, "get_inventory",
+                return_value=(inv, mock.MagicMock()),
+            ), mock.patch(
+                "audit.serialize.inventory_summary",
+                return_value={"record_count": 0},
+            ):
+                # Mid-scan: a new scan zeroed _finished_at; the served (old)
+                # snapshot must keep its true stamp, never read as 0.
+                audit_manager._started_at = 3000.0
+                audit_manager._finished_at = 0.0
+                r = self.client.get("/api/audit/summary", headers=headers)
+                self.assertEqual(r.status_code, 200)
+                body = r.get_json()
+                self.assertEqual(body["scanned_at"], 2000.0)
+                self.assertIn("summary", body)
+                # Errored rescan: _finalise freshly stamped _finished_at while
+                # the old inventory stayed cached; stale must not read fresh.
+                audit_manager._finished_at = 4000.0
+                r = self.client.get("/api/audit/summary", headers=headers)
+                self.assertEqual(r.get_json()["scanned_at"], 2000.0)
+        finally:
+            (audit_manager._started_at, audit_manager._finished_at) = saved
+        # And 404 with no cached scan, unchanged.
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=(None, None)
+        ):
+            r = self.client.get("/api/audit/summary", headers=headers)
+        self.assertEqual(r.status_code, 404)
+
+    def test_summary_carries_the_paper_index_build_stamp(self):
+        """Additive `paper_index_built_at` (2026-09-23): the ISO stamp of the
+        vault's paper-label index, or null when none — so the audit tab can
+        say how stale the labels a chat sees are."""
+        headers = {"X-Requested-With": "ChatEKLD"}
+        inv = mock.MagicMock()
+        inv.records = {}
+        inv.built_at = 2000.0
+
+        class _Idx:
+            built_at = "2026-09-23T10:00:00+00:00"
+
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=(inv, mock.MagicMock()),
+        ), mock.patch("audit.serialize.inventory_summary", return_value={}), \
+                mock.patch("rag.paper_index.load", return_value=_Idx()):
+            body = self.client.get("/api/audit/summary", headers=headers).get_json()
+        self.assertEqual(body["paper_index_built_at"], "2026-09-23T10:00:00+00:00")
+        with mock.patch.object(
+            audit_manager, "get_inventory", return_value=(inv, mock.MagicMock()),
+        ), mock.patch("audit.serialize.inventory_summary", return_value={}), \
+                mock.patch("rag.paper_index.load", return_value=None):
+            body = self.client.get("/api/audit/summary", headers=headers).get_json()
+        self.assertIsNone(body["paper_index_built_at"])
+
     def test_apply_tag_drift_requires_confirm_and_scan(self):
         headers = {"X-Requested-With": "ChatEKLD"}
         # confirm missing → 400 before any scan lookup.
@@ -673,6 +748,72 @@ class TestAuditConfigValidation(unittest.TestCase):
             self.assertTrue(r.get_json()["cleared"])
             self.assertEqual(dd.load_dismissed(), set())
 
+    def test_pdf_decision_verbs_and_validation(self):
+        """Batch B: dismiss/clear/clear_all round-trip; undo verbs checked
+        first; garbage bodies 400 without touching the sidecar."""
+        import audit.engine.pdf_wanted as pw
+        with mock.patch.object(
+            pw, "decisions_path", lambda: self.tmp / "pdf_wanted.json"
+        ):
+            post = lambda body: self.client.post(  # noqa: E731
+                "/api/audit/pdf-decision", json=body, headers=self.headers)
+            self.assertEqual(post({}).status_code, 400)
+            self.assertEqual(post({"citation_keys": []}).status_code, 400)
+            self.assertEqual(post({"citation_keys": "a2020"}).status_code, 400)
+            # A verb is required: a well-formed key list alone does nothing.
+            self.assertEqual(post({"citation_keys": ["a2020"]}).status_code, 400)
+            self.assertEqual(pw.load_dismissed(), set())
+
+            r = post({"citation_keys": ["a2020", "b2021"], "dismiss": True})
+            self.assertEqual(r.status_code, 200, r.get_json())
+            self.assertEqual(r.get_json()["changed"], 2)
+            self.assertEqual(pw.load_dismissed(), {"a2020", "b2021"})
+
+            # An undo body carrying dismiss too must be read as CLEAR — the
+            # mapping/dup-decision precedent.
+            r = post({"citation_keys": ["a2020"], "clear": True, "dismiss": True})
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.get_json()["cleared"])
+            self.assertEqual(pw.load_dismissed(), {"b2021"})
+
+            # clear_all is the report's "show them again": it needs no keys,
+            # because the report ships the COUNT of what it hid, not the keys.
+            r = post({"clear_all": True})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()["changed"], 1)
+            self.assertEqual(pw.load_dismissed(), set())
+
+    def test_pdf_decision_rejects_control_characters_and_oversized_batches(self):
+        import audit.engine.pdf_wanted as pw
+        with mock.patch.object(
+            pw, "decisions_path", lambda: self.tmp / "pdf_wanted.json"
+        ):
+            post = lambda body: self.client.post(  # noqa: E731
+                "/api/audit/pdf-decision", json=body, headers=self.headers)
+            self.assertEqual(
+                post({"citation_keys": ["a\x00b"], "dismiss": True}).status_code, 400)
+            self.assertEqual(
+                post({"citation_keys": ["a\nb"], "dismiss": True}).status_code, 400)
+            from api.routes.audit import _PDF_DECISION_MAX_KEYS
+            too_many = [f"k{i}" for i in range(_PDF_DECISION_MAX_KEYS + 1)]
+            self.assertEqual(
+                post({"citation_keys": too_many, "dismiss": True}).status_code, 400)
+            self.assertEqual(pw.load_dismissed(), set())
+
+    def test_no_pdf_types_config_round_trip_and_validation(self):
+        """The bulk-dismiss offer is driven by a user-editable item-type list;
+        a typo must 400 rather than silently stop offering a whole class."""
+        r = self._post_config({"audit_no_pdf_types": "webpage, blogPost ,webpage"})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        cfg = self.client.get("/api/audit/config", headers=self.headers).get_json()
+        # Trimmed, deduped, order preserved.
+        self.assertEqual(cfg["audit_no_pdf_types"], "webpage,blogPost")
+        # Empty is valid and means "offer no bulk dismissals".
+        self.assertEqual(self._post_config({"audit_no_pdf_types": ""}).status_code, 200)
+        for bad in ("web page", "web-page", "9webpage", "x" * 3000):
+            self.assertEqual(
+                self._post_config({"audit_no_pdf_types": bad}).status_code, 400, bad)
+
     def test_build_pdf_text_provider(self):
         """Plan 2026-08-05/4 (F4.5): the route-built provider is None without
         a vault path, a working cache-first callable with one, and swallows
@@ -751,6 +892,49 @@ class TestAuditConfigValidation(unittest.TestCase):
         d = r.get_json()
         self.assertEqual(d["added"], ["sleep"])
         self.assertEqual(d["still_missing"], [])  # canonical-keyed too
+
+    def test_zotero_attachments_report_serves_the_delink_facts(self):
+        """The report exists to answer one question — "what does Zotero hold a
+        file for, and what would removing it cost?" — so the two facts a
+        removal turns on must reach the client: which side owns the bytes, and
+        how many annotations ride along."""
+        from types import SimpleNamespace
+        from audit.engine.inventory import ZoteroAttachmentRow
+
+        inv = mock.MagicMock()
+        inv.records = {}
+        inv.zotero_attachments = [
+            ZoteroAttachmentRow(
+                item_key="ATT1", parent_key="P1", parent_title="A paper",
+                parent_citation_key="smith2020", parent_item_type="journalArticle",
+                link_mode="imported_file", content_type="application/pdf",
+                filename="smith.pdf", annotation_count=4,
+                file_owned_by_zotero=True, library_type="user"),
+            ZoteroAttachmentRow(
+                item_key="ATT2", parent_key="P2", parent_citation_key="jones2019",
+                link_mode="linked_file", content_type="application/pdf",
+                filename="jones.pdf", file_owned_by_zotero=False),
+        ]
+        settings = SimpleNamespace(vault_root=self.vault)
+        with mock.patch.object(audit_manager, "get_inventory",
+                               return_value=(inv, settings)):
+            r = self.client.get("/api/audit/reports/zotero_attachments",
+                                headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        d = r.get_json()
+        self.assertEqual(d["count"], 2)
+        self.assertEqual(d["owned"], 1)
+        self.assertEqual(d["with_annotations"], 1)
+        rows = {row["item_key"]: row for row in d["rows"]}
+        self.assertEqual(rows["ATT1"]["annotation_count"], 4)
+        self.assertTrue(rows["ATT1"]["file_owned_by_zotero"])
+        self.assertFalse(rows["ATT2"]["file_owned_by_zotero"])
+
+    def test_zotero_attachments_report_is_read_only(self):
+        """The verb on its rows posts to /api/zotlink/*, outside the vendored
+        tree — the audit blueprint must expose no write for it."""
+        from api.routes import audit as audit_routes
+        self.assertIn("zotero_attachments", audit_routes._REPORT_NAMES)
 
     def test_finder_tag_drift_report_carries_fix_fields(self):
         """Drift-fix (2026-08-06): the report ships ``variants`` /
@@ -888,7 +1072,7 @@ class TestAuditRevealPathBounds(unittest.TestCase):
         self.platform_patch.start()
         self.addCleanup(self.platform_patch.stop)
 
-    @mock.patch("api.routes.audit.subprocess.Popen")
+    @mock.patch("api.routes.audit.run_open")
     def test_rejects_path_outside_allowed_roots(self, popen_mock):
         r = self.client.post(
             "/api/audit/reveal",
@@ -899,7 +1083,7 @@ class TestAuditRevealPathBounds(unittest.TestCase):
         self.assertIn("outside the configured roots", r.get_json().get("error", ""))
         popen_mock.assert_not_called()
 
-    @mock.patch("api.routes.audit.subprocess.Popen")
+    @mock.patch("api.routes.audit.run_open")
     def test_allows_path_inside_vault_root(self, popen_mock):
         r = self.client.post(
             "/api/audit/reveal",
@@ -909,7 +1093,39 @@ class TestAuditRevealPathBounds(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         popen_mock.assert_called_once()
 
-    @mock.patch("api.routes.audit.subprocess.Popen")
+    @mock.patch("api.routes.audit.run_open")
+    def test_zotero_reveal_routes_group_items_to_the_group_library(self, popen_mock):
+        """2026-08-18: the personal-library deep link selects NOTHING for a
+        group-library item, so an orphan row carrying a group_id must produce
+        the groups/<id> form. Without the field, the user form is kept."""
+        r = self.client.post(
+            "/api/audit/reveal",
+            json={"zotero_key": "ABCD1234", "zotero_group_id": 484650},
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200)
+        url = popen_mock.call_args.args[0][1]
+        self.assertEqual(url, "zotero://select/groups/484650/items/ABCD1234")
+        popen_mock.reset_mock()
+        r = self.client.post(
+            "/api/audit/reveal",
+            json={"zotero_key": "ABCD1234"},
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200)
+        url = popen_mock.call_args.args[0][1]
+        self.assertEqual(url, "zotero://select/library/items/ABCD1234")
+        # A malformed group id degrades to the user form, never a 500.
+        popen_mock.reset_mock()
+        r = self.client.post(
+            "/api/audit/reveal",
+            json={"zotero_key": "ABCD1234", "zotero_group_id": "nope"},
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("library/items", popen_mock.call_args.args[0][1])
+
+    @mock.patch("api.routes.audit.run_open")
     def test_open_refuses_non_document_types_failclosed(self, popen_mock):
         """Finding 7: the launch check is now a fail-closed ALLOWLIST — an
         extension-less binary or an unlisted script type inside the vault is
@@ -932,7 +1148,7 @@ class TestAuditRevealPathBounds(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         popen_mock.assert_called_once()
 
-    @mock.patch("api.routes.audit.subprocess.Popen")
+    @mock.patch("api.routes.audit.run_open")
     def test_open_allows_a_pdf(self, popen_mock):
         pdf = self.vault / "paper.pdf"
         pdf.write_bytes(b"%PDF-1.4\n")
@@ -1066,6 +1282,7 @@ class TestUnzoterodReportsUseCache(unittest.TestCase):
             ),
             pdfs_skipped=[Path("/vault/Z_attachments/biblio_articles/z_item_x.pdf")],
             unmapped_annotations=cache,
+            zotero_error=None,
         )
         settings = SimpleNamespace(annotations_read_threshold=5)
 
@@ -1161,6 +1378,13 @@ class TestAuditSearch(unittest.TestCase):
         p = mock.patch("core.constants.BASE_DIR", str(self.tmp))
         p.start()
         self.addCleanup(p.stop)
+        # The Library half of the search corpus builds off-thread (2026-09-17,
+        # C2); join it before this test's BASE_DIR patch is undone so it never
+        # runs against another test's stores.
+        from api.routes import audit as _audit_routes
+        join = getattr(_audit_routes, "join_library_search_build", lambda: None)
+        join()
+        self.addCleanup(join)
 
         self.client = _build_audit_only_app().test_client()
         self.headers = {"X-Requested-With": "ChatEKLD"}
@@ -1221,6 +1445,12 @@ class TestAuditSearch(unittest.TestCase):
             vault_root=self.vault,
             biblio_skip_prefix="z_item",
             annotations_read_threshold=3,
+            biblio_articles_dir=self.vault / 'attachments',
+            # Read by the Library half of the corpus (projection scope/join).
+            zotero_sqlite=self.tmp / "zotero.sqlite",
+            zotero_storage=self.tmp / "storage",
+            mapping_file=self.tmp / "mapping.json",
+            master_bib=self.vault / "_master.bib",
         )
         return inv, settings
 
@@ -1258,6 +1488,17 @@ class TestAuditSearch(unittest.TestCase):
         ):
             r = self.client.get("/api/audit/search?q=dupont", headers=self.headers)
         self.assertEqual(r.status_code, 404)
+
+    def test_warm_search_does_not_rebuild_the_library_documents_view(self):
+        """2026-09-17 review, C2: every keystroke rebuilt library.documents +
+        library.search_corpus on the request thread (~4 s warm, live)."""
+        from accession import library
+        self._inv_settings = self._fixture()
+        self.assertEqual(self._search("dupont").status_code, 200)
+        with mock.patch.object(library, "documents", wraps=library.documents) as spy:
+            for q in ("dupont", "etude", "sommeil"):
+                self.assertEqual(self._search(q).status_code, 200)
+        self.assertEqual(spy.call_count, 0)
 
     def test_matches_across_reports(self):
         self._inv_settings = self._fixture()
@@ -1420,12 +1661,12 @@ class TestClearCuration(unittest.TestCase):
     def test_clears_a_match_and_prunes_its_hash(self):
         from audit.engine import bridge
         bridge.add_match(self.mapping, self.pdf, "smith2020", self.vault)
-        matches, _no_match, hashes = self._state()
+        matches, _no_match, hashes, _sources = self._state()
         self.assertIn("smith2020", matches)
         self.assertTrue(hashes)   # anchored on write
 
         self.assertTrue(bridge.clear_curation(self.mapping, self.pdf, self.vault))
-        matches, no_match, hashes = self._state()
+        matches, no_match, hashes, _sources = self._state()
         # The key's last path went, so the key goes with it.
         self.assertNotIn("smith2020", matches)
         self.assertNotIn("att/smith_2020.pdf", no_match)
@@ -1469,8 +1710,12 @@ class TestAuditPdfAndClearRoutes(unittest.TestCase):
         (self.vault / "att").mkdir(parents=True)
         self.pdf = self.vault / "att" / "paper.pdf"
         self.pdf.write_bytes(b"%PDF-1.4\nfake\n")
+        (self.vault / "_master.bib").write_text(
+            "@article{smith2020, title={Current entry}}\n", encoding="utf-8")
         (self.tmp / "config.json").write_text(
-            json.dumps({"obsidian_vault_path": str(self.vault)}), encoding="utf-8",
+            json.dumps({"obsidian_vault_path": str(self.vault),
+                        "audit_attachments_subdir": "att",
+                        "audit_biblio_articles_subdir": "."}), encoding="utf-8",
         )
         cfg_path = str(self.tmp / "config.json")
         for target in ("core.constants.CONFIG_FILE", "core.config.CONFIG_FILE"):
@@ -1482,6 +1727,11 @@ class TestAuditPdfAndClearRoutes(unittest.TestCase):
         self.addCleanup(p.stop)
         self.client = _build_audit_only_app().test_client()
         self.headers = {"X-Requested-With": "ChatEKLD"}
+
+    def _mapping_bytes(self):
+        from audit.config import load_settings
+        path = load_settings().mapping_file
+        return path.read_bytes() if path.exists() else None
 
     def test_requires_xrw_header(self):
         self.assertEqual(self.client.get("/api/audit/pdf?rel=att/paper.pdf").status_code, 403)
@@ -1524,7 +1774,8 @@ class TestAuditPdfAndClearRoutes(unittest.TestCase):
         settings = load_settings()
         r = self.client.post(
             "/api/audit/mapping",
-            json={"pdf": "att/paper.pdf", "citation_key": "smith2020"},
+            json={"pdf": "att/paper.pdf", "citation_key": "smith2020",
+                  "confirm": True},
             headers=self.headers,
         )
         self.assertEqual(r.status_code, 200, r.get_json())
@@ -1532,7 +1783,7 @@ class TestAuditPdfAndClearRoutes(unittest.TestCase):
 
         r = self.client.post(
             "/api/audit/mapping",
-            json={"pdf": "att/paper.pdf", "clear": True},
+            json={"pdf": "att/paper.pdf", "clear": True, "confirm": True},
             headers=self.headers,
         )
         self.assertEqual(r.status_code, 200, r.get_json())
@@ -1541,19 +1792,941 @@ class TestAuditPdfAndClearRoutes(unittest.TestCase):
         self.assertTrue(d["changed"])
         self.assertNotIn("smith2020", bridge._load_mapping_full(settings.mapping_file)[0])
 
-    def test_clear_wins_over_a_leftover_citation_key(self):
-        """An undo body carrying the key it reverses must not re-add it."""
+    def test_conflicting_clear_and_key_is_rejected_without_mutation(self):
+        """Separate action schemas prevent a stale UI field changing intent."""
+        from audit.engine import bridge
+        from audit.config import load_settings
+        settings = load_settings()
+        before = settings.mapping_file.read_bytes() \
+            if settings.mapping_file.exists() else None
+        r = self.client.post(
+            "/api/audit/mapping",
+            json={"pdf": "att/paper.pdf", "citation_key": "smith2020",
+                  "clear": True, "confirm": True},
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(bridge._load_mapping_full(settings.mapping_file)[0], {})
+        after = settings.mapping_file.read_bytes() \
+            if settings.mapping_file.exists() else None
+        self.assertEqual(after, before)
+
+    def test_mapping_source_annotation_is_allowlisted_and_persisted(self):
+        """`source: "accession"` marks an accession-made link (2026-08-19);
+        any other label is refused — an arbitrary client string must never
+        become a scan-visible provenance label."""
         from audit.engine import bridge
         from audit.config import load_settings
         settings = load_settings()
         r = self.client.post(
             "/api/audit/mapping",
-            json={"pdf": "att/paper.pdf", "citation_key": "smith2020", "clear": True},
+            json={"pdf": "att/paper.pdf", "citation_key": "smith2020",
+                  "source": "accession", "confirm": True},
             headers=self.headers,
         )
-        self.assertEqual(r.get_json()["action"], "clear")
-        self.assertEqual(bridge._load_mapping_full(settings.mapping_file)[0], {})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        sources = bridge._load_mapping_full(settings.mapping_file)[3]
+        self.assertEqual(sources, {"att/paper.pdf": "accession"})
+
+        r = self.client.post(
+            "/api/audit/mapping",
+            json={"pdf": "att/paper.pdf", "citation_key": "smith2020",
+                  "source": "evil", "confirm": True},
+            headers=self.headers,
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_mapping_requires_confirmation_without_touching_the_file(self):
+        before = self._mapping_bytes()
+        r = self.client.post(
+            "/api/audit/mapping", headers=self.headers,
+            json={"pdf": "att/paper.pdf", "citation_key": "smith2020"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self._mapping_bytes(), before)
+
+    def test_invalid_forward_pdf_shapes_leave_mapping_byte_identical(self):
+        directory = self.vault / "att" / "folder.pdf"
+        directory.mkdir()
+        (self.vault / "att" / "notes.md").write_text("x", encoding="utf-8")
+        (self.vault / "outside.pdf").write_bytes(b"%PDF-1.4\noutside\n")
+        cases = [
+            ("att/missing.pdf", 404),
+            ("att/folder.pdf", 400),
+            ("att/notes.md", 400),
+            ("outside.pdf", 400),
+        ]
+        for rel, status in cases:
+            before = self._mapping_bytes()
+            r = self.client.post(
+                "/api/audit/mapping", headers=self.headers,
+                json={"pdf": rel, "no_match": True, "confirm": True})
+            self.assertEqual(r.status_code, status, (rel, r.get_json()))
+            self.assertEqual(self._mapping_bytes(), before, rel)
+
+    def test_symlink_escaping_biblio_scope_cannot_be_curated(self):
+        outside = self.vault / "outside.pdf"
+        outside.write_bytes(b"%PDF-1.4\noutside\n")
+        link = self.vault / "att" / "linked.pdf"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("symlinks unavailable")
+        before = self._mapping_bytes()
+        r = self.client.post(
+            "/api/audit/mapping", headers=self.headers,
+            json={"pdf": "att/linked.pdf", "no_match": True,
+                  "confirm": True})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self._mapping_bytes(), before)
+
+    def test_stale_or_absent_bib_key_cannot_be_curated(self):
+        before = self._mapping_bytes()
+        r = self.client.post(
+            "/api/audit/mapping", headers=self.headers,
+            json={"pdf": "att/paper.pdf", "citation_key": "stale2020",
+                  "confirm": True})
+        self.assertEqual(r.status_code, 409)
+        error = r.get_json()["error"]
+        self.assertIn("stale2020", error)
+        self.assertIn("paper.pdf", error)
+        self.assertNotIn(str(self.vault), error)
+        self.assertEqual(self._mapping_bytes(), before)
+
+    def test_unhashable_pdf_cannot_create_a_durable_decision(self):
+        before = self._mapping_bytes()
+        with mock.patch("audit.engine.bridge._hash_entry", return_value=None):
+            r = self.client.post(
+                "/api/audit/mapping", headers=self.headers,
+                json={"pdf": "att/paper.pdf", "no_match": True,
+                      "confirm": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(self._mapping_bytes(), before)
+
+    def test_clear_remains_available_after_the_pdf_moves(self):
+        from audit.config import load_settings
+        from audit.engine import bridge
+        r = self.client.post(
+            "/api/audit/mapping", headers=self.headers,
+            json={"pdf": "att/paper.pdf", "citation_key": "smith2020",
+                  "confirm": True})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.pdf.rename(self.vault / "att" / "moved.pdf")
+        cleared = self.client.post(
+            "/api/audit/mapping", headers=self.headers,
+            json={"pdf": "att/paper.pdf", "clear": True,
+                  "confirm": True})
+        self.assertEqual(cleared.status_code, 200, cleared.get_json())
+        self.assertEqual(
+            bridge._load_mapping_full(load_settings().mapping_file)[0], {})
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBibKeyMemo(unittest.TestCase):
+    """PERF (2026-09-02): a full bib parse per triage click.
+
+    ``POST /api/audit/mapping`` re-parsed the WHOLE bibliography on every click
+    just to test one citation key for membership — 3900 ms on the maintainer's
+    6141-entry / 7.2 MB ``_master.bib``, on a Waitress worker.
+
+    The parse count is asserted through the ROUTE, at ``parse_bib``, which both
+    the pre- and post-change code reach: a counter on the new helper would make
+    the red mean only "that helper is new".
+    """
+
+    def setUp(self):
+        from audit.core import bib
+        self.tmp = Path(tempfile.mkdtemp(prefix="bibmemo-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.bib = self.tmp / "_master.bib"
+        self._write(("a2020", "b2021"))
+        memo = getattr(bib, "_KEYS_MEMO", None)
+        if memo is not None:
+            memo.clear()
+            self.addCleanup(memo.clear)
+
+    def _write(self, keys):
+        self.bib.write_text(
+            "\n".join(f"@article{{{k},\n  title = {{T {k}}},\n  year = {{2020}}\n}}"
+                       for k in keys), encoding="utf-8")
+
+    def test_repeat_validations_parse_the_bib_once(self):
+        from audit.core import bib
+        parses = []
+        real = bib.parse_bib
+
+        def _counted(path):
+            parses.append(path)
+            return real(path)
+
+        with mock.patch.object(bib, "parse_bib", _counted):
+            keys = None
+            for _ in range(5):
+                keys = self._keys()
+        self.assertEqual(set(keys), {"a2020", "b2021"})
+        self.assertEqual(len(parses), 1, f"{len(parses)} whole-bib parses")
+
+    def _keys(self):
+        """Whichever accessor the route uses, so this runs on both versions."""
+        from audit.core import bib
+        fn = getattr(bib, "parse_bib_keys", None)
+        if fn is not None:
+            return fn(self.bib)
+        return {e.citation_key for e in bib.parse_bib(self.bib)}
+
+    def test_an_edited_bib_is_reparsed_without_a_rescan(self):
+        """The live-bib rejection guarantee: mtime is the key."""
+        self.assertIn("b2021", self._keys())
+        time.sleep(0.01)
+        self._write(("a2020",))          # the user removed an entry
+        self.assertNotIn("b2021", self._keys())
+
+    def test_the_result_is_immutable(self):
+        """A shared parsed ENTRY list could be mutated by a caller; a frozenset
+        of keys cannot."""
+        from audit.core.bib import parse_bib_keys
+        self.assertIsInstance(parse_bib_keys(self.bib), frozenset)
+
+    def test_the_route_validates_through_the_memoised_accessor(self):
+        """Source ratchet: the triage route must not re-parse the whole bib."""
+        import inspect
+
+        import api.routes.audit as auditmod
+        src = inspect.getsource(auditmod.api_audit_mapping)
+        self.assertIn("parse_bib_keys(", src)
+        self.assertNotIn("for entry in parse_bib(", src)
+
+
+class TestInventoryRowsMemo(unittest.TestCase):
+    """PERF (2026-09-02): the 6 000-row inventory serialises once per scan.
+
+    Counted at ``serialize.inventory_records`` — the level both the pre- and
+    post-change code reach.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="audit-invmemo-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        self.client = _build_audit_only_app().test_client()
+        self.headers = {"X-Requested-With": "ChatEKLD"}
+        import api.routes.audit as audit_routes
+        clear = getattr(audit_routes, "_clear_inventory_rows_cache", None)
+        if clear is not None:
+            clear()
+            self.addCleanup(clear)
+
+    def _fixture(self):
+        from types import SimpleNamespace
+        from audit.core.bib import BibEntry
+        from audit.engine.bridge import BridgeResult
+        from audit.engine.inventory import Inventory, Record
+
+        rec = Record(citation_key="dupont2019")
+        rec.bib_entry = BibEntry(citation_key="dupont2019", entry_type="article",
+                                 title="T", year="2019", authors=["Dupont, M"])
+        inv = Inventory(records={"dupont2019": rec}, bridge=BridgeResult(),
+                        pdfs_skipped=[], zotero_matched_by_title=0)
+        settings = SimpleNamespace(vault_root=self.vault,
+                                   biblio_skip_prefix="z_item",
+                                   annotations_read_threshold=3)
+        return inv, settings
+
+    def _get_twice(self, pair):
+        from audit import serialize
+        calls = []
+        real = serialize.inventory_records
+
+        def _counted(inv, settings):
+            calls.append(inv)
+            return real(inv, settings)
+
+        # This serializer memo fixture intentionally lacks reconciliation settings.
+        # Isolate that independent projection even if another test populated its store.
+        with mock.patch("api.routes.audit._pdf_projection_summary", return_value={}), \
+                mock.patch.object(serialize, "inventory_records", _counted), \
+                mock.patch.object(audit_manager, "get_inventory",
+                                  return_value=pair):
+            first = self.client.get("/api/audit/inventory", headers=self.headers)
+            second = self.client.get("/api/audit/inventory", headers=self.headers)
+        return calls, first, second
+
+    def test_two_identical_gets_serialise_once(self):
+        calls, first, second = self._get_twice(self._fixture())
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json()["records"], second.get_json()["records"])
+        self.assertEqual(len(calls), 1, f"{len(calls)} serialisations")
+
+    def test_a_new_scan_reserialises(self):
+        """A replaced Inventory must not be served from the old rows."""
+        self._get_twice(self._fixture())
+        calls, first, _ = self._get_twice(self._fixture())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first.status_code, 200)
+
+    def test_the_result_listener_releases_the_rows(self):
+        """The memo must not outlive the Inventory it was built from."""
+        import api.routes.audit as audit_routes
+        pair = self._fixture()
+        self._get_twice(pair)
+        cache = getattr(audit_routes, "_INVENTORY_ROWS_CACHE", None)
+        if cache is None:
+            self.skipTest("no rows memo on this build")
+        audit_manager._fire_result_listeners()
+        self.assertIsNone(audit_routes._INVENTORY_ROWS_CACHE)
+
+
+class TestDriftSynonymMemo(unittest.TestCase):
+    """PERF (2026-09-02): _tags.md is read and parsed once per (size, mtime_ns).
+
+    Counted at ``rag.thesaurus.parse_tags`` — reached by both versions.
+    """
+
+    def setUp(self):
+        from types import SimpleNamespace
+        self.tmp = Path(tempfile.mkdtemp(prefix="audit-synmemo-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        self.tags = self.vault / "_tags.md"
+        self._write("sommeil", "sleep, insomnie")
+        self.settings = SimpleNamespace(vault_root=self.vault)
+        import api.routes.audit as audit_routes
+        memo = getattr(audit_routes, "_SYNONYM_MEMO", None)
+        if memo is not None:
+            memo.clear()
+            self.addCleanup(memo.clear)
+
+    def _write(self, tag, phrases):
+        self.tags.write_text(
+            "| Description | Tag |\n| --- | --- |\n"
+            f"| {phrases} | #{tag} |\n", encoding="utf-8")
+
+    def _parses(self, times):
+        from rag import thesaurus
+        import api.routes.audit as audit_routes
+        calls = []
+        real = thesaurus.parse_tags
+
+        def _counted(text, **kw):
+            calls.append(text)
+            return real(text, **kw)
+
+        with mock.patch.object(thesaurus, "parse_tags", _counted), \
+                mock.patch("core.config.load_config",
+                           return_value={"vault_thesaurus_tags_path": "_tags.md"}):
+            out = [audit_routes._drift_synonyms(self.settings)
+                   for _ in range(times)]
+        return calls, out
+
+    def test_repeat_calls_parse_the_tag_file_once(self):
+        calls, out = self._parses(4)
+        self.assertEqual(len(calls), 1, f"{len(calls)} tag-file parses")
+        self.assertTrue(all(o == out[0] for o in out))
+        self.assertEqual(out[0].get("sleep"), "sommeil")
+
+    def test_an_edited_tag_file_is_reparsed_without_a_rescan(self):
+        first, _ = self._parses(1)
+        self.assertEqual(len(first), 1)
+        time.sleep(0.01)
+        self._write("sommeil", "sleep, insomnie, dormir")
+        calls, out = self._parses(1)
+        self.assertEqual(len(calls), 1, "an edited _tags.md must be re-read")
+        self.assertEqual(out[0].get("dormir"), "sommeil")
+
+    def test_the_caller_cannot_reach_the_cached_mapping(self):
+        _calls, out = self._parses(2)
+        out[0]["poisoned"] = "x"
+        again = self._parses(1)[1][0]
+        self.assertNotIn("poisoned", again)
+
+
+class TestSearchCorpusCancel(unittest.TestCase):
+    """PERF (2026-09-02): an in-flight corpus build can be told to stop.
+
+    Before, a scan finishing mid-build left the OLD Inventory pinned by the
+    build's own arguments for the rest of a run whose result the supersession
+    check then discarded — two multi-hundred-MB inventories at once.
+    """
+
+    def test_build_corpus_stops_between_report_sections(self):
+        from types import SimpleNamespace
+
+        from audit import search as audit_search
+        from audit.engine.bridge import BridgeResult
+        from audit.engine.inventory import Inventory
+
+        inv = Inventory(records={}, bridge=BridgeResult(), pdfs_skipped=[],
+                        zotero_matched_by_title=0)
+        settings = SimpleNamespace(vault_root=Path("/vault"),
+                                   biblio_skip_prefix="z_item",
+                                   annotations_read_threshold=3)
+        cancelled = getattr(audit_search, "CorpusCancelled", RuntimeError)
+        # False on the first poll, True after: a build that only checked once,
+        # at entry, would run to completion — so this pins the poll BETWEEN
+        # sections, not merely the existence of the parameter.
+        state = {"n": 0}
+
+        def _cancel():
+            state["n"] += 1
+            return state["n"] > 1
+
+        with self.assertRaises(cancelled):
+            audit_search.build_corpus(inv, settings, should_cancel=_cancel)
+        self.assertGreater(state["n"], 1, "the cancel was polled only once")
+
+    def test_a_complete_build_is_unaffected(self):
+        """The poll must not change what a normal build returns."""
+        from types import SimpleNamespace
+
+        from audit import search as audit_search
+        from audit.engine.bridge import BridgeResult
+        from audit.engine.inventory import Inventory
+
+        inv = Inventory(records={}, bridge=BridgeResult(), pdfs_skipped=[],
+                        zotero_matched_by_title=0)
+        settings = SimpleNamespace(vault_root=Path("/vault"),
+                                   biblio_skip_prefix="z_item",
+                                   annotations_read_threshold=3)
+        plain = audit_search.build_corpus(inv, settings)
+        polled = audit_search.build_corpus(inv, settings,
+                                           should_cancel=lambda: False)
+        self.assertEqual(len(plain), len(polled))
+
+    def test_clearing_the_cache_arms_the_cancel(self):
+        import api.routes.audit as audit_routes
+        event = getattr(audit_routes, "_SEARCH_CANCEL", None)
+        if event is None:
+            self.fail("no corpus cancel event")
+        event.clear()
+        audit_routes._clear_search_cache()
+        self.assertTrue(event.is_set())
+
+
+class TestHarmonizationReportRoutes(unittest.TestCase):
+    """The three 2026-09-06 read-only reports over a mocked cached scan:
+    ``multi_pdf`` / ``not_in_zotero`` / ``dead_curation``. Each is served by
+    name, 404s before a scan like every report, and reaches the client with
+    its disclosure counts intact."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="audit-test-harm-"))
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        (self.tmp / "config.json").write_text(
+            json.dumps({"obsidian_vault_path": str(self.vault)}), encoding="utf-8")
+        cfg_path = str(self.tmp / "config.json")
+        for p in (mock.patch("core.constants.CONFIG_FILE", cfg_path),
+                  mock.patch("core.config.CONFIG_FILE", cfg_path),
+                  mock.patch("core.constants.BASE_DIR", str(self.tmp))):
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.client = _build_audit_only_app().test_client()
+        self.headers = {"X-Requested-With": "ChatEKLD"}
+
+    def _inv(self, records, bridge):
+        from audit.engine.inventory import Inventory
+        return Inventory(records=records, bridge=bridge, pdfs_skipped=[],
+                         zotero_matched_by_title=0)
+
+    def test_all_three_are_declared_and_404_without_a_scan(self):
+        from api.routes import audit as audit_routes
+        for name in ("multi_pdf", "not_in_zotero", "dead_curation"):
+            self.assertIn(name, audit_routes._REPORT_NAMES)
+            with mock.patch.object(audit_manager, "get_inventory",
+                                   return_value=(None, None)):
+                r = self.client.get(f"/api/audit/reports/{name}", headers=self.headers)
+            self.assertEqual(r.status_code, 404, name)
+
+    def test_multi_pdf_serves_per_file_provenance_and_the_dup_decision(self):
+        from types import SimpleNamespace
+        from audit.config import Settings
+        from audit.engine.bridge import BridgeResult
+        a1, a2 = self.vault / "a_1.pdf", self.vault / "a_2.pdf"
+        for p in (a1, a2):
+            p.write_bytes(b"%PDF")
+        rec = SimpleNamespace(
+            citation_key="a2020", pdf_paths=[a1, a2], obsidian_note=None,
+            bib_entry=SimpleNamespace(title="T", year="2020", authors=["A"]),
+            zotero_item=None)
+        inv = self._inv({"a2020": rec}, BridgeResult(
+            source_per_pdf={a1: "doi", a2: "authoryear"}))
+        settings = Settings(vault_root=self.vault)
+        memo = {str(a1): {"size": 4, "mtime_ns": a1.stat().st_mtime_ns, "sha256": "aa"},
+                str(a2): {"size": 4, "mtime_ns": a2.stat().st_mtime_ns, "sha256": "bb"}}
+        with mock.patch.object(audit_manager, "get_inventory",
+                               return_value=(inv, settings)), \
+             mock.patch("audit.core.hash_cache.load_cache", return_value=memo), \
+             mock.patch("audit.engine.dup_decisions.load_dismissed",
+                        return_value={"multi_pdf:aa+bb"}):
+            r = self.client.get("/api/audit/reports/multi_pdf", headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        d = r.get_json()
+        self.assertEqual(d["count"], 1)
+        self.assertEqual(d["mixed_count"], 1)
+        self.assertEqual(d["dismissed_count"], 1)
+        row = d["rows"][0]
+        self.assertTrue(row["mixed"] and row["dismissed"])
+        self.assertEqual({f["name"]: f["source"] for f in row["files"]},
+                         {"a_1.pdf": "doi", "a_2.pdf": "authoryear"})
+
+    def test_pdf_views_consume_the_same_reconciled_workspace(self):
+        """Both entry points use current relationship state, never cached absence."""
+        from audit.config import Settings
+        from audit.engine.bridge import BridgeResult
+        settings = Settings(vault_root=self.vault)
+        payload = dict(rows=[dict(state='Awaiting bibliography',can_create=False)],
+                       count=1,counts={'Awaiting bibliography':1},review_scope='fixture')
+        with mock.patch.object(audit_manager, 'get_inventory', return_value=(self._inv({}, BridgeResult()), settings)), \
+                mock.patch('api.routes.pending.workspace', return_value=payload) as workspace:
+            for name in ('pdf_review','not_in_zotero'):
+                response = self.client.get('/api/audit/reports/' + name, headers=self.headers)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()['rows'], payload['rows'])
+            self.assertEqual(workspace.call_count, 2)
+
+    def test_dead_curation_reads_mapping_json_beside_the_scan(self):
+        from types import SimpleNamespace
+        from audit.config import Settings
+        from audit.engine.bridge import BridgeResult
+        mapping = self.tmp / "audit" / "mapping.json"
+        mapping.parent.mkdir()
+        mapping.write_text(json.dumps({
+            "matches": {"gone2020": ["gone.pdf"]}, "no_match": ["nm_gone.pdf"]}),
+            encoding="utf-8")
+        rec = SimpleNamespace(citation_key="gone2020", pdf_paths=[], obsidian_note=None,
+                              bib_entry=SimpleNamespace(title="T", year="2020", authors=[]),
+                              zotero_item=None)
+        inv = self._inv({"gone2020": rec}, BridgeResult(mapping_orphans=2))
+        settings = Settings(vault_root=self.vault, mapping_file_override=mapping)
+        with mock.patch.object(audit_manager, "get_inventory",
+                               return_value=(inv, settings)):
+            r = self.client.get("/api/audit/reports/dead_curation", headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        d = r.get_json()
+        self.assertEqual(d["count"], 2)
+        self.assertEqual(d["by_kind"], {"match_missing_file": 1, "no_match_missing_file": 1})
+        self.assertEqual(d["mapping_orphans"], 2)
+
+
+class TestMappingStatesAndDetach(unittest.TestCase):
+    """The mapping route's Phase 2 verbs (2026-09-06): the ``pending`` state,
+    the list form of the bucket verbs (validated in full before ONE write),
+    and ``detach_from``."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="audit-mapstate-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.vault = self.tmp / "vault"
+        (self.vault / "att").mkdir(parents=True)
+        self.a = self.vault / "att" / "a_2020.pdf"
+        self.b = self.vault / "att" / "b_2020.pdf"
+        for p in (self.a, self.b):
+            p.write_bytes(b"%PDF-1.4\n" + p.name.encode())
+        (self.vault / "_master.bib").write_text(
+            "@article{smith2020, title={Current entry}}\n", encoding="utf-8")
+        (self.tmp / "config.json").write_text(
+            json.dumps({"obsidian_vault_path": str(self.vault),
+                        "audit_attachments_subdir": "att",
+                        "audit_biblio_articles_subdir": "."}), encoding="utf-8")
+        cfg_path = str(self.tmp / "config.json")
+        for target in ("core.constants.CONFIG_FILE", "core.config.CONFIG_FILE"):
+            p = mock.patch(target, cfg_path)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch("core.constants.BASE_DIR", str(self.tmp))
+        p.start()
+        self.addCleanup(p.stop)
+        self.client = _build_audit_only_app().test_client()
+        self.headers = {"X-Requested-With": "ChatEKLD"}
+
+    def _post(self, body):
+        return self.client.post("/api/audit/mapping", json=body, headers=self.headers)
+
+    def _mapping(self):
+        from audit.config import load_settings
+        path = load_settings().mapping_file
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+    def test_pending_is_a_first_class_state_and_moves_are_the_same_verb(self):
+        r = self._post({"pdf": "att/a_2020.pdf", "pending": True, "confirm": True})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(r.get_json()["action"], "pending")
+        self.assertEqual(self._mapping()["pending"], ["att/a_2020.pdf"])
+        r = self._post({"pdf": "att/a_2020.pdf", "no_match": True, "confirm": True})
+        self.assertEqual(r.status_code, 200)
+        d = self._mapping()
+        self.assertEqual(d["no_match"], ["att/a_2020.pdf"])
+        self.assertNotIn("pending", d)
+
+    def test_list_form_is_validated_in_full_before_any_write(self):
+        """One bad path refuses the whole request — a partial bulk write would
+        leave the user unable to tell which half landed."""
+        r = self._post({"pdfs": ["att/a_2020.pdf", "att/missing.pdf"],
+                        "pending": True, "confirm": True})
+        self.assertEqual(r.status_code, 404, r.get_json())
+        self.assertIsNone(self._mapping())
+        r = self._post({"pdfs": ["att/a_2020.pdf", "att/b_2020.pdf", "att/a_2020.pdf"],
+                        "pending": True, "confirm": True})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(r.get_json()["changed"], 2)
+        self.assertEqual(self._mapping()["pending"],
+                         ["att/a_2020.pdf", "att/b_2020.pdf"])
+
+    def test_list_form_clear_and_the_bound(self):
+        self._post({"pdfs": ["att/a_2020.pdf", "att/b_2020.pdf"],
+                    "no_match": True, "confirm": True})
+        r = self._post({"pdfs": ["att/a_2020.pdf", "att/b_2020.pdf", "att/gone.pdf"],
+                        "clear": True, "confirm": True})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(r.get_json()["changed"], 2)   # gone.pdf: nothing to clear
+        self.assertEqual(self._mapping()["no_match"], [])
+        from api.routes import audit as audit_routes
+        too_many = [f"att/x{i}.pdf" for i in range(audit_routes._MAPPING_MAX_PDFS + 1)]
+        r = self._post({"pdfs": too_many, "clear": True, "confirm": True})
+        self.assertEqual(r.status_code, 400)
+
+    def test_pdf_and_pdfs_together_or_two_verbs_are_refused(self):
+        r = self._post({"pdf": "att/a_2020.pdf", "pdfs": ["att/b_2020.pdf"],
+                        "clear": True, "confirm": True})
+        self.assertEqual(r.status_code, 400)
+        r = self._post({"pdf": "att/a_2020.pdf", "pending": True, "no_match": True,
+                        "confirm": True})
+        self.assertEqual(r.status_code, 400)
+        # link stays single-PDF: the list form is not offered for it.
+        r = self._post({"pdfs": ["att/a_2020.pdf"], "citation_key": "smith2020",
+                        "confirm": True})
+        self.assertEqual(r.status_code, 400)
+
+    def test_detach_writes_the_exclusion_and_clear_undoes_it(self):
+        r = self._post({"pdf": "att/a_2020.pdf", "detach_from": "smith2020",
+                        "confirm": True})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(r.get_json()["action"], "detach")
+        self.assertTrue(r.get_json()["changed"])
+        self.assertEqual(self._mapping()["exclude"], {"att/a_2020.pdf": ["smith2020"]})
+        r = self._post({"pdf": "att/a_2020.pdf", "detach_from": "smith2020",
+                        "confirm": True})
+        self.assertFalse(r.get_json()["changed"])
+        r = self._post({"pdf": "att/a_2020.pdf", "clear": True, "confirm": True})
+        self.assertTrue(r.get_json()["changed"])
+        self.assertNotIn("exclude", self._mapping())
+
+    def test_detach_all_writes_the_wildcard_and_clear_undoes_it(self):
+        r = self._post({"pdf": "att/a_2020.pdf", "detach_all": True,
+                        "confirm": True})
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertEqual(body["action"], "detach_all")
+        self.assertEqual(body["citation_key"], "*")
+        self.assertEqual(self._mapping()["exclude"],
+                         {"att/a_2020.pdf": ["*"]})
+        r = self._post({"pdf": "att/a_2020.pdf", "clear": True, "confirm": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._mapping().get("exclude", {}), {})
+
+    def test_the_wildcard_cannot_ride_in_on_detach_from(self):
+        """It is not a citation key, and reaching it through the per-key field
+        would let a body impose a blanket refusal where the caller — and the
+        confirm text the user read — meant exactly one key."""
+        r = self._post({"pdf": "att/a_2020.pdf", "detach_from": "*",
+                        "confirm": True})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("detach_all", r.get_json()["error"])
+        # No mapping file at all is the strongest form of "nothing written".
+        self.assertEqual((self._mapping() or {}).get("exclude", {}), {})
+
+    def test_detach_all_is_confirm_gated_and_exclusive(self):
+        r = self._post({"pdf": "att/a_2020.pdf", "detach_all": True})
+        self.assertEqual(r.status_code, 400)
+        r = self._post({"pdf": "att/a_2020.pdf", "detach_all": False,
+                        "confirm": True})
+        self.assertEqual(r.status_code, 400)
+        r = self._post({"pdf": "att/a_2020.pdf", "detach_all": True,
+                        "detach_from": "smith2020", "confirm": True})
+        self.assertEqual(r.status_code, 400)
+        r = self._post({"pdfs": ["att/a_2020.pdf"], "detach_all": True,
+                        "confirm": True})
+        self.assertEqual(r.status_code, 400)   # single-PDF verb
+        self.assertEqual((self._mapping() or {}).get("exclude", {}), {})
+
+    def test_detach_needs_a_key_and_one_existing_pdf(self):
+        r = self._post({"pdf": "att/a_2020.pdf", "detach_from": "", "confirm": True})
+        self.assertEqual(r.status_code, 400)
+        r = self._post({"pdf": "att/missing.pdf", "detach_from": "smith2020",
+                        "confirm": True})
+        self.assertEqual(r.status_code, 404)
+        r = self._post({"pdfs": ["att/a_2020.pdf"], "detach_from": "smith2020",
+                        "confirm": True})
+        self.assertEqual(r.status_code, 400)
+
+    def test_forward_verbs_still_need_confirm_and_containment(self):
+        r = self._post({"pdf": "att/a_2020.pdf", "pending": True})
+        self.assertEqual(r.status_code, 400)
+        r = self._post({"pdf": "../a_2020.pdf", "pending": True, "confirm": True})
+        self.assertEqual(r.status_code, 400)
+
+    def test_excluded_key_rematch_needs_accept_excluded(self):
+        """Accession Link selected must not silently lift a detach exclude."""
+        self._post({"pdf": "att/a_2020.pdf", "detach_from": "smith2020",
+                    "confirm": True})
+        r = self._post({"pdf": "att/a_2020.pdf", "citation_key": "smith2020",
+                        "confirm": True, "source": "accession"})
+        self.assertEqual(r.status_code, 409, r.get_json())
+        body = r.get_json()
+        self.assertEqual(body["reason"], "excluded")
+        self.assertEqual(body["citation_key"], "smith2020")
+        self.assertEqual(self._mapping()["exclude"],
+                         {"att/a_2020.pdf": ["smith2020"]})
+        r = self._post({"pdf": "att/a_2020.pdf", "citation_key": "smith2020",
+                        "confirm": True, "source": "accession",
+                        "accept_excluded": True})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertNotIn("exclude", self._mapping())
+        self.assertEqual(self._mapping()["matches"]["smith2020"],
+                         ["att/a_2020.pdf"])
+
+    def test_detach_all_wildcard_also_blocks_rematch_without_ack(self):
+        self._post({"pdf": "att/a_2020.pdf", "detach_all": True, "confirm": True})
+        r = self._post({"pdf": "att/a_2020.pdf", "citation_key": "smith2020",
+                        "confirm": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["reason"], "excluded")
+
+    def test_detach_without_trash_flag_never_touches_zotero(self):
+        with mock.patch(
+            "tagging.writers.find_linked_attachments"
+        ) as find:
+            r = self._post({"pdf": "att/a_2020.pdf", "detach_from": "smith2020",
+                            "confirm": True})
+            self.assertEqual(r.status_code, 200, r.get_json())
+            find.assert_not_called()
+            body = r.get_json()
+            self.assertEqual(body.get("trashed"), [])
+            self.assertIsNone(body.get("batch_id"))
+
+    def test_detach_trash_refuses_when_links_exist_but_transport_cannot_write(self):
+        from types import SimpleNamespace
+        ref = SimpleNamespace(item_key="ATT1", parent_key="PARENT1")
+        inv = SimpleNamespace(records={
+            "smith2020": SimpleNamespace(
+                zotero_item=SimpleNamespace(item_key="PARENT1")),
+        })
+        transport = SimpleNamespace(kind="local", can_write=False)
+        with mock.patch("tagging.writers.find_linked_attachments",
+                        return_value=([ref], None)), \
+             mock.patch("audit.manager.audit_manager.get_inventory",
+                        return_value=(inv, None)), \
+             mock.patch("tagging.zotero_write.resolve_transport",
+                        return_value=transport), \
+             mock.patch("tagging.writers.zotero_attachment_prepare") as prep, \
+             mock.patch("audit.engine.bridge.detach") as detach_fn:
+            r = self._post({
+                "pdf": "att/a_2020.pdf", "detach_from": "smith2020",
+                "confirm": True, "trash_zotero_links": True,
+            })
+            self.assertEqual(r.status_code, 409, r.get_json())
+            self.assertEqual(r.get_json()["reason"], "zotero_not_writable")
+            prep.assert_not_called()
+            detach_fn.assert_not_called()
+            self.assertIsNone(self._mapping())
+
+    def test_detach_trash_filters_to_the_detached_parent_only(self):
+        from types import SimpleNamespace
+        mine = SimpleNamespace(item_key="ATT_MINE", parent_key="PARENT1")
+        other = SimpleNamespace(item_key="ATT_OTHER", parent_key="OTHER")
+        inv = SimpleNamespace(records={
+            "smith2020": SimpleNamespace(
+                zotero_item=SimpleNamespace(item_key="PARENT1")),
+        })
+        transport = SimpleNamespace(kind="web", can_write=True)
+        plan = {
+            "commit": {
+                "item_key": "ATT_MINE",
+                "parent_item": "PARENT1",
+                "filename": str(self.a),
+            },
+        }
+
+        def _prepare(cfg, item_key, ref):
+            self.assertEqual(item_key, "ATT_MINE")
+            self.assertIs(ref, mine)
+            return plan
+
+        with mock.patch("tagging.writers.find_linked_attachments",
+                        return_value=([mine, other], None)), \
+             mock.patch("audit.manager.audit_manager.get_inventory",
+                        return_value=(inv, None)), \
+             mock.patch("tagging.zotero_write.resolve_transport",
+                        return_value=transport), \
+             mock.patch("tagging.writers.zotero_attachment_prepare",
+                        side_effect=_prepare), \
+             mock.patch("api.routes.audit._trash_prepared_attachments",
+                        return_value=([{
+                            "item_key": "ATT_MINE",
+                            "parent_key": "PARENT1",
+                            "path": str(self.a),
+                        }], "batch-1", None)) as trash:
+            r = self._post({
+                "pdf": "att/a_2020.pdf", "detach_from": "smith2020",
+                "confirm": True, "trash_zotero_links": True,
+            })
+            self.assertEqual(r.status_code, 200, r.get_json())
+            body = r.get_json()
+            self.assertEqual(body["trashed"][0]["item_key"], "ATT_MINE")
+            self.assertEqual(body["batch_id"], "batch-1")
+            trash.assert_called_once()
+            prepared = trash.call_args[0][0]
+            self.assertEqual(len(prepared), 1)
+            self.assertEqual(self._mapping()["exclude"],
+                             {"att/a_2020.pdf": ["smith2020"]})
+
+    def test_detach_trash_refuses_before_unmap_when_zotero_unreadable(self):
+        with mock.patch("tagging.writers.find_linked_attachments",
+                        return_value=([], "Zotero database unreadable: boom")), \
+             mock.patch("audit.engine.bridge.detach") as detach_fn:
+            r = self._post({
+                "pdf": "att/a_2020.pdf", "detach_from": "smith2020",
+                "confirm": True, "trash_zotero_links": True,
+            })
+            self.assertEqual(r.status_code, 409)
+            self.assertEqual(r.get_json()["reason"], "zotero_unreadable")
+            detach_fn.assert_not_called()
+
+    def test_post_detach_trash_failure_still_reports_unmap_ok(self):
+        """Detach landed; trash journal lock busy must not look like unmap failed."""
+        from types import SimpleNamespace
+        ref = SimpleNamespace(item_key="ATT1", parent_key="PARENT1")
+        inv = SimpleNamespace(records={
+            "smith2020": SimpleNamespace(
+                zotero_item=SimpleNamespace(item_key="PARENT1")),
+        })
+        transport = SimpleNamespace(kind="web", can_write=True)
+        plan = {"commit": {"item_key": "ATT1", "parent_item": "PARENT1",
+                           "filename": str(self.a)}}
+        err_body = mock.Mock()
+        err_body.get_json.return_value = {
+            "error": "Indexing is in progress; try again shortly.",
+        }
+        with mock.patch("tagging.writers.find_linked_attachments",
+                        return_value=([ref], None)), \
+             mock.patch("audit.manager.audit_manager.get_inventory",
+                        return_value=(inv, None)), \
+             mock.patch("tagging.zotero_write.resolve_transport",
+                        return_value=transport), \
+             mock.patch("tagging.writers.zotero_attachment_prepare",
+                        return_value=plan), \
+             mock.patch("api.routes.audit._trash_prepared_attachments",
+                        return_value=([], "", (err_body, 503))):
+            r = self._post({
+                "pdf": "att/a_2020.pdf", "detach_from": "smith2020",
+                "confirm": True, "trash_zotero_links": True,
+            })
+            self.assertEqual(r.status_code, 200, r.get_json())
+            body = r.get_json()
+            self.assertTrue(body["ok"])
+            self.assertTrue(body["changed"])
+            self.assertEqual(body["trashed"], [])
+            self.assertIn("Indexing", body["zotero_error"])
+            self.assertEqual(self._mapping()["exclude"],
+                             {"att/a_2020.pdf": ["smith2020"]})
+
+    def test_post_detach_partial_patch_sets_zotero_error(self):
+        from types import SimpleNamespace
+        ref = SimpleNamespace(item_key="ATT1", parent_key="PARENT1")
+        inv = SimpleNamespace(records={
+            "smith2020": SimpleNamespace(
+                zotero_item=SimpleNamespace(item_key="PARENT1")),
+        })
+        transport = SimpleNamespace(kind="web", can_write=True)
+        plan = {"commit": {"item_key": "ATT1", "parent_item": "PARENT1",
+                           "filename": str(self.a)}}
+        with mock.patch("tagging.writers.find_linked_attachments",
+                        return_value=([ref], None)), \
+             mock.patch("audit.manager.audit_manager.get_inventory",
+                        return_value=(inv, None)), \
+             mock.patch("tagging.zotero_write.resolve_transport",
+                        return_value=transport), \
+             mock.patch("tagging.writers.zotero_attachment_prepare",
+                        return_value=plan), \
+             mock.patch("api.routes.audit._trash_prepared_attachments",
+                        return_value=([], "batch-x", None)):
+            r = self._post({
+                "pdf": "att/a_2020.pdf", "detach_from": "smith2020",
+                "confirm": True, "trash_zotero_links": True,
+            })
+            self.assertEqual(r.status_code, 200)
+            body = r.get_json()
+            self.assertEqual(body["trashed"], [])
+            self.assertIn("could not be moved to trash", body["zotero_error"])
+
+    def test_mapping_detach_never_uses_http_delete(self):
+        from pathlib import Path as _P
+        src = (_P(__file__).resolve().parent / "api" / "routes" / "audit.py"
+               ).read_text(encoding="utf-8")
+        # Trash must stay PATCH {"deleted": 1} via the shared writers — never
+        # a DELETE verb invented on the mapping route.
+        self.assertNotIn('method="DELETE"', src)
+        self.assertNotIn("method='DELETE'", src)
+
+
+class TestZoteroLinkWarning(unittest.TestCase):
+    def test_a_zotero_linked_rel_is_named(self):
+        from types import SimpleNamespace
+        from api.routes import audit as auditmod
+
+        tmp = Path(tempfile.mkdtemp(prefix="zotlink-warn-"))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        vault = tmp / "vault"
+        pdf = vault / "att" / "paper.pdf"
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF")
+        rel = "att/paper.pdf"
+        inv = SimpleNamespace(bridge=SimpleNamespace(source_per_pdf={pdf: "zotero_link"}))
+        settings = SimpleNamespace(vault_root=vault)
+        with mock.patch("audit.manager.audit_manager.get_inventory",
+                        return_value=(inv, settings)):
+            msg = auditmod._zotero_link_warning(settings, [rel])
+        self.assertIsNotNone(msg)
+        self.assertIn("paper.pdf", msg)
+        self.assertIn("Zotero wins", msg)
+
+    def test_a_manual_pairing_is_silent(self):
+        from types import SimpleNamespace
+        from api.routes import audit as auditmod
+
+        tmp = Path(tempfile.mkdtemp(prefix="zotlink-warn-"))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        vault = tmp / "vault"
+        pdf = vault / "att" / "paper.pdf"
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF")
+        inv = SimpleNamespace(bridge=SimpleNamespace(source_per_pdf={pdf: "manual"}))
+        settings = SimpleNamespace(vault_root=vault)
+        with mock.patch("audit.manager.audit_manager.get_inventory",
+                        return_value=(inv, settings)):
+            self.assertIsNone(auditmod._zotero_link_warning(settings, ["att/paper.pdf"]))
+
+    def test_an_inventory_without_a_usable_bridge_is_silent(self):
+        """The warning is observational, so a bridge it cannot read must make
+        it say nothing — never raise into the mapping route, which WRITES.
+
+        `Inventory.bridge` is a required field, so a real scan always has one;
+        this is defence in depth for a partially built inventory (the shape
+        `reports/multi_pdf.py` already guards for with `is not None`) and for
+        the stubs the detach tests hand the route. Before 2026-09-19 the bare
+        `inv.bridge` turned either into a 500 on a confirmed write."""
+        from types import SimpleNamespace
+        from api.routes import audit as auditmod
+
+        settings = SimpleNamespace(vault_root=Path("/tmp"))
+        for inv in (SimpleNamespace(), SimpleNamespace(bridge=None)):
+            with self.subTest(inv=inv), \
+                    mock.patch("audit.manager.audit_manager.get_inventory",
+                               return_value=(inv, settings)):
+                self.assertIsNone(auditmod._zotero_link_warning(
+                    settings, ["att/paper.pdf"]))

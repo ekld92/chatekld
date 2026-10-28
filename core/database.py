@@ -32,6 +32,25 @@ def init_db():
                         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_attachments (
+                        attachment_id TEXT PRIMARY KEY,
+                        filename TEXT,
+                        kind TEXT,
+                        extracted_text TEXT,
+                        chars INTEGER,
+                        truncated INTEGER DEFAULT 0,
+                        created_at REAL
+                    )
+                """)
+                # `_prune_expired` runs a `created_at <` sweep on every upload
+                # and the rows carry up to 120 000 characters of extracted text
+                # each, so the scan is the expensive kind. IF NOT EXISTS so an
+                # existing database gains it on the next boot without a
+                # migration step.
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_chat_attachments_created_at "
+                    "ON chat_attachments (created_at)")
                 conn.commit()
             finally:
                 conn.close()

@@ -757,6 +757,13 @@ def test_generate_resumes_from_checkpoint(tmp_path):
     # Seed a checkpoint at a fixed key (compute_job_key is patched to match).
     sections = [Section(title="Intro", points=["a"]), Section(title="Methods", points=["b"])]
     manifest = checkpoint.new_manifest(
+        context=checkpoint.generation_context(
+            deckmod.obsidian_manager.get_vault_path() or "",
+            embed=deckmod.load_config().get("embed", deckmod.DEFAULT_EMBED),
+            embed_provider=deckmod.resolve_embed_provider(
+                deckmod.load_config(), deckmod.load_config().get("provider", "ollama")),
+            generation=getattr(deckmod.obsidian_manager, "_index_generation", 0),
+            index_dir=deckmod.OBSIDIAN_INDEX_DIR),
         job_key="ckpt-resume", topic="T", slug="resumed", out_dir=str(tmp_path), sections=sections,
     )
     checkpoint.set_section(manifest, 1, SectionOutput(
@@ -806,6 +813,13 @@ def test_generate_resume_retries_placeholder_section(tmp_path):
 
     sections = [Section(title="Intro", points=["a"]), Section(title="Methods", points=["b"])]
     manifest = checkpoint.new_manifest(
+        context=checkpoint.generation_context(
+            deckmod.obsidian_manager.get_vault_path() or "",
+            embed=deckmod.load_config().get("embed", deckmod.DEFAULT_EMBED),
+            embed_provider=deckmod.resolve_embed_provider(
+                deckmod.load_config(), deckmod.load_config().get("provider", "ollama")),
+            generation=getattr(deckmod.obsidian_manager, "_index_generation", 0),
+            index_dir=deckmod.OBSIDIAN_INDEX_DIR),
         job_key="ckpt-ph", topic="T", slug="phretry", out_dir=str(tmp_path), sections=sections,
     )
     # Section 1 = real saved content; section 2 = a placeholder a prior failed run
@@ -886,6 +900,13 @@ def test_generate_force_fresh_ignores_checkpoint(tmp_path):
 
     seeded = [Section(title="Old", points=[])]
     manifest = checkpoint.new_manifest(
+        context=checkpoint.generation_context(
+            deckmod.obsidian_manager.get_vault_path() or "",
+            embed=deckmod.load_config().get("embed", deckmod.DEFAULT_EMBED),
+            embed_provider=deckmod.resolve_embed_provider(
+                deckmod.load_config(), deckmod.load_config().get("provider", "ollama")),
+            generation=getattr(deckmod.obsidian_manager, "_index_generation", 0),
+            index_dir=deckmod.OBSIDIAN_INDEX_DIR),
         job_key="ckpt-fresh", topic="T", slug="fresh", out_dir=str(tmp_path), sections=seeded,
     )
     checkpoint.set_section(manifest, 1, SectionOutput(title="Old", body="\\section{Old}"))
@@ -1193,14 +1214,15 @@ def test_augment_busy_lock_returns_409(tmp_path):
     deck, _ = _write_deck(tmp_path)
     client = app.test_client()
     headers = {"X-Requested-With": "ChatEKLD"}
-    assert deckmod._DECK_OP_LOCK.acquire(blocking=False)
+    lease = deckmod._DECK_OP_LOCK.acquire(deck, blocking=False)
+    assert lease is not None
     try:
         r = client.post("/api/deck/augment", json={
             "deck_path": str(deck), "instruction": "deepen", "citations_enabled": False,
         }, headers=headers)
         assert r.status_code == 409
     finally:
-        deckmod._DECK_OP_LOCK.release()
+        lease.release()
 
 
 # --- apply-augment (staging-based) ------------------------------------------
@@ -1747,7 +1769,7 @@ class TestBackupOriginalPreservation:
 
 class TestSharedLatexOpLock:
     """Audit H1: deck and docgen accept the same absolute .tex paths, so their
-    op locks must be ONE object or check-then-write interleaves across panels."""
+    lock registry must be ONE object or same-path operations can interleave."""
 
     def test_deck_and_docgen_locks_are_one_object(self):
         from api.routes._latexdoc import LATEX_OP_LOCK

@@ -9,6 +9,7 @@ retrieval-cache sidecars all share, so ``rag/sidecars.py`` can be lifted out of
 ``rag/vault.py`` re-exports every name here, so ``from rag.vault import
 _write_json_atomic`` keeps working unchanged.
 """
+import hashlib
 import json
 import os
 import tempfile
@@ -87,3 +88,13 @@ def _simple_vector_store_has_any_embedding(path: Path) -> bool:
                 pos += 1
             return pos < len(head) and head[pos:pos + 1] != b"}"
     return False
+
+
+def vault_key(vault_root) -> str:
+    """Stable per-vault cache key: the first 16 hex of sha256(str(root)).
+
+    The ONE definition behind ``ObsidianVaultManager._vault_cache_key`` (which
+    delegates here) and the paper-label index file name, so both name the same
+    vault the same way. Callers pass an already-resolved root.
+    """
+    return hashlib.sha256(str(vault_root).encode("utf-8")).hexdigest()[:16]

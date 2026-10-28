@@ -21,6 +21,31 @@ import { helpTip, helpPopover, sanitiseHtml, runTour, announceError } from './ui
 // Mirrors the [id, key, kind] tuple tables in settings.js. Ids that are absent
 // from the current DOM are skipped silently at install time.
 export const HELP_ENTRIES = [
+    ['vault-index-btn', 'popover', {
+        title: 'Update Index',
+        body: 'Daily update after imports, renames or note edits. Unchanged chunks are reused; new or changed chunks need local embeddings. Renamed PDFs can reuse extracted text but need current search references. Review the preview and confirm once, then wait for vector and lexical search completion and inspect deferred documents. Preparing text or applying Library changes does not do this update automatically. This does not refresh Library Audit or synchronise tags.',
+    }],
+    ['vault-online-visual', 'popover', {
+        title: 'Online OCR and vision', anchor: 'label',
+        body: 'Use online providers for scanned-page text and image descriptions. Choose their models in Settings → Global · Extraction and indexing. Previewing does not send images; confirmation starts external transmission and may incur charges. Embeddings remain local. Successful cached text is reused by default.',
+    }],
+    ['vault-online-full-rebuild', 'popover', {
+        title: 'Full rebuild', anchor: 'label',
+        body: 'Only the advanced operation button uses this option. The daily button ignores it. After online extraction, this archives the existing index and rebuilds all search embeddings. Explicitly deferred sources are omitted from the new index; incremental updates retain their old chunks when present. An index archive is not a backup of Library decisions or vault files.',
+    }],
+    ['online-ocr-reextract', 'popover', {
+        title: 'Re-extract cached text', anchor: 'label',
+        body: 'Request a new transcription even when cached text exists. This can incur new provider charges after confirmation. It is separate from rebuilding the index. Select only the intended sources and check the preview.',
+    }],
+    ['online-source-search', 'popover', {
+        title: 'Select extraction sources',
+        body: 'Browse sources shows 50 files at a time. Its checkboxes restrict the advanced online operation; the daily button always covers the whole admissible vault. They do not fill the separate One PDF or image path. For that one-file workflow, enter a vault-relative path and use Preview eligibility. Neither browsing nor previewing starts paid OCR.',
+    }],
+    ['audit-library-update-btn', 'popover', {
+        title: 'New PDFs and renames',
+        body: 'Review library update checks changes, prepares text without indexing, then offers names, tags and optional notes. Review or skip proposals, apply selected changes, inspect outcomes and confirm the final search update. Online OCR and tag generation have separate consents. The search-only shortcut remains under Scan, settings and recovery. Memory checks never restart work or authorize online calls.',
+    }],
+
     // ── Deck generation knobs (the jargon the user flagged) ──
     ['deck-max-sections', 'tip', {
         text: 'Upper bound on how many sections the outline may produce. Fewer sections = a shorter, faster deck.',
@@ -61,7 +86,7 @@ export const HELP_ENTRIES = [
         text: 'Sampling temperature. Lower is more focused and repeatable; higher is more varied and creative.',
     }],
 
-    // ── Provider / timeout plumbing (LLM Settings) ──
+    // ── Provider / timeout plumbing (Settings) ──
     ['set-online-timeout', 'tip', {
         text: 'Time to wait for one online-provider request before giving up on that call.',
     }],
@@ -143,6 +168,9 @@ export const HELP_ENTRIES = [
     ['vault-thesaurus-enabled', 'tip', {
         text: 'Expand the query with synonyms from your curated _abreviations.md / _tags.md tables (FR/EN shorthand bridging).',
     }],
+    ['set-paper-labels-enabled', 'tip', {
+        text: 'Name each retrieved chunk by its paper ("Smith et al., 2020, Title") from the last Library Audit scan. Needs a completed scan; stale until the next one.',
+    }],
     ['vault-primer-enabled', 'tip', {
         text: 'Prepend a small glossary of your vault’s shorthand to the system prompt so the model can read abbreviations in the retrieved notes.',
     }],
@@ -150,15 +178,16 @@ export const HELP_ENTRIES = [
     // ── Plain Chat ──
     ['plainchat-input', 'tip', {
         text: 'A direct conversation with the configured model — no vault retrieval, no tools. The transcript lives in this window only (lost on reload; use Export to keep it).',
+        // This input has no <label> of its own (its name is an aria-label), so
+        // the default anchor is the input, which put the "?" BETWEEN the text
+        // field and Send — reading as help for Send, and splitting the one row
+        // the eye follows left to right. `rowStart` leads the row instead.
+        anchor: 'rowStart',
+        rowSelector: '.input-bar',
+        labelText: 'Plain Chat',
     }],
 
     // ── Note Refactor scope knobs ──
-    ['refactor-scope', 'tip', {
-        text: 'The sub-folder of your vault to analyze. The plan only ever reads and writes inside this scope.',
-    }],
-    ['refactor-strip-preamble', 'tip', {
-        text: 'When an image OCR callout is inlined, drop its descriptive preamble and keep only the transcription. Applies scope-wide.',
-    }],
 
     // ── Actions (click popovers) ──
     ['deck-generate-btn', 'popover', {
@@ -181,31 +210,34 @@ export const HELP_ENTRIES = [
         title: 'Generate a Markdown note',
         body: 'Builds a structured long-form Markdown note (# Title + ## sections) from your topic, grounded in the vault, and writes it as a NEW note in the sub-folder you choose. It never overwrites an existing note.',
         writes: true,
-        writesText: 'Writes a new note into your vault — journalled and reversible from Note Refactor → Restore.',
+        writesText: 'Writes a new note into your vault — journalled and reversible from Settings → History and Restore.',
     }],
-    ['refactor-run-btn', 'popover', {
-        title: 'Run Plan',
-        body: 'Read-only analysis of the scoped notes: proposes OCR callouts, formatting fixes and hygiene notes, and shows a preview diff. Runs no vision or LLM calls and writes nothing — nothing changes until you approve and Apply.',
-        writes: false,
+
+    // ── Library Audit / Notes Sync / Maintenance ──
+    ['set-notesync-zotero-authoritative', 'tip', {
+        text: 'Edit reading notes in Zotero, then preview the mirror in Notes Sync. Replaced regions need verified Git recovery; new notes use History and Restore. Preview again after changing names or content.',
     }],
-    ['refactor-apply-btn', 'popover', {
-        title: 'Apply approved',
-        body: 'Writes the approved OCR callouts into your notes. Each note is re-checked against the preview (content + WYSIWYG hashes) before writing, and the originals are snapshotted first.',
-        writes: true,
-        writesText: 'Writes to your vault — journalled and reversible via Restore.',
+    ['audit-library-checks-btn', 'tip', {
+        text: 'Deterministic observations of the library (storage, bibliography campaigns). Checks never approve or write metadata.',
     }],
-    ['refactor-normalize-btn', 'popover', {
-        title: 'Fix formatting',
-        body: 'Deterministic formatting cleanup — no LLM. Fixes missing blank lines, trailing whitespace and the final newline only; predictable and identical to the preview. Never changes your wording.',
-        writes: true,
-        writesText: 'Writes to your vault — journalled and reversible via Restore.',
+    ['audit-rtab-note_sync', 'tip', {
+        text: 'Compare each reference note with its Zotero reading note. In authoritative mode, [refresh all] rewrites every marked region from Zotero.',
+    }],
+    ['audit-rtab-zotero_attachments', 'tip', {
+        text: 'Every file Zotero holds against an item. [attach] creates a linked-file path (no bytes). [remove] trashes the attachment, never the vault PDF. [Title = filename] relabels connector saves; no file is renamed.',
+    }],
+    // The Maintenance panel is private-only and stripped at publish. A help
+    // entry for a missing element is inert, so this costs the public build
+    // nothing (`helpTable.test.js` pins shape, not presence).
+    ['maint-run-btn', 'tip', {
+        text: 'Runs the selected checks. The default selection is read-only and free; compilation, network and write steps are opt-in and confirmed per run.',
     }],
 ];
 
 // Static vault-write action buttons. The ratchet in tests/js/helpTable.test.js
 // asserts each has a writes:true popover entry above — so a new write button
 // without help fails the suite.
-export const WRITE_ACTION_IDS = ['refactor-apply-btn', 'refactor-normalize-btn', 'docgen-md-generate-btn'];
+export const WRITE_ACTION_IDS = ['docgen-md-generate-btn'];
 
 /**
  * Find the best anchor to hang a setting's "?" badge on: its <label> (so the
@@ -217,8 +249,71 @@ function _tipAnchorFor(id) {
     const el = document.getElementById(id);
     if (!el) return null;
     const group = el.closest ? el.closest('.control-group, .checkbox-row') : null;
+    // A label-WRAPPED checkbox (`<label class="checkbox-row"><input …> text</label>`)
+    // has no label inside its group: the group IS the label. Anchoring on the
+    // input put the "?" between the box and its own caption (Note Refactor's
+    // strip-preamble row, the Report/Article citations row — 2026-09-20 UX
+    // audit); the badge belongs after the caption, like every other label.
+    if (group && group.tagName === 'LABEL') return group;
     const label = group ? group.querySelector('label') : null;
     return label || el;
+}
+
+/**
+ * A badge hung on a BUTTON (an action or a report tab) is a loose sibling in
+ * whatever flex row or column holds that button, so it either dropped onto
+ * its own line (the Library tab groups are column-flex) or landed between two
+ * buttons and read as the NEXT one's help (Maintenance "Run selected ? Stop",
+ * Note Refactor "Run Plan ? Apply ? Fix ?"). Wrapping the pair in one
+ * inline-flex span keeps the badge glued to the button it describes. The
+ * badge stays the button's next sibling, which is what the tests and the
+ * idempotence guard read.
+ */
+/**
+ * Move a badge to the START of the row that holds its control.
+ *
+ * For a control with no <label> of its own, the default "badge after the
+ * anchor" placement drops the "?" into the middle of a row of controls, where
+ * it reads as help for whatever comes NEXT. Leading the row is unambiguous:
+ * nothing precedes it to be confused with.
+ */
+function _bindBadgeToRowStart(anchorEl, badge, rowSelector) {
+    if (!badge || !anchorEl || !rowSelector || typeof anchorEl.closest !== 'function') return false;
+    const row = anchorEl.closest(rowSelector);
+    if (!row) return false;
+    row.insertBefore(badge, row.firstChild);
+    return true;
+}
+
+function _bindBadgeToButton(anchorEl, badge) {
+    if (!badge || !anchorEl || anchorEl.tagName !== 'BUTTON') return;
+    const tablist = anchorEl.closest('[role="tablist"]');
+    if (tablist) {
+        // A tablist owns tabs, not independent help buttons. Keep the help
+        // beside that group, with visible labels and the same visibility.
+        let help = tablist.nextElementSibling;
+        if (!help || !help.classList.contains('audit-report-help')) {
+            help = document.createElement('div');
+            help.className = 'audit-report-help control-hint';
+            help.setAttribute('role', 'group');
+            help.setAttribute('aria-label', 'Help for audit reports');
+            help.style.display = tablist.style.display;
+            tablist.insertAdjacentElement('afterend', help);
+        }
+        const label = anchorEl.textContent.trim();
+        const item = document.createElement('span');
+        item.className = 'help-anchor';
+        item.append(label + ' ', badge);
+        badge.setAttribute('aria-label', `Help: ${label}`);
+        help.append(item, ' ');
+        return;
+    }
+    const wrap = document.createElement('span');
+    wrap.className = 'help-anchor';
+    wrap.setAttribute('role', 'presentation');
+    anchorEl.replaceWith(wrap);
+    wrap.appendChild(anchorEl);
+    wrap.appendChild(badge);
 }
 
 /**
@@ -252,6 +347,31 @@ export async function loadHelpTab() {
         inner.className = 'help-guide-inner';
         if (window.marked && typeof window.marked.parse === 'function') {
             inner.innerHTML = sanitiseHtml(window.marked.parse(md));
+            // Marked does not emit heading IDs. Give this trusted guide scoped
+            // targets after sanitisation, without allowing IDs in chat Markdown.
+            const targets = new Map();
+            const counts = new Map();
+            for (const heading of inner.querySelectorAll('h1, h2, h3, h4, h5, h6')) {
+                const slug = heading.textContent.trim().toLowerCase()
+                    .replace(/[^\p{L}\p{N}_\s-]/gu, '').replace(/\s/g, '-');
+                const count = counts.get(slug) || 0;
+                counts.set(slug, count + 1);
+                const key = slug + (count ? `-${count}` : '');
+                heading.id = 'help-section-' + key;
+                targets.set(key, heading.id);
+            }
+            for (const link of inner.querySelectorAll('a[href^="#"]')) {
+                const target = targets.get(link.getAttribute('href').slice(1));
+                if (target) link.setAttribute('href', '#' + target);
+            }
+            // A table wider than the reading column scrolls on its own
+            // instead of pushing the whole guide sideways (2026-09-19).
+            for (const table of inner.querySelectorAll('table')) {
+                const wrap = document.createElement('div');
+                wrap.className = 'help-table-wrap';
+                table.replaceWith(wrap);
+                wrap.appendChild(table);
+            }
         } else {
             const pre = document.createElement('pre');
             pre.className = 'help-guide-fallback';
@@ -275,8 +395,18 @@ export function installHelp(entries = HELP_ENTRIES) {
         if (kind === 'tip') {
             const anchor = _tipAnchorFor(id);
             if (!anchor) continue;
-            const labelText = anchor.tagName === 'LABEL' ? (anchor.textContent || '').trim() : id;
-            if (helpTip(anchor, { text: payload.text, labelText })) attached++;
+            // A label-less control can name itself in the entry; falling back
+            // to the element id made a screen reader say "Help: plainchat-input".
+            const labelText = anchor.tagName === 'LABEL'
+                ? (anchor.textContent || '').trim()
+                : (payload.labelText || id);
+            const badge = helpTip(anchor, { text: payload.text, labelText });
+            if (badge) {
+                attached++;
+                if (payload.anchor === 'rowStart'
+                    && _bindBadgeToRowStart(anchor, badge, payload.rowSelector)) continue;
+                _bindBadgeToButton(anchor, badge);
+            }
         } else if (kind === 'popover') {
             // Default anchor is the element itself (an action BUTTON — the
             // original use). `anchor: 'label'` opts a settings CONTROL into the
@@ -288,7 +418,8 @@ export function installHelp(entries = HELP_ENTRIES) {
                 ? _tipAnchorFor(id)
                 : document.getElementById(id);
             if (!anchorEl) continue;
-            if (helpPopover(anchorEl, payload)) attached++;
+            const badge = helpPopover(anchorEl, payload);
+            if (badge) { attached++; _bindBadgeToButton(anchorEl, badge); }
         }
     }
     return attached;
@@ -297,18 +428,16 @@ export function installHelp(entries = HELP_ENTRIES) {
 // ── Guided tour (Batch H): one pass over the main views ─────────────────────
 
 const TOUR_STEPS = [
-    { tab: 'obsidian', target: 'obsidian-tab', title: 'Obsidian Agent',
+    { tab: 'obsidian', target: 'obsidian-tab', title: 'Ask · vault questions',
       text: 'Index your vault, then ask questions against it. Retrieval knobs under the chat apply to the next Send — no reindex needed. Agent mode lets the model search across several steps; exports carry full provenance.' },
-    { tab: 'document', target: 'document-tab', title: 'Single Paper',
+    { tab: 'document', target: 'document-tab', title: 'Read · single paper',
       text: 'Upload one PDF and stream a tunable summary. Papers larger than the model window are summarised map-reduce — slower, never silent.' },
-    { tab: 'audit', target: 'audit-tab', title: 'Library Audit & Tagging',
-      text: 'Run Scan reconciles the vault against Zotero, PDFs and Finder tags. The Tagging report writes tags to all three stores (confirmed, journalled, undoable); Tag Hygiene can retire a tag everywhere.' },
-    { tab: 'deck', target: 'deck-tab', title: 'Deck Generator',
+    { tab: 'audit', target: 'audit-tab', title: 'Library · update search',
+      text: 'Review library update prepares text before proposal review and a separately confirmed search update. Online processing is an explicit choice. Names, tags and notes are optional; scans and recovery remain under advanced controls.' },
+    { tab: 'deck', target: 'deck-tab', title: 'Create · Studio',
       text: 'A topic + instructions becomes a Beamer deck in your template’s style, grounded in the vault. Emit-only: compile with make. Preview, Augment, and Compile & Auto-Fix are opt-in and screened.' },
     { tab: 'docgen', target: 'docgen-tab', title: 'Report / Article',
       text: 'The prose sibling of the deck: a LaTeX article, or a Markdown note written (reversibly) into the vault.' },
-    { tab: 'refactor', target: 'refactor-tab', title: 'Note Refactor',
-      text: 'Read-only analysis of a sub-folder with preview diffs; every write is confirmed and reversible from Restore. Notes too large for one LLM pass can be edited section by section.' },
     { tab: 'chat', target: 'chat-tab', title: 'Plain Chat',
       text: 'A direct conversation with the configured model — no vault, no tools. Export keeps the transcript with model + usage stamping.' },
     { tab: 'help', target: 'help-guide-body', title: 'Help',

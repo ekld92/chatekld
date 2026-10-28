@@ -1,4 +1,4 @@
-"""conftest.py — pytest session configuration for ChatEKLD.
+"""conftest.py — pytest session configuration for CHERQAiN.
 
 Provides inter-test-file isolation so that each test file that uses
 ``sys.modules.setdefault()`` stub injection receives a clean import
@@ -75,8 +75,23 @@ from suite_helpers import join_post_index_daemons  # noqa: F401
 # env var here guarantees core.constants sees it on first import.  The
 # explicit-set check lets a developer point the suite at a fixture dir.
 # ---------------------------------------------------------------------------
+os.environ.pop("CHERQAIN_BASE_DIR", None)
+for _storage_key in (
+    "CHERQAIN_DB_PATH", "CHATEKLD_DB_PATH", "PAPERMIND_DB_PATH",
+    "CHERQAIN_INDEX_DIR", "CHATEKLD_INDEX_DIR", "PAPERMIND_INDEX_DIR",
+    "CHERQAIN_CACHE_DIR", "CHATEKLD_CACHE_DIR", "PAPERMIND_CACHE_DIR",
+):
+    os.environ.pop(_storage_key, None)
 if not os.environ.get("CHATEKLD_BASE_DIR"):
     os.environ["CHATEKLD_BASE_DIR"] = tempfile.mkdtemp(prefix="chatekld-test-")
+
+# Keys that let app code WRITE to the maintainer's own data (the Zotero Web
+# library) or reach a paid search API are removed for the whole session: a
+# test that needs one sets a fake with monkeypatch. Found 2026-09-18, when a
+# driver replay ran a real five-minute observation of the live Zotero library
+# with a key `launch.py`'s import-time `.env` loading had put in os.environ.
+for _key in ("ZOTERO_API_KEY", "TAVILY_API_KEY"):
+    os.environ.pop(_key, None)
 
 
 # ---------------------------------------------------------------------------

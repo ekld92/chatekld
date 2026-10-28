@@ -109,7 +109,7 @@ describe('ambiguous-PDF triage deck', () => {
         const [url, opts] = fetchMock.mock.calls[0];
         expect(String(url)).toContain('/api/audit/mapping');
         expect(JSON.parse(opts.body))
-            .toEqual({ pdf: 'att/a.pdf', citation_key: 'smith2020' });
+            .toEqual({ pdf: 'att/a.pdf', citation_key: 'smith2020', confirm: true });
 
         await vi.waitFor(() => {
             expect(document.getElementById('audit-ambig-card').textContent)
@@ -132,7 +132,7 @@ describe('ambiguous-PDF triage deck', () => {
         acceptConfirm();
         await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
         expect(JSON.parse(fetchMock.mock.calls[0][1].body))
-            .toEqual({ pdf: 'att/a.pdf', no_match: true });
+            .toEqual({ pdf: 'att/a.pdf', no_match: true, confirm: true });
     });
 
     it('undo is confirm-gated, posts clear, and returns to the undone card', async () => {
@@ -149,7 +149,7 @@ describe('ambiguous-PDF triage deck', () => {
         acceptConfirm();
         await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
         expect(JSON.parse(fetchMock.mock.calls[0][1].body))
-            .toEqual({ pdf: 'att/a.pdf', clear: true });
+            .toEqual({ pdf: 'att/a.pdf', clear: true, confirm: true });
 
         // Lands back on the card whose decision was reversed.
         await vi.waitFor(() => {
@@ -247,6 +247,52 @@ describe('ambiguous-PDF triage deck', () => {
         expect(document.getElementById('audit-ambig-card').textContent).toContain('b.pdf');
     });
 
+    // The manual link picker (2026-08-19), dropped into this deck too: the
+    // bridge parks a PDF here because author+year matched SEVERAL keys — and
+    // the right key may be none of them, which the candidate list alone can
+    // never express.
+    it('L opens the bibliography picker and assigns a key outside the candidates', async () => {
+        fetchMock.mockImplementation(async (url) => {
+            const u = String(url);
+            if (u.includes('/api/audit/reports/ambiguous_pdfs')) return jsonOk(REPORT);
+            if (u.includes('/api/audit/inventory')) {
+                return jsonOk({
+                    summary: {},
+                    records: [
+                        { citation_key: 'vonkanel2019', title: 'Sleep', first_author: 'von Känel, R', year: '2019', has_bib_entry: true },
+                        { citation_key: 'smith2020', title: 'Cardiac outcomes', first_author: 'Smith, J', year: '2020', has_bib_entry: true },
+                    ],
+                });
+            }
+            return jsonOk({ ok: true });
+        });
+        document.getElementById('audit-ambig-deck')
+            .dispatchEvent(new KeyboardEvent('keydown', { key: 'l', bubbles: true }));
+        const input = await vi.waitFor(() => {
+            const el = document.querySelector('.acc-keypicker-input');
+            expect(el).toBeTruthy();
+            return el;
+        });
+        await vi.waitFor(() => {
+            expect(document.querySelector('.acc-keypicker-count').textContent)
+                .toContain('Type to search');
+        });
+        input.value = 'kanel';
+        input.dispatchEvent(new Event('input'));
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        acceptConfirm();
+        await vi.waitFor(() => {
+            const call = fetchMock.mock.calls.find(
+                ([u, o]) => String(u).includes('/api/audit/mapping') && o);
+            expect(call).toBeTruthy();
+            // A key that is NOT one of this row's two candidates, and no
+            // `source` annotation — hand curation is not an accession.
+            expect(JSON.parse(call[1].body)).toEqual({
+                pdf: 'att/a.pdf', citation_key: 'vonkanel2019', confirm: true,
+            });
+        });
+    });
+
     // Finding 3: the undo stack is keyed to a scan snapshot and must survive a
     // deck↔table view toggle (same scan). The old code wiped it on every payload.
     it('keeps the undo stack across a view toggle within one scan', async () => {
@@ -259,5 +305,62 @@ describe('ambiguous-PDF triage deck', () => {
         const undoBtn = document.querySelector('[data-ambig="undo"]');
         expect(undoBtn).toBeTruthy();
         expect(undoBtn.disabled).toBe(false);   // stack preserved, not wiped
+    });
+});
+
+// The table view of the same report (bulk overview). Its write verbs DISABLE
+// themselves on success — and disabling the focused element drops focus to
+// <body>, so a keyboard user working down the rows had their next Tab restart
+// from the top of the page after every assignment. Paired with the accession
+// table's re-render focus loss in the deferral registry: fixed together.
+describe('ambiguous-PDF table view — focus after a write', () => {
+    let fetchMock;
+
+    beforeEach(async () => {
+        document.body.innerHTML = DOM;
+        const store = new Map([['audit_ambig_view', 'table']]);
+        vi.stubGlobal('localStorage', {
+            getItem: (k) => (store.has(k) ? store.get(k) : null),
+            setItem: (k, v) => store.set(k, String(v)),
+            removeItem: (k) => store.delete(k),
+        });
+        fetchMock = vi.fn(async (url) => {
+            if (String(url).includes('/api/audit/reports/ambiguous_pdfs')) {
+                return jsonOk(REPORT);
+            }
+            return jsonOk({ ok: true });
+        });
+        vi.stubGlobal('fetch', fetchMock);
+        await selectAuditReport('ambiguous_pdfs');
+        fetchMock.mockClear();
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+    });
+
+    it('assigning a key moves focus to the next row, never to <body>', async () => {
+        const btns = [...document.querySelectorAll('[data-action="pick-key"]')];
+        expect(btns.length).toBe(2);
+        btns[0].focus();
+        btns[0].click();
+        acceptConfirm();
+        await vi.waitFor(() => expect(btns[0].disabled).toBe(true));
+        await vi.waitFor(() => {
+            expect(document.activeElement.tagName).not.toBe('BODY');
+        });
+        expect(document.activeElement).toBe(btns[1]);
+    });
+
+    it('the LAST row keeps focus in its own row rather than dropping it', async () => {
+        const btns = [...document.querySelectorAll('[data-action="no-match"]')];
+        btns[btns.length - 1].click();
+        acceptConfirm();
+        await vi.waitFor(() => expect(btns[btns.length - 1].disabled).toBe(true));
+        await vi.waitFor(() => {
+            expect(document.activeElement.tagName).not.toBe('BODY');
+        });
+        expect(document.activeElement.getAttribute('data-action')).toBe('reveal');
     });
 });

@@ -98,6 +98,7 @@ class NoteInfo:
     path: Path
     tags: list[str] = field(default_factory=list)
     pdf_links: set[str] = field(default_factory=set)
+    pdf_pointers: set[str] = field(default_factory=set)
     has_frontmatter: bool = False
     frontmatter: dict[str, Any] = field(default_factory=dict)
 
@@ -164,15 +165,16 @@ def _extract_tags(fm: dict[str, Any]) -> list[str]:
     return []
 
 
+def find_pdf_pointers(text: str) -> set[str]:
+    """Retain directory-qualified references so the bridge can resolve exactly."""
+    return {raw.split("?")[0].split("#")[0].replace("%20", " ").strip()
+            for raw in [*WIKI_PDF_RE.findall(text), *MD_PDF_RE.findall(text)]
+            if raw.strip()}
+
+
 def find_pdf_links(text: str) -> set[str]:
-    """Return basenames of all .pdf references (wikilinks and markdown links)."""
-    found: set[str] = set()
-    for m in WIKI_PDF_RE.findall(text):
-        found.add(Path(m.strip()).name)
-    for m in MD_PDF_RE.findall(text):
-        cleaned = m.split("?")[0].split("#")[0]
-        found.add(Path(cleaned).name.replace("%20", " ").strip())
-    return {f for f in found if f}
+    """Basename projection retained for existing note/report consumers."""
+    return {Path(pointer).name for pointer in find_pdf_pointers(text)}
 
 
 def read_note(path: Path) -> NoteInfo | None:
@@ -218,6 +220,11 @@ def _read_note_uncached(path: Path) -> NoteInfo | None:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
+    front = YAML_RE.match(text)
+    if ('template' in path.stem.casefold() and front
+            and re.search(r'^\s*\{%[- ]', front.group(1), re.MULTILINE)):
+        # Unrendered import templates are not bibliographic notes.
+        return None
     fm, body = parse_frontmatter(text, path=path)
     note = NoteInfo(path=path)
     if fm is not None:
@@ -231,6 +238,7 @@ def _read_note_uncached(path: Path) -> NoteInfo | None:
             logger.warning(f"Failed to convert frontmatter dict in {path}: {e}")
             note.frontmatter = {}
     note.pdf_links = find_pdf_links(text)
+    note.pdf_pointers = find_pdf_pointers(text)
     return note
 
 

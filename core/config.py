@@ -27,7 +27,7 @@ from core.constants import (
     DEFAULT_VISION_MAX_TOKENS,
     DEFAULT_OCR_MAX_TOKENS,
     DEFAULT_VISION_FAILURE_COOLDOWN_S,
-    DEFAULT_REFACTOR_THUMB_MAX_SIDE,
+    DEFAULT_CHAT_ATTACHMENT_MAX_CHARS,
     VAULT_IMAGE_EXTS,
 )
 
@@ -76,7 +76,7 @@ def _invalidate_config_cache() -> None:
 # `_MIGRATIONS[old_version]` step whenever a persisted key is renamed, retyped,
 # or retired — load_config() runs the pending steps once and rewrites the file.
 # Version 0 (implicit) = any config written before the key existed.
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 _DEFAULTS = {
     # Stamped into every saved config; server-owned (POST /api/config strips
@@ -89,6 +89,11 @@ _DEFAULTS = {
     "provider": "ollama",
     "ocr_provider": "ollama",
     "vision_provider": "ollama",
+    "online_ocr_provider": "deepseek",
+    "online_ocr_model": "deepseek-flash",
+    "online_vision_provider": "deepseek",
+    "online_vision_model": "deepseek-flash",
+    "vault_online_visual_enabled": False,
     # Local-backend base URLs. Empty ⇒ resolve env var (OLLAMA_HOST) then the
     # hardcoded localhost default. Set to e.g. "http://192.168.1.50:11434" to
     # point at a remote/custom-port backend. Resolved by
@@ -205,6 +210,11 @@ _DEFAULTS = {
     "vault_wikilink_neighbor_cap": 10,
     "vault_wikilink_node_cap": 24,
     "vault_wikilink_score_decay": 0.5,
+    # Paper labels (2026-09-23): after reranking, chunks whose source the
+    # audit's join knows carry "Smith et al., 2020, Title [key]" into the
+    # prompt, the agent's vault_search results and the retrieval frame.
+    # Config-only (never a body override); needs a completed audit scan.
+    "vault_paper_labels": True,
     # Agent web_search tool (2026-07-22, Batch C): opt-in, ONLINE chat
     # providers only, requires TAVILY_API_KEY in the environment at call time
     # (never persisted). The toggle is body-overridable per Send
@@ -257,6 +267,7 @@ _DEFAULTS = {
     "online_timeout_s": DEFAULT_ONLINE_TIMEOUT_S,
     "online_max_retries": DEFAULT_ONLINE_MAX_RETRIES,
     "online_max_tokens": DEFAULT_ONLINE_MAX_TOKENS,
+    "online_reasoning_effort": "provider_default",
     # Document-token bound for ONLINE single-paper summaries: past this the
     # map-reduce path splits the document. A reliability/cost bound, not a
     # hard model limit — LOWER it when the selected online model's real
@@ -325,6 +336,11 @@ _DEFAULTS = {
     # used as the FULL system prompt (no retrieval grounding to protect).
     "chat_temperature": 0.3,
     "chat_system_prompt": "You are a helpful assistant.",
+    # Per-attachment extracted-text cap. Rationale and the measurement that
+    # sized the default are at DEFAULT_CHAT_ATTACHMENT_MAX_CHARS; the number
+    # lives in core/constants.py so the route's fallback and this default
+    # cannot drift (the tagging_propose_max_tokens lesson).
+    "chat_attachment_max_chars": DEFAULT_CHAT_ATTACHMENT_MAX_CHARS,
     # --- Prompt Hub (transparency panel) ---
     # Gates the in-memory capture of the effective system prompt last sent per
     # workflow (see core/prompt_capture.py + GET /api/prompts). Default on: it is
@@ -389,41 +405,8 @@ _DEFAULTS = {
     "docgen_retry_backoff_s": 3,
     "docgen_section_max_tokens": 4096,
     "docgen_resume_enabled": True,
-    # --- Note Refactor knobs ---
-    # Scope sub-folder analyzed by /api/refactor/plan; validated as a
-    # vault-relative no-traversal path in api/routes/config.py.
-    # "" ⇒ no default scope: the user must pick a folder before a plan
-    # runs (an empty scope resolves to None → a clean 400 in the route).
-    # refactor_extract_model "" ⇒ fall back to vision_model.
-    "refactor_scope_subdir": "",
-    "refactor_extract_model": "",
-    "refactor_table_double_read": True,
-    # When True the extracted-text callout drops the descriptive
-    # "This image is…/Transcribed Text:" preamble for EVERY image (the
-    # per-image `strip` flag stays additive). Read identically by the plan
-    # and the apply writer so the WYSIWYG guard holds; a body override is
-    # deliberately NOT accepted (config is the single source of truth).
-    "refactor_strip_preamble_default": False,
-    # Opt-in per-note LLM prose review (refactor/review.py). review_model ""
-    # ⇒ fall back to the configured chat model for the active provider; set a
-    # model name to point the quality-sensitive prose pass at a stronger
-    # model than everyday chat (mirrors refactor_extract_model for vision).
-    "refactor_review_model": "",
-    "refactor_review_max_tokens": 1024,
-    # Max tokens for the applyable LLM formatting rewrite (refactor/llm_edit.py
-    # rewrite_formatting). Larger than the review/summary/chart cap because it
-    # re-emits the whole note/section body. The summary + chart actions reuse
-    # refactor_review_max_tokens (bounded outputs); the model for all three is
-    # refactor_review_model (→ chat model when empty).
-    "refactor_rewrite_max_tokens": 4096,
-    # Phase 2 vault-write knobs.  refactor_archive_dir "" ⇒ default
-    # BASE_DIR/refactor/archive/<vault_key>/ (local disk only — NOT iCloud);
-    # set an absolute path to point at a backed-up folder.  Must resolve
-    # OUTSIDE the vault (re-checked at apply time).  refactor_thumb_max_side
-    # bounds the longest side of the in-vault PNG thumbnail the archiver
-    # writes when it moves a full-res original out.
+    # Compatibility: keep existing default/custom recovery evidence locations.
     "refactor_archive_dir": "",
-    "refactor_thumb_max_side": DEFAULT_REFACTOR_THUMB_MAX_SIDE,
     # Biblio Tagging write knobs. tagging_archive_dir "" ⇒ default
     # BASE_DIR/tagging/archive/<vault_key>/ (the tagging Restore manifest +
     # pre-write note snapshots; local disk only). Must resolve OUTSIDE the vault
@@ -458,6 +441,35 @@ _DEFAULTS = {
     # embed provider is unavailable.
     "tagging_candidate_tags": 20,
     "tagging_fewshot_k": 3,
+    # Restore-journal retention (2026-08-26). Applied Finder/Zotero ops are
+    # exempt from the _MAX_OPS cap because their prior tag lists live INLINE in
+    # the record with no snapshot file behind them — eviction destroys the only
+    # restore mapping — so that population grows for the life of the library
+    # (measured: 11,451 of 11,651 ops, 8 MB re-parsed on every write).
+    #
+    # Ships DISABLED, deliberately. This is the one setting in the app whose
+    # effect is to delete undo records, so it must be an informed choice, never
+    # a default that quietly trims history. The manual, confirm-gated
+    # "Compact journal" action covers the occasional case without it.
+    # Note and vocab ops are never touched by either path.
+    # Zotero-note sync (Batch E, 2026-08-26). `notesync_template` is the
+    # user-editable note layout — blank means the built-in default, a faithful
+    # port of the maintainer's Zotero Integration template. `notesync_containment`
+    # is the drift threshold: the fraction of a Zotero reading note's distinct
+    # words that must still be present in the exported note. Calibrated at 0.85
+    # against the live library (3 of 1,231 flagged, all genuine).
+    "notesync_template": "",
+    "notesync_containment": 0.85,
+    # Zotero-authoritative note sync (maintainer decision 2026-09-19): the
+    # reading notes are edited ONLY in Zotero and `Z_Zotero_Notes/` is a
+    # read-only mirror. On, the Notes Sync tab hides the Obsidian → Zotero
+    # verbs and offers ONE git-gated sweep (`/api/notesync/refresh-all`) that
+    # rewrites every note's region from Zotero. Off keeps the two-way sync.
+    "notesync_zotero_authoritative": False,
+    "tagging_journal_retention_enabled": False,
+    "tagging_journal_retention_policy": "age_days",
+    "tagging_journal_retention_days": 365,
+    "tagging_journal_retention_keep": 5000,
     # Zotero local-API base for the tag writer (loopback; no key). The writer
     # appends /api/<library>/items/<key>. Zotero must have "Allow other
     # applications on this computer to communicate with Zotero" enabled.
@@ -473,6 +485,34 @@ _DEFAULTS = {
     #           local API gains PATCH.
     "tagging_zotero_transport": "auto",
     "tagging_zotero_web_api_base": "https://api.zotero.org",
+    # Accession (keyless bibliographic resolution for orphan PDFs). OFF by
+    # default and never automatic: identification runs only when the user
+    # presses Identify on the "PDFs Without Zotero" report, and never during
+    # a scan. What leaves the machine is a DOI, or a title and a surname —
+    # never PDF bytes, never full page text (README egress note). The
+    # contact e-mail is OPTIONAL (Crossref polite pool); empty falls back to
+    # the public pool, and it is never read from the git identity.
+    # Vault Maintenance (private-only subsystem, STRIP STEP 4; the keys ship
+    # because the generic config surface does — publicly they are inert).
+    # The links-step folder/note default to "": the REAL default names live in
+    # the stripped maintenance/paths.py, so the maintainer's vault folder
+    # names never materialise into a public install's config.json
+    # (save_config writes every default to disk — the vault_paths rule-5
+    # privacy posture). Thresholds are measured baselines (2026-08-11, from
+    # the retired scripts/vault_maintain/audit_library.py).
+    "maintenance_links_index_subdir": "",
+    "maintenance_links_index_note": "",
+    "maintenance_max_drift": 0,
+    "maintenance_max_no_pdf": 2200,
+    "maintenance_max_dupes": 0,
+    "maintenance_max_hygiene": 0,
+    "maintenance_max_hygiene_unmapped": 0,
+    "accession_enabled": False,
+    "accession_contact_email": "",
+    "accession_sources": ["crossref", "europepmc", "arxiv", "hal", "thesesfr"],
+    "accession_max_candidates": 5,
+    "accession_timeout_s": 15,
+    "accession_batch_max": 50,
     # Library Audit (kb_harmonizer) settings. The audit subsystem
     # is fully manual — these keys are read only when the user
     # explicitly clicks "Run Scan" on the Library Audit tab.
@@ -554,6 +594,25 @@ def _migrate_3_to_4(data: dict) -> dict:
     return data
 
 
+def _migrate_4_to_5(data: dict) -> dict:
+    """Replace only model selections whose retirement is confirmed."""
+    data = _prune_unknown_keys(data)
+    retired = {
+        "openai_model": {"o1-preview", "o1-mini"},
+        "google_model": {"gemini-1.5-pro", "gemini-1.5-flash",
+                         "gemini-2.0-flash", "gemini-2.0-flash-exp"},
+        "deepseek_model": {"deepseek-v4-flash"},
+    }
+    for key, model_ids in retired.items():
+        if data.get(key) in model_ids:
+            data[key] = _DEFAULTS[key]
+    retired_overrides = set().union(*retired.values())
+    for key in ("deck_review_model", "tagging_propose_model"):
+        if data.get(key) in retired_overrides:
+            data[key] = _DEFAULTS[key]
+    return data
+
+
 _MIGRATIONS: dict = {
     # 0→1 and 1→2 both prune keys unknown to the CURRENT release. 1→2 (2026-07-13)
     # retires `library_root` (a config key that was declared but referenced
@@ -568,6 +627,7 @@ _MIGRATIONS: dict = {
     # 3→4 (2026-07-30): reset a persisted retired DeepSeek alias (see
     # _migrate_3_to_4 — the sunset stopped offering the id, not using it).
     3: _migrate_3_to_4,
+    4: _migrate_4_to_5,
 }
 
 

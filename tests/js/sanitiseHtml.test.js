@@ -101,9 +101,10 @@ describe('sanitiseHtml — control-character scheme smuggling (Track 1.2)', () =
         expect(out).toContain('t</p>');
     });
 
-    it('keeps a benign style attribute without url()', () => {
+    it('drops all style attributes because rendered Markdown needs none', () => {
         const out = sanitiseHtml('<p style="color:red">t</p>');
-        expect(out).toContain('color:red');
+        expect(out).not.toMatch(/style=/);
+        expect(out).toContain('<p>t</p>');
     });
 
     // E5 (2026-07-20 audit): the bare `url(` substring test was evadable.
@@ -118,6 +119,58 @@ describe('sanitiseHtml — control-character scheme smuggling (Track 1.2)', () =
         const out = sanitiseHtml('<p style="background:image-set(&quot;http://attacker/x&quot; 1x)">t</p>');
         expect(out).not.toContain('attacker');
         expect(out).not.toMatch(/style=/);
+    });
+});
+
+describe('sanitiseHtml — maintained allowlist and no-beacon policy', () => {
+    it('drops remote and protocol-relative images but keeps relative/inline bitmaps', () => {
+        const out = sanitiseHtml(
+            '<img alt="remote" src="https://attacker.test/pixel.png">'
+            + '<img alt="proto" src="//attacker.test/pixel.png">'
+            + '<img alt="local" src="attachments/local.png">'
+            + '<img alt="inline" src="data:image/png;base64,AAAA">');
+        expect(out).not.toContain('attacker.test');
+        expect(out).toContain('attachments/local.png');
+        expect(out).toContain('data:image/png;base64,AAAA');
+    });
+
+    it('removes SVG/MathML namespaces and mutated active descendants', () => {
+        const vectors = [
+            '<svg><a xlink:href="javascript:alert(1)"><text>x</text></a></svg>',
+            '<math><mtext><img src=x onerror=alert(1)></mtext></math>',
+            '<svg><foreignObject><iframe srcdoc="<script>x</script>"></iframe></foreignObject></svg>',
+            '<math><annotation-xml encoding="text/html"><script>x</script></annotation-xml></math>',
+        ];
+        for (const vector of vectors) {
+            const out = sanitiseHtml(vector);
+            expect(out).not.toMatch(/svg|math|xlink|script|iframe|onerror/i);
+        }
+    });
+
+    it('drops srcset, ids/names, forms, media and malformed namespace attributes', () => {
+        const out = sanitiseHtml(
+            '<img src="local.png" srcset="https://attacker/x 2x" id="clobber">'
+            + '<form><input name="location"></form>'
+            + '<video autoplay src="https://attacker/v"></video>'
+            + '<p xmlns:x="urn:x" x:href="javascript:x">kept</p>');
+        expect(out).not.toMatch(/srcset|id=|name=|form|input|video|autoplay|xmlns|x:href/i);
+        expect(out).not.toContain('attacker');
+        expect(out).toContain('kept');
+    });
+
+    it('allows only explicit supported link schemes', () => {
+        const out = sanitiseHtml(
+            '<a href="obsidian://open?vault=x">obsidian</a>'
+            + '<a href="zotero://select/items/x">zotero</a>'
+            + '<a href="file:///etc/passwd">file</a>'
+            + '<a href="//attacker/x">protocol relative</a>'
+            + '<a href="java&#x0d;script:x">smuggled</a>');
+        const host = document.createElement('div');
+        host.innerHTML = out;
+        const links = [...host.querySelectorAll('a')];
+        expect(links[0].getAttribute('href')).toBe('obsidian://open?vault=x');
+        expect(links[1].getAttribute('href')).toBe('zotero://select/items/x');
+        expect(links.slice(2).every((a) => !a.hasAttribute('href'))).toBe(true);
     });
 });
 
@@ -141,5 +194,42 @@ describe('_styleHasExternalRef', () => {
                 expect(_styleHasExternalRef(v), v).toBe(false);
             }
         });
+    });
+});
+
+describe('policy is applied inside DOMPurify, not over a re-parsed copy', () => {
+    it('drops stylesheet classes untrusted Markdown tries to borrow', () => {
+        // `class` is allowed so fenced code keeps `language-x`. Unrestricted, a
+        // note or model reply could apply any app class — including overlay and
+        // positioning ones — which is UI redress, not styling.
+        const out = sanitiseHtml(
+            '<p class="modal-overlay audit-link-btn">x</p>'
+            + '<pre><code class="language-python">y</code></pre>');
+        expect(out).not.toContain('modal-overlay');
+        expect(out).not.toContain('audit-link-btn');
+        expect(out).toContain('language-python');
+    });
+
+    it('keeps the app link schemes and still refuses the rest', () => {
+        expect(sanitiseHtml('<a href="obsidian://open?vault=x">o</a>'))
+            .toContain('obsidian://open');
+        expect(sanitiseHtml('<a href="zotero://select/items/1">z</a>'))
+            .toContain('zotero://select');
+        for (const href of ['javascript:alert(1)', 'vbscript:x',
+                            'file:///etc/passwd', 'data:text/html,<b>']) {
+            expect(sanitiseHtml(`<a href="${href}">x</a>`)).not.toContain(href);
+        }
+    });
+
+    it('does not re-parse and re-serialise DOMPurify output', async () => {
+        // Source ratchet. The extra DOMParser round trip after sanitization is
+        // the mXSS shape DOMPurify warns against; keeping the policy in a hook
+        // is what removed it, so a reintroduction should fail here.
+        const fs = await import('node:fs/promises');
+        const src = await fs.readFile('static/js/ui.js', 'utf8');
+        const body = src.slice(src.indexOf('export function sanitiseHtml'),
+                               src.indexOf('export function renderExampleChips'));
+        expect(body).not.toMatch(/DOMParser/);
+        expect(body).not.toMatch(/ALLOW_UNKNOWN_PROTOCOLS/);
     });
 });

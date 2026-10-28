@@ -1,4 +1,4 @@
-"""Entry point for ChatEKLD 2026 — a privacy-first, offline-first AI assistant
+"""Entry point for CHERQAiN 2026 — a privacy-first, offline-first AI assistant
 (fully local).
 
 This module orchestrates the full application lifecycle:
@@ -16,6 +16,7 @@ This module orchestrates the full application lifecycle:
    once the window is closed, ensuring no stray child processes are left
    behind.
 """
+from core.branding import env_value
 
 import atexit
 import os
@@ -125,22 +126,14 @@ def _load_env_files() -> None:
     import) is sufficient.  The python-dotenv import is optional — a missing
     install only disables ``.env`` loading, it never blocks startup.
     """
-    try:
-        from dotenv import load_dotenv
-    except Exception:
-        logger.debug("python-dotenv not installed; skipping .env loading.")
-        return
-    candidates = [os.path.join(_BASE_DIR, ".env")]
+    # The loader is shared with the headless `papermind server`
+    # (core/env_files.py, CLI proof run 2026-09-23 C4), so both entry points
+    # read the same files the same way.
+    from core.env_files import load_env_files
+    dirs = [_BASE_DIR]
     if not getattr(sys, "frozen", False):
-        candidates.append(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-        )
-    for path in candidates:
-        try:
-            if os.path.isfile(path) and load_dotenv(path, override=False):
-                logger.info("Loaded environment overrides from %s", path)
-        except Exception:
-            logger.debug("Failed to load .env from %s", path, exc_info=True)
+        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    load_env_files(dirs)
 
 
 def _maybe_enable_hf_offline() -> None:
@@ -281,7 +274,7 @@ def seed_models() -> int:
 
     # Terminal-visible summary (logger also mirrors to stdout for the .command window).
     print("")
-    print("ChatEKLD offline model seed: " + (
+    print("CHERQAiN offline model seed: " + (
         "DONE — the app can now index and chat fully offline."
         if ok else
         "FINISHED WITH ERRORS — see chatekld.log and re-run while online."
@@ -307,20 +300,24 @@ _maybe_enable_hf_offline()
 if "--seed-models" in sys.argv:
     raise SystemExit(seed_models())
 
-try:
-    import webview
-    from app import app as flask_app
-    from core.providers.server import (
-        start_ollama_server,
-        start_lm_studio_server,
-        shutdown_ollama,
-        add_provider_warning,
-    )
-    from core.config import load_config
-except Exception as e:
-    logger.error(f"Failed to import core modules: {e}")
-    logger.error(traceback.format_exc())
-    sys.exit(1)
+def _load_runtime():
+    """Import services only after the common GUI/CLI ownership gate."""
+    global webview, flask_app, start_ollama_server, start_lm_studio_server
+    global shutdown_ollama, add_provider_warning, load_config
+    try:
+        import webview
+        from app import app as flask_app
+        from core.providers.server import (
+            start_ollama_server,
+            start_lm_studio_server,
+            shutdown_ollama,
+            add_provider_warning,
+        )
+        from core.config import load_config
+    except Exception as e:
+        logger.error(f"Failed to import core modules: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)
 
 def find_free_port():
     """Find and return an available TCP port on the loopback interface.
@@ -345,13 +342,12 @@ def find_free_port():
         return 5000 # Fallback
 
 def run_flask(port):
-    """Run the Flask development server on the loopback interface.
+    """Run the supported bounded WSGI server on the loopback interface.
 
     This function is the target for the daemon thread started in
-    ``main()``.  It calls ``flask_app.run()`` which blocks until the
-    server is shut down (i.e. when the process exits).  The reloader is
-    disabled because PyWebView already owns the main thread and a
-    reloader restart would orphan the native window.
+    ``main()``. It calls the shared bounded Waitress launcher, which blocks
+    until the process exits. PyWebView owns the main thread; no development
+    reloader is involved.
 
     Args:
         port: The TCP port number on which Flask should listen.  Must be
@@ -368,29 +364,19 @@ def run_flask(port):
         # become the only barrier against external access.  Making the binding
         # explicit prevents an accidental host='0.0.0.0' change from silently
         # opening the server to the local network.
-        # Using Waitress as a production WSGI server to prevent thread pool exhaustion
-        # caused by long-lived Server-Sent Events (SSE). Flask's development server
-        # (Werkzeug) limits concurrent connections severely in synchronous mode.
-        # threads=32: pool slots are occupied for the full duration of SSE
-        # generations (up to 300 s) and upload extractions (proc.join up to
-        # 600 s) while the UI keeps 1 Hz status polling going — the threads
-        # are I/O-parked, so doubling the pool is cheap insurance against
-        # exhaustion presenting as a frontend hang.  Do NOT add a
-        # channel_timeout here expecting it to reap stuck requests: waitress'
-        # maintenance() only closes channels with no in-flight request.
-        try:
-            from waitress import serve
-            serve(flask_app, host='127.0.0.1', port=port, threads=32)
-        except ImportError:
-            logger.warning("Waitress not found. Falling back to Flask dev server.")
-            flask_app.run(host='127.0.0.1', port=port, debug=False, use_reloader=False)
+        # GUI and headless must share one bounded resource policy. Falling back
+        # to Werkzeug would silently reintroduce unbounded per-request threads
+        # exactly when a packaging error removes Waitress, so startup now fails
+        # visibly instead of weakening the execution model.
+        from core.wsgi import serve_loopback
+        serve_loopback(flask_app, host='127.0.0.1', port=port)
 
     except Exception as e:
         logger.error(f"Flask failed to run: {e}")
         logger.error(traceback.format_exc())
 
 def main():
-    """Execute the full ChatEKLD startup-and-shutdown sequence.
+    """Execute the full CHERQAiN startup-and-shutdown sequence.
 
     The sequence is deliberately ordered to minimise perceived launch
     latency:
@@ -416,6 +402,11 @@ def main():
             unrecoverable error occurs during startup.
     """
     try:
+        from core.server_info import acquire_server_lease
+        server_lease = acquire_server_lease()
+        # The daemon HTTP thread lives until process exit, so does its lease.
+        atexit.register(server_lease.close)
+        _load_runtime()
         port = find_free_port()
 
         # Start Flask in a background thread first — do NOT block on Ollama before this.
@@ -497,21 +488,20 @@ def main():
         # the GUI's random port. Written exactly at the probe-verified "socket
         # is accepting" moment (Flask 3 has no before_first_request and
         # waitress.serve blocks, so the launch site IS the right hook). A
-        # pre-existing record from another LIVE server is logged and then
-        # overwritten — GUI wins, last-writer-wins, and readers always
-        # re-probe health so a stale record can never misroute a request.
+        # startup lease already excludes competing GUI and CLI instances.
         try:
-            from core.server_info import (clear_server_info, pid_alive,
-                                          read_server_info, write_server_info)
-            _prev_info = read_server_info()
-            if _prev_info and _prev_info.get("pid") != os.getpid() \
-                    and pid_alive(_prev_info["pid"]):
-                logger.warning(
-                    "Another ChatEKLD server appears to be running on port %s "
-                    "(pid %s); the CLI/MCP tools will now target THIS instance.",
-                    _prev_info.get("port"), _prev_info.get("pid"),
-                )
+            from core.server_info import (SERVER_INFO_FILE, clear_server_info,
+                                          write_server_info)
             write_server_info(port)
+            # Explicit confirmation that the write site was REACHED (2026-08-12).
+            # The investigation into a live GUI with no server.json could only
+            # infer that from the next log line, which left "never written" and
+            # "written then removed" indistinguishable. Logging the observed
+            # post-write state separates them if it ever happens again.
+            logger.info(
+                "Server discovery file written: %s (port %s, exists=%s)",
+                SERVER_INFO_FILE, port, os.path.exists(SERVER_INFO_FILE),
+            )
             # Belt-and-braces for exits that skip the post-window cleanup
             # (clear_server_info only deletes its OWN pid's record, so this
             # can never race another instance's file).
@@ -524,8 +514,14 @@ def main():
         # load_config() is safe to call here — Flask is already accepting requests
         # so the config file is fully initialised.
         _provider = load_config().get("provider", "ollama")
+        # Explicit maintenance/native-acceptance opt-out. A reachable LM Studio
+        # can still auto-load a model in its startup helper, so skipping only
+        # process creation is insufficient. Keep the decision through cleanup.
+        _skip_provider_startup = env_value("CHATEKLD_SKIP_PROVIDER_STARTUP") == "1"
 
-        if _provider == "lm_studio":
+        if _skip_provider_startup:
+            logger.info("Provider startup/shutdown disabled for this launch.")
+        elif _provider == "lm_studio":
             # LM Studio is a GUI app launched via ``open -a`` — we have no
             # subprocess handle to track, so there is nothing to join on shutdown
             # and no equivalent of shutdown_ollama().  The thread is daemon=True
@@ -590,13 +586,28 @@ def main():
         ).start()
 
         # Launch native window — webview.start() blocks until the user closes the window.
-        logger.info(f"Launching ChatEKLD window at {url}")
+        logger.info(f"Launching CHERQAiN window at {url}")
         # min_size keeps the window above the layout's narrow breakpoint so the
         # sidebar (all model/provider/OCR controls) can never be resized out of
         # reach — the app is desktop-only, so there is no mobile layout to fall
         # back to.
+        # text_select=True is LOAD-BEARING, not a nicety. PyWebView's default
+        # is False, and when it is False pywebview injects
+        #   body { -webkit-user-select: none; user-select: none; cursor: default }
+        # into the document at load time (webview/js/customize.js). `user-select`
+        # inherits, so that single rule made every answer, summary and report in
+        # the app unselectable with the mouse — the Copy buttons and the MD/TXT
+        # exports were the only ways to get text out, and the caret never even
+        # appeared. Nothing in this project's own CSS ever blocked selection.
+        #
+        # No automated gate can catch a regression here: tests/browser/ boots the
+        # real app in Chromium, which never sees pywebview's injection. It has to
+        # be checked by hand in the packaged window (same blind spot as the
+        # WKWebView CSP/blob-PDF class in Known Issues) — hence test_launch.py's
+        # argument assertion, which at least pins that we still pass it.
         window = webview.create_window(
-            "ChatEKLD", url, width=1200, height=800, min_size=(960, 640)
+            "CHERQAiN", url, width=1200, height=800, min_size=(960, 640),
+            text_select=True,
         )
 
         # Shutdown watcher: monitors _shutdown_event (set by SIGINT/SIGTERM signal
@@ -652,7 +663,9 @@ def main():
         except Exception:  # noqa: BLE001 — cleanup is best-effort
             pass
 
-        if _provider == "lm_studio":
+        if _skip_provider_startup:
+            logger.info("Leaving externally managed provider services unchanged.")
+        elif _provider == "lm_studio":
             # LM Studio is a user-owned GUI process — we must not terminate it.
             # The startup thread is daemon=True so it will be cleaned up
             # automatically when the interpreter exits.  No explicit join needed.

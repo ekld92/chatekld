@@ -1,4 +1,4 @@
-"""Model Context Protocol (MCP) stdio server for ChatEKLD / PaperMind.
+"""Model Context Protocol (MCP) stdio server for CHERQAiN.
 
 Exposes tools and resources to local AI Agents (Claude Code, OpenClaw, Cursor, Roo Code).
 Runs over stdio transport using standard JSON-RPC 2.0.
@@ -32,19 +32,23 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from core.driver import (  # noqa: E402
+    AUDIT_REPORT_NAMES,
+    audit_inventory,
+    audit_report,
     audit_scan,
+    audit_summary,
     generate_deck,
     generate_doc,
     get_status,
-    refactor_apply,
-    refactor_plan,
     summarize_paper,
     tagging_apply,
     tagging_propose,
     vault_ask,
     vault_search,
+    notesync_status,
 )
 from api.security import sanitise_error_msg  # noqa: E402
+from core.constants import TAGGING_TARGETS  # noqa: E402
 from core.utils import log_vault_write  # noqa: E402
 
 # Redirect python logger strictly to stderr to protect stdout JSON-RPC stream
@@ -68,7 +72,27 @@ _write_semaphore = threading.Semaphore(1)
 # all 4 pool workers, after which even ping/tools/list starved and the host
 # marked the server unresponsive. A vault write queued behind a long doc
 # generation should wait a while — but not forever.
-WRITE_LOCK_TIMEOUT_S = 300.0
+#
+# TIMEOUT CHAIN (2026-09-02): the wait now OUTLASTS the writes it serialises,
+# and the pool is protected by bounding the WAITERS instead of the wait.
+# Before: 300 s, while the driver gives a refactor apply 900 s — so a second
+#   write queued behind a legitimate, still-running first one was told
+#   "busy, retry shortly" after 300 s, at a moment when retrying could only
+#   fail the same way. Outer-must-exceed-inner, broken at the CLI/MCP seam.
+# Change: the wait is the longest write the driver allows plus a margin, and
+#   at most _WRITE_WAITER_MAX callers may queue — beyond that the answer is
+#   an immediate busy. The pool-starvation property the 300 s bound was
+#   introduced for is therefore preserved exactly (holder 1 + waiters 2 = 3
+#   of the 4 workers, leaving one for ping/tools/list), while a legitimate
+#   waiter is no longer cut off inside the write it is waiting for.
+# Pinned by: tests/test_mcp_server.py::TestWriteSlotWaiting.
+_DRIVER_LONGEST_WRITE_S = 900.0
+WRITE_LOCK_TIMEOUT_S = _DRIVER_LONGEST_WRITE_S + 60.0
+#: How many callers may WAIT for the slot at once. Chosen so the holder plus
+#: the waiters can never occupy every worker in the pool above.
+_WRITE_WAITER_MAX = 2
+_write_waiters = 0
+_write_waiters_lock = threading.Lock()
 
 
 class ServerBusyError(Exception):
@@ -89,7 +113,7 @@ def _is_write_call(name: str, args: Dict[str, Any]) -> bool:
     ``log_vault_write`` audit line the docs claim cover every write tool. Its
     latex mode is emit-only (scaffolds outside the vault) and stays a read.
     """
-    if name in ("biblio_apply_tags", "refactor_apply_callouts"):
+    if name == "biblio_apply_tags":
         return True
     if name == "generate_document":
         return (args or {}).get("mode", "markdown") == "markdown"
@@ -107,7 +131,10 @@ MCP_TOOLS = [
         "description": ("Search notes and documents in the Obsidian vault index. "
                         "Runs one full RAG chat turn (retrieval + an LLM answer) "
                         "and returns the retrieval sources plus the answer — "
-                        "each call costs a generation, not just a lookup."),
+                        "each call costs a generation, not just a lookup. Each "
+                        "result is {source, score, is_image} plus an additive "
+                        "paper: {key, label} when the audit's paper index knows "
+                        "the chunk's paper."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -167,6 +194,55 @@ MCP_TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "audit_summary",
+        "description": (
+            "Headline counters from the last completed audit scan: how many "
+            "records have a PDF, a reference note, a Zotero item; unmapped "
+            "PDFs; tag coverage and tag depth. Read-only, and far smaller "
+            "than audit_inventory — prefer this for 'where does the library "
+            "stand'."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "notesync_status",
+        "description": (
+            "The two-way Zotero ⇄ Obsidian reading-note sync state, per note: "
+            "in_sync, pull (Zotero changed), push (the note changed), conflict "
+            "(both), unbaselined, missing on either side. Read-only; reads "
+            "Zotero fresh. The write verbs are GUI-only and confirm-gated."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "audit_report",
+        "description": (
+            "One reconciliation report from the last completed audit scan "
+            "(read-only). Use audit_summary first to see whether a report is "
+            "worth pulling."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "enum": list(AUDIT_REPORT_NAMES),
+                    "description": "Which report to read",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "audit_inventory",
+        "description": (
+            "Every per-citation-key record from the last completed audit scan "
+            "(read-only). LARGE — thousands of records. Prefer audit_summary "
+            "for counts and audit_report for a specific question."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "biblio_propose_tags",
         "description": "Propose tags for a paper constrained to the vault's controlled vocabulary (_tags.md).",
         "inputSchema": {
@@ -197,42 +273,6 @@ MCP_TOOLS = [
                 },
             },
             "required": ["citation_key", "tags"],
-        },
-    },
-    {
-        "name": "refactor_plan_folder",
-        "description": "Analyze Markdown notes in a vault subfolder for OCR callouts, broken embeds, and formatting.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "subfolder": {
-                    "type": "string",
-                    "default": "",
-                    "description": "Vault subfolder path (empty = root)",
-                }
-            },
-        },
-    },
-    {
-        "name": "refactor_apply_callouts",
-        "description": "Apply approved image OCR callouts into vault notes (atomic, journalled, reversible).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "subfolder": {
-                    "type": "string",
-                    "default": "",
-                    "description": "Vault subfolder path",
-                },
-                "rels": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": ("Vault-relative note paths to restrict the "
-                                    "write to (omit = every changed note in "
-                                    "scope). Prefer restricting — it bounds "
-                                    "the blast radius of one confirmed call."),
-                },
-            },
         },
     },
     {
@@ -316,21 +356,21 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         )
     elif name == "audit_library":
         res = audit_scan()
+    elif name == "audit_summary":
+        res = audit_summary()
+    elif name == "notesync_status":
+        res = notesync_status()
+    elif name == "audit_report":
+        res = audit_report(name=args.get("name", ""))
+    elif name == "audit_inventory":
+        res = audit_inventory()
     elif name == "biblio_propose_tags":
         res = tagging_propose(citation_key=args.get("citation_key", ""))
     elif name == "biblio_apply_tags":
         res = tagging_apply(
             citation_key=args.get("citation_key", ""),
             tags=args.get("tags", []),
-            targets=args.get("targets", ["note", "finder", "zotero"]),
-        )
-    elif name == "refactor_plan_folder":
-        res = refactor_plan(subfolder=args.get("subfolder", ""))
-    elif name == "refactor_apply_callouts":
-        rels = args.get("rels")
-        res = refactor_apply(
-            subfolder=args.get("subfolder", ""),
-            rels=[str(r) for r in rels] if isinstance(rels, list) and rels else None,
+            targets=args.get("targets", list(TAGGING_TARGETS)),
         )
     elif name == "generate_deck":
         res = generate_deck(
@@ -354,6 +394,24 @@ def _dispatch_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     return res
 
 
+def _acquire_write_slot() -> bool:
+    """Take the single write slot, waiting only if the queue has room.
+
+    Returns False for "busy" — either too many callers are already waiting
+    (the pool-starvation bound) or the wait itself expired.
+    """
+    global _write_waiters
+    with _write_waiters_lock:
+        if _write_waiters >= _WRITE_WAITER_MAX:
+            return False
+        _write_waiters += 1
+    try:
+        return _write_semaphore.acquire(timeout=WRITE_LOCK_TIMEOUT_S)
+    finally:
+        with _write_waiters_lock:
+            _write_waiters -= 1
+
+
 def handle_tool_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a tool and return the MCP text-content result.
 
@@ -373,7 +431,7 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if is_write:
         logger.info("Executing MCP WRITE tool '%s'", name)
         log_vault_write("mcp_tool_call", name, json.dumps(args, ensure_ascii=False))
-        acquired = _write_semaphore.acquire(timeout=WRITE_LOCK_TIMEOUT_S)
+        acquired = _acquire_write_slot()
         if not acquired:
             raise ServerBusyError(
                 "Busy: another vault write is in progress; retry shortly.")
@@ -507,7 +565,7 @@ def handle_request(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "resources": [
                     {
                         "uri": "papermind://status",
-                        "name": "PaperMind System Status",
+                        "name": "CHERQAiN System Status",
                         "mimeType": "application/json",
                         "description": "Current configuration, index status and health",
                     }
@@ -609,7 +667,7 @@ def process_line(line: str) -> None:
 
 def main():
     """Main stdio loop reading line-delimited JSON-RPC requests."""
-    logger.info("PaperMind MCP Server starting over stdio...")
+    logger.info("CHERQAiN MCP Server starting over stdio...")
     for line in sys.stdin:
         line = line.strip()
         if not line:

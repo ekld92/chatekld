@@ -1,6 +1,4250 @@
 # Changelog
 
+## Unreleased — Ask usage attribution
+
+- Exclude concurrent Read/Create usage from single-shot Ask export totals by
+  tagging and filtering the Ask workflow. Retain enriched Prompt Hub capture.
+- Document the remaining same-workflow time-window approximation and cover the
+  historical contamination pattern with focused local/online route tests.
+
+## Unreleased — Accurate startup graph progress
+
+- Show note-link graph preparation separately from reranker loading, retaining
+  Ask readiness gating and existing retrieval/cache behavior.
+
+## Unreleased — Ask progress and Read presentation
+
+- Clear transient Ask progress on completion, error and Stop, and ignore late
+  callbacks while retaining durable notices and partial text.
+- Render Read Markdown with the shared sanitizer; preserve original source for
+  copy/export and cancel pending rendering on New Paper. Math stays source text.
+- Label total section attempts accurately; distinguish them from provider retries.
+
+## Unreleased — Read empty-output outcomes
+
+- Fail empty online summaries and empty map-part notes explicitly, without
+  replaying provider calls or changing their recorded token costs.
+- Emit available usage before terminal summary errors so SSE consumers can
+  retain accounting evidence. Add adapter replay and route regression coverage.
+
+## Unreleased — Field-test timing and recovery guidance
+
+- Measure local Ask duration from server workflow entry, including retrieval and
+  eager synthesis, while preserving partial/failure accounting.
+- Explain that corpus changes can interrupt Create and that retained checkpoints
+  require compatibility review before reuse. Context guards remain unchanged.
+- Add focused timing regressions; native acceptance remains a separate check.
+
+## Unreleased — Staged Library workflow and operation monitoring
+
+- Make Review library update the staged entry, with separate text preparation,
+  selected writes and final search confirmation. Keep search-only and saved
+  Search status controls secondary; clarify daily versus existing-library review.
+- Bind explicit session modes and initiating actions to previews; persist receipt
+  provenance and prevent preparation receipts from indexing through recovery.
+- Follow server-active work independently of history, including newer standalone
+  index completion, and show unknown status on failed/malformed observation.
+- Keep partial/uncertain/retry continuation gates locked; ignore departed preview
+  callbacks and avoid accumulating settings handlers. Check metadata-derived names
+  even when existing filenames have a plausible format.
+- Add a disposable preparation → approved writes → real fixture index test and
+  focused frontend/recovery regressions. These are local source changes, not an
+  installed-app deployment. See the review receipt (historical record in Git).
+
+## Unreleased — Repository review and delivery integrity
+
+- Reject empty or non-object CLI/MCP JSON acknowledgements; retain inspection
+  guidance for writes whose outcome is unknown.
+- Refuse recovery-source symlinks before opening PDFs. Report reset cache
+  deletion failures with completed steps instead of claiming success.
+- Redirect launch-test dotenv discovery to fixtures; refresh OCR, index-admission,
+  Library uncertainty and Create/browser regressions to match current contracts.
+- Remove obsolete typing allowances and consolidate the completed rename plan
+  and validation instructions. Mark abandoned upgrade permissions as historical.
+- Replace private-document links in public artifact copies with explicit omitted
+  reference labels before manifest hashing; keep public link checks enforced.
+  Align private regression-test ownership with the public-source boundary.
+
+## Unreleased — Index-build typing contract
+
+- Complete the build mixin's type-only host-member declarations, restoring the
+  repository mypy gate without runtime changes. Remove its 47-error allowance;
+  `rag/build.py` is now held to zero findings.
+
+## Unreleased — Library evidence and settings
+
+- Distinguish dated saved-manifest source counts from unknown current search
+  coverage. Bound observational metadata reads and reject malformed or changing
+  evidence; preview counts state their scope and preserve unknown values.
+- Link index/history and Library path tools from Settings; move Reset App Data
+  under Advanced data controls with its existing confirmation.
+- Layer nested dialogs by invocation order, hide lower dialogs from accessibility
+  navigation, and retain keyboard focus through reopening or early parent closure.
+
+## Unreleased — resource evidence and daily navigation
+
+- Bound shared OCR diagnostic history and freeze each PDF snapshot's memory
+  evidence so later documents cannot change an earlier snapshot or export.
+- Show search readiness and recovery outcomes even when all selected documents
+  were deferred. Use Ask, Read, Library and Create for the main task tabs.
+
+
+## Unreleased — Memory pressure and daily search updates
+
+- Allow bounded preparation at warning-level macOS memory pressure while retaining
+  critical-pressure, monitoring and swap-growth stops. Share the PDF batch baseline.
+- Add direct, preview-confirmed **Update library search**, with an explicit online
+  choice and optional names/tags/notes workflow. Preserve the embedding model.
+- Describe resource stops separately from document failures and offer a read-only
+  memory check; never restart work from that check.
+
+## Unreleased — Full inventory rendering
+
+- Display large inventories in pages of 100 rows while filtering and sorting the
+  complete dataset. Search jumps reveal their target page. Preserve open details
+  and pending confirmations on their original record across page changes.
+- Load optional note-link status separately with a bounded wait.
+- Validate the 7,300-record fixture with browser regressions and native WKWebView
+  pagination/filter interactions; retain native controller and timing limits.
+
+## Unreleased — Daily extraction and responsiveness fixes
+
+- Expose memory safety stops and recovery guidance without classifying the PDF as
+  defective; recover verifiable legacy diagnostics without rewriting receipts.
+- Keep Prepare busy through observation, preview and lexical preparation, bound
+  network waits, and reconnect after uncertain starts without replaying them.
+- Require a fresh explicit online choice for a targeted retry. Show all-deferred
+  preparation as no new text, with exceptions visible.
+- Preserve saved index metadata and valid lexical caches when a completed scan
+  proves no mutation. Group readable-copy warnings without overwriting copies.
+- Clarify daily vault/search procedures and validate using disposable fixtures.
+
+## Unreleased — Markdown Apply retryability
+
+- Separate definite rejection from preview-token retryability. Keep Apply
+  disabled after snapshot/write rejection and request a fresh preview; preserve
+  the apply-start barrier. Explicit path/vault contention can retry the same
+  unattempted preview. Cover rejection/replay/fresh-preview and contention retries
+  with isolated route and frontend regressions.
+
+## Unreleased — Final review corrections
+
+- Keep uncertain Markdown Apply outcomes unknown, retain recovery guidance, and
+  enable retry only after an explicit pre-write rejection.
+- Stop LaTeX generation between figure copies and before scaffolding on
+  cancellation or lost ownership; disclose retained files before retrying.
+- Defer Pillow oversized-image rejections without stopping unrelated sources.
+- Preserve author wording in Markdown slide prompts and selected-view hover
+  contrast in Index tools. Clarify Markdown preview expiry and cleanup timing.
+- Add isolated route, provider, frontend outcome and rendered regressions.
+
+## Unreleased — Audit corrections and isolated recovery checks
+
+- Stop online cache publication/index handoff on cancellation or lost operation
+  ownership; preserve partial-publication recovery evidence.
+- Keep provider timeouts and ambiguous HTTP errors global; require specific image
+  evidence before deferring a document.
+- Bound ordinary Markdown previews to seven days/newest 50 and invalidate them
+  across server sessions; retain uncertain apply evidence.
+- Make the activity task list keyboard-focusable and propagate authoritative
+  completion, partial, failure and cancellation outcomes.
+- Cache validated history completion counts in memory, keeping page reads
+  observational and invalidating counts on receipt changes.
+- Update Vitest to 4.1.12 and reconcile Studio, Maintenance and recovery docs.
+
+
+## Unreleased — Actionable extraction failures
+
+Preserve bounded, redacted provider HTTP errors in extraction receipts and show
+the actual error with next steps in daily preparation and History. Explicitly
+rejected images are deferred during daily updates while other documents continue.
+Authentication, quota, service, unknown request failures and integrity failures
+still stop the run. Retrying remains explicit; existing cached text is retained
+where available. Rename index recovery to “Finish interrupted search update”.
+
+## Unreleased — Unified workspaces
+
+Merge installed maintenance tools into Vault audit & maintenance. Add Studio
+selectors for decks/reports, generate/augment and Markdown/LaTeX. Add Markdown
+slides and staged, journalled append-only Markdown augmentation. Split index
+tools into task views with readable history cards, add a bottom activity console,
+and bundle Source Sans 3 throughout the interface.
+
+## Unreleased — Daily Library simplification
+
+Centralize extraction and embedding controls in general settings. Add native-only
+preparation, deferred unchanged failure receipts, explicit advanced retries, and
+Library text-preparation/final-index previews. Remember tag destinations with
+Zotero as the initial default. Preserve existing writer/recovery boundaries.
+
+
+## Unreleased — Clear daily index action
+
+Expose **Mettre à jour l’index** as the daily action, with OCR configuration,
+source selection, forced re-extraction and full rebuild in **Réglages de l’index**.
+The daily action ignores advanced source/rebuild/re-extraction choices and keeps
+the preview/confirmation boundary. Preserve contextual help and status visibility.
+
+## Unreleased — Daily workflow guidance
+
+Replace the Documents loading placeholder with an actionable no-scan/error
+message. Distinguish older OCR sessions with no recorded final status from
+interrupted sessions without inferring success from the active index. Add six
+keyboard-accessible contextual help popovers for everyday Library/index/OCR use.
+
+## Unreleased — Daily index integration
+
+Integrate the online extraction and index-integrity branches, preserve explicit
+incomplete-source manifests during legacy rebuild completion, and clarify daily
+updates versus re-extraction and full rebuilds. Cover renamed-PDF cache reuse and
+online history driver replay. Update filelock to 4.2.1 and setuptools to 84.1.0
+with regenerated macOS/Linux hash locks to address newly reported advisories.
+
+## Unreleased — UI/index review corrections
+
+Fix selected-cache reuse, cache-only short-PDF loading, recovery scope binding
+and durable omission reporting. Bound polling payloads, paginate saved evidence,
+and preserve usable extraction-panel height in small windows. Legacy continuation
+without scope evidence now refuses safely. Native acceptance remains open.
+
+## Unreleased — Explicit index admission and bounded extraction recovery
+
+Routine updates refuse incompatible embedding/store identities rather than
+implicitly rebuilding. Online updates reuse complete caches and preview selected
+new/changed sources; deferred binaries are enforced in the loader. One-file and
+batch promotion share before-images and landed markers. Saved run inspection,
+explicit bounded retries, exact omissions, reconciled index continuation, source
+selection and authenticated exports are available. Library freshness remains
+separate; applying Library changes offers navigation to a reviewed index update.
+Native and production acceptance remain open.
+
+
+## Unreleased — Run-wide online OCR and vision indexing
+
+Add a confirmed Vault index switch that stages eligible scanned-page OCR and
+referenced-image descriptions through separately saved online models, including
+cached sources. Immutable attempt, run and cache-promotion receipts precede an
+incremental index update with local OCR/vision model calls disabled. Local
+embedding identity is checked before external transmission; a model/backend
+change still requires a separate full rebuild. Incomplete extraction blocks
+promotion, and a new confirmed run can retry within the attempt limit. Focused
+disposable checks pass; live provider, production-vault and native UI acceptance
+remain open.
+
+## Unreleased — Optional online PDF and image transcription
+
+Add explicit one-file and previewed vault-session online text extraction for
+eligible PDF pages and note-referenced images. DeepSeek Flash, OpenAI,
+Gemini, and OpenRouter use allowlisted image-input models and the existing
+environment keys. Attempts and readable exports stay outside the vault;
+only a separate confirmed action promotes complete text to the existing cache
+and incremental index. Failed or partial results remain retryable and do not
+replace indexed content. Local provider and installed-app acceptance remain
+unverified.
+
+## Unreleased — Note Refactor retirement
+
+Remove Note Refactor analysis, editing, image archiving, settings, CLI commands
+and MCP tools. Move journal recovery to **Settings → History and Restore**,
+with independent shared note writers, file resolution and Plain Chat model locking.
+Existing journal formats, operation IDs, default/custom archive paths and historical
+restoration remain supported. Git-only Notes Sync mirror recovery is unchanged.
+
+## Unreleased — PDF extraction integrity and readable caches
+
+Keep known partial PDF extraction out of index replacement and stale cleanup;
+completed range caches remain retryable. Export successfully cached legacy text
+to no-clobber Markdown outside the vault, with an explicit cache-only backfill
+command for older PDFs. No model, embedding, or profile change is introduced.
+Installed-app delivery has not been performed.
+
+## Unreleased — Opt-in canonical PDF text profiles
+
+Add source-bound cached plain-text exports, separate page/provenance sidecars and
+an explicitly activated PDF cache-reader profile. Legacy routing remains the default;
+failed or stale profile reads visibly fall back. Add an isolated production-chunker
+retrieval comparison and disposable real-PDF recovery evidence. Production activation
+and installed/native acceptance remain unverified; the app build is deferred.
+
+## Unreleased — Certifi trust-store security update
+
+Pin certifi 2026.10.19 and regenerate both platform hash locks to address
+GHSA-6q48-6c7w-9gw2 (emSign roots). The macOS dependency audit and dependency
+gate tests pass. This source update does not update the installed environment.
+
+## Unreleased — Documentation and dependency gate
+
+Add a user and agent CLI guide, clarify Library workflows in the README and
+in-app help, and check public documentation links during CI and artifact
+creation. Update vulnerable Python pins in both platform lockfiles and move
+the JavaScript test harness to Vitest 4.1.11. CI runs on `codex/**` pushes so
+validated commits can satisfy protected-branch checks without a pull request.
+Manual CI runs scan the pending commits for secrets; normal push and pull
+request scans retain their existing action. Local JavaScript tests and the
+macOS dependency audit pass; installed app behavior remains unverified.
+
+## Unreleased — Provider routing review fixes
+
+OpenRouter now requires a capable upstream route for tool and explicit-reasoning
+requests. A model without cached capability metadata can still be dispatched
+with this routing requirement. The Gemini parallel-call fixture and provider
+contract now reflect the signature on the first call part. These changes have
+hermetic coverage; live forwarding and installed-app behavior remain unverified.
+
+## Unreleased — Online provider request contracts
+
+Gemini 3.x omits sampling controls and maps unsupported minimal thinking to
+low on 3.8 Flash. OpenRouter applies namespaced model-family rules, retains
+text-capable Codex models in discovery, treats model parameter metadata as
+advisory, and surfaces tool-routing failures instead of answering without
+required tools. Direct DeepSeek omits ineffective thinking-mode sampling;
+GLM-5.3 maps explicit reasoning effort to its supported values. These are
+checkout-level, hermetically tested changes; live generation, provider-route
+forwarding, and installed-app behavior remain unverified.
+
+## Unreleased — Adversarial recovery corrections
+
+Bind Zotero metadata/merge/trash reads to the observed database and transport.
+Retain uncertain merge writes and missing-note snapshots; include unknown
+operations in batch recovery and refuse tag restores over metadata changes.
+Read mapping fields from one generation, preserve tag drafts during Desktop
+authorization, and include mixed-case PDFs in the repoint picker. Report missing
+Zotero observations and path ambiguity without claiming absence. Reset no longer
+steals active vault locks; SSE budgets include Retry-After. Separate npm notices
+from audit JSON and clarify per-operation recovery limits.
+
+## Unreleased — Library Audit associations and Zotero tags
+
+Prevent uncorroborated note/filename associations from hiding unlinked PDFs,
+resolve qualified PDF paths exactly, and discover mixed-case PDF extensions.
+Tagging exposes Desktop authorization and distinguishes it from reachability;
+Desktop selections remain ineligible for Web writes. Uncertain tag writes keep
+their journal evidence and require verified current tags before restoration.
+Validated with disposable fixtures; installed-app/native acceptance is separate.
+
+## 2026-10-02 — Disposable disk docstore for existing LanceDB indexes
+
+Existing JSON docstores load record by record into a private temporary SQLite
+copy. Targeted reads and counts avoid full materialization; persisted formats
+and embeddings remain unchanged. Cold import takes time and scratch disk space;
+bulk APIs and cold retrieval caches can still materialize the corpus. This is a
+memory/disk tradeoff, not a demonstrated overall speedup. The
+performance review (historical record in Git) records costs and
+pending user/native acceptance. No installed bundle update is established.
+
+## 2026-10-01 — Retrieval cache counts and SSE budgets
+
+Warm BM25/wikilink lookups and health/drift counts avoid full node
+deserialization on SimpleDocumentStore. In-memory cache fingerprints include
+index identity and mutation epochs, including same-count replacements and
+partial failures; persisted index/sidecar formats are unchanged.
+Deck/docgen silence guards include online retries, and Vault/Plain Chat consume
+the server-advertised budget with a renewing browser margin. Opt-in bounded
+monotonic timings separate retrieval stages and lock wait/hold without content
+logging. Offline fixture evidence is recorded in `docs/performance_2026-10-01.md`.
+The consolidated review (historical record in Git) closes the
+experimental campaign; installed-app acceptance remains pending.
+
+## 2026-10-01 — Project review remediation
+
+Public source artifacts now exclude private cleanup, native
+prototypes and machine configuration, and publish directories with atomic
+no-replace semantics. The npm audit gate refuses operational errors and incomplete
+reports. Compilation, Bandit and mypy share the full application scope; fixed SQL
+and Git's explicit non-security SHA-1 remove the new warnings without expanding
+the security baseline. Newly covered Notes Sync/cleanup typing errors are resolved
+without increasing the 137-error legacy ceiling. Both platform locks update
+anyio, urllib3, sentence-transformers and soupsieve to clear eight advisories.
+
+CI separates static, Python, JavaScript, browser, dependency, secret and macOS
+checks. Missing provider keys cannot produce a green all-skipped live smoke.
+Historical campaign citation-key findings have exact fingerprint dispositions.
+Private prototype/Maintenance tests explicitly skip only when those capabilities
+are absent from the public artifact. Root instructions are synchronized and
+condensed; detailed contracts and the dated backlog are retained in separate
+references. Research evidence remains preserved.
+
+## 2026-10-01 — Sol Responses review fixes
+
+Reject malformed function-call batches before dispatch, classify structured
+Responses errors, and record known usage for failed attempts separately from
+functional success. Agent tool turns stay on a successful fallback provider
+and model to preserve reasoning continuity. GPT-6.1 Sol estimates use the
+published long-context rates above 272K input tokens; explicit pricing
+overrides remain final rates. Targeted offline tests cover dispatcher replay,
+fallback continuity, terminal failures, retries, cache accounting and pricing.
+
+
+## 2026-09-23 — CLI proof-run fixes: the leftovers
+
+The four open items from Batch D, handled. **Thesis:** the LaTeX sweep now
+builds a document with XeLaTeX when its own preamble loads `fontspec` or
+`unicode-math` (only the thesis does), still without reading any rc file.
+**Templates:** the four Beamer templates declare `\refline` with
+`\providecommand`, so they no longer clash with `cress-style.sty`. Live: all
+102 documents compile and convert. **README mirrors:** the three mirrors whose
+READMEs had changed on GitHub were replaced, and the step published all 12; a
+second run finds them unchanged. **CLI discovery:** the server probe waits up
+to 10 s (was 1.5 s), so a busy server during a scan is no longer reported as
+"not running"; a stopped server is still detected at once.
+
+## 2026-09-23 — CLI proof-run fixes, Batch D: live re-verification
+
+Re-ran the proof run's CLI sequence against a headless server started from the
+fixed code, with no API key exported by hand. `zotlink status` reports the
+`web` transport (the server loaded `.env` itself). After a scan, the first
+`library run analyze --propose-tags` (DeepSeek `deepseek-flash`, $2 limit;
+spent $0.0022) closed 148 already-named renames and jung's tag step, listed no
+leftovers and nothing blocked; the second analysis left 4 open units (was
+151): `buciuc_.pdf` (no year), `heneghan_2006.pdf` (now "editors only"),
+Scienceverse (no text; its exit is a hand-written tag row) and one paper
+imported since the morning, with a stable mirror digest. Maintenance: `links`
+74, `attachments` 5, `latex` 5 of 102 (four templates redefining `\refline`
+and the XeLaTeX thesis, PPTX/DOCX all OK), `readmes` 14/14 fetched with
+publication stopped on three mirror files you must decide about. Nothing was
+applied or trashed.
+
+## 2026-09-23 — CLI proof-run fixes, Batch C: small fixes
+
+**CLI help.** `library run apply --approvals-file` names the real keys
+(`mirror`, `pdf_links`, `tags`, `renames`, `leftovers`); `audit report --help`
+lists every report name from the driver's list, now pinned equal to the
+route's own allow-list; `audit scan` points at `papermind audit wait` (not
+`papermind status`, which does not report the scan). **Report responses.**
+The PDF observation block was added to every report by re-parsing and
+re-serialising each response, and computed even for reports that never show
+it. It is now added once, only to the twelve reports that render it (one
+server-side set, pinned against the interface's). Measured in-process on the
+live library: `not_in_zotero` 1,438 → 1,213 ms and 44.7 → 43.1 MB,
+`tag_hygiene` 649 → 197 ms. **Headless server.** `papermind server` now loads
+`.env` exactly like the app (one shared loader), so it no longer needs the
+keys sourced by hand. (The deck compiler's missing `letters/common` path, C2,
+shipped with Batch B.)
+
+## 2026-09-23 — CLI proof-run fixes, Batch B: Vault Maintenance
+
+**Links.** `links` reported 2,860 broken references and `attachments` 2,746
+missing files, almost all bare markdown links such as `[x](file.pdf)` to a
+file elsewhere in the vault, which Obsidian opens. A bare markdown name now
+falls back to the vault-wide basename after the note's own folder, exactly
+as a bare wikilink does; a link with a directory never does. Live: 74 and 5.
+**README mirror.** Every README failed as "unparseable" since 2026-08-24:
+GitHub wraps the base64 at 60 characters. Whitespace is now removed before
+decoding. The step then stops, by design, on three hand-changed mirror files
+(see Known Issues). **LaTeX sweep.** 77 of 102 documents failed because the
+security change that stopped reading the suite's `.latexmkrc` also dropped the
+TeX search paths it set. They are now passed as data, from one helper shared
+with the deck compiler, which also gained the missing `letters/common` path.
+Live: 5 failures left, 4 real template defects and the XeLaTeX thesis.
+**Renamer.** An edited book (editors, no author) is refused with that reason
+instead of "no mapped bib record".
+
+## 2026-09-23 — CLI proof-run fixes, Batch A: the library run
+
+Found by driving a library update through the CLI only. **Renames:** 147 PDFs
+that already carried their derived name stayed "open rename work" in every
+session forever — the renamer refused them with no machine field and the
+orchestrator's `proposal == name` test could never be true. The renamer now
+marks that refusal `code: "already_named"`, and the analysis records the unit's
+rename step as done-by-nothing (`skipped`, `closed_renames`), keyed on the
+code, never the prose. **Tags:** a paper tagged outside a run (by hand, in
+Zotero) kept owing tags, and every `--propose-tags` run asked the model about
+it again. The analysis now closes the tag step when every destination the unit
+owes and has already carries a `_tags.md` tag (`closed_tags`), read from the
+last scan (Finder from the PDF itself); a new PDF on a tagged paper still owes
+its Finder tags. **Leftovers:** two imported attachments whose files were gone,
+each beside a live linked copy, were reported for 16 h as "still being moved by
+Attanger". Those are now "leftover Zotero attachments": listed for review,
+unticked by default, trashed on approval through the journalled de-link route
+(reversible from Tagging → Restore), never when annotated.
+
+## 2026-09-23 — Online LLM API contracts
+
+Verified the six provider contracts against official documentation and bounded
+live requests; verdicts and probe limits are in
+`docs/verification_2026-09-23_online_llm_api.md`. Tool loops now retain and
+replay DeepSeek/OpenRouter reasoning state and Anthropic's ordered assistant
+blocks only to the originating provider/model. Gemini function-call IDs are
+preserved and echoed when the API supplies one.
+Streaming replies now announce output truncation in the affected chat and
+summary routes. An empty agent reply stopped by the token cap reports that
+cap directly. The optional online reasoning control is exposed in Settings;
+its default preserves provider behavior and cost.
+Curated lists now remove confirmed retired OpenAI and Gemini IDs and add
+priced current GPT-5.6, Claude 5.x, Gemini 3.x, DeepSeek and GLM models.
+Configuration version 5 migrates saved retired selections; the DeepSeek
+default uses its current Flash ID. OpenRouter's ten curated prices were
+refreshed from its public model catalog.
+The migration also clears retired IDs from workflow-specific model overrides.
+The type ratchet now holds the agent loop and tool-wire builder to zero
+findings, reducing the legacy allowance by 14.
+Named parameter rejections are remembered per provider, endpoint and model,
+avoiding the same sampling 400 on later requests. Opus 5.x omits unsupported
+sampling, Haiku 4.5 keeps temperature when top-p conflicts, and Z.AI clamps
+sampling values to its published range. Gemini now retries named parameter
+400s and remembers the rejected field.
+Six tiny live GPT-5.6 requests confirmed that Sol, Terra and Luna reject
+nondefault temperature and top_p. Those exact ids now omit sampling before
+the first request; `gpt-5-chat` remains unaffected.
+Claude and Gemini stop reasons now distinguish filtering, output limits and
+malformed tool calls. Gemini's invalid-key detail is classified as an auth
+error even though its HTTP status is 400.
+
+## 2026-09-23 — Audit remediation of the library-workflow commits
+
+Remediation of the 2026-09-23 audit of `22490593..a7a171d9`, one commit per
+batch. **Batch 1 — tracker honesty:** a Zotero note's `mirror` step now
+closes only when the mirror names it in `settled_keys` (a record newer than
+the last scan used to be closed unmirrored and never reopen; it now stays
+open as "rescan needed"); ticked note tags the mirror could not write, and a
+`pdf:` list it could not insert, keep the work open and are reported; a tag
+row with no destination is "not needed", never "done"; `apply` refuses while
+an audit scan runs; `/api/library/observe` and `/api/library/steps` take the
+run gate, and `/steps` only resolves an uncertain step (confirm-gated); an
+attachment's parent entry is credited only when its Zotero tags were written;
+the CLI exits 1 for anything left open or ignored and refuses cost flags
+without a model. **Batch 2 — rename outcomes:** a rename the renamer
+refused before touching the file is a plain, retryable failure (it used to
+be "uncertain" and block the paper forever); an uncertain rename is settled
+from its journal by the next analysis when the journal can tell, and
+otherwise by hand ("Mark resolved…", `papermind library run resolve`); a
+rename chain crossing the 200-row preview boundary gets the same names as a
+single preview; the live bibliography and the notes are memoised on their
+files' signatures, so a rename no longer re-parses the whole `_master.bib`
+under the vault lock. **Batch 3 — cost honesty:** an unpriced online model
+runs only under "No spending limit" (a limit could never bound it; the budget
+check used to compare nothing for such a session), and a limited session with
+an unknown spend always stops; a proposal whose cost could not be recorded is
+reported and makes the spend unknown; the analysis backs off on a failing
+provider and stops after five failures in a row; a session and its model are
+created in one transaction; the spend and model are columns and run results
+are rows, migrated from the old JSON. **Batch 4 — journal and note-sync
+safety:** `apply-pdf-links` keeps the undo of the notes it already wrote when a
+later note fails (one failed snapshot now fails one note, not the batch) and
+merges instead of pruning after a lost lock; a PDF replaced since it was
+observed is a clear refusal ("analyse again"), not an unexplained 500; the
+note writers refuse a note that became a symlink; an unreadable notes folder
+refuses the plan; note creation beats its lock and stops when it is lost; the
+vault link walk has a budget; the sync-point store's lock is a bounded wait.
+**Batch 5 — concurrency and performance:** the "Update my library" run now
+shows the note mirror's progress as it happens and its Stop reaches a running
+mirror; an observation resolves each path once; the safe-save lookup uses a
+per-pass index; the tracker's schema is set up once per store file instead of
+on every write; the model list's prefill no longer offers the active local
+provider's model for another local provider; the Maintenance log appends
+lines instead of rebuilding the whole pane per line. **Batch 6 — interface:**
+an apply the server refused before starting no longer locks the review or
+warns that something may have been written; leaving and returning to "Update
+my library" restores the review or result; Stop works while analysing and
+applying; progress shows as a bar and is announced every 25 items; a ticked
+mirror is confirmed in the danger tone; "Select all" / "Select none"; visible
+field labels; local result times; coloured failed/uncertain/partial outcomes;
+plainer intro text; the Maintenance panel stays quiet when hidden and asks
+again before re-running a writing run that ended without a summary.
+**Batch 7 — documentation:** the guide, README and routine describe the
+current apply order, default note tags, `--no-limit`, the `pdf:` group, the
+05m stage and where the library checks live; dangling "see Known Issues"
+pointers, hardcoded counts and a misplaced cross-reference are corrected;
+Known Issues is regrouped (closed entries moved to *Closed*, half-closed ones
+split, orphan numbering removed, one `apply-repair` entry); the retired
+annotation-transfer sections, the September 15 plan and three native
+verification records are removed (Git history keeps them). Every regression
+test was proven red on `a7a171d9`; an app rebuild and native WKWebView /
+VoiceOver QA are still owed.
+
+## 2026-09-22 — Library follow-ups: no spending limit, Library-hosted checks, a new apply order
+
+A session model can run under **"No spending limit — I accept the cost"**
+(`no_limit`, refused together with a budget; spend still measured). The
+library checks (`pdfnames`, `library`, `tagcheck`, `zoterostorage`, and
+`batchtags`) render only in **Library → Checks & campaigns**, reported to a
+persistent surface that survives a section re-render; a passing check states
+its summary and each result card takes focus. The note mirror writes each
+created note's `pdf:` list (the exact shape `pdf-links-status` reads as
+current) and the ticked, vocabulary-gated tags, through one render shared by
+the preview, the plan digest and the write. An "Update my library" apply runs
+**mirror → `pdf:` lists of existing notes → tags → renames**, tags go to all
+three destinations by default (`--no-note-tags` opts out), and the renames run
+last so a rename no longer invalidates a reviewed mirror plan.
+`GET /api/models?provider=` lists another provider's models with its
+configured one. The same-day review fixed the mirror's `note_tags` bound,
+refused tag rows tagging created notes, silent loss of ticked note tags, the
+`pdf:` lost-lock bookkeeping, overlapping Maintenance runs and result cards
+stealing focus.
+
+## 2026-09-21 — Reviewed library maintenance (lots 1–6)
+
+Library → **Update my library** and `papermind library run` share a manual,
+reviewed import → names → tags → Zotero-note mirror workflow. Imports use
+stable scoped identities; the first pass establishes a baseline. Session
+models leave global configuration unchanged, disclose source/destination,
+cache proposals and enforce an estimated priced budget without fallback.
+Default tag destinations are Finder and Zotero; Obsidian tags are explicit.
+Mirrors bind confirmation to a digest and prove Git recovery for each replaced
+file; creation-only runs use their own journal without an unrelated Git gate.
+
+Adversarial review `ddc59278` corrected stale identity/history, partial results,
+missing receipts, uncertain retries, cancelled base work, obsolete proposal
+paths and collisions across bounded name-preview chunks. Nineteen regressions
+were proven red by restoring original production code; seven disposable
+production-route acceptance checks cover the full sequence and recovery.
+Full Python gate: 4,791 passed, 3 skipped, 246 subtests. No real-provider/native
+or process-kill acceptance is implied. Two scratch isolation incidents added
+fixture state to real app stores; exact retained evidence is in the review report.
+
+Documentation now separates Git recovery from journal Restore, identifies all
+write destinations and session side effects, and describes the shared CLI.
+The delivered September 21 plan and superseded September 20 proposal are
+retired; open work remains in CLAUDE Known Issues. Dated implementation records
+are explicitly historical. (The incomplete September 15 plan was retired on 2026-09-23; its open points are in CLAUDE Known Issues.)
+Developer workflow detail moved to `docs/library_workflow_contract.md`, with
+user instructions in `docs/library_workflow.md`.
+
+Mounted Chromium review corrected partial/cancelled result messages, stale
+announcements after navigation, rename destination disclosure, tag error tones
+and excerpt keyboard access, HTTP Retry, Restore outcome persistence and
+confirmation wording, hoverable help outside the tablist, and long filenames
+that hid the proposed-name column inside the report. The last browser
+session can now be recovered with its saved result date. Native WKWebView and
+VoiceOver, real writes/providers and abrupt process-death recovery remain open.
+
+## 2026-09-20 — UI consolidation: a verb grammar, one outcome line, restrained trends
+
+Four passes over how the app *reads*, all client-side.
+
+**Buttons say what they cost.** 54 distinct `data-action` values across ~159
+inline verbs were one undifferentiated blue: `[open]`, `[unmap]` and `[retire
+everywhere]` looked identical. Five roles now, mapped in one table
+(`audit.js::ACTION_ROLES`) and stamped centrally by `applyActionRoles` rather
+than at 159 emit sites — primary, secondary, navigation, destructive-confirmed,
+inline verb (read / write ✎ / destructive ⚠). The role is decided by what the
+click costs the user, never by which endpoint it calls: an online
+identification is `read` (it writes only regenerable memos), and BOTH note-sync
+directions are `destructive`, since each overwrites the other side's region.
+The Library section strip is drawn as a tab strip; it was already `<nav>` +
+aria-current, only its shape said "action". Glyphs use the empty
+alternative-text form (`content: "…" / ""`), so they are a channel for the eye
+without adding a word to what a screen reader reads.
+
+**One outcome line.** Five subsystems' `_xSay(msg, isError)` had drifted into
+three conventions. `ui.js::statusLine(host, {tone, text, at})` is the one shape
+— glyph · text · "7 min ago" — with four tones, because collapsing a status to
+"error or not" is what made a finished scan wear the warning palette.
+`banner-neutral`, a modifier whose whole job was to say "ignore my colour", is
+retired. Three real fixes rode with it: the stamp (a persisted Library status
+line from earlier in the scan read as if it had just happened — a recorded
+Known Issue); a double announcement (two hosts were minted with `role="status"`
+AND announced through the static announcer, and WebKit drops a minted live
+region); and `audit-status-line`, applied to three hosts and defined in no
+stylesheet. The contrast lint earned its keep — `--ok-fg`, `--danger` and
+`--text-tertiary` all measure 4.17–4.44:1 on `--bg-elevated` in at least one
+theme, so the scan banner is drawn on the card surface instead. Maintenance
+step rows get a state chip on the head line and say the Library sentence once
+rather than under every step.
+
+**Help badges.** Plain Chat's "?" led the Send row instead of wedging between
+the field and Send (where it read as help for Send); two Library tabs dropped a
+`title` that duplicated their badge. The ratchet requiring a `title` on every
+report tab now accepts either surface, and gains its other half: no tab may
+carry both.
+
+**Restrained trends.** A library-health sparkline over the last ten scans, a
+"since you last looked" delta per report tab, the tagging deck's "N today"
+generalised to the ambiguous and accession decks through one shared primitive,
+and one-shot milestones for zero orphans and no dead curation (plus every note
+baselined, from the note-sync tab). The health number is a named list of the
+five things a cleanup actually closes — "tagged nowhere" would swamp it and
+"entry, no local PDF" would never move — and its composition is printed beside
+it. Explicitly declined and now ratcheted absent: streaks, points, levels,
+badges, and any prompt beside a write verb.
+
+## 2026-09-20 — Mirror review: the lock covers note writes only, and a cancel is pinned
+
+Review of `92371234` (the one-click mirror). `_refresh_write` took the obsidian
+op-lock even with nothing planned, so a mirror whose only work was a stale sync
+record to delete stopped at `indexing` during an index run — for a phase that
+writes no vault file. The lock is now taken only when a region is to be
+rewritten; the base store and the stale-base deletions never needed it.
+`/refresh-all` inherits it (an empty plan during indexing succeeds instead of
+503ing). The cancel gate in front of the mirror's first create had no test —
+removing it left the file green — and is pinned now. Every other claim of the
+commit held under mutation, and a created note reads `in_sync` after a rescan
+(measured over plain, list, blockquote and rule content; wikilinks and images
+stay `unparsed` by decision). The "Sync the library" button is assessed in
+the now-retired September 20 feasibility proposal: not the whole thing, and the
+honest subset is a private-only Maintenance step over the routine's proposers.
+
+## 2026-09-20 — A Zotero-linked PDF never reads as "not in Zotero"
+
+The pairing rung leaves an unexported Better BibTeX key, and a file two items
+link, on `unmapped_pdfs` — right for pairing, wrong for the three reports
+whose whole claim is "no Zotero entry". All three now skip such a file and
+disclose the count, through ONE definition (`bridge.zotero_unclaimed`) that
+the accession routes already used; the *↳ Unread Only* tab is filtered too, or
+it would list a row its own documented superset does not. A Web create runs ONE complete observation, immediately
+before the reservation, instead of two identical ones back to back. The
+renamer's attachment lookup prefers an exact path before falling back to the
+case-folded key, so two case-distinct files cannot ride one rename. Only codes
+Zotero returns before writing retire a reservation — a 408 or 409 no longer
+authorises a second unkeyed POST. `storage_check` excludes Connector web pages
+only, not every non-PDF import. A resumed Phase 4a row is no longer counted as
+freshly renamed and now names its remedy. Zotero Attachments gains the
+**Title = filename** verb (the route shipped 2026-09-18 with a CLI caller
+only), one status line for the whole tab, and the relative-link disclosure the
+scan had been counting unrendered. The two persisted status lines are cleared
+by a new scan. Two JS ratchets that went red for a change that improved what
+the user sees now accept the status-line path.
+
+## 2026-09-19 — Docs and UI follow Zotero-first pairing
+
+The help guide, README and Audit tab now name the Zotero linked-file as the
+first pairing rung: it beats `mapping.json`, Dead Curation lists the override,
+and **[never auto-map]** no longer "guarantees" unmapped. Notesync outcomes stay
+visible after the report re-renders; Dead Curation offers **[clear decision]**;
+Inventory shows the `pdf:` list state; **Key changed in Zotero** is on the Notes
+Sync tab. The tracked migration/verification JSON dumps (vault paths) moved to
+`BASE_DIR`; the 2026-09-09 plan/review/continuation chain is deleted (open items
+already in Known Issues).
+
+## 2026-09-19 — Pair and undo against Zotero's real state
+
+Shared `linked_path_key` (NFC + casefold) for attachment lookups. Create undo
+tolerates Better BibTeX's `citationKey` write-back. A landed Extra PATCH that
+also moved an unselected field is applied and trash still runs. A Web create
+proves absence before reserving, so a timed-out second observation no longer
+blocks the PDF at `parent_unknown`. A definitive 4xx parent POST retires as
+`never_created`. pdf_management link/trash go through the journalled writers.
+Accession rows skip a pending file Zotero has not uniquely claimed. Clearing or
+detaching a mapping that Zotero still links warns, and still writes.
+
+## 2026-09-19 — The Zotero link is the first pairing rung
+
+`inventory.build_inventory` reads Zotero before the bridge and claims every PDF
+linked by exactly one item whose key is in the bib (`source: zotero_link`). It
+beats `mapping.json`; disagreements land on Dead Curation as
+`overridden_by_zotero`. The scan still never writes `mapping.json`. Omitting the
+index leaves the ladder byte-identical.
+
+## 2026-09-19 — Annual library cleanup closed
+
+Seven phases through the journalled routes; recurring `papermind cleanup
+new-pdfs`. zotrecord retitle/merge/trash; zotcreate batch (one Web observation)
+and `settle-never-created`; zotlink retitle; `pdf-links-status`; notesync
+key-changes and rename-note; a rename carries `mapping.json` with it.
+
+## 2026-09-19 — Zotero-authoritative note sync
+
+Maintainer decision: the reading notes are edited only in Zotero and
+`Z_Zotero_Notes/` is a read-only mirror. New `notesync_zotero_authoritative`
+setting; on, the Zotero Notes Sync tab hides keep-mine / merge / push-all and the
+per-row create-in-Zotero, and offers one git-gated, un-journalled
+`POST /api/notesync/refresh-all` (`papermind notesync refresh-all`) that rewrites
+every note's marked region that differs from Zotero AFTER the converter (a byte
+plan wanted 1,222 of 1,236 notes on the first live dry run — framing and Markdown
+spelling), rebaselines every note and drops stale bases. Notes gone from Zotero
+are listed, never deleted. In that mode push and merge refuse; cleanup 05b
+defers to refresh-all; the git gate requires tracked files; listed notes keep
+their bases. new-pdfs refuses a scan that is still running or ended in error.
+Data prep on the live vault: the three notes carrying
+Obsidian-only text were pushed to Zotero (yatham's pasted image dropped), the
+deleted `hafnerDigitalHealthInterventions2022` item re-created through the web
+API with its reading note, and the plugin template moved out of the folder.
+
+## 2026-09-17 — Review remediation G: documentation matches what shipped
+
+README no longer says there is no metadata executor (it exists, is journalled and
+answers 501). CLAUDE.md gains the `/api/accession/pdfs/*`, `/api/audit/library/<view>`,
+`/api/accession/review/*` and `/api/notesync/campaign/*` routes, the corrected
+note-scope and bootstrap rules, the Manage PDFs lock and link order, and a Known
+Issues section for everything the remediation left open. The help guide lists the
+Zotero storage step. The 2026-09-14 annotation evidence is deleted (decision D5);
+the five run session prompts and this remediation's plan and prompt are deleted
+(decision D6); the 2026-09-15 unification plan is kept, still incomplete.
+
+## 2026-09-17 — Review remediation F: low-severity findings
+
+A cleanup stuck after a failed restore can be inspected and completed; a
+cross-volume recovery root is a preview blocker; trash previews digest the
+survivor's stable identity; audit lines name the PDF; symlinks are refused only
+below the vault root; a reviewed value must be text or keep the current shape;
+PDF authentication folds Greek letters on both sides and requires an author near
+the title; the executor's no-replay guard reads every earlier batch; an unreadable
+native note is `native_unreadable`; the pre-write prune protects its own op; merges
+work through a symlinked notes folder inside the vault; dead code removed.
+
+## 2026-09-17 — Review remediation E: tests and ratchets
+
+The driver replay suite enforces coverage: every `ENDPOINTS` row is claimed by a
+case that is checked to actually send it (fourteen rows had none). The CLI refuses
+out-of-range note campaign selections before any request. Manage PDFs gains tests
+for inspect/complete, later-verb blocking, cross-volume refusal, its routes and its
+Zotero-side UI flows; the metadata executor's `apply()` itself refuses while
+production application is closed.
+
+## 2026-09-17 — Review remediation D: Library UI
+
+Opening PDF identification review or Ambiguous PDFs selects exactly one report tab.
+Library facts relabel only state fields and date only date fields; structured
+values render as names and facts, never JSON. Library-hosted Maintenance checks
+keep their progress glyphs across re-renders. Three Library status lines reach
+static live regions.
+
+## 2026-09-17 — Review remediation C: classification and search cost
+
+The storage control no longer counts images embedded in Zotero notes as stored PDFs
+(they are disclosed as excluded). Cross-report search stops rebuilding the Library
+documents view per keystroke: ~4.2 s → ~13 ms warm on copied live stores. Note sync
+no longer refuses a note for text outside its region (decision D4): 1,194 of 1,237
+live notes read `unparsed` before, 157 after — all for in-region content.
+
+## 2026-09-17 — Review remediation B: executor data safety
+
+Campaign settle/recover/undo no longer hold the vault lock across Zotero I/O. An
+`outcome_unknown` note write is resolved by one live read on the next push or merge
+(decision D2), a refused connection is `failed`, and Restore offers a live-checked
+revert. An unknown annotation count blocks deletion. Manage PDFs reads notes once
+per operation, tolerates non-UTF-8 notes and holds the vault lock around physical
+moves. Sync bases from the previous converter are carried over on re-baseline when
+the note is unchanged.
+
+## 2026-09-17 — Review remediation A: two production-breaking defects
+
+The bibliography plan, authenticate, apply and decisions routes answered 500 on
+every request (`load_settings()` called with an argument); fixed, with tests that
+no longer patch above the seam. Linking a PDF from Manage PDFs now creates the
+Zotero attachment before writing the mapping (decision D1); a refused create no
+longer blocks the entry forever and the block message names the operation.
+
+## 2026-09-16 — Library views: no raw JSON, contractual vocabulary
+
+Every Library view (Overview, Documents, Checks & campaigns, Storage control,
+History & recovery, dependent links, bibliography review) now renders
+structured facts, tables and lists instead of JSON dumps; states read as the
+plan's contractual labels (Identity to review, Associated in PaperMind,
+Deferred by you, Note contents match, …); counters name their population and
+date. Pinned by a source ratchet, a JS walk of every view and a Chromium spec
+that captures each view.
+
+## 2026-09-16 — Phase 7: duplicate copies compared, annotated copies kept
+
+`accession/duplicates.py` recognises `_1`-style collision suffixes as clues
+and compares copies by bytes, native and embedded annotations, note
+dependencies and mappings. Manage PDFs shows those facts per copy; recoverable
+removal of a copy that carries annotations now requires an explicit
+acknowledgement that rides the plan digest. Different bytes are a version and
+stay. A copy renamed between preview and apply stops the plan with nothing
+removed.
+
+## 2026-09-16 — Phase 6 reduced: the Zotero storage control
+
+No storage conversion is built. `accession/storage_check.py` classifies every
+saved Zotero attachment (stored, outside the bibliography folder, broken,
+relative, duplicate path) with manual guidance for Zotero or Attanger, read by
+the new Library → Checks & campaigns → Storage control view, `papermind
+library storage` and the private Maintenance step `zoterostorage`.
+
+## 2026-09-16 — Phase 5: PDF authentication and the metadata executor
+
+`accession/pdf_authentication.py` locates a record's DOI, title and authors in
+its own PDF pages with page, offset, excerpt and passage fingerprint; a DOI
+printed only in the reference list is `reference_list_only`, never identity.
+`papermind library authenticate` and `POST /api/audit/library/bibliography/
+authenticate` expose it; `bibliography-plan` runs it for records naming their
+`pdf`. `accession/metadata_executor.py` writes only review-approved fields
+through `zotero_write.set_item_fields` under the version guard, journalled as
+`zotero_metadata_write` and reversible; it refuses stale fields and predicted
+unselected changes (the Extra → citationKey promotion) before the PATCH and
+records unpredicted ones after it. Closed in production (501).
+`prototypes/bibliography_corpus/build.py` builds the disposable evaluation
+corpus with planted errors.
+
+## 2026-09-16 — Campaign undo on both destinations
+
+`POST /api/notesync/campaign/<id>/undo` and `papermind notesync undo` reverse
+one applied campaign note on Obsidian AND Zotero as a single decision, only
+while both notes still carry the exact written image (journalled hash and
+written HTML at the written version). The pre-campaign base is retained at
+reservation time and put back; a partial undo is kept as `undo_incomplete`
+and never retried. Closed in production (501) like the other executors.
+The campaign runner gained `--undo`, `--concurrent`, `--native-stop` /
+`--recover-native-stop` and `--human-screen` scenarios.
+
+## 2026-09-16 — Annotation transfer abandoned and removed
+
+**User decision.** Moving native Zotero annotations between two attachments of
+the same parent was a fail-closed prototype whose production port was never
+opened. It is now removed rather than kept dormant: the engine, transport and
+pairing modules under `accession/`, the whole `native/` companion, the nine
+pairing/transfer routes on `/api/accession/pdfs/*`, the Manage PDFs fieldset
+and its polling/reversal handlers, eleven test files, eleven prototype runners
+and fixtures and the 2026-09-15 acceptance folder. Git history keeps them.
+*(Corrected 2026-09-17: the 2026-09-**14** evidence — `docs/annotation_acceptance_2026-09-14/`
+with its XPI, `evidence.json` and 24 screenshots, `native_annotation_selection_2026-09-14.png`,
+the three `native_verification_2026-09-14_annotation_*.json` and the `.gitignore` exemption —
+was NOT removed by this entry; it was deleted on 2026-09-17, decision D5.)*
+
+* Duplicates that both carry native annotations are **kept**, and the
+  dependency is displayed; recoverable physical removal is offered only for
+  annotation-free files or after an explicit user decision.
+* `pdf_management.require_settled` blocks cleanup on any retained operation of
+  the entry that is not `complete`/`restored`; the completed-transfer native
+  readback it also ran is gone with the feature.
+* Annotation counts on the Zotero Attachments report and in Manage PDFs, and
+  the `accept_annotation_loss` gate on attachment trash, are unchanged.
+
+## 2026-09-07 — Note sync in three buttons, unmapping, and renames Zotero follows
+
+**Note sync is one table with three verbs.** The tab stacked six sections,
+two of which drove the older one-directional `update` route: the same note
+appeared as `[pull]` in the sync table and again as `[update]` or
+`[overwrite region]` below it — three names for two writes, with the
+destructive one reachable from a list that looked like the safe one. Those
+sections and their handlers are gone; every comparable row now carries
+**[take Zotero's] / [keep mine] / [merge…]**.
+
+* `_pullable` / `_pushable` tested the row's STATE NAME, so a row summarised
+  as `push` could never be pulled — not even with `accept_conflict` — and
+  "throw my edit away, take Zotero's" was inexpressible on precisely the row
+  a person most wants to say it about. They now test what actually changed:
+  pull asks a second time when the region moved since the sync point, push
+  when Zotero moved. `_COMPARABLE_STATES` bounds the widening — `missing_*`,
+  `unparsed` and `multiple_notes` are refused in both directions even with
+  the acknowledgement.
+* Baselining is promoted to the top of the tab while any note lacks a sync
+  point (3 of 1 236 have one here), since without a base the state is a
+  word-count guess and the merge view has no "before" to show. It writes
+  nothing to the vault or Zotero.
+
+**Unmapping a PDF.** `detach` was fully general but `[detach]` was rendered
+only on "Entries With Several PDFs", so a record with ONE wrongly-matched PDF
+had no unmap affordance anywhere. The verbs now live in the Inventory pair
+drawer, and `detach_all` is the blanket form: per-key exclusion is
+whack-a-mole because the ladder finds the next candidate — measured live, 2
+of 127 exclusions had already needed a second round. A hand link still beats
+the wildcard, and `*` cannot ride in on `detach_from`.
+
+**A rename moves Zotero's pointer with it.** The 2026-09-06 attach run put
+5 242 `linked_file` attachments into Zotero, each with an absolute vault
+path, so every rename broke a real reference — while the confirm still quoted
+"20 files in this library are", measured on 2026-08-21. `set_attachment_path`
+PATCHes one field (the display title is deliberately untouched) under
+`retire-tag`'s four-phase choreography. The new path is Zotero's OWN stored
+string with its basename swapped, never one re-derived from the route's
+realpath, and `find_linked_attachments` returns `(refs, error)` so "Zotero
+holds no link" is never confused with "Zotero could not be read".
+
+**Broken links are visible and repairable.** `zotero_attachments` rows carry
+`exists`; a broken row says so in text and offers `[re-point…]`, a picker
+ranked against the filename Zotero remembers. It reads 0 of 5 242 today,
+which is the right moment to build it — the nine hand repairs after the
+Zotero-preference and Attanger incidents are what it automates.
+
+**A note can link to its own PDF.** A `pdf:` frontmatter list of wikilinks,
+written by `POST /api/tagging/apply-pdf-links` from the cached scan's join
+(KEYS ONLY on the wire). It is one machine-written shape because of the
+renamer: the rename route rewrites exactly that shape inside its own
+journalled op, and any other reference still refuses.
+
+**Fixed:** the Attanger skip-rule reader round-tripped `prefs.js` strings
+through `unicode_escape`, a latin-1 codec, so a rule naming a non-ASCII
+surname came back mojibake — a valid regex matching nothing, which in that
+gate means every PDF is skipped as `plugin_would_rename` and the run writes
+nothing while blaming the files.
+
+## 2026-09-06 — Library harmonization, Phase 4: linked files into Zotero
+
+The forward verb the de-link has been the undo of. `POST /api/zotlink/attach`
+(SSE, `{citation_keys ≤ 200, confirm, dry_run?}`) creates one `linked_file`
+attachment on the Zotero item for each of a record's mapped PDFs — a path and
+no bytes, so no cloud storage is used and it syncs down within seconds (spike
+S1). Absolute vault paths by maintainer decision (the Linked Attachment Base
+Directory is unset). Personal library only: a group-library record is
+skipped with a reason, never refused as a whole (spike S2). A PDF Zotero
+already links is skipped, so a re-run after sync-down is idempotent.
+
+* Three phases, the note-create shape: plan + parent reads lock-free, POSTs
+  lock-free, ONE short hold to journal the creates as
+  `zotero_attachment_create` (a new never-evicted external kind whose revert
+  is a TRASH — `tagging/writers.py::_revert_zotero_attachment_create*`,
+  dispatched by the single and batch restore routes). Never a DELETE; the
+  source ratchet still holds.
+* `GET /api/zotlink/attach-candidates` lists every record with a Zotero item
+  and ≥1 mapped PDF, what Zotero already links, and the group-library rows.
+* UI: a "Link vault PDFs into Zotero" section on the Zotero Attachments tab
+  (lazy candidate load, selection, dry run, confirm-gated run, per-row
+  outcomes; undo is the existing remove verb / Tagging → Restore).
+* **Zotero's "Rename linked files" preference is a hard gate (2026-09-07).**
+  The first live run created five links and Zotero immediately renamed the
+  five VAULT files per its template (`_.pdf` … `_ 5.pdf`, because those
+  institutional parents carry no author or year). The attach route now reads
+  `extensions.zotero.autoRenameFiles.linked` from `prefs.js` and refuses —
+  dry run included — while it is on. The five files were renamed back and
+  their attachments re-pointed by hand (version-guarded path PATCHes), links
+  kept. Note Zotero rewrites `prefs.js` on exit, so the gate lifts only after
+  a Zotero restart following the preference change.
+* **Attanger and the app reconcile through Attanger's own skip rule
+  (2026-09-07).** Read from the plugin's code: its "skip auto move and
+  rename" and "skip rename" fields are comma-separated regexes tested
+  against the filename without extension; a match stops the rename (the
+  second stops the move too, so the FIRST is the one to use with a connector
+  import flow). The attach route reads both from `prefs.js`; with a rule present
+  the run proceeds and each PDF is guarded PER FILE — a name the rule does
+  not cover is skipped with `reason: plugin_would_rename`, never linked. The
+  refusal names the rule to paste (`SUGGESTED_SKIP_RULE`, the vault's
+  author_year convention, which every one of the 5 606 conventional PDFs
+  already matches). Web imports, which arrive under browser names, are
+  still renamed and filed by Attanger as before.
+* **Attachment-renaming plugins are a second gate (2026-09-07).** With
+  Zotero's own preference off, the Attanger plugin renamed the next four
+  files on link creation (`ades_2017.pdf` → `adès_.pdf`,
+  `bland_1_1998.pdf` → `bland_1998.pdf`). The route refuses while Attanger,
+  ZotFile or ZotMoov appears in `prefs.js` unless the request carries
+  `acknowledge_plugins: true` (UI checkbox, CLI `--acknowledge-plugins`),
+  meaning the user has disabled the plugin's auto-rename/move. The four
+  files were renamed back and re-pointed by hand, links kept.
+* **Same-day fixes from first use.** The primary "Link selected into Zotero"
+  button never fired — the report body's row-action delegate matches
+  `.audit-link-btn` only and the button is a `.btn`; it is now bound
+  directly (ratcheted). The attach cap is 7 500 records per run, not 200 (the whole library in one run).
+  `POST /api/accession/batch` accepts `force: true` (bulk RE-identify,
+  bypassing the cache consult — the per-row verb's semantics batched) and
+  the Not in Zotero tab offers `[re-identify selected]`; the
+  `accession_batch_max` ceiling is 7 500 (Settings → Accession; default still 50).
+* CLI: `papermind zotlink candidates` and `papermind zotlink attach
+  --keys/--keys-file [--dry-run]` (driver rows, replay, projection and CLI
+  tests). MCP gains no write tool.
+
+## 2026-09-06 — Library harmonization, Phase 2: the second curated state, detach, and the CLI rows
+
+* **`pending` — "add to Zotero later".** `mapping.json` gains an additive
+  `pending` list beside `no_match`; the bridge treats both as curated and
+  matched (`BridgeResult.pending_pdfs`, hash-anchored recovery included), the
+  *Not in Zotero* tab lists both with their state, *PDFs Without Zotero*
+  discloses the count with a jump, and the dashboard gains a tile. Every
+  triage surface — the accession deck (`P`), the ambiguous deck and table —
+  offers it beside "not in bib", and moving between the two is one verb.
+* **`detach`** (`{pdf, detach_from: key}`): the multi-PDF review's verb.
+  Writes `exclude[rel] = [key…]`; `build_bridge._link` now refuses every
+  automatic rung's claim of that PDF for that key, so an absorbed
+  numbered-sibling file returns to the orphan queue instead of being
+  re-absorbed at the next scan. A hand link to the same key lifts the
+  exclusion; `clear` removes it. Per-file `[detach]` on *Entries With
+  Several PDFs*.
+* **List form of the mapping route** (`pdfs: [...]`, ≤ 500) for the three
+  bucket verbs, validated in full before ONE atomic write — a bulk re-sort
+  never half-lands. *Not in Zotero* gains row selection with
+  `[selected → pending]` / `[→ not in bib]` / `[clear selected]`, skipping
+  rows a table filter hides.
+* **Writers load `MappingData` and save every field.** `_load_mapping_all`
+  is the writers' reader; the 4-tuple `_load_mapping_full` stays for
+  read-only consumers. A writer built on the old shape would silently erase
+  `pending`/`exclude` — pinned.
+* **Identification reaches pending PDFs.** `api/routes/accession.py::_resolve_orphan`
+  accepts the curated `pending` bucket beside the orphan queue (never
+  `no_match`), so the Not in Zotero tab offers per-row `[identify]` /
+  `[re-identify]` and a confirm-gated `[identify selected]` batch, repainting
+  the resolution cells in place; the copy-DOIs hand-off then covers what the
+  resolver found. Live: 88 of the 362 pending files had never been looked at.
+* **Headless rows:** `papermind audit mapping` (`--link`/`--detach`/
+  `--no-match`/`--pending`/`--clear` over `--pdfs`/`--pdfs-file`) and
+  `papermind audit pdf-decision` (`--dismiss`/`--clear`/`--clear-all`),
+  with the driver registry rows, replay cases and projection tests. MCP
+  deliberately gains no write tool (the elicitation gap).
+
+## 2026-09-06 — Library harmonization, Phase 0 + Phase 1: the invisible buckets get tabs
+
+Plan in `docs/plan_2026-09-06_library_harmonization.md` (deleted after Phase 4
+ships). A read-only assessment measured the live library and found two facts
+the app could not show: the 291 PDFs curated "not in bib" were listed by no
+report (and 203 of them carried a resolvable DOI — the intent had been "add to
+Zotero later"), and the 107 citation keys owning two or more PDFs had all been
+dismissed in Possible Duplicates, the only surface that ever showed them.
+
+* **Phase 0 — two live spikes against api.zotero.org.** A `linked_file`
+  attachment is a plain item write: created with an absolute `path`, no upload
+  step, `GET …/file` 404, synced down to the desktop within 5 s, seen by the
+  app's Zotero reader, removed afterwards. A group library refused with 403
+  because of its `fileEditing: none` policy, so the future writer gates on
+  library type, never on that status. Outcomes recorded in the plan's §7.
+* **Three read-only audit reports** (`api/routes/audit.py::_REPORT_NAMES`,
+  tabs, search corpus, CLI/MCP allowlist): **Entries With Several PDFs**
+  (`multi_pdf` — per-file match rung, mixed-provenance groups first, the
+  Possible Duplicates decision mirrored from the hash memo), **Not in Zotero**
+  (`not_in_zotero` — the curated `no_match` bucket joined by memoised sha to
+  the cached accession resolution, with a `[copy N DOIs]` hand-off for
+  Zotero's Add Item by Identifier; the join is route-injected because the
+  vendored tree may never import `accession`), and **Dead Curation**
+  (`dead_curation` — mapping.json entries pointing at a missing file or a
+  citation key absent from both bib and Zotero). No write verb: those come
+  with Phase 2.
+* **Driver allowlist repaired.** `core/driver.py::AUDIT_REPORT_NAMES` had
+  fallen one behind the route (`zotero_attachments`), so that report was
+  GUI-only; it and the three new names are now reachable over `audit_report`.
+* **Two documentation drifts closed.** The root CLAUDE.md still recorded
+  "`add_matches` leaves the PDF under both keys" as an open bug — the sweep
+  has been in `bridge.py` for some time; and `audit/CLAUDE.md` said fourteen
+  reports where the route served fifteen (now eighteen).
+
+## 2026-09-04 — Note sync, Phases 4 + 5: pull, push, merge, and the surfaces
+
+The two-way sync plan's last two phases. Every write in either direction is
+a confirm-gated verb, each reversible from the Restore panel that already
+owns that side (Note Refactor for the vault, Tagging for Zotero), and a
+conflict is never a one-click verb in any surface.
+
+* **Pull** (`POST /api/notesync/pull`) writes today's Zotero note — read
+  FRESH, not the scan's copy — into the marked region, prefix and suffix
+  byte-identical, journalled as `notesync_update`; a `conflict` needs
+  `accept_conflict`, the two-decisions rule. **Push** (`/push`) writes the
+  region to the Zotero note through the web API in retire-tag's four-phase
+  choreography (reads lock-free → ONE hold to journal → PATCHes lock-free →
+  ONE hold to record outcomes), as a `zotero_note_write` op in the tagging
+  journal with the server's own `before` HTML inline; a failed PATCH flips the
+  op to `failed`, never leaves an `applied` claim. Push additionally refuses
+  when the API is ahead of the local SQLite — the listing could not see that
+  edit, and writing over it is exactly the conflict case. Both verbs write
+  the base record after success with the text they SENT, so the next pass
+  does not flag the app's own normalisation as an edit.
+* **Merge** (`/merge-preview`, `/merge`): the three texts of a note and a
+  pre-filled three-way merge (`notesync/merge.py`, a small line-level diff3:
+  one side's change applies, an identical change applies once, overlapping
+  changes become one marked block). The user edits the result and chooses
+  where it lands — both sides, the note only, or Zotero only — and whatever
+  is not written is accepted as it is. A result still carrying markers is
+  refused; the write is stale-diff guarded on the note's hash.
+* **Create in Zotero** (`/create-zotero-note`): the only verb that creates a
+  Zotero item, opt-in and per row; journalled as `zotero_note_create` whose
+  undo is a TRASH, never a delete. The note's frontmatter then gains the two
+  keys through a journalled note write.
+* **Reverts** for both op kinds live in `notesync/zotero_notes.py` with the
+  same prepare/commit split as the tag reverts, and the Tagging → Restore
+  route dispatches them on both its single-op and batch paths.
+* **Surfaces:** the Zotero Notes Sync tab gains a two-way section — counts,
+  bulk pull/push over VISIBLE rows of exactly that state (a conflict can
+  never ride a bulk verb), a baseline verb, per-row pull/push/merge/create,
+  and the merge view built on the shared side-by-side diff. `papermind
+  notesync status` and the MCP tool `notesync_status` are read-only; no
+  write tool is exposed until elicitation can put the confirm in front of a
+  human. Help guide section added.
+* **Fresh-vs-scan trap, closed by construction:** the update path's region
+  renderer reads the record the SCAN cached, so `pull` builds a record copy
+  whose child note is today's (`_fresh_record`); anything that pulls from the
+  cached copy would silently write last scan's text.
+
+## 2026-09-04 — Note sync, Phase 3: the two-way state
+
+Third phase of the sync plan. The app can now say WHICH side of a reference
+note changed, which is the question a two-way sync turns on and the one the
+containment test could never answer.
+
+* **`notesync/state.py`** (pure) is the 2×2 table — `in_sync` · `pull` ·
+  `push` · `conflict` — decided by text against a per-note **base record**
+  (`BaseRecord`: the Zotero HTML and the region bytes at the last sync, the
+  note item's version, the converter's identity). "Zotero changed" compares
+  the converter's rendering of now against its rendering of the base, so
+  converter-vs-plugin formatting can never masquerade as an edit; a base
+  written by another converter is treated as absent rather than compared
+  across converters. Without a base the note is `unbaselined` and the
+  pre-Phase-3 word/structure test (`bootstrap_state`) says what is at stake.
+* **`notesync/base_store.py`** keeps one fsynced JSON per citation key under
+  `BASE_DIR/notesync/base/<vault>/` — never the vault — named by a digest of
+  the key so a key can never shape a path; a corrupt, tampered or foreign
+  file loads as `None`.
+* **`GET /api/notesync/sync-status`** reads Zotero FRESH (`read_items` over
+  the current SQLite, memoised on the file's size + mtime; 0.49 s live) and
+  joins it to the cached scan's key map — the scan stays the source of the
+  citekey ↔ item join, the text and version come from the database as it is
+  now, so a sync pass no longer waits on an audit scan. An unreadable
+  database is a 503, never a stale listing. **`POST /api/notesync/bootstrap`**
+  writes a base for every unbaselined note that is in step today and refuses
+  the rest with `needs_decision` — it is the one bulk verb that touches
+  neither the vault nor Zotero.
+
+## 2026-09-04 — Note sync, Phase 2: the marker layout
+
+Second phase of the two-way sync plan. Every reference note can now carry
+an explicit region boundary and the Zotero keys that address it, and the
+app can put them there — and take them out again — without touching a byte
+of the region itself.
+
+* **`notesync/migrate.py`** wraps the region `split_note_parts` already
+  identifies in `<!-- zotero-note:begin -->` / `<!-- zotero-note:end -->`
+  (HTML comments by maintainer decision: hidden in Obsidian, dropped by a
+  pandoc export) and appends `zotero-key` / `zotero-note-key` to the
+  frontmatter as the last lines of the block, in the note's own newline
+  style, behind a YAML round-trip guard that refuses any other change to the
+  mapping. `unmigrate_note` is the exact inverse; `unmigrate(migrate(x)) == x`
+  is pinned for six note shapes including CRLF, an empty region and a note
+  with no trailing newline. **Not journalled**: 1,235 notes cannot ride the
+  refactor journal's 200-op window, so the undo is the inverse verb plus the
+  vault's git — the write route refuses unless the notes folder is committed.
+  Dry-run over the live vault: 1,234 of 1,234 notes plan cleanly and invert
+  byte-for-byte; +100 bytes per note.
+* **`notesync.compare.split_note_parts`** returns `(prefix, region, suffix)`
+  with `prefix + region + suffix == raw`, preferring the marker pair and
+  falling back to the single-rule shape, so migrated and unmigrated notes
+  coexist. The update path writes `prefix + new_region + suffix`, which is
+  what keeps anything the user writes BELOW the end marker byte-identical
+  across a refresh. `split_note` keeps its two-part read-side shape.
+* **`DEFAULT_TEMPLATE` is marked**, so app-created notes arrive in the new
+  layout with the keys stamped, and `render_region(marked_target=…)` renders
+  the legacy shape for an unmarked target — measured identical bytes for the
+  same note either way, so no unmigrated note reads as changed.
+* Routes `POST /api/notesync/migrate` and `/unmigrate` (dry run without
+  `confirm`; op-locked, heartbeat acted on, re-read under the lock, a note
+  edited between plan and write is skipped as `changed_on_disk`), a `layout`
+  block on `/status`, and a layout line on the Zotero Notes Sync tab with the
+  two verbs behind `confirmInline`. The Zotero Integration template lines to
+  add are returned as `template_hint` and logged to the console; the app
+  never edits the plugin's template file.
+
+## 2026-09-04 — Note sync, Phase 1: the Markdown reference
+
+First shipped phase of the two-way Zotero ⇄ Obsidian reading-note sync plan
+(`docs/plan_2026-09-04_zotero_note_sync.md`, approved the same day). No layout
+change, no new write path; this phase corrects what the app compares and
+renders a Zotero note AGAINST.
+
+* **`notesync/convert.py`** is the one HTML ⇄ Markdown pair the sync path
+  uses: markdownify with `-` bullets, misc-escaping on and `<img>` nodes passed
+  through verbatim; markdown-it (CommonMark + tables, raw HTML on) wrapped in
+  Zotero's `znv1` shell for the write direction. Each setting was measured over
+  all 1,236 live child notes (spike S2): the plugin emits `-` bullets, so the
+  default `*` alone produced 277 false "annotated" rows; without misc-escaping
+  a line beginning `>20 : severe` or `+ fqt que MDD` round-tripped as a
+  BLOCKQUOTE or a nested LIST — the only failure class that changes meaning;
+  and the 7 notes embedding Zotero image attachments would have lost them.
+  Non-breaking spaces are emitted as `&nbsp;` because markdown-it-py strips a
+  leading U+00A0 (Python's `str.strip` counts it as whitespace) and the
+  de-indented text re-parsed as a list. 1,211 of 1,236 notes are exact
+  round-trip fixed points; the residue is blank-line placement (14) and bold
+  adjacent to punctuation that CommonMark cannot express (11, degrades to
+  literal asterisks — the accepted "lossy but readable"). `CONVERTER_ID` names
+  the pair so a later sync base record can invalidate itself loudly.
+* **`notesync.render.zotero_note_text` returns Markdown.** It returned
+  `body_plain` — the HTML stripped to text — so a note the app created was
+  LOSSIER than one the plugin created, and the comparison was measured against
+  a reference the vault never contained. Live matrix before → after: "annotated
+  by the user" 555 → 48, "conflict" 15 → 8, and every one of the 8 is a genuine
+  two-sided edit. The 0.85 containment threshold was re-measured against the
+  Markdown reference and still flags exactly the same three notes, so it is
+  unchanged. A note object without `body_html` falls back to `body_plain`.
+* **`ZoteroChildNote` gains `body_html` and `version`** (additive; the reader
+  also selects `items.version`). The Markdown rendering deliberately does not
+  live in `audit/` — that tree depends on nothing but `audit/config.py`.
+* **`notesync.compare` folds `&nbsp;`/U+00A0 to a space in every tokenizer and
+  ignores `<img …>` tags** — left in, "nbsp" counted as a word on one side only
+  (111 false "update" rows) and the image attributes as words (7 more).
+* **`markdownify` and `markdown-it-py` are first-class dependencies.** They had
+  reached the tree only transitively through markitdown; both lockfiles
+  regenerated (the only diff is the two new `via requirements.txt` lines).
+* **Spike S1, live against api.zotero.org on a throwaway item:** a child note
+  PATCH with `If-Unmodified-Since-Version` answers 204, a stale one 412, the
+  `<img data-attachment-key>` node survives create and PATCH byte-exact, the
+  shell is stored verbatim, and a tag write on the PARENT leaves the note's own
+  version untouched. The item is in Zotero's trash.
+
+## 2026-09-04 — CI back to green, and one bulk verb
+
+CI had been red on every push since 2026-08-28. Five commits: the blocker and
+its two neighbours, one rendering defect the user reported, and the bulk action
+the Zotero-attachments route had always supported without a client for it.
+
+**CI (three commits).** The single failing step was the dependency-audit gate,
+and it was failing for a reason no change to our dependencies could have fixed:
+`pip-audit` ran with no `-r`, so it audited the live ENVIRONMENT. On
+ubuntu-24.04 that swept the runner's own system packages — 26 of its 50
+findings were about `twisted`, `pyjwt`, `pyasn1`, `pyopenssl`, `httplib2`,
+`configobj` and `wheel`, none of them project dependencies, none present in
+either lockfile, and its skip list named `cloud-init`, `ufw` and `walinuxagent`
+outright. It was also not reproducible on a developer machine, which is why it
+sat for a week.
+
+* **The gate now audits the platform's hash-locked requirements file**, which
+  is the graph CI actually installs. Measured: 50 findings across 10 packages →
+  26 across 3. `--require-hashes` rather than `--no-deps`, so a lockfile
+  regenerated without `--generate-hashes` fails the gate instead of being
+  audited silently as a plain pin list; a missing lockfile is a failure too,
+  because the gate must never report a pass it did not perform.
+* **`nltk` 3.10.0 → 3.10.3, `transformers` 5.8.0 → 5.10.1, `banks` 2.4.2 →
+  2.4.5**, clearing 25 advisories. transformers is 5.10.1 and NOT the 5.10.0
+  pip-audit names as the fix: 5.10.0 is yanked upstream ("pushed from a week
+  old main branch … missing a bunch of fixes"), which uv reports during the
+  compile. Both lockfiles regenerated; the diff is exactly these three
+  packages. Verified beyond the suite — the pinned chunking invariant holds, so
+  no reindex is forced, and the cross-encoder was loaded and scored by hand
+  because the suite mocks it.
+* **The 26th finding is waived, with its reachability argued rather than
+  asserted.** PYSEC-2026-3740 on nltk has NO upstream fix — the advisory says
+  so itself — and is a sandbox bypass in model-artifact load/save helpers
+  (`TransitionParser`, `AveragedPerceptron`, `PerceptronTagger.save_to_json`,
+  `save_maxent_params`) that appear nowhere in this tree; nltk enters
+  transitively for the punkt_tab/stopwords corpora, which the app seeds itself,
+  and exploiting it needs a caller-controlled model path the app never passes.
+  Expires 2026-12-03.
+* **All four pinned actions moved off the Node 20 runtime** (checkout v7.0.1,
+  setup-python v7.0.0, setup-node v7.0.0, gitleaks v3.0.0), in live-smoke.yml
+  as well as ci.yml. Every run had been warning about this, and it was a
+  deadline rather than a grumble: GitHub removes Node 20 from hosted runners on
+  2026-09-16. Every major crossed was read — the only removals are things this
+  workflow does not use. The version comments were stale in a way worth not
+  repeating: three named v4.2.2 beside a SHA that is in fact v4.4.0, so the
+  human-readable half of the pin had drifted from the enforced half.
+
+**A row of commas above the "Needs review" table.** User-reported, and a real
+defect rather than a cosmetic one. `_renderNoteSync`'s two update tables passed
+`rows.map(...)` to `_tbodyHtml` without `.join('')`, where the four sibling
+tables in the same function join correctly; the template literal coerced the
+array with `Array.prototype.toString`, and because the commas land between
+`<tbody>` and `<tr>` the parser foster-parents them out of the table and drops
+them immediately before it — which is also where `installTableControls` mounts
+its filter strip. 15 conflicts, 14 commas. Invisible at 0 or 1 row, so the fix
+is not only the two call sites: `_tbodyHtml` now joins an array rather than
+coercing it, covering its other ten callers, and a ratchet walks every call
+site in the file.
+
+**Bulk de-link on the Zotero Attachments report.** `POST /api/zotlink/trash`
+has accepted `item_keys: [...]` up to 200 since it shipped — SSE progress, the
+annotation acknowledgement, per-key results, one batch_id for the undo — but
+the report only offered a per-row verb, so clearing a folder's worth of
+attachments meant one confirm each. Client-side only; the server still
+re-derives every attachment from the last scan's index. Selection model and
+lifetime are Tag Harmony's verbatim. Four decisions that are silent if got
+wrong: the confirm names the SUMMED annotation loss and the acknowledgement
+rides only when the selection actually contains annotated rows (a blanket true
+would disarm the server's second gate for every batch); "select all" skips a
+row the table filter is HIDING, since it hides rather than removes and this is
+a destructive verb; outcomes are read per key and a failure goes back into the
+selection so a retry picks up the remainder; and rows are marked in place,
+never removed, because the report is a view of one cached scan. Three of the
+11 new ratchets were proven red by breaking the code.
+
+## 2026-09-03 — UI / UX review
+
+Reviewed the app as a user meets it, by booting the real shell in Chromium at
+first run (throwaway `BASE_DIR`, every tab) rather than by reading markup.
+Four fixes applied, three findings checked and deliberately left, one migration
+scoped and costed into the registry.
+
+**Applied.**
+
+* **The landing tab had no empty state.** The Obsidian Agent tab — the tab the
+  app opens on, and the one the Library Audit's own empty state directs a new
+  user to — showed "Vault: Not configured", an empty box and a Send button,
+  with nothing about needing an index. It now carries a three-register hint
+  decided from what `/api/obsidian/status` already returns: pick a folder, or
+  index it, or ask a question. A hint and not a message (no `role`), never
+  painted over a transcript, removed when the first turn starts, silent
+  mid-run, and flipped in place when an index completes.
+* **The settings filter had no zero-result answer.** A query matching nothing
+  hid every section and left "0 match(es)" — a dead end on the one surface a
+  user searches when a setting is missing, in an app with three settings
+  surfaces. It now names the other two. (The recorded "give the audit modal a
+  filter too" idea was dropped on measurement: that modal has 10 controls and
+  no nesting.)
+* **Three CSS custom properties were used and never declared.** `--font-mono`
+  at seven sites, so those seven rendered Courier while ten sibling surfaces
+  declared the SF Mono stack literally; `--mono` as a second spelling; and
+  `--bg` in the command palette's scrim, which therefore always painted 40%
+  black instead of the theme-aware `--overlay-scrim` every modal uses. CSS
+  fallbacks are why this looked fine and was wrong. `tests/js/cssTokens.test.js`
+  now fails on any `var()` whose token is undeclared.
+* **Two axe violations the shell-only run structurally could not see**, plus
+  focus restoration after a confirmed write. Details in the a11y commit: an
+  unlabelled `.sr-only` file input (CRITICAL) and an unfocusable scroll region
+  (SERIOUS), found by auditing each tab panel — now a committed test — and
+  `confirmInline`'s Confirm returning focus to a surviving anchor, which Cancel
+  and Escape already did.
+
+**Checked, adequate, left alone** (recorded in the registry so it is not
+re-derived): the new streaming-cap 503 reaches every client as the server's own
+retryable sentence, with draft preservation and Retry boundaries already in
+place; the audit Settings modal needs no filter; and all three keyboard decks
+are properly focusable named regions.
+
+**Scoped, not started:** the 113 inline `on*=` handlers whose hashes force
+`'unsafe-hashes'` into the CSP. The registry entry now carries the measurement
+— 104 of 113 mechanically convertible, three delegates retiring 42 of them,
+nine needing hand-written bodies, the order of work, and the two ratchets to
+add with it.
+
+## 2026-09-03 — Documentation: truth pass, then the registry by subsystem
+
+No behaviour change. Three commits.
+
+* **CLAUDE.md described mechanisms that no longer exist.** The 2026-09-02
+  performance plan landed here but not in the invariant doc, so five symbols a
+  reader now has to know were absent (`_MAX_LIVE_SSE_WORKERS`,
+  `_budget_tool_history`, `run_open`, `join_snapshot_refresh`,
+  `_INVENTORY_ROWS_CACHE`) and eight bullets described superseded behaviour.
+  Each is now recorded at its owning Module Ownership bullet as an INVARIANT
+  and the reason it holds — never as change prose, which is this file's job.
+  The SSE call-site count was re-measured (19/9 → 20/10; `zotlink` was added
+  2026-08-30 and nobody re-counted).
+* **Known Issues was 397 of 705 lines across 20 date-keyed subsections.** Every
+  entry was checked against the CODE rather than against its own text. Two were
+  found already fixed and are struck with the mechanism (`extract-image`'s
+  unbounded inline vision call; `retire-tag` saving its manifest after
+  `lock_lost`). Seven findings that appeared in two or three subsections are
+  merged into one live entry each. **Nothing was deleted** — a bulk check of
+  every backticked symbol and path in the section found no entry describing
+  code that no longer exists, and a completeness check proves all 164 parsed
+  blocks survive verbatim or in a named merge. The result is 16 subsystem
+  sections, each entry stamped with the review it came from, plus *Measured and
+  declined* (each carrying the number that settled it) and *Closed, kept for
+  the lesson*.
+* **The one user-visible status code the plan introduced was undocumented.**
+  README's Limits and the in-app guide now both explain the streaming cap's
+  **503** as transient and retryable, and README's timeout-chain line says the
+  online stall guard budgets the whole retry ladder. The two `docs/ideas_*`
+  files keep their ideas and gain a dated status pass so nobody re-plans what
+  has since shipped.
+
+## 2026-09-02 — The timeout chain, made uniform
+
+Not part of Phases 3–5, but the same plan's outer-must-exceed-inner rule. Two
+legs remained after Phase 1 closed the compile-fix one.
+
+* **The online stall floor ignored the retry count.** `online_aware_floor_s`
+  widened the consumer stall guard to ONE `online_timeout_s`, but the online
+  adapters retry a transient failure `online_max_retries` times (attempts, not
+  extra tries), each bounded by that same timeout, with a
+  1 s-doubling-to-16 s backoff between them — so at a plausible 150 s / 3
+  attempts the inner reaches 450+ against an outer of 330, and the app killed,
+  and the provider still billed, a call that was inside its configured budget.
+  The floor now budgets `attempts × timeout` plus the bounded backoff gaps
+  (150/3: **330 → 482 s**). It only ever LENGTHENS the window, and only for a
+  config that asked for a long one; the defaults are unchanged. Stated cost: a
+  genuinely dead online stream takes longer to be declared timed out on such a
+  config — the correct direction, since the alternative is killing legal calls.
+* **The driver's SSE timeout was a per-read socket bound read everywhere as a
+  wall clock.** `core/driver.py::_http_sse` passed it straight to `urlopen`,
+  which bounds each individual READ — so a server emitting a frame every few
+  seconds had no bound at all (`papermind maintain` could stream indefinitely
+  inside a nominally 18 000 s call). The socket timeout still detects a dead
+  peer; the consume loop now also stops once the budget has elapsed in total,
+  returning the frames gathered so far with an explicit error — the shape
+  every caller already handles, and the same thing a client disconnect already
+  means to the SSE skeleton.
+* **The MCP write-slot wait was shorter than the writes it serialises.** 300 s
+  against a driver that gives a refactor apply 900 s, so a write queued behind
+  a legitimate first one was told "busy, retry shortly" at a moment when
+  retrying could only fail the same way. The wait is now 960 s, and the
+  pool-starvation property the 300 s bound was introduced for is preserved
+  exactly by bounding the WAITERS instead (`_WRITE_WAITER_MAX` 2, so holder +
+  waiters can never occupy all four workers).
+
+  The remaining leg — the client-side fetch abort, which recomputes its own
+  formula in JS and knows nothing about the online knobs — is recorded in
+  CLAUDE.md rather than fixed, because closing it means shipping the resolved
+  floor to the client rather than duplicating the formula again.
+
+  Pinned by `tests/test_sse_timeout_chain.py`,
+  `tests/test_driver.py::TestSseWallClock` and
+  `tests/test_mcp_server.py::TestWriteSlotWaiting`, red against the pre-change
+  code with `300 not greater than 450 : the guard still kills a legal retried
+  call`, `'error' not found in {...}` and `300.0 not greater than 900.0 : a
+  write can be refused inside a legal write`.
+
+## 2026-09-02 — Performance plan, Phase 5: durability
+
+* **Three write orders that a crash could catch mid-way.** The BM25 sidecar
+  was `rmtree`'d and only then rebuilt IN PLACE, so from the first line onwards
+  there was a window — the whole persist of a large index — in which a crash,
+  or simply a concurrent cold launch, found NO sidecar and paid the full
+  re-tokenise the sidecar exists to avoid; it now builds in `<sidecar>.new` and
+  swaps, so a failed persist leaves the PREVIOUS sidecar standing (a stale one
+  self-invalidates on load, and having one beats having none). The index meta —
+  the file every loader reads first, whose `phase: done` is what makes an index
+  look complete — was written BEFORE the manifest it advertises, so a crash in
+  the gap left a "done" index with a missing or stale
+  `indexed_materials.json`, sending the materials route back to parsing the
+  whole docstore (the cost Phase 2 removed from the request thread); the two
+  writes are simply swapped, both still inside the same brief write-lock hold.
+  And `deckgen/checkpoint.py::prune` only ever listed `.json`, so a
+  `.ckpt-*.tmp` left by a SIGKILL between `mkstemp` and `os.replace` could
+  never be seen or removed and accumulated one per killed generation; prune now
+  unlinks temp files older than `_TMP_ORPHAN_AGE_S` (1 h) — the age gate is
+  what makes the sweep safe beside a live save. Pinned by
+  `test_vault_regressions.py::TestPhase5WriteOrdering` and
+  `deckgen/tests/test_deckgen.py::TestCheckpointTmpOrphans`, red against the
+  pre-change code with `the sidecar was destroyed` and `Lists differ:
+  ['meta', 'manifest'] != ['manifest', 'meta']`.
+
+* **Every `open` child was a zombie, and two recorders could rotate the usage
+  log over each other.** The four route sites that hand a path or URL to macOS
+  `open` (`api/routes/open.py`, two in `audit.py`, one in `tagging.py`) called
+  `subprocess.Popen` and never waited, so each reveal/open left a defunct
+  process entry for the life of the app — one per click, all session long. They
+  now go through `open.py::run_open`, which uses `subprocess.run` with a short
+  timeout: it reaps the child, and kills a wedged one instead of leaking it. A
+  timeout is a warning, not a failure, because `open` returns as soon as
+  LaunchServices has the request; `OSError` still propagates, so the routes'
+  500 path is unchanged. Separately, `_rotate_log_if_large` checked the size
+  and renamed WITHOUT holding the lock, so two recorders whose appends both
+  crossed the 10 MB cap each ran `os.replace(log, log.1)` — the second moving
+  the new, nearly-empty live log over the generation the first had just
+  preserved. The size is now re-read inside the lock and the rotation skipped
+  when another recorder has already done it. Pinned by
+  `test_open.py::TestOpenChildIsReaped` and
+  `test_llm.py::TestUsageRotationRace`; the existing route tests were repointed
+  from `subprocess.Popen` to the consumer's `run_open` name.
+
+* **The three unregenerable decision sidecars now fsync their directory
+  entry.** `mapping.json` (hand-curated PDF↔citation-key matches),
+  `dup_decisions.json` and `pdf_wanted.json` each fsync the FILE before the
+  rename, so the content is durable — but not the parent directory, so the
+  entry naming the new file may not be, and a power loss right after the
+  rename can leave the old file (or none) despite a successful save. The
+  app-wide policy omits parent fsync for REGENERABLE files deliberately; these
+  three are the one place it costs something real. Best-effort: a filesystem
+  that refuses a directory fsync is not a reason to fail a write that has
+  already landed. Pinned by `tests/audit/test_sidecar_dir_fsync.py`, red
+  against the pre-change code with `assert []` (no directory fd was ever
+  fsynced).
+
+* **The scan-time curated-mapping re-anchor could overwrite a FRESHER anchor.**
+  `refresh_mapping_hashes` loads `mapping.json`, hashes every curated file
+  (O(curated) whole-file reads, deliberately outside the RMW lock), then
+  re-loads under the lock and wrote back on PRESENCE alone — so a
+  `POST /api/audit/mapping` landing in that window, which re-anchors a PDF to
+  its CURRENT bytes, was silently reverted to the refresh's own older digest.
+  The value seen at the first load is now carried through and an entry is
+  written only when the freshly loaded value still equals it (compare-and-set).
+  A concurrent writer's anchor is by definition at least as fresh as ours, so
+  skipping is always right; an untouched entry refreshes exactly as before and
+  an entry curated AWAY in the window is still skipped. Lock scope unchanged.
+  Pinned by `tests/audit/test_bridge_reanchor.py`, red against the pre-change
+  code with `AssertionError: the refresh reverted a fresher anchor to its own
+  older digest`.
+
+* **A Finder op's restore mapping lived in memory for up to 25 papers.** A note
+  op's `.bak` snapshot is durable BEFORE its write; a Finder op's
+  `before`/`before_raw` lists — the ONLY record of which colours to put back —
+  existed only in the manifest, which a batch checkpoints every
+  `JOURNAL_FLUSH_EVERY` (25) ops. A crash between an xattr write and the next
+  checkpoint therefore lost the colours for up to 25 papers, with only
+  `log_vault_write`'s names left. `journal.write_external_snapshot` now
+  persists the same mapping as one small fsynced JSON sidecar named by op id,
+  written before the first xattr change and reclaimed by `prune` through the
+  same `snapshot_rel` field the note snapshots use — parity at last, and
+  **without a per-op SQLite transaction**, so a batch's write cost is unchanged
+  in kind. The inline lists stay the revert's first source; the sidecar is the
+  recovery-of-last-resort fallback. A sidecar write failure logs and proceeds,
+  which is exactly the pre-fix durability. The Known Issues entry is struck in
+  the same commit. Pinned by `test_tagging.py::TestFinderSnapshotDurability`,
+  red against the pre-change code with `AssertionError: 0 != 1 : sidecars on
+  disk: []`.
+
+## 2026-09-02 — Performance plan, Phase 4: bounds on growth
+
+* **Uncapped SSE workers, an uncancellable corpus build, and a scan thread
+  doing widget work.** The finding's fourth part was measured and declined.
+  * **A process-wide cap on live SSE workers.** All 19 streaming call sites
+    spawned a daemon worker per request with no process-wide bound, and the
+    threads are daemons — invisible to the Waitress pool bound — so a wedged
+    local backend accumulated one blocked thread per retry with nothing
+    refusing the next. `api/sse.py` now takes one of `_MAX_LIVE_SSE_WORKERS`
+    (12) slots BEFORE the Response is built, so a refusal is a real **503**
+    rather than an error frame inside a 200, and releases it through the SAME
+    `_SSEOpGuard` that owns the op lock (stream ended AND any worker exited).
+    A refusal hands the caller's op lock back and runs its `on_stream_finished`
+    observer — otherwise the cap would strand exactly the locks Phase 0
+    stopped leaking.
+  * **The search-corpus build can be cancelled.** A scan finishing mid-build
+    left the OLD Inventory pinned by the build's own arguments for the rest of
+    a run whose result the supersession check then discarded — two
+    multi-hundred-MB inventories at once, for minutes on a large vault.
+    `_clear_search_cache` (the manager's result listener) now sets an event
+    that `build_corpus` polls BETWEEN report sections, raising
+    `CorpusCancelled`; a partial corpus is never returned, and a cancelled
+    build is not recorded as an error.
+  * **The widget snapshot left the scan thread.** The result listener built the
+    payload inline — including a PDF text extraction for the excerpt — so a
+    scan that had already reported `done` kept its worker busy. It now
+    enqueues onto one coalescing daemon (`widget-snapshot`, joined by
+    `suite_helpers.join_post_index_daemons` and by the targeted
+    `api.routes.widget.join_snapshot_refresh`); repeat requests collapse into a
+    single follow-up build. The manual `POST /api/widget/refresh` stays
+    synchronous, because its caller wants the result in its response.
+  * Declined on measurement: lazy Zotero child-note bodies — **1 236 notes,
+    1.06 MB total** on the live library (see CLAUDE.md).
+
+  Pinned by `tests/test_sse_worker_cap.py`,
+  `test_audit.py::TestSearchCorpusCancel` and
+  `test_widget.py::TestSnapshotOffScanThread`, red against the pre-change code
+  with `200 != 503`, `6 builds` and `unexpectedly identical: <_MainThread…> :
+  the build ran on the caller's (scan) thread`; the corpus poll was
+  additionally proven red against a deliberately wrong entry-only variant
+  (`CorpusCancelled not raised`).
+
+* **Five caches with no bound.** The three ONLINE adapters' client caches
+  (`openai.py`, `anthropic.py`, `google.py`) were plain dicts with no eviction,
+  so a rotated API key stranded the previous client's idle connection pool for
+  the process lifetime; they are now `OrderedDict`s capped at
+  `_CLIENT_CACHE_MAX` (8) and LRU-evicted, exactly as the local adapters
+  already are — an evicted client is not closed in place (a concurrent call may
+  still be streaming on it), and key composition is untouched so a new key
+  still yields a new client. `refactor/resolver.py`'s index cache kept one
+  full-vault name+link index pair per `(root, exclusion set)` EVER used; it is
+  capped at 2, matching its sibling `archive.py::_REF_INDEX_MAX_ROOTS`.
+  Browser-side, the tagging deck's snippet cache was an unbounded object that
+  `taggingRenderInto` **wiped on every render** — so flipping the
+  with-PDF/all scope threw away every excerpt the user had already paid a
+  server-side extraction for; it is now a 200-entry LRU that SURVIVES a scope
+  flip or view toggle and is dropped only when a new `scanned_at` arrives,
+  beside the selection it shares that rule with. And the audit report body now
+  releases a report's cached payload (`_acc.rows`, `_acc.report`, the
+  ambiguous payload) when a DIFFERENT report takes the body, instead of holding
+  it for the session. Declined on measurement: narrowing the archive sweep's
+  canvas index to basename sets — its substring test is deliberately
+  conservative on a destructive path, and the live vault holds zero `.canvas`
+  files (see CLAUDE.md). Pinned by
+  `test_concurrency.py::TestOnlineClientCacheBound` /
+  `::TestResolverIndexCacheBound` and `tests/js/taggingSnippetCache.test.js`,
+  red against the pre-change code with `39 not less than or equal to 8 : 39
+  cached clients` and `expected [ 'a2020', 'a2020' ] to deeply equal
+  [ 'a2020' ]`.
+
+* **The usage tracker kept every parsed record and re-folded on every poll.**
+  `_disk_records` parsed the whole JSONL — up to `_MAX_LOG_BYTES` (10 MB) live
+  plus the same again rotated — into `UsageRecord` dataclasses, held them for
+  the process lifetime, and `summary()` re-folded all of them on every call.
+  The cache key is the log's `(size, mtime_ns)` and **every LLM call appends**,
+  so any `/api/usage` poll during generation re-read and re-parsed everything.
+  Measured on a synthetic 20 000-record log (5.0 MB): **301.8 ms per poll while
+  appending, 9.4 MB retained**. The window is now kept as a FOLD, not a list —
+  per-`since_iso` state holding the byte offset consumed of the live log, the
+  rotated file's signature, the accumulated `UsageSummary` and a bounded tail
+  of disk uids — so a later `summary()` parses only the appended bytes: **0.1 ms
+  per poll, 0.1 MB retained**, cold cost unchanged. Anything that could
+  invalidate an offset (a rotation, a shrunk or replaced live log, a changed
+  rotated generation, a reconfigure) falls back to a full re-fold, so the
+  incremental path is only ever taken for a pure append; the
+  read-BOTH-generations rotation window (the 2026-08-09 fix) and the uid
+  de-dup against the ring are preserved — the ring holds at most 500 records,
+  so a uid it shares with disk is always inside the retained tail of 1 000.
+  Pinned by `test_llm.py::TestUsageFold` (8 cases incl. rotation, a partial
+  trailing line, per-window independence and fold immutability), red against
+  the pre-change code with `AssertionError: 303 != 3 : 303 records parsed by
+  the second poll`.
+
+## 2026-09-02 — Performance plan, Phase 3: redundant I/O and compute
+
+* **Frontend: bootstrap, listeners, the tab-switch walk and two per-token
+  costs.** Six independent defects, one batch.
+  * **Launch rendered the whole audit report.** `initAuditTab` ran
+    `_loadReport` inside `app.js`'s init sequence, so a cached scan made the
+    browser fetch and render the full inventory (**3.71 MB, ~6 000 rows**)
+    before the refactor, deck, docgen and maintenance steps ran — on the vault
+    tab, which is the one on screen. The load is now armed and runs on the
+    first activation of the Audit tab (`ui.js::showTab` dispatches a
+    feature-blind `chatekld:tabshown`; the hook is registered once per
+    DOCUMENT). The dashboard tiles still refresh at launch, from
+    `/api/audit/summary` — the endpoint that exists for exactly that — instead
+    of as a by-product of the deferred inventory payload. The scan is neither
+    started nor polled by this path.
+  * **One closure per row verb.** `_wireRowActions` bound a listener to each
+    `.audit-link-btn` and each `[data-inv-view]` / `[data-inv-detail]` on every
+    render — **12 000 to 20 000 closures** for the 6 000-row inventory,
+    re-created on every re-render. One delegated listener on
+    `#audit-report-body` now serves all of them, attached once via a dataset
+    marker; the deck views keep their own card wiring behind `_genericRowPass`,
+    because their `[data-action="reveal"]` buttons carry `.audit-link-btn` too
+    and a flag-blind delegate would fire twice.
+  * **Leaving a tab walked every descendant.** `showTab` ran
+    `prev.querySelectorAll('*')` and read `scrollTop` on every node to find the
+    handful that had scrolled. One passive capture-phase `scroll` listener now
+    records which elements actually scroll, per panel, and only those are read.
+  * **The ambiguous-PDF view toggle re-fetched the report** for a view of the
+    same cached scan; it now re-renders from the payload it already has (the
+    accession toggle's pattern), decided/undo still keyed to the scan token.
+  * **Plain chat forced a layout per streamed token** by wrapping the
+    renderer's `update` to set `scrollTop = scrollHeight`. The scroll now rides
+    `makeAnswerRenderer`'s own 40 ms coalesced render through a new optional
+    `onRender` hook.
+  * **The table filter wrote `hidden` on every row per keystroke** and ran the
+    attachment sibling-walk for each; both now happen only when a row's
+    visibility actually changes.
+
+  Pinned by `tests/js/auditDeferredLoad.test.js`, `auditRowDelegate.test.js`
+  and `tabScrollMemo.test.js` — red against the pre-change code with
+  `expected 1 to be +0` (inventory fetched at launch), `expected 50 to be +0`
+  (per-button listeners) and `expected [ '*' ] to not include '*'`.
+
+* **A snippet or propose on an unindexed PDF hashed the whole file three
+  times.** `tagging/text_source.py::_cache_probe` fingerprinted the document to
+  locate its `.notext` marker, the fresh-extract path re-probed under its
+  serialisation lock and fingerprinted it again, and
+  `rag/vault.py::_read_pdf_text` fingerprinted it a third time — **3 whole-file
+  sha256 reads for one snippet**, counted at `_sha256_file`. The persisted
+  signature map spares an INDEXED PDF, so the cost landed on exactly the
+  unindexed ones the tagging deck reaches. The signature now rides from the
+  probe into the read: **3 → 1**, worth ~2 ms at the maintainer's median biblio
+  PDF (0.6 MB of 5 943 files) and ~260 ms on the 114.5 MB outlier. A handed-in
+  signature is trusted only while a FRESH stat still matches its size and
+  `mtime_ns`, so a file changed mid-read falls back to a full hash rather than
+  reading or writing a cache under a stale digest. Pinned by
+  `test_tagging.py::TestSnippetHashesOnce`, red against the pre-change code
+  with `AssertionError: 3 != 1 : 3 whole-file hashes`.
+  The finding's other half — moving `.get()`-only readers to
+  `load_config_readonly()` — was measured and declined: 0.044 → 0.0012 ms per
+  call against a proxy that raises on any mutation (see CLAUDE.md).
+
+* **The audit routes re-read and re-serialised per request.** Two of the
+  finding's four halves were real and are fixed; the other two were measured
+  and declined (recorded in CLAUDE.md's deferral subsection).
+  * `GET /api/audit/inventory` re-flattened every `Record` on every request:
+    **75.3 ms of serialisation plus 10.9 ms of `json.dumps` for a 3.71 MB
+    payload**, measured on a synthetic 6 000-record inventory (the
+    maintainer's library is ~6 150). It is now memoised on the IDENTITY of the
+    `(Inventory, Settings)` objects the manager hands out — the search-corpus
+    discipline, released by the **same** result listener so a superseded
+    Inventory is never pinned: **75.3 → 0.0 ms** on every request after the
+    first.
+  * `_drift_synonyms` re-read and re-parsed `_tags.md` on every call — three
+    times per drift report and once per cross-report search KEYSTROKE. On the
+    maintainer's 105 620-byte file (339 synonym entries) that is **1.47 ms per
+    call → 0.002 ms** through a memo keyed on the file's own
+    `(path, size, mtime_ns)`. An edit still applies on the very next call with
+    no rescan, because mtime is the key, and every caller gets a fresh dict so
+    none can reach the cached value.
+  * Declined on measurement: the accession panel's two cache-file loads
+    (**6.4 ms**, not the "two 100 000-entry memos" the plan assumed — the files
+    hold 5 561 and 575 entries) and the DOI cache's twice-per-scan load and
+    save (**~36 ms of a multi-minute scan**).
+
+  Pinned by `test_audit.py::TestInventoryRowsMemo` and `::TestDriftSynonymMemo`,
+  red against the pre-change code with `2 serialisations` and `4 tag-file
+  parses`.
+
+* **Bib relevance re-folded 6 000 entries per deck section.** The `.bib` parse
+  is cached on `(path, size, mtime_ns)`, but the accent-folded haystacks
+  `relevant_bib_keys` scores against were not part of the cached value, so
+  every section re-did `2 x len(bib_index)` pure-Python NFD passes. Measured on
+  a synthetic 6 000-entry index (the maintainer's `_master.bib` is 6 141):
+  **73.0 ms per section, 37.7 ms of it the fold pass alone**. `_fold_cached` is
+  now an LRU-bounded memo (`_FOLD_CACHE_MAX` 32 768) over the same pure
+  function, so every section after the first folds nothing: **73.0 → 35.3 ms
+  warm**, the first section unchanged. The query text is deliberately folded
+  through the uncached function — it differs on every call, so memoising it
+  would only fill the LRU. Scoring, ordering and the returned key list are
+  byte-identical, and the folding recipe itself is untouched (still
+  byte-identical to `audit/search.py::fold`). Pinned by
+  `deckgen/tests/test_template.py::TestBibFoldMemo`, red against the pre-change
+  code with `AssertionError: entry folds on the second section: 400`.
+
+* **Few-shot exemplar selection embedded every key the journal ever touched.**
+  `tagging/candidates.py::_select_exemplars` mined the whole tagging journal
+  and embedded every candidate title on EVERY propose, under the 30 s
+  construction bound the single-flight propose gate is held across — so in the
+  field it timed out and degraded to the recency fallback after spending the
+  entire budget to reach the answer the fallback gives for free. Measured with
+  a counting fake embedder over a journal holding 3 000 tagged keys: **3 000
+  titles embedded per proposal**. The pool is now truncated to the newest
+  `_EXEMPLAR_MAX_CANDIDATES` (200) by op timestamp **before anything is
+  embedded**, and each title's vector is cached on disk by (embed model,
+  title) exactly as gloss vectors are: **200 on the first proposal, 0 on the
+  next**. The cap applies to the ranking POOL, never to the `k` exemplars the
+  prompt receives, and both the similarity sort and the recency fallback run
+  over the same truncated pool. Degradation stays total — every new failure
+  mode still raises into `propose_context`'s single `try/except`, which
+  returns `(vocab, [])`. Pinned by `test_tagging.py::TestCandidateSelection`'s
+  four new cases, red against the pre-change code with `AssertionError: 3000
+  != 200`.
+
+* **The agent loop re-sent its whole tool history on every iteration.** Tool
+  results are kept at their per-tool caps (`vault_search` 12 000,
+  `vault_list_materials` 20 000, `vault_read_note` 32 512 characters) and every
+  completed `ToolTurn` was passed verbatim to every subsequent `generate()`, so
+  prompt characters grew **quadratically in iteration count** — and a deck runs
+  one such turn per section. Measured on a scripted 6-iteration turn whose tool
+  returns 30 000 characters, the six requests carried
+  `0 + 30 246 + 60 492 + 90 738 + 120 984 + 151 230 = 453 690` history
+  characters, the last request 151 230 on its own. `core/agent/loop.py`'s new
+  `_budget_tool_history` now renders the history the REQUEST carries: the
+  newest turns verbatim while they fit `_HISTORY_CHAR_BUDGET` (70 000, sized
+  above two whole `vault_read_note` turns) and never fewer than
+  `_HISTORY_KEEP_VERBATIM` (2), with every older turn's result content replaced
+  by a one-line stub naming how much was elided. Same turn after:
+  `0 + 30 246 + 60 492 + 60 617 + 60 742 + 60 867 = 272 964`, the last request
+  **60 867 — bounded, not growing**. Under the budget the function returns the
+  input object, so a short turn's request is byte-identical to before it
+  existed. **Every `tool_use` keeps its paired `tool_result`** (Anthropic 400s
+  otherwise) with its `tool_call_id` and `is_error`, the `ToolCall` objects —
+  Gemini `thought_signature` included — are carried over by identity, and only
+  WHOLE turns, oldest-first, are ever stubbed; the loop's own `tool_history`
+  list is untouched, so the `on_event` trace and the SSE frames are unchanged.
+  Pinned by `test_agent.py::TestToolHistoryBudget`, red against the pre-change
+  code with `AssertionError: 151230 not less than or equal to 150000`.
+
+## 2026-09-02 — Performance plan, Phase 2: lock scopes narrowed to their rationale
+
+The 120-second retrieval acquire is argued in the docs for checkpoints; it had
+come to cover archive pruning, legacy cache migration and LanceDB compaction as
+well. Each item here returns one lock to what its own comment says it protects.
+
+* **Archive pruning ran inside the rw WRITE lock.** On any fresh rebuild
+  `_archive_old_index_dir` did the rename and then, still holding the write
+  lock, ran a bounded 5 s size walk and an **unbounded `rmtree`** of stale
+  archives — the retention windows are 2 routine + 5 protected, and the
+  maintainer's index is 5.4 GB, so tens of GB of deletes is in range. Every
+  chat read is a writer-preference reader on that lock and waits with **no
+  timeout**, so a rebuild could stall retrieval for the whole sweep. The
+  rename stays under the lock — it is the part that must be atomic with the
+  decision to rebuild — and the walk plus the prune move to one short
+  `index-archive-sweep` daemon holding no lock at all. Measured on a
+  3000-file stand-in archive: **117 ms** of walk + `rmtree` leaves the write
+  lock (10 ms walk, 107 ms delete), and that scales with archive size and
+  count while the lock hold no longer does. Safe because neither step touches
+  the new index dir: the walk reads the renamed-aside archive, and the prune
+  removes only `<index>.bak.*` siblings outside the retention windows — the
+  archive just created is the newest by mtime, so a prune racing a later
+  archive can never take either one. Every removal still routes through
+  `log_storage_deletion` (`_prune_old_index_backups` is called unchanged) and
+  both windows stay bounded and independent. The user-visible size line still
+  arrives on the same `_emit` ring, a moment later. The daemon is joined by
+  `suite_helpers.join_post_index_daemons`, which now waits for it as well —
+  an unjoined daemon writing into a patched temp dir is the 2026-07-31 flake
+  class. Pinned by
+  `test_vault_regressions.py::TestArchivePruneOffTheWriteLock`, proven red
+  against the pre-change code with `AssertionError: 3.002642417000061 not less
+  than 1.0 : the rw write lock was held for 3.0s of sweep`.
+
+  **The legacy cache migration named in the same finding was measured and left
+  alone** — see the deferral registry.
+
+* **The three longest single windows were unheartbeated and silent.** LanceDB
+  compaction ran under `_index_mutation_lock` with no bound, no heartbeat and
+  no status line — and the 120-second retrieval-acquire rationale is argued in
+  the docs for *checkpoints*, not for this — while the store load and the
+  checkpoint persist were each one unheartbeated window against the op-lock's
+  3600 s TTL. A stall read as a hang, and a lapsed TTL went unnoticed, so the
+  run kept writing as a second concurrent writer — exactly what
+  `_heartbeat_or_stop` exists to prevent. All four sites (store load, mid-run
+  checkpoint, final persist, compaction) now emit a stage line before and call
+  `_heartbeat_or_stop` after. Compaction stays best-effort and otherwise
+  untouched; a `False` heartbeat still sets the stop event rather than being
+  discarded, because `_heartbeat_or_stop` is the shared helper that does
+  exactly that; and `op_epoch == 0` — every direct and test caller — leaves all
+  of it inert. `_PersistTarget` gained the `op_epoch` field, which is precisely
+  the shared-locals bundle it exists to be. Pinned by
+  `test_vault_regressions.py::TestLongPhasesHeartbeat`, proven red on all four
+  subtests (`'Loading the existing index from disk' not found in …` and the
+  three siblings).
+
+  Incidentally, `rag/build.py`'s mypy findings dropped **69 → 47**: a
+  `TYPE_CHECKING` declaration of the two host-class members the mixin reaches
+  through `self` removes a whole class of "IndexBuildMixin has no attribute"
+  noise that would have hidden a real typo among it. The baseline is lowered in
+  the same change, per the ratchet's rule; the tree now measures **152/153**.
+
+* **The two restore peeks parsed the whole journal.** `_restore_batch`'s "does
+  this batch id exist?" pre-check and the single-op restore's "what kind is
+  this op?" each called `journal.load()`, parsing **every** op. Measured on a
+  journal of 11 651 ops (the live count): single-op peek **63 ms → 0.38 ms**,
+  batch peek **60 ms → 1.47 ms**, and ~11 651 dict allocations per peek — twice
+  per restore — gone. `operations` already carried a UNIQUE index on `op_id`
+  and `operations_batch_idx` on `(batch_id, seq)`, so neither new query scans.
+  **The dirty-tracking contract is untouched, structurally:** `peek_op` and
+  `peek_batch_ops` return PLAIN dicts, exactly as `load_page` does, never a
+  `_JournalManifest` — so it is impossible to hand a partial history to
+  `save()`, whose incremental-write contract depends on the baseline id set
+  covering the whole history. Both call sites already re-`load()` under the
+  op-lock for the actual write; the peek only decides a 404 and which Zotero
+  read to do first. Like `load`, `stats` and `load_page`, these are pure
+  readers with no schema creation on the path — a `CREATE TABLE` there takes a
+  RESERVED lock and turns an ordinary read into `SQLITE_BUSY` against a
+  concurrent `BEGIN IMMEDIATE`, defeating WAL. **The partial-load rewrite of
+  `load()` itself is still NOT taken** — it is the recorded deferral, and it
+  changes exactly the invariants that lost writes twice in August. Pinned by
+  `test_tagging.py::TestScopedJournalPeeks`, which counts parses at
+  `json.loads` (a level both versions reach), proven red with
+  `AssertionError: 40 not less than or equal to 2 : the peek parsed 40 of 40 ops`.
+
+* **A whole-bib parse and a whole-vault walk ran inside the op-lock, per
+  request.** Two halves of one plan finding, both "cheap in isolation, and each
+  sitting inside a lock that indexing waits on". (a) `POST /api/audit/mapping`
+  re-parsed the entire bibliography on **every triage click**, only to test one
+  citation key for membership: measured **3900 ms** on the maintainer's
+  6141-entry / 7.2 MB `_master.bib`. `audit/core/bib.py::parse_bib_keys` now
+  memoises a `frozenset` of keys on the file's `(size, mtime_ns)` —
+  **3900 ms → 0.001 ms** on a hit — and returns an immutable set rather than
+  the parsed entry list, so no caller can mutate shared state; `parse_bib`
+  itself is untouched, so the scan (which needs the entries) is unchanged. The
+  live-bib rejection guarantee stands because mtime is the key: an entry
+  removed from the bib is rejected on the next click, with no rescan. (b)
+  `refactor/apply.py` and `refactor/archive.py` called the *uncached*
+  `build_name_index` — a fresh whole-vault `rglob` — under the obsidian
+  op-lock, moments after `build_plan` had cached exactly that index. Both now
+  use `get_file_index`, the cached accessor the plan and the single-note
+  re-analyze route already share, dropped by `invalidate_index_cache` after any
+  write that changes the file set: measured on a 9120-entry vault,
+  **185 ms → 0.05 ms**. Pinned by `test_audit.py::TestBibKeyMemo` (which counts
+  parses through the ROUTE, at `parse_bib` — a level both versions reach) and
+  `test_refactor.py::TestWritersUseTheCachedFileIndex`, proven red with
+  `AssertionError: 5 != 1 : 5 whole-bib parses` and
+  `AssertionError: 'build_name_index(' unexpectedly found in ... refactor.apply
+  still does an uncached whole-vault rglob inside the op-lock`.
+
+* **The LaTeX lease had no TTL, so a wedged worker kept it until restart.**
+  Release fired only when the worker exited, and with `local_request_timeout_s`
+  defaulting to `0` a worker wedged in `client.chat()` never returns — one
+  lease **and one of the two global slots** were consumed for the life of the
+  process, every later deck/docgen op on that path answering 409.
+  `RagOperationLock` exists precisely because a zombie must not keep a lock
+  forever, and the lease now uses its model: an epoch bumped on every acquire,
+  passive expiry at `_LATEX_LEASE_TTL_S`, and a heartbeat that pushes the
+  deadline out for anyone still alive. A stolen lease's later `release` and
+  `heartbeat` no-op, so a zombie can neither free nor extend a lock a newer
+  holder owns. **The stealer INHERITS the victim's global slot** rather than
+  taking a second one — otherwise two steals would exhaust the semaphore
+  permanently, which is the same leak one level down. **1800 s is measured
+  against the longest honest SILENT stage, not the longest run:** the widest
+  stall window in the file is compile-fix's (2 × `deck_compile_timeout_s`,
+  ≤ 1230 s), and every SSE worker emits an `{"info"}` frame per stage. The
+  zombie-writer rule is preserved through the mechanism already there rather
+  than by touching every write site: `run_sse_worker` gained an optional
+  `heartbeat=` called on each frame, and a refused beat **sets the worker's
+  `cancel` event**, so every existing `if cancel.is_set(): return` gate in
+  front of a write covers the steal case — plus a visible error frame, so the
+  loss is never silent. Pinned by
+  `tests/test_latex_lock_registry_phase3g.py::TestLeaseTtlSteal` and
+  `::TestSseHeartbeatStopsAStolenWorker`. **Honest note on the red:** the TTL
+  is a new mechanism, so a red against the pre-change code is vacuous (it fails
+  on an unknown keyword, not on a claim). The tests were instead proven red
+  against three deliberately WRONG versions of the mechanism — the technique
+  used for the bounded-runner move: dropping slot inheritance gives
+  `AssertionError: the steal consumed a second global slot` and `the global
+  slots leaked across steals`; dropping the epoch check in `_release` lets the
+  zombie free the new holder's lock; and not cancelling on a refused beat gives
+  `Lists differ: [0, 1, 2, 3, 4] != [0]` — the worker writing four more times
+  after the steal.
+
+* **The materials-manifest fallback parsed the whole docstore on a request
+  thread, unserialised.** With `indexed_materials.json` missing, the materials
+  route and the agent's `vault_list_materials` tool each parsed
+  `docstore.json` — several hundred MB on a real vault — with nothing
+  collapsing concurrent callers, and both then wrote the manifest. The
+  indexer's own documentation cites exactly this cost as the reason it skips
+  the parse at checkpoint time. Measured on a 20 000-document stand-in:
+  **561 ms per parse, per caller → 0.013 ms** on a memo hit, and four
+  concurrent callers now do **one** parse instead of four. One build lock plus
+  a memo keyed on the docstore's `(size, mtime_ns)`; a reindex rewrites the
+  file and moves both, so the memo cannot serve a stale answer, and it is
+  dropped on a vault switch as well. Holding a lock across the parse is
+  deliberate and is the point — the alternative is N concurrent
+  several-hundred-MB parses — and it is a leaf, taking no other lock beneath
+  it. The recovered manifest is still written atomically in the existing
+  shape, by the elected caller, exactly once. Pinned by
+  `test_vault_regressions.py::TestManifestFallbackSingleFlight`, which counts
+  parses at `json.load` (a level both the pre- and post-change code reach, so
+  the red is not merely "this helper is new"), proven red with
+  `AssertionError: 5 != 1 : 5 concurrent whole-docstore parses`.
+
+## 2026-09-02 — Performance plan, Phase 1: blocking work off the request thread
+
+Every item in this phase parks a Waitress worker for seconds to minutes with no
+deadline, no cancel and no busy signal. The fix shape is the one the Note
+Refactor tab already uses: a daemon with a deadline, per-action single-flight,
+504 on timeout, 429 when busy.
+
+* **The bounded-action runner is promoted into `api/bounded.py`.** A move +
+  re-export out of `api/routes/refactor.py`, so the two upload routes and
+  `extract-image` can share one implementation instead of each growing a
+  near-identical single-flight registry that drifts. `refactor.py` keeps
+  `_llm_action_deadline_s` and a thin binding, and re-exports the registry
+  names as the SAME objects — all 152 existing refactor tests pass untouched.
+  Two decisions are load-bearing and are ratcheted rather than commented: the
+  deadline is a *parameter* (the right bound is action-kind-specific, and
+  resolving it at the call site is what keeps the route's function a live
+  `mock.patch.object` target — a from-import in the helper would silently
+  ignore every such patch), and the registry is shared, not copied (a copy
+  would give the two modules independent single-flight state, so the bound
+  that caps the daemon backlog would stop bounding). Both new ratchets were
+  demonstrated failing against a deliberately wrong version of the move.
+
+* **Both upload routes extracted inline on the Waitress request thread.** A
+  chat attachment or a paper upload joined the PDF extraction subprocess for up
+  to `PDF_EXTRACT_TIMEOUT_S` (600 s), and an image attachment made a vision
+  call, each holding one of thirty-two pool slots with no ceiling of its own
+  and no way to answer "busy". Both now run the extraction through
+  `api.bounded.run_bounded_action`. The split is at the boundary between "needs
+  the live request" and "does not": the streamed save stays on the request
+  thread (it reads the request stream, and is already bounded by the byte cap)
+  and only the extractor — which is handed a temp path and touches no Flask
+  state — moves to the daemon. Deadlines sit OUTSIDE each extractor's own bound
+  per the timeout chain's outer-must-exceed-inner rule (PDF: 600 s + margin;
+  image: `vision_timeout_s` + margin, read per request), so this never kills a
+  legal extraction and discards work the user is waiting for. Action names are
+  per route AND per kind, so a slow paper upload never makes a chat attachment
+  wait, and a slow PDF never blocks a text file. Honest about what it does not
+  buy: neither the extraction subprocess nor a vision call is interruptible, so
+  a 504 frees the worker but not the work — the same residual recorded for the
+  tagging propose gate. Pinned by
+  `test_chat_attachment.py::TestExtractionIsBounded` and the new
+  `test_paper_upload_bounded.py` (7 of 9 cases red pre-fix).
+
+  Both test files reach `_EXTRACTORS` through the CONSUMER's `__globals__`
+  rather than through a fresh `import services.attachment_service`. The obvious
+  form passed on the file alone and failed under the full suite: this repo's
+  `conftest.py::IsolatedModule.collect()` evicts app-prefixed `sys.modules`
+  entries per test file, so the re-imported module is not the one the route's
+  `store_attachment` closed over. That is the trap `cap_of`'s docstring already
+  states; it caught me anyway.
+
+* **The chat image attachment joined the shared local-model gate.** It is a
+  user-triggered LOCAL vision call, but ran outside
+  `refactor/local_model.py::LOCAL_MODEL_LOCK`, whose docstring puts the worst
+  case at 1 (user-triggered) + 1 (indexer) — the real worst case was 1 + 1 + 1
+  against a single local backend, which is the concurrent load the deck's
+  per-section retry layer exists to paper over. Recorded in Known Issues as
+  accepted, with `_run_llm_action_bounded` named as the fix shape; that is the
+  shape taken, and the entry is struck. It waits a bounded 15 s and then
+  reports **503 "the local vision model is busy"** rather than queueing
+  silently — a distinct condition from the 400 that means the file is the
+  problem, and from the 429 that means another upload of the same kind is
+  running. Safe to add only because extraction now runs on a daemon, so the
+  wait blocks a daemon thread and never a Flask worker — the precondition the
+  gate's own docstring states. Pinned by
+  `test_chat_attachment.py::TestImageSharesTheLocalModelGate`.
+
+* **Finder tags forked `/usr/bin/xattr` once per read and once per write.**
+  Every tag read and every tag write spawned a child process, inside the one
+  obsidian op-lock hold a harmonize or a retire keeps for its whole batch, with
+  indexing frozen behind it. Both now go through libc's `getxattr`/`setxattr`
+  by ctypes — the binding `audit/core/finder_tags.py` has used for the read
+  side since the audit shipped, extended with the write side. Measured on
+  Darwin 25.6 (arm64): read **1.8 ms → 0.017 ms**, write **1.4 ms → 0.007 ms**,
+  so a 2000-key harmonize goes from **~6.4 s and 4000 process spawns to
+  ~0.05 s and none**. **The plan's premise was wrong and is corrected here:**
+  it costed the spawn at 60–120 ms on the assumption that `/usr/bin/xattr` is a
+  Python script, and on this release it is a Mach-O binary, so the real figure
+  is 130× rather than the 4–8 minutes claimed — the fork-from-a-multi-GB-RSS
+  process cost that the app pays and this micro-benchmark cannot see is what
+  keeps it worth doing. `os.setxattr` (which the plan named) does not exist on
+  macOS at all — CPython ships the xattr family on Linux only — so ctypes is
+  the only fork-free route. What is preserved is the part that makes the write
+  safe: a genuinely absent attribute still reads as `[]` (ENOATTR, where the
+  subprocess path matched `"No such xattr"` on stderr) and **every other
+  failure still raises**, so a caller about to union tags can still tell "no
+  tags" from "could not read" and refuse the PDF rather than clobber its whole
+  colour set; raw colour-suffixed entries still round-trip verbatim. The
+  historical subprocess path survives as a fallback for any platform where the
+  binding cannot be made, and its own version of the absent-vs-error contract
+  is now pinned by forcing `_LIBC` to `None`. Pinned by
+  `test_tagging.py::TestFinderTagXattrNoFork`, proven red against the pre-change
+  module with `AssertionError: Finder-tag I/O forked a child process`.
+
+* **Batch restore PATCHed Zotero serially under the obsidian op-lock.** Retire
+  and harmonize were refactored into four lock phases by the 2026-07-23 audit
+  for exactly this reason; batch restore never was, so its single hold covered
+  every revert *including* each Zotero PATCH — and, for a
+  `zotero_attachment_trash` op, a GET as well. A 50-op batch against an
+  unreachable Zotero froze indexing and every other vault write for
+  50 × 15 s ≈ 750 s in one hold. It now runs the same four phases: reads
+  lock-free (the tag reads already were; the attachment GET now is too, via a
+  new `_revert_zotero_attachment_prepare`/`_commit` split mirroring the tag
+  one), ONE hold for the vault-local note/Finder reverts and the save, every
+  PATCH lock-free, then a short second hold that **reloads** the manifest and
+  records the outcomes. Measured with 10 Zotero ops at 50 ms per round-trip:
+  the op-lock is held **564 ms → 8 ms** of a 1.14 s batch, with the same 10/10
+  reverted — so the 50-op unreachable-Zotero case goes from ~750 s of frozen
+  indexing to ~0.04 s. Safe because the lock never protected the round-trip in
+  the first place: `If-Unmodified-Since-Version` does, and it is untouched.
+  Phase 4 reloads rather than saving the phase-2 object, so a writer that took
+  the lock in the gap is never clobbered, and the state flips travel by op id;
+  results are collected per op id and emitted in the original newest-first
+  order, so the terminal frame is unchanged for any batch that succeeds. Per-op
+  conservatism is preserved exactly — an unreachable Zotero is still an `error`
+  that KEEPS the op `applied` and retryable, never a "reverted" claim for a
+  PATCH that did not land, and failing to re-acquire the lock in phase 4 leaves
+  those ops `applied`, which a re-run resolves by re-reading the store and
+  answering `skipped`. Pinned by
+  `test_tagging.py::TestRetireTag::test_batch_restore_never_calls_zotero_while_holding_the_op_lock`,
+  proven red against the pre-change routes with
+  `Lists differ: [('read', False), ('write', True)] != [('read', False), ('write', False)]`.
+  (Test trap re-encountered: the first draft drained the SSE response *after*
+  the patch scope closed, so phase 3 ran unpatched and hit the real network —
+  drain inside the scope.)
+
+* **`GET /api/notesync/status` re-compared every reference note per request.**
+  No memo of any kind: each poll re-read and re-tokenised the whole library.
+  Measured over 1235 notes (the live count) with a 120-word reading note each:
+  **467 ms per request → 3 ms** on a warm memo. **The plan's attribution was
+  wrong and is corrected:** it blamed "about 1 200 whole-file reads", and the
+  disk is 26 ms of that 467 — the cost is the tokenising comparison. The memo
+  is keyed on the cached `Inventory`'s **identity** (the Zotero half of every
+  comparison comes from it, so it cannot move while the identity holds) plus,
+  per note, the file's `(size, mtime_ns)`, and is dropped by the same
+  `register_result_listener` hook the audit search corpus uses, so a replaced
+  or cleared scan releases both the memo and its Inventory reference. The
+  threshold is part of the key, so a Settings change applies on the next poll.
+  Worth stating because `notesync/compare.py` says the opposite in a nearby
+  context: mtime is used here purely as the app-wide "has this file changed
+  since I read it?" key (`load_config`'s and the deckgen template cache's
+  idiom), **never** to answer "has this note drifted?", which that module
+  correctly documents as unanswerable from a timestamp in this vault. The
+  module lock guards the dict only — every read and comparison runs outside
+  it, so two concurrent pollers can duplicate work but never block each other
+  on I/O. Pinned by `test_notesync_route.py::TestStatusMemo`, proven red
+  against the pre-memo route with
+  `Lists differ: ['ok2021', 'ok2022', 'ok2021', 'ok2022'] != ['ok2021', 'ok2022']`.
+
+  **Tag Hygiene's half of the same finding was measured and deliberately not
+  changed** — see the deferral registry. Its residual-PDF xattr sweep costs
+  **9 ms for 1250 files**, because `audit/core/finder_tags.py` has read through
+  ctypes since the audit shipped and never forked. Precomputing it at scan time
+  would add an `Inventory` field, a serialisation concern and a lazy fallback
+  for 9 ms.
+
+* **The polled status routes probed the local backend uncached and unbounded.**
+  `app.js` polls `/api/status` every 15 s and each request ran a live
+  `check_running()` against Ollama with the client's **generation** timeout —
+  `local_request_timeout_s`, which defaults to `0` = leave the SDK default =
+  **unbounded** — so a wedged backend parked one of the 32 Waitress workers per
+  poll, per open window, for as long as it stayed wedged. LM Studio's sibling
+  probe has been 3 s bounded since it was written; Ollama's was the odd one
+  out. `/api/models` had the same unbounded probe, and `/api/health` had a TTL
+  but computed *outside* its lock (correctly — a lock must never span a probe),
+  so N concurrent misses each probed both backends. Three changes, one shape:
+  a hard `PROBE_TIMEOUT_S` (3 s) on the Ollama liveness probe, independent of
+  the generation knob (`get_models` deliberately keeps the config timeout by
+  default, because `resolve_model` calls it on the generation path where a 3 s
+  ceiling would be a new failure mode rather than a bound — `/api/models`
+  passes the 3 s explicitly); and one `_TtlSingleFlight` helper behind all
+  three routes, which keeps the never-hold-the-lock-across-a-probe property and
+  adds single-flight on top, so concurrent misses share one probe instead of
+  each running their own. Measured against a backend answering in 250 ms:
+  four sequential polls **1024 ms → 263 ms**, four concurrent polls **4 probes
+  → 1**. Two deliberate exclusions: provider **warnings** stay outside the
+  cache (they accumulate in-process, cost nothing to read, and a newly raised
+  one must not wait out the TTL — pinned), and a probe that RAISES caches
+  nothing and leaves no wedged in-flight marker. `_health_cache` was replaced
+  by the helper rather than mirrored into; it had exactly one non-route reader,
+  the test fixture. Pinned by `test_status_routes.py`, proven red against the
+  pre-change routes with `AssertionError: the 15 s badge poll re-probed the
+  backend (assert 5 == 1)` and `AssertionError: 4 concurrent probes,
+  expected 1`.
+
+* **`POST /api/pull` downloaded to a host nothing else uses.** It called
+  `ollama.pull` on the module-level client, which resolves `OLLAMA_HOST`
+  independently of the app's resolved host — the same split-brain the status
+  probe was fixed for, where a pull lands on one server while generation and
+  embedding use another, so a model appears to download and then "was not
+  installed". It now goes through the app's own `resolve_ollama_host()` and the
+  shared `(host, timeout)` client cache. `timeout=None` is deliberate and not
+  an oversight: a pull legitimately streams for many minutes and the SDK's read
+  timeout applies per chunk. Pinned by
+  `test_status_routes.py::TestPullUsesTheResolvedHost`.
+
+* **A LaTeX compile was uninterruptible for a whole pass, and its total budget
+  was installed as the SSE per-frame stall window.** `compile_latex` blocked in
+  `proc.communicate(timeout=…)`, so there was no path from the user's Stop to
+  the process-group kill: Cancel was **invisible for up to
+  `deck_compile_timeout_s` (max 600 s) per pass**, with the LaTeX lease and one
+  of its two global slots held throughout, and a compile-fix run makes up to
+  `2*iters+1` passes. The maintenance `latex` step has polled since it was
+  written; this one did not. It now uses that step's `run_command` shape — 200 ms
+  `proc.wait` slices, `should_cancel()` polled each time, the **same** TERM →
+  5 s → KILL escalation on either exit, so "never kill latexmk alone" still
+  holds. A caller passing no `should_cancel` is byte-identical to before. One
+  non-obvious consequence: stdout/stderr became temporary **files** rather than
+  pipes, because polling a live process while holding unread pipes deadlocks
+  once the OS buffer fills — which a failing LaTeX run reliably manages (pinned
+  with a ~2 MB-of-stdout stand-in). Separately, `consumer_timeout_s` for
+  compile-fix was `(2*max_repairs+1) * timeout_s` — up to **4 200 s** at the
+  knob ceilings — and that is the window the SSE consumer waits for **one**
+  frame, so a worker wedged before its first frame sat silent for over an hour.
+  It is now the longest honest silent stage (one compile plus one repair, since
+  a repair producing nothing is followed straight by the next compile), and the
+  total budget moved into the worker, where a total budget belongs; it stops
+  only after a **verified** compile, never mid-write. Both changes are mirrored
+  in `api/routes/docgen.py`. Pinned by `test_compile.py::TestCompileCancel` and
+  `::TestCompileFixBudgets`, proven red against the pre-change code with
+  `assert 'cancelled' in 'compilation timed out after 30 seconds.'` (Stop took
+  the full 30 s to reach latexmk) and `AssertionError: the per-frame stall
+  window is the whole run's budget (930s) — assert 930 < 900`.
+
+## 2026-09-02 — Performance plan, Phase 0: leaks that need a restart to clear
+
+Six subsystem sweeps against `aeca4fc` found 29 items; Phase 0 is the five that
+leave the app in a state only a restart clears. Each fix here is proven RED
+against the pre-fix code before it lands, carries the structured `PERF` comment
+block at the change site, and strikes or adds its Known Issues entry in the
+same commit.
+
+* **The Zotero de-link gate leaked on a client disconnect.** `POST
+  /api/zotlink/trash` released `_ZOTLINK_GATE` in its worker's own `finally`,
+  but `api/sse.py::run_sse_worker` spawns that worker on the generator's FIRST
+  iteration — so a client that received the 200 and went away without draining
+  never ran it, and every later de-link answered **429 for the rest of the
+  process's life with nothing running**. One abandoned request was enough.
+  Release is now handed to the skeleton's `_SSEOpGuard` via `release=`, which
+  covers exactly the never-iterated-generator case (`call_on_close`) and still
+  guarantees release never fires while a worker that may still PATCH is alive.
+  `api/routes/accession.py` had always passed `release=`; this route had not.
+  Before: gate held indefinitely after one disconnect. After: free immediately.
+  Pinned by `test_zotlink.py::TestTheGateIsNotLeaked::test_a_client_that_disconnects_before_draining_leaves_the_gate_free`,
+  which builds the response through `full_dispatch_request` and closes it
+  without iterating — the test client's `post()` drains the stream, spawning
+  the worker, and so exercises a different path entirely.
+
+* **The vault panel drained its own one-shot status feed twice.**
+  `GET /api/obsidian/status` destructively drains `_status_messages`, so a
+  message handed to one reader is gone for every other. `pollVaultStatus`
+  (2 s) and `pollPrewarmStatus` (1.5 s) both polled it, and the prewarm loop
+  kept two fields and discarded the rest — so while prewarm and indexing
+  overlap (the normal cold launch, since they compete for the same index load)
+  progress lines and any warning raised in that window went to the prewarm
+  loop and were rendered nowhere. Measured over a six-message window against
+  the pre-fix code: **9 GETs where 4 suffice, and 3 of 5 non-empty batches
+  silently discarded**; after, 4 GETs and 5 of 5. While a run is in flight the
+  vault poller is the single reader and paints the prewarm banner from its own
+  payload — only when a prewarm loop is actually alive, so a tick can never
+  re-enable Send for a panel no prewarm ever gated — and the prewarm loop
+  suspends, pushing its 30-minute deadline out while suspended because prewarm
+  state is still being observed through the other loop.
+  `refreshIndexState`'s one-shot GET renders the latest drained line for the
+  same reason. The SwiftBar and Übersicht widgets carry this as a hard
+  prohibition; the app's own panel had been breaking it against itself.
+  Pinned by `tests/js/vaultStatusDrain.test.js` (3 of its 4 cases red against
+  the pre-fix code; the fourth is a preservation assertion).
+
+* **The BM25 warm was kicked before the terminal state was published.** The
+  post-index warm thread ends in `_persist_bm25_sidecar`, which bails unless
+  `_index_state` is `idle` or `done` — correctly, since a mid-run persist
+  would churn a full-corpus write at every checkpoint. The kick ran one line
+  *before* `_index_report_outcome` flipped the state: measured at the kick,
+  the state was `embedding`, so on a fast run the daemon rebuilt the retriever
+  and wrote no sidecar at all, and the next cold launch paid the full docstore
+  re-tokenise the sidecar exists to avoid. It failed silently, and
+  intermittently — whichever side of the flip the daemon happened to land on.
+  The two tail calls are now in the other order. The `_stop_event` gate, not
+  the state, is what keeps a cancelled or paused run from churning the build,
+  and it is untouched (a cancelled run lands on `idle`, which is itself inside
+  the persist allowlist). Pinned by
+  `test_vault_regressions.py::TestVaultChatBM25Manager::test_bm25_warm_is_kicked_after_the_terminal_state_is_published`,
+  which asserts at the kick rather than through the daemon: the defect is a
+  race, and a thread assertion would only reproduce it sometimes — which is
+  exactly how it stayed invisible.
+
+* **A cancel could silently revert the run's final index metadata.**
+  `cancel_indexing` read, edited and rewrote `obsidian_meta.json` under
+  `_status_lock`, while the indexing thread's `_write_index_meta` held only the
+  rw write lock — two writers with no shared serialisation. A cancel that read
+  the file before the final persist and wrote it back after reverted `phase`,
+  `has_vector_data` and `embed_provider`. The last is the expensive one: the
+  incremental gate REFUSES a run whose recorded local backend differs from the
+  current one and adopts silently when the field is empty, so reverting it to
+  `""` turns that refusal into an unnoticed adoption and lets a genuinely
+  switched backend mix two vector spaces in one index. It was also file I/O
+  with an fsync inside the very lock the 2026-07-22 P5 audit removed I/O from.
+  Both writers now take a dedicated `_meta_write_lock`, and the cancel's edit
+  runs *before* the in-memory flip rather than beside it: that ordering is what
+  preserves the original rationale ("a concurrent `get_status()` must never see
+  in-memory idle while on-disk meta still says partial") without holding two
+  locks at once — in the new window the disk already says `partial: false`
+  while the state is still non-idle, and `get_status` returns early there, so
+  lazy recovery never runs. Unknown meta keys still survive a cancel. Pinned by
+  `test_vault_regressions.py::TestCancelDoesNotClobberFinalMeta`, which drives
+  the interleave deterministically by landing the indexer's write in the gap
+  between the cancel's read and its write-back.
+
+* **Three PDF preview blobs outlived the iframes that showed them.** `deck.js`
+  and `docgen.js` revoked the previous preview's object URL only at the moment
+  the *next* one landed, so every path that clears the host without producing a
+  new blob — a compile that fails, a PDF fetch that errors, Cancel — removed
+  the `<iframe>` referencing it and left a multi-megabyte blob alive with
+  nothing pointing at it for the rest of the process; repeat a failing compile
+  and you leak one PDF per attempt. `tagging.js`'s `V` panel went the same way
+  on a deck→table switch: `_renderView` re-renders the whole body, destroying
+  the panel, but `_deckClosePdf` (which owns the revoke) was wired only to the
+  `V` toggle, the card change and `window.taggingTeardown`. Both now release at
+  the point the referencing element is destroyed. The plan's fix shape also
+  named a tab switch; that one is deliberately NOT taken — `showTab` only drops
+  the `.active` class, so the iframe stays in the DOM and the blob backs a
+  preview the user can return to. Recorded in Known Issues with the reason.
+  Pinned by `tests/js/previewBlobTeardown.test.js` (six cases, all red pre-fix).
+
+## 2026-08-30 — Audit remediation: six batches over the 2026-08-29 lot
+
+A full audit of the previous ten commits found seventeen defects, none visible
+to the gates (2,915 python / 740 JS / ruff clean / mypy ratchet holding, all
+green throughout). Three were P0. Every fix here was proven RED against the
+pre-fix code before it landed; the counts below are net new tests.
+
+**Batch A — three P0s** (`e3ecfff`)
+
+* **The Zotero-region overwrite gate was blind to digits and markup.**
+  `fold_words`' `[^\W\d_]+` drops digits entirely AND strips them from inside
+  a token, so `"dose 2019 p. 47 750mg"` reduced to `['dose','p','mg']`.
+  `extra_words` — the count whose whole job is "is there something of yours to
+  lose?" — could not see a year, a dose, a page number, a p-value or a sample
+  size the user had corrected, nor bold, bullets or a `[[wikilink]]` they had
+  added. Such a note classified as a SAFE update, the UI offered it as a
+  one-click refresh, and the write deleted them. Fixed by measurement over the
+  live library (1,234 notes, read-only): `risk_words` includes digits and
+  `structure_markers` covers markup, asymmetrically — structure counts for LOSS
+  and never for IMPORT, because counting it symmetrically invented five phantom
+  "something to import" rows out of pure formatting. The actionable set is
+  unchanged at 16 rows; 555 notes carrying markup a regeneration would flatten
+  move from "in step" to "annotated", which offers no verb.
+* **`split_note`'s byte-exactness invariant was false** when the `---` rule is
+  the last line with no trailing newline — the prefix gained a fabricated `\n`,
+  so a region write perturbed a byte outside the region while the sha256 guard
+  certified it. Its test's four fixtures all ended with a newline.
+  `_body_offset` also matched `\n----` and `\n---foo` and could land mid-line,
+  and returned 0 for an unterminated frontmatter block — making the OPENING
+  fence look like the body's rule, so an update could overwrite the tagging
+  subsystem's tags. Now line-anchored, and such a note is refused.
+* **Sorting an audit table stranded the open diff panel.**
+  `installTableControls` snapshots its rows at install time; sort
+  `appendChild`-moves every data row to the end of the tbody, leaving an
+  injected panel behind to float to the TOP — detached from its own note and
+  sitting under an unrelated row whose `[update]` button it appeared to
+  describe. Filtering never hid it either. Rows marked `data-row-attachment`
+  now travel with their parent.
+
+**Batch B — the Zotero de-link route** (`4f73875`)
+
+`POST /api/zotlink/trash` ran up to 200 sequential PATCHes INSIDE the obsidian
+op-lock, synchronously, with no heartbeat: every vault write frozen for the
+batch, a lapsed TTL still appending to the manifest, and a browser that gave up
+long before the server did. That is the pattern the 2026-07-23 audit removed
+from retire-tag. Now SSE with the same four phases, `_BatchJournalKeeper`
+hoisted to `api/routes/_batch_journal.py` rather than copied a third time, and
+`zotero_attachment_commit_locked` split into journal + patch halves like its
+tag-removal twin. Also: a gate leak introduced mid-conversion and pinned;
+duplicate keys inflating the annotation warning; `str.isalnum()` accepting
+`'٣'`; the redundant blueprint origin guard removed; and the client — which had
+NO tests and still parsed `r.json()` on an event stream — converted and
+ratcheted.
+
+**Batch C — Plain Chat attachments** (`5b23fc2`)
+
+The Attach button was never actually held during an upload (`_setSending` read
+the raw argument for it and folded `_uploading` in only for Send), so a second
+click opened a concurrent extraction — which `_uploadOne`'s docstring says is
+impossible. A long PDF was extracted in FULL and then truncated, discarding
+~95% of the work; now page-bounded from the character cap, with the clipping
+disclosed explicitly because a sparse document can fall under the cap while
+still being cut short. One expired attachment re-sent across a conversation was
+announced as three. `wrap_untrusted`'s new `source=` kwarg took a user-supplied
+filename straight into the trusted preamble, unsanitised, three lines above the
+guard that exists for exactly that. Per-message DB round-trips collapsed to one
+query, plus a `created_at` index. `.jpeg` restored to the accepted-types hint.
+
+**Batch D — the shared diff** (`9f29e16`)
+
+The alignment budget bounded CPU and nothing else: the degraded path still
+expanded into thousands of rows, so a long reworded note built ~20k elements
+synchronously. Capped at 1,500 rendered blocks — AFTER folding, which the
+existing "does not degrade a big note whose edits are few" test caught on the
+first attempt. Word-level changes were signalled by colour ALONE (the -/+ signs
+cover the line, not the words), so removed words are struck and added ones
+underlined. The stacked layout kept two column headings above one interleaved
+column, taking the load-bearing counts with them; a single caption replaces
+them there. The fold is a toggle rather than a one-way reveal.
+
+**Batch E — accessibility and UX** (`69cf946`)
+
+An unhandled file drop navigates the PyWebView window to the file and replaces
+the app with a PDF viewer; only the chat panel was guarded, so a drop that
+missed it destroyed the session. `installGlobalDropGuard` is document-level and
+last-resort. The attachment strip was a live region full of buttons
+(double-announcing every attach) and its wipe-and-rebuild ate keyboard focus.
+The diff and preview panels had no in-flight guard, so two clicks inserted two
+un-closable panels, and neither announced anything. Two 409s instructed end
+users to "re-send with `accept_overwrite: true`". The chip's × was ~8×12 px.
+
+**Batch F — the record** (this commit)
+
+Three comments asserted properties the code did not have. Two are now true
+rather than merely corrected: `_noteSyncUpdate` fetches its preview BEFORE the
+confirm (it claimed the confirm text stated the real cost while composing it
+from a flag stamped at last render, so the user could approve "nothing you
+wrote is at risk" and then get a 409), and `_uploadOne`'s "sequential by
+caller" holds now that Batch C fixed the guard. The third quoted a CSP hash
+count that had drifted 111 → 114 and now points at the measurement instead.
+
 This file tracks the current refactor line. Older entries were removed because they described deleted integrations and stale endpoints.
+
+## 2026-08-29 — Review of the day's two features
+
+An adversarial review of the attachments and side-by-side-diff commits. Five
+fixes; the two behavioural ones were each reachable from the shipped UI.
+
+### Plain Chat refused nothing while a file was still being read
+
+The Send button is disabled during an extraction, but `#plainchat-input`'s
+`onkeydown` calls `chatPlain()` directly, so the button was never the guard.
+Attach a large PDF, type the question while the chip still reads "reading…",
+press Enter: the turn went out carrying the CLIENT-invented
+`pending-<ts>-<rand>` placeholder id, and three wrong outputs followed — the
+transcript claimed the file rode the turn, the server found no row and
+announced "1 earlier attachment(s) are no longer available … kept for 24 hours"
+(a false explanation for a file that was never uploaded, repeated on every
+later turn because the bogus id was now permanently in `_history`), and when
+the upload finally landed its attachment was pushed into the composer for the
+NEXT turn, so an unrelated later question silently carried the PDF.
+`chatPlain` now refuses while an upload is in flight and announces, mirroring
+`newChat()`. The existing test asserted `sendBtn.disabled`, which was true
+throughout the defect.
+
+### The same-role merge dropped the newest attachment
+
+`_validate_messages` merges consecutive same-role turns for strict-alternation
+providers, then re-capped the merged ids with
+`[:CHAT_ATTACHMENT_MAX_PER_MESSAGE]`. That slice takes from the END, so a
+4-attachment turn merged with a 1-attachment one silently dropped the newest
+file — the exact failure the comment above it claimed to prevent. Adjacent user
+turns are a designed-for path (an empty-but-clean stream records the user turn
+with no assistant turn and does not clear the composer), so the client reaches
+it. The cap is no longer re-applied: **it bounds what a user may attach to ONE
+submitted message and is enforced there by `_validate_attachment_ids`**;
+re-applying it after a merge this function itself performed can only destroy
+something the user did supply. `CHAT_ATTACHMENT_REQUEST_MAX_CHARS` is the bound
+that protects the provider, and it is untouched. The existing test used 1 + 1
+ids, so the slice never fired and it passed over exactly the broken case.
+
+### Honest refusals, and the budget refused before it is paid for
+
+* A short but perfectly readable `.md`/`.txt` was refused with "No readable text
+  found in that file. A scanned PDF with no OCR layer is the usual cause" — for
+  a nine-character note the app read without difficulty. The
+  `_MIN_USEFUL_CHARS` floor exists because a two-word result **from an
+  extractor** means the extractor failed; a text file is read directly, so a
+  short one is simply short. The floor now applies to `pdf`/`image` only, and a
+  genuinely empty file gets its own message.
+* `CHAT_ATTACHMENT_MAX_PER_MESSAGE` (4) and `CHAT_ATTACHMENT_REQUEST_MAX_CHARS`
+  (240 000) **do not compose** with the 120 000-character per-file default: two
+  files at the cap already exceed the request budget, so "four files" is
+  reachable only for small ones. The user paid for up to four extractions and
+  learned at SEND time. The composer now refuses when the conversation is
+  already at the budget (nothing extracted, nothing paid for) and — because a
+  file's length is unknowable before extraction — flags the one that tips the
+  balance immediately after it lands, while the chip is still in the composer
+  and removing it is one click.
+* The server's refusal said "Remove an attachment, or start a new chat". The
+  budget sums across the whole 20-turn window, so the offending file is often on
+  an earlier turn where "remove an attachment" cannot reach it. It now says so.
+
+### The upload envelope was wired but untested
+
+`register_request_limits(extra_upload_limits=…)` — the `api/security.py`
+parameter, its below-the-default validation, and the `app.py` call site — was
+exercised by no test, because every route-level upload test uses a file of a few
+dozen bytes. Deleting the whole block from `create_app` left both suites green
+while in production every attachment over the 2 MiB default envelope would 413:
+essentially every real PDF. Four tests, all red-proven against the removed
+wiring — a ~3.2 MB attachment is accepted; the raise is scoped to that path AND
+that method (a sibling POST does not inherit it, the DELETE under the same
+prefix stays small); an extra limit below the default is refused; the small
+default is still installed as `MAX_CONTENT_LENGTH`.
+
+### The side-by-side diff duplicated every unchanged line when stacked
+
+Below the 900 px breakpoint the grid collapses to one column, so a row's two
+cells sit one above the other. An `equal` row holds the SAME text on both
+sides, so every unchanged line was rendered twice in succession and the diff
+read as though the note contained duplicated lines — with the default three
+lines of context around each change, roughly doubling the context noise on
+exactly the surface built for "is there something of mine in here". One column
+IS the unified reading, so the `b` side of an `equal` row is now hidden there; a
+changed pair still shows both versions, and del/ins rows already hid their empty
+side. Also: the line-number track was `3ch` and inherited the cell's
+`overflow-wrap: anywhere`, so a number of 1000+ wrapped inside it and made its
+row twice as tall (36 px against 18 px). Now `4ch` and `nowrap`. Both new tests
+are browser-only — jsdom has no layout engine, no media queries applied to
+boxes and no text wrapping — and the existing stacking test inspected only the
+`is-chg` row, the one row where two stacked cells are correct and intended.
+
+Gates: 2 915 Python (+8), 740 JS (+5), 15 browser (+2), ruff clean, mypy 174/175.
+
+## 2026-08-29 — Plain Chat attachments
+
+Attach (or drop) up to four `.pdf` / `.png` / `.jpg` / `.md` / `.txt` files onto
+a Plain Chat message. New: `services/attachment_service.py`,
+`api/routes/chat_attachment.py`, `chat_attachments` in SQLite, and the
+`chat_attachment_max_chars` knob.
+
+### Extract to text, not native multimodal
+
+`core/llm/types.py::Message.content` is still a plain `str` and no adapter sends
+an image. The alternative was weighed and declined: widening it to content
+blocks means per-adapter wire formats (OpenAI `image_url`, Anthropic
+`source.base64`, Gemini `inlineData`) — the same territory that produced the
+2026-07-02 P0 bugs — and the mocked suite cannot see provider-side validation, so
+it needs live smokes and fixtures per provider, while local providers would keep
+the text path as a fallback anyway. **The cost is real and is stated in the
+README, the guide and Known Issues:** images go through the LOCAL vision model,
+so attaching a picture needs Ollama or LM Studio even on an online chat
+provider, and the model reads a description rather than seeing the image.
+
+### A sibling route, not a widened `/api/upload`
+
+`/api/upload` feeds `/api/summarise`, which assumes its stored text is "one
+PDF's full text". Accepting images and `.txt` there would let a vision
+description or a 40-line note reach the paper summariser through a path nobody
+designed, and would put Plain Chat's cleanup in the paper flow's id space. The
+new route also gets its **own** request envelope (64 MB + overhead) via
+`register_request_limits(extra_upload_limits=…)` rather than inheriting the
+500 MB paper one — sharing it would mean buffering half a gigabyte for a route
+that refuses anything over 64 MB.
+
+### Nothing is silently missing
+
+This is the through-line of the design, because every failure here produces a
+confident answer about a document the model never received:
+
+* **Extraction runs at ATTACH time**, not send time. It costs a visible wait and
+  buys the user the answer to "did it actually read this?" before they spend a
+  turn on it.
+* **Refuse by name, never attach empty.** `.svg`/`.heic` have no extraction path
+  and are rejected on extension. A file yielding nothing readable is a 400 —
+  narrowed the same day to `pdf`/`image` only, since a `.md`/`.txt` is read
+  directly and a short one is simply short (see the review entry above). An
+  image whose `describe_image` returns `""` — its documented no-raise failure
+  sentinel, right for the indexer and wrong here, where the empty result *is*
+  the whole answer — is refused with the local-vision cause named.
+* **Truncation is disclosed twice**: on the chip, and inside the wrapper the
+  model reads. A model told it holds a whole report answers as though it does,
+  and "the report does not mention X" is exactly the wrong answer a silent cut
+  produces. Per-file cap `chat_attachment_max_chars` defaults to 120 000, sized
+  from 400 cached PDF extractions of the maintainer's library (median 43 916,
+  p90 108 073, max 3.6 M) — roughly nine papers in ten kept whole.
+* **An expired attachment is announced** in the transcript rather than dropped.
+  Refusing the whole turn would strand a long conversation the moment a
+  24-hour-old file aged out; answering silently is worse.
+* **Over the whole-request budget is a 400 with the figures named**, never a
+  silent trim — the policy `_validate_messages` already applies to a malformed
+  turn.
+
+### Untrusted, and the ids ride the message
+
+Each file gets its own nonce'd `wrap_untrusted` tag, exactly as vault and
+web-search content does — one shared wrapper would let the first file's text
+close the guard and pass the second off as trusted material. `wrap_untrusted`
+grew an additive `source=` keyword for this: telling the model a chat attachment
+was "retrieved from the user's vault" is false, and that sentence exists to be
+believed; the default keeps every agent call site byte-identical.
+
+`attachment_ids` ride the MESSAGE, not the request, so a document attached on
+turn 1 is re-inflated on turn 4 without the client re-uploading or ever holding
+extracted text — the server owns what reaches the model.
+
+### Defects found while building, each now pinned
+
+* The internal `attachment_ids` key leaked into `stream_chat_messages` — and so
+  toward the provider adapters — on the no-attachment fast path. Caught by the
+  existing plainchat contract test, which asserts the exact array the helper
+  receives.
+* `get_db_connection` yields **tuple** rows; `build_attachment_block` indexed
+  them by name. That would have crashed every attachment send.
+* The client posted multipart through `secureFetch`, which forces
+  `Content-Type: application/json` and suppresses the browser's multipart
+  boundary. Python cannot see this; `tests/js/chatAttachments.test.js` can.
+* The chip tooltip pointed at a Settings control that did not exist. It exists
+  now (**LLM Settings → Plain Chat → Attachment text limit**).
+* Merging consecutive same-role turns kept only one side's ids — an invisible
+  drop, since the text still merges and the answer still streams.
+
+Every one of those is covered by a test proven to fail without the fix
+(five server mutations, five client mutations). Two client failure modes exist
+only in the browser and are pinned there: the multipart content-type, and
+`dragover` needing `preventDefault` or PyWebView navigates the window to the
+dropped file and replaces the app with a PDF viewer.
+
+### One suite hazard recorded, not fixed
+
+`mock.patch.object(svc, …)` lands where the request never reaches, so the test
+silently asserts nothing. Test-only (production imports once at boot), but the
+failure mode is a green test proving nothing, so it is in Known Issues. The
+tests here drive the real config knob instead, which is immune and is the better
+test anyway. **The mechanism recorded here on the day — "two distinct module
+objects when `tests/test_optional_maintenance_import.py` is collected first" —
+was diagnosed later the same day and is only half of it; see the Known Issues
+entry, which names both causes and the measurements.**
+
+Gates: 2 907 Python (+28), 735 JS (+22), 13 browser, ruff clean, mypy 174/175.
+
+## 2026-08-29 — Side-by-side diff for the Zotero-note comparison
+
+The `[preview]` on the Zotero Notes Sync report rendered the two regions as two
+plain, uncoloured `<pre>` blocks stacked vertically. That is adequate for "is
+this note behind?" and useless for the decision the report actually asks the
+user to make, which is whether an update would delete writing of their own.
+Live matrix at build time: **1 safe update, 15 conflicts** — so fifteen times
+out of sixteen, "82 words of yours at risk" was a number with nothing behind it.
+
+Now `ui.js::renderSideBySideDiff` — a shared primitive beside `confirmInline`
+and `installTableControls`, used by BOTH that preview and Note Refactor, where
+it is a new third view mode.
+
+### Two decisions taken from measurement, not taste
+
+Measured over the 16 actionable region updates in the live library (offline,
+reproducing the app's own 15/1 split exactly, so the method is validated):
+
+| opcode | blocks | lines |
+|---|---|---|
+| `replace` | 52 | **178** |
+| `insert` | 9 | 31 |
+| `delete` | 4 | 14 |
+| `equal` | 53 | 105 |
+
+`replace` dominates, and the similarity of positionally-paired replaced lines is
+strongly **bimodal**: 32 pairs at ≥0.9 (the same line lightly reworded), 26 at
+≤0.1 (unrelated lines merely adjacent inside one block), **4 in between**.
+
+* **Word-level highlighting inside a changed line** therefore earns its keep:
+  line-level-only would paint 178 lines as wholesale changes when half of them
+  differ by a few words.
+* **But it must be gated**, or the low mode becomes confetti.
+  `_DIFF_WORD_MIN_RATIO` = 0.5 sits in the empty middle of that distribution.
+  Similarity is weighted by the character length of non-whitespace tokens, so
+  re-indenting a line is not read as a rewrite.
+
+### Client-side, which is what made it free
+
+It takes two **texts**, not a server-computed diff. `/api/notesync/update-preview`
+already ships `current_region` + `proposed_region`, and the refactor plan frame
+already ships the full `original` + `proposed` bodies — so one renderer serves
+both callers with **no payload change on either route**. Server-side opcodes
+would have meant growing two payloads (one of them the app's heaviest) and
+maintaining a second alignment implementation.
+
+### Four invariants, each pinned by a test proven to fail without it
+
+* **Losslessness.** The word pass tokenises a changed line and reassembles it
+  from the tokens. A dropped or duplicated character would show the user
+  something other than the bytes on disk *while the downstream WYSIWYG sha256
+  guard stayed green*, because that guard hashes the server's text and not the
+  pixels the user approved. Every DOM test therefore re-derives both full texts
+  from the rendered output; six fixtures cover prose, markdown lists, unicode,
+  tabs and trailing spaces, whitespace-only edits, and an empty side.
+* **Never `innerHTML`** — both sides are vault/Zotero content. The plain branch
+  and the word branch are tested **separately**: the obvious single test only
+  ever exercises one of them, which a mutation run demonstrated.
+* **Colour is never the sole channel** (WCAG 1.4.1): every cell carries a
+  visible `−`/`+`, verified in a real browser with the tints ignored. Line
+  numbers are `aria-hidden`.
+* **Cells wrap, they never scroll sideways.** These are prose notes, not code.
+  The host `.audit-table-scroll` has `overflow-x: auto`, so an unwrapped diff
+  would be absorbed by the host while `.diff-sxs` (`overflow: hidden`) silently
+  **clipped** the right-hand column — which is why the browser test asserts on
+  the diff box's own width and not only on the document's. Below 900px the two
+  columns stack rather than scroll.
+
+Divs, never a `<table>`: audit.js injects this INTO a report table cell, where a
+nested table would be caught by `_installReportTableControls`' `table.audit-table`
+sweep. Alignment is LCS with the common prefix/suffix stripped first and a 1e6
+cell budget — sized from the live vault (regions run to 175 lines, whole notes to
+3,399, p99 678), where the strip means the budget bounds the lines that actually
+*differ*. Past it the core is reported as one wholesale replacement with a
+visible note, and the word pass is skipped: the pairing inside a degraded block
+is positional and therefore arbitrary, so marking "the words that changed" would
+assert a relationship the aligner had just failed to establish.
+
+### Note Refactor keeps its unified diff
+
+Side-by-side is a **third** view mode, not a replacement. The unified view hides
+unchanged regions, which is the better read for a long note with a few scattered
+edits; side-by-side shows everything. Losing it would have been a regression
+dressed as consolidation, so `tests/js/sideBySideDiff.test.js` pins that both
+survive.
+
+`tests/browser/sideBySideDiff.spec.js` is new and covers the half jsdom
+structurally cannot: real text wrapping, the stacking breakpoint, and genuine
+column adjacency. The contrast lint gained six pairs, including the **word tint
+composited over the line tint over the surface** — a naive single-layer check
+would have missed the tighter of the two — for which its `over()` helper now
+accepts an already-composited colour. One real regression was caught by the
+existing gates during the work: the column label shipped at `0.7rem`, under the
+app's 12px type floor.
+
+Gates: 2 879 Python (unchanged), 706 JS (+46), 13 browser (+6), ruff clean,
+mypy 174/175.
+
+## 2026-08-28 — Selectable text, Zotero-region note updates, Zotero attachment de-link
+
+Three requested capabilities, plus the measurement defect the second one
+uncovered. Gates: 2 834 Python, 660 JS, ruff clean, mypy 174/175.
+
+### The HTML→text fusion bug (found while measuring, fixed first)
+
+`audit/core/zotero.py::_strip_html` was `BeautifulSoup(...).get_text()` with no
+separator. That concatenates across `<br>` and adjacent inline elements, fusing
+the words on either side — `appendicitis<br>Lebrun` became `appendicitisLebrun`,
+and `criteriainclusion`, `evidencecovidnma`, `dépressionutile` are all the same
+artifact. It mattered twice:
+
+* `notesync.render.render_note` writes that text into the vault, so every note
+  `POST /api/notesync/create` produced carried the fused spellings.
+* `notesync.compare` measures word containment against the Obsidian note, and a
+  fused word is missing from BOTH vocabularies — permanent drift no edit can
+  close. It reported **91** notes as "the Zotero note has words this note
+  lacks" where the true figure is **16**.
+
+Now block-aware, and deliberately not a per-inline-sibling split (that would
+break `<em>anti</em>depressant` into two words). `notesync/compare.py` had
+already recorded one instance of this as an unexplained "tokenisation artifact";
+that comment now names the cause. Pinned by `tests/audit/test_zotero_note_text.py`.
+
+### Text selection in the app window
+
+`launch.py` now passes `text_select=True` to `webview.create_window`.
+PyWebView defaults it to False and then injects
+`body { user-select: none; cursor: default }` into the document, so **nothing in
+the app was selectable with the mouse** — the Copy buttons and the MD/TXT
+exports were the only ways to get text out, and the caret never appeared. None
+of the project's own CSS was responsible.
+
+No automated gate can see this: `tests/browser/` runs Chromium, which never
+receives pywebview's injection. `test_launch.py` therefore ratchets the call
+site, and the real check is manual in the packaged window.
+
+`ui.js::installLinkInterceptor` gained a companion fix — it now ignores a click
+that ends a non-collapsed selection, because a drag-select that begins and ends
+inside one anchor fires a `click` on that anchor, which used to open Finder
+instead of selecting the sentence.
+
+### Zotero → Obsidian note sync can now update, not only create
+
+The old rule was "create only, never rewrite a drifted note", which was right
+under the only measurement then available. It is now scoped to what the user
+actually wrote: `compare.py::split_note` splits a note at its single `---` rule
+with `prefix + region == raw` exactly, and only the region is rewritten —
+frontmatter (and therefore tags), the generated header and the rule survive
+byte-for-byte. No sentinel is written or needed: all 1 235 notes have exactly
+one rule in the body.
+
+`containment` could not gate this, so `NoteState` gained `missing_words` /
+`extra_words` measured over the region. The live matrix over 1 234 comparable
+notes: **1 186 nothing to do · 32 annotated by the user · 1 safe update ·
+15 conflict**. Hence no bulk verb, and a separate `accept_overwrite: true` on
+top of `confirm` for the conflict bucket — "yes, write" and "yes, delete what I
+wrote there" are different decisions.
+
+New: `POST /api/notesync/update-preview` and `POST /api/notesync/update`
+(stale-diff re-checked under the op-lock, WYSIWYG, overwrite acknowledgement),
+journalled as `notesync_update` and reverted by the existing Note Refactor →
+Restore. The note is read with `read_bytes()` + explicit decode, never
+`read_text()`, whose newline translation would LF-convert a CRLF note.
+
+### Removing a file from a Zotero item without deleting it
+
+`ZoteroItem.attachments` had been populated and read by nothing since it was
+written (the "dead Zotero attachments pipeline" note). It now backs a
+`zotero_attachments` audit report and a de-link verb in a new
+`api/routes/zotlink.py` blueprint. The read gained `linkMode` — which side owns
+the bytes — and a per-attachment annotation count.
+
+**Trash, never delete.** `PATCH {"deleted": 1}` is exactly reversible, keeps
+the item key (so relations and annotations survive), and for an `imported_*`
+attachment leaves the bytes on disk until the user empties Zotero's trash —
+which is what makes "without deleting the PDF" true for every link mode.
+`DELETE` would destroy all three and a re-create mints a new key, so it is not
+an undo; no DELETE verb exists on the path and a source ratchet keeps it that
+way. Annotations need their own acknowledgement, since they are trashed with
+the attachment.
+
+Journalled in `tagging/journal.py` as `zotero_attachment_trash` and reverted
+from the existing Tagging → Restore. Adding the kind exposed a latent trap: the
+prune carve-out duplicated `EXTERNAL_OP_KINDS` as a second literal tuple, so a
+kind added to one and not the other would have been silently evictable —
+destroying the only record of what to restore. The carve-out now reads the
+constant.
+
+Removing a Zotero attachment cannot damage any mapping this app keeps: the
+PDF↔bib↔Zotero join runs on citation keys and never consults an attachment.
+Measured state: the library currently holds **zero** PDF attachments, so the
+verb is anticipatory — Zotero's "Add Item by Identifier" re-creates them.
+
+### What the review of the above changed
+
+An adversarial pass over the uncommitted diff, before commit. Four real defects,
+two of them silent-data-loss shaped:
+
+* **The region renderer could truncate a note.** It derived the new region by
+  splitting the *finished* rendered note, and the Zotero reading note's own text
+  is part of that document — so a note containing a markdown `---` rule split in
+  the wrong place. Against a custom template with no rule of its own the split
+  returned only the text *after* the note's internal rule, and the writer would
+  have laid that over the whole region. `render_region` now renders the slot as
+  an opaque sentinel, splits that, and substitutes the real text afterwards, so
+  the rule is unambiguous whatever the note contains. Zero live notes trigger it
+  (measured across all 1,236 reading notes), which is why it was worth fixing
+  before it could happen rather than after. Pinned in `notesync/tests/test_region.py`,
+  including an assertion that the naive split really would have dropped text.
+* **The de-link batch deferred its journal saves to the end**, so a crash after
+  N PATCHes would have left N attachments trashed in Zotero with nothing to
+  restore them from — the exact hazard journal-before-write exists to close.
+  Each op is now persisted before its own PATCH (cheap since the journal became
+  SQLite), and `zotero_attachment_commit_locked` raises rather than silently
+  skipping a save a caller asked for. Ordering pinned by a test.
+* **A completed batch could still return 503** if the final prune/save failed,
+  telling the caller nothing had happened after Zotero had already been written
+  to. It now reports a `journal_warning` beside the per-key results.
+* **Dead client-side code with a docstring that contradicted the code.**
+  `_noteSyncDiff` cached hashes "so the subsequent update sends exactly the pair
+  the user looked at" — but `_noteSyncUpdate` re-previews and never read them.
+  Removed, and the comment now says why re-previewing is the correct behaviour.
+
+Two consistency gaps closed in the same pass: the `zotero_attachments` report
+was missing from the cross-report search corpus (a filename absent from a search
+that claims to cover every report reads as "Zotero does not have it"), and the
+tagging journal's prune carve-out duplicated `EXTERNAL_OP_KINDS` as a second
+literal tuple. Also corrected a pre-existing README error the pass surfaced: the
+audit's writable surfaces were described as "exactly three" and had been four
+since `pdf_wanted.json` landed on 2026-08-26.
+
+## 2026-08-26 (later) — Reviewing the seven batches: six defects the gates could not see
+
+An adversarial review of `17498c7..ecdce9b`, re-deriving every load-bearing
+measurement against the live 6 316-record library rather than trusting the
+figures the batches were justified by. The gates were green throughout — 2 748
+Python, 643 JS, ruff clean, mypy 174/175 — which is the point.
+
+**What the re-derivation confirmed:** 371 orphans with `pdf_text_provider` and
+532 without; zero out-of-vocabulary tags across all three writable surfaces
+against a 172-tag vocabulary; 1 231 notes ⟺ 1 231 reading notes with 0 missing
+and 3 drifted; 11 651 journal ops of which 11 451 are permanently protected,
+`load()` at 88–95 ms against `load_page` at 1.4 ms. **What it corrected:**
+`tag_harmony` finds 39 rows, not 45; the no-PDF queue holds 1 350 rows, not
+1 502; and the provenance page table was computed on the 532-file set — the
+exact mistake the batch's own correction was written to prevent, six lines
+below it.
+
+**The Restore panel reported an empty history to any upgrading install.**
+`stats()` and `load_page()` were written as pure readers and skipped
+`_ensure_database`, so a journal still in its pre-SQLite `manifest.json` form
+read as zero ops — and because the size header renders nothing at `ops == 0`,
+the Compact control vanished with it and `papermind status` dropped its Tag
+Journal line. Measured against the maintainer's own 7.5 MB legacy manifest:
+11 637 ops reported as 0. A shared `_open_for_read` now migrates on all three
+paths while keeping the schema-creation-free fast path that made `load` immune
+to SQLITE_BUSY.
+
+**`notesync/create` silently lost the undo for every note past 200.** The
+refactor journal caps evictable ops and `create_note` prunes on every call, so
+a 300-note batch evicted 100 of its own records while the response returned
+their `op_id` and the confirm said "Reversible from Note Refactor → Restore".
+`prune` gained `protect_op_ids` (ported from the tagging journal, where the
+identical defect was found first), `create_note` gained `prune`/`save` flags so
+a batch prunes once and checkpoints every 25, and `_MAX_CREATE` is now
+`_MAX_OPS // 2` with a refusal that says why — `_HARMONIZE_MAX_NOTE_OPS`'s
+precedent. The `[create all N]` button caps to match and no longer sweeps
+drifted rows into a create.
+
+**The provenance memo never once served a hit.** `doi_cache.lookup` coerced any
+non-string to `None`, so the `prov` field — a dict — came back `(True, None)`
+and the caller's `isinstance(cached, dict)` gate could not pass. Every scan
+re-opened all 371 residual PDFs and re-ran the text provider: **11.81 s, now
+0.00 s warm**, plus a needless rewrite of a 1.1 MB cache file each time.
+Making it work exposed a second problem it had been hiding — the memo key is
+`(size, mtime_ns)` and cannot tell a scan that had page-1 text from one that
+did not, so a CLI scan would have durably recorded "no source URL" for every
+printed web page. Entries now carry `text_seen`.
+
+**`browser_print` was 97% not browser prints.** `quartz pdfcontext` is the
+generic macOS producer every Cocoa app's Print → Save as PDF writes; 36 of the
+37 rows carried it, 13 of them book-length (up to 845 pages) with no
+recoverable URL, each badged "printed web page … add it by URL in Zotero" — a
+wrong instruction, not just a wrong label. It is now a weak marker needing
+corroboration (a browser in `/Creator`, or a recovered URL). Two things had to
+land with it: the bare `tex` publisher marker matched `PDFContext` as a
+substring and was masked only by browser_print being tested first (it now
+names `itext`/`pdftex`/`dvips` explicitly), and `Skia/PDF … Google Docs
+Renderer` is an app export whose specific product name must beat the generic
+engine name. **Result: 37 → 8 rows, 7 of them with a URL.**
+
+**`extract_isbn` returned a phone number and discarded the real ISBN.** A
+10-digit toll-free number passes the ISBN-10 check about one time in eleven,
+and on `meyer_2019.pdf` one sat above the book's real ISBN. Selection is now
+label-decisive with a group-shape gate for unlabelled runs — a printed ISBN's
+last group is the single check character, which 3-3-4 cannot be. Validated over
+all 371 residual PDFs: 45 ISBNs before and after, **none lost**, one repaired,
+four switched to the labelled e-ISBN of the same work. The whole candidate
+corpus is now a replayable fixture.
+
+**The cross-report search kept returning dismissed rows**, contradicting the
+corpus's own "a hit is a row you can go and look at" invariant. Filtering
+happens at query time, not in the memoised build.
+
+**And the depth invariant was pinned by a test that could not see it.**
+`tag_coverage` computed its union from raw strings while the batch and the
+table folded, so the dashboard bucket and `--max-tags N` could disagree over
+any case, `#` or NFD variant — and `test_dashboard_buckets_and_batch_depth_agree`
+only fed `tag_depth`'s output into `_depth_bucket`, never running the dashboard's
+own pass. One `fold_tag` now serves all three; the replacement test drives
+`tag_coverage` for real and is red against the old code on exactly the three
+variant cases. Live numbers are unchanged (0 divergences across 6 316 records),
+which is why it was safe to land.
+
+**The EMC measurement was wrong.** The batches recorded that the app's page-1
+text drops EM-Consulte's article code, deleted a built classifier on that
+basis, and wrote "do not re-add the branch" into the permanent deferral
+registry. Re-measured through the app's own chokepoint, cold cache and warm,
+the code is at offset 1302 / 1409 / 1583 on the three files cited as proof —
+inside the window `extract_printed_identifier` already scans. Only "it is not
+the first line" held. The instruction is withdrawn and the class is now an open
+scoping decision, with an argument on its side: it would be the first thing
+able to supply the container-scoped Crossref search its missing caller.
+
+Also corrected: `CLAUDE.md` still described the audit's write surfaces as
+"exactly three" after `pdf_wanted.json` made them four, and `_restoreMore`
+carried a comment promising an in-place append over code that rewrote the whole
+list (destroying an open confirm strip and focus). Both now match the code.
+
+Gates: 2 786 Python tests, 648 JS, ruff clean, mypy ratchet 174/175.
+
+## 2026-08-26 — Seven batches on the library workflow: cohorts, queues, provenance, note sync, ISBN, journal bounds, MCP reads
+
+A read-only survey of the live 6 311-record library first, then seven batches
+built on what it measured. Three of the findings changed the plan rather than
+confirming it, and two of them corrected figures this changelog had otherwise
+been about to repeat.
+
+**The survey.** Zero out-of-vocabulary tags across all three writable surfaces;
+the three-way harmony report finds 45 rows in the entire library; the 1 231
+Obsidian reference notes match the 1 231 Zotero items carrying a reading note
+EXACTLY, with 3 content drifts. So tag harmonisation is a solved problem here
+and the note-sync invariant already holds — which is why neither batch is a
+repair job. What is left is coverage (1 401 records carrying two tags or fewer)
+and mapping (371 orphan PDFs, 1 502 entries with no local PDF, 72 Zotero items
+outside the join).
+
+**Batch F — the restore journal is bounded, and visible.** Applied
+Finder/Zotero ops are exempt from the `_MAX_OPS` cap because their prior tag
+lists live INLINE with no snapshot file behind them, so eviction would destroy
+the only restore mapping — measured at 11 451 of 11 651 ops, an 8 MB payload
+that `load()` JSON-parses on every single tagging write (83–110 ms), behind a
+Restore panel that rendered one table row per op. `journal.stats()` aggregates
+in SQL and parses no payloads (30 ms); `journal.load_page()` is bounded SQL
+over a `seq` cursor (1.1 ms against 110); `journal.compact()` routes through
+`load → _TrackedOps.retain → save` so removal reuses the tested
+tombstone-then-delete transaction rather than adding a second write path
+through this module. Automatic retention exists and **ships disabled** — it is
+the only setting in the app whose effect is to delete undo records. Neither
+path can touch note or vocab ops, a malformed setting drops NOTHING rather
+than guessing, an unparseable timestamp keeps its op, and both honour prune's
+`protect_batch_id`/`protect_op_ids`.
+
+**Batch A — tag depth.** Everything upstream treated tags as a boolean, so a
+paper with one tag was indistinguishable from one with nine and
+`--include-tagged` had to demand an explicit key file. `tag_coverage` gained a
+bucket histogram computed in the pass that already walked every record; the
+batch gained `--min-tags`/`--max-tags`; the table gained a `#` column and a
+cohort filter. The invariant is that the dashboard bucket, the cell, the filter
+and `--max-tags N` select the SAME papers — depth is the case-folded union over
+the surfaces a record HAS — and both halves are pinned against each other.
+
+**Batch B — the no-PDF list becomes a queue.** `mapping.json` could record
+"this PDF is deliberately not in the bibliography"; nothing said it in the
+other direction, so *Bib Entries Without PDFs* could only grow. A
+`pdf_wanted.json` decision sidecar (dup_decisions' discipline exactly), a
+`pdf-decision` route with dismiss/clear/clear_all, item types on the rows, and
+bulk dismissal by type — 293 of the 1 502 are types that never have a PDF.
+`book`/`bookSection` are deliberately absent from the default type list.
+
+**Batch C — orphans routed by what they physically are.** Orphans run 27% over
+30 pages against 8% of mapped PDFs, with a 90th percentile of 300 against 26.
+*(Those figures were computed over the 531-file residual this same entry warns
+against; over the real 371 it is 36% and p90 417 — see the entry above.)*
+A pure classifier over the producer string and page count, riding the pikepdf
+open `extract_embedded_doi` already performed and memoised into the same
+self-invalidating cache entry. Printed web pages (37 of 371) get their source
+URL recovered instead of a DOI search that cannot work.
+
+**Batch E — Zotero → Obsidian note sync.** A closed-vocabulary template
+renderer (not a template language: that would be arbitrary code execution over
+vault content), content-based comparison, and a writer that CREATES ONLY. In
+every measured drift case the Obsidian body is longer than the Zotero note —
+the user edits after import — so regenerating would delete real work.
+
+**Batch D — ISBN.** Books and chapters had no resolver at all. Check-digit
+validated extraction, ISBN-10 → ISBN-13, its own identifier-grade tier, and
+Open Library plus Google Books, both keyless and both off by default.
+
+**Batch G — read-only audit tools over MCP.** Three driver rows and three
+tools; `_is_write_call` untouched and asserted untouched.
+
+### Three corrections
+
+**The orphan count was 531; it is 371.** A bridge built WITHOUT
+`pdf_text_provider` leaves 531 unmapped because the printed-DOI rung has no
+text to read. The app always injects it. Any measurement script must too, or
+it overstates the residual by 43%.
+
+**The EMC classifier is not shippable, and the reason is recorded so it is not
+rediscovered.** *(Superseded the same day — see the entry above: the
+measurement behind this was re-derived and does not hold. The article code IS
+present in the text the app serves. Do not act on this paragraph.)* Every EM-Consulte chapter prints its article code as line 1 of
+page 1, which would classify the class exactly — but the app's page-1 text
+comes from the vault indexer's cache, whose extractor drops that line (PyMuPDF
+sees it), and it is absent from `/Info` and XMP too. Verified on three known
+EMC files. An inert branch was designed, built, measured and removed.
+
+**A live Crossref record whose title IS its DOI no longer erases the
+identifier** — reversing HALF of a deliberate 2026-08-19 decision. Measured on
+the 20 EMC entries in `_master.bib`: Crossref holds 18 of 20 by DOI, and 2 of
+them answer 200 with a registry stub whose `title[0]` is the DOI string.
+`_title_or_none` rightly refuses a DOI-shaped title, but dropping the whole
+candidate reported "nothing found" for an identifier Crossref had just
+confirmed. On a DOI lookup the identifier is itself the evidence; on a title
+search an untitled candidate still cannot be scored and is still refused.
+
+The same probe produced Batch D's container-scoped title search: unconstrained,
+a Crossref title search lands on the right EMC DOI 10 times in 20 and returns a
+CONFIDENT WRONG record 4 times ("Personnalité narcissique" matched a Kernberg
+volume at 0.92); with `query.container-title` it is 14 right and 1 wrong.
+Generic clinical nouns are the failure mode, so the constraint is a safety
+improvement as much as a recall one.
+
+### Defects the gates caught while this was written
+
+* **ruff** — the provenance splat was pasted into BOTH orphan serializers but
+  only one had the map in scope, so the subset report raised `NameError` for
+  any non-empty row list; invisible to a test that only ever serialised an
+  empty report.
+* **The JS suite** — `[Load more]` was gated on `total > shown` rather than on
+  the cursor, so a last page could offer a button whose click could not issue a
+  request. Separately, Batch B's bulk and undo controls were rendered into the
+  meta element, which the `.audit-link-btn` dispatcher never wires: they would
+  have been inert.
+* **The mypy ratchet** — a comment line beginning `# type: -1 …` parsed as a
+  type comment and broke the whole file's type check; and the maintenance step
+  read a `-1` sentinel through `_int_opt`, which clamps to ≥ 0, so every run
+  would silently have narrowed to the UNTAGGED cohort.
+* **Measurement over intuition** — a substring test for short note bodies was
+  written, measured worse (a two-word note interleaved into a sentence read as
+  total drift at containment 1.0) and removed for one flat threshold.
+
+Gates: 2 748 Python tests, 643 JS, ruff clean, mypy ratchet 174/175 (one
+allowance lowered in the same change that earned it).
+
+## 2026-08-25 — Remediating the remediation: a blank PDF, a silent journal, and the gates that missed both
+
+The 2026-08-24 audit-remediation program (`b34063a`, `8499d6b`) passed every
+gate it defined — ruff clean, 2 562 Python tests, 614 JS tests, mypy ratchet at
+177/177. A follow-up review found two defects those gates structurally could not
+see, plus one live user-facing break, and closed the coverage holes that let
+them through. Every fix below has a regression test proven red against the prior
+commit.
+
+**PDF previews rendered a white page — and the two engines disagree about why.**
+A document loaded from a local scheme (`blob:`) inherits its embedder's CSP, and
+the previews put that blob in an `<iframe>`, so all six surfaces (audit
+inventory/accession/ambiguous decks, the Tagging deck's `V` panel, Deck and
+Report Preview PDF) broke together. Chromium refuses on `object-src 'none'`,
+loudly, with a reported violation. **WebKit — which is what PyWebView actually
+ships — refuses on `frame-ancestors 'none'`**: the inherited policy applies to
+the blob document, which is itself framed, so it is told to refuse every
+embedder including our own page, and WebKit obeys SILENTLY (the iframe's load
+event fires, no violation is reported, the frame is blank). Established by
+bisecting the policy in a real WKWebView window: `frame-ancestors 'none'` alone
+blanks it, and removing it restores rendering with `object-src 'none'` still in
+place. Both are fixed. `X-Frame-Options: DENY` keeps the anti-framing guarantee
+— it is a response header and takes no part in CSP inheritance, so it never
+reaches the blob document. `tests/test_security_hardening.py` had *pinned*
+`frame-ancestors 'none'`, encoding the regression as intent, and no
+Chromium-based test could have caught it: that engine renders it either way.
+
+**The tagging journal silently discarded failure states.** Every write path
+appends an op, saves it as the crash trail, attempts the write and on failure
+flips the same object to `failed` and saves again. That second save was a
+no-op, so a failed Zotero PATCH or `_tags.md` edit kept claiming `applied` —
+and Restore reverts an un-run *add* by removing tags nobody added. Two causes,
+both in `tagging/journal.py`: `prune()` republished survivors through
+`manifest["ops"] = kept`, which rewraps each as a **copy** and detaches the
+object the writer still holds; and `save()` cleared its dirty set without
+recording anything to compare against, so a plain-dict op could never be dirty
+again. Fixed with `_TrackedOps.retain` (in-place, identity-preserving) and
+value-comparison for this request's own appends. The Phase-3F suite had tested
+only `load()`-derived ops — the one shape production never uses — so the new
+tests drive the real writers with an injected `OSError`.
+
+**The journal read path took write locks.** `load()` ran `CREATE TABLE IF NOT
+EXISTS` + `INSERT OR IGNORE` under `synchronous=FULL`, taking a RESERVED lock,
+so a concurrent `BEGIN IMMEDIATE` turned an ordinary read into SQLITE_BUSY —
+defeating WAL and 503-ing the Restore manifest during any harmonize/retire
+batch. Schema creation now lives only in first-open, migration and save.
+
+**Retrieval concurrency (AP-09 residuals).** Reranking left the mutation lock
+but each request gets a shallow `copy.copy` facade over one shared cross-encoder,
+so two chats could run inference on the same torch model simultaneously —
+previously impossible, and unbounded on Apple Silicon's shared memory. Added a
+gate covering the rerank pass only. Corrected a comment in `rag/vault.py` that
+claimed `_build_retrieval_pipeline` runs "inside the mutation-lock hold" and is
+"the only writer of `top_n`" — both false since AP-09, in a comment whose whole
+job is a concurrency invariant. Pinned the ~10 LlamaIndex private members the
+prepare/read split depends on with a contract test over the real objects.
+Measured `_detach_node` (1.2 ms for a 200-node pool) and deliberately left it
+whole rather than micro-optimising.
+
+**Crash-recovery gaps.** A case-only rename whose destination was taken
+externally mid-staging left the PDF reachable only from a hidden dotfile with
+the op stuck `pending`; recovery now restores it where the filesystem allows and
+otherwise records `staged_recovery_rel` so the file is always findable. A
+README-mirror transaction that failed closed (an ordinary outcome in a
+synchronized vault) wedged the step forever with neither the directory nor a
+remedy named; it now names both and offers a confirm-gated
+`discard_pending_transaction`.
+
+**Lifecycle and honesty.** The rename-recovery `before_app_request` hook
+re-parsed the whole refactor manifest on *every* request while indexing held
+the vault lock — memoised on the file signature with a back-off. Snapshot
+consumption moved from a literal set in the route onto `Step.uses_snapshot`,
+with a source ratchet. A step that ran and genuinely failed is no longer
+relabelled "cancelled" because Stop arrived during it (cancellation is now the
+step's own `StepResult.was_cancelled`). Accession cancellation reaches the
+ladder at each source-call boundary instead of only bracketing a 60-second run.
+`#maint-error` gained `role="alert"` — after the AU-03 fix it had no
+announcement path at all.
+
+**Security posture, made honest.** The sanitizer no longer re-parses and
+re-serialises DOMPurify's output (the mXSS shape DOMPurify warns against) or
+disables its URI check via `ALLOW_UNKNOWN_PROTOCOLS`; policy runs in an
+`afterSanitizeAttributes` hook, obsidian:/zotero: ride a custom
+`ALLOWED_URI_REGEXP`, and `class` is narrowed to `language-*` so untrusted
+Markdown cannot borrow app stylesheet classes. Bandit moved from `-lll -iii`
+against an **empty** baseline (a combination nothing here can trigger) to
+`-ll -ii` against 9 assessed findings, each dispositioned in
+`docs/bandit-baseline-rationale.md`. Dependency audits gained the waiver
+mechanism the plan required — owner, rationale, path, expiry, and an expired
+waiver *fails*. The 6.4 KB script-hash CSP is now sent only on HTML documents.
+
+**Coverage.** `tests/browser/` (Playwright + Chromium) boots the real app shell
+and asserts the served CSP, blob-PDF rendering with zero CSP violations,
+document reflow at 960/1024/1280/1600 px and axe serious/critical. It closes the
+Chromium half of the PDF class; the WebKit half is pinned as a header assertion
+instead, because the only engine CI can run does not reproduce it. CI was also
+red on `main` for an unrelated reason — the Linux lockfile resolves CUDA torch
+(~8 GB) and exhausted the runner disk — now reclaimed before install.
+A **macOS-arm64 CI job** runs the platform-sensitive
+suites; the renamer's staging branch exists because APFS is case-insensitive and
+was validated only on ext4. The `docs/audit_remediation_*_2026-08-24.md` plan
+and tracker are deleted per the plan-docs rule, their open items transferred to
+Known Issues.
+
+Gates: ruff clean · **2 586** Python tests · **617** JS tests · **7** browser
+tests · mypy ratchet 177/177 · bandit ratchet green.
+
+
+## 2026-08-21 — The Vault Sync suite in-app (Maintenance subsystem, Phases 1–3 + the renamer)
+
+The private `maintain.sh` / Tk panel / `Vault Sync.app` stack is replaced by
+one in-process subsystem: a hidden top-level **Maintenance** tab behind a
+capability probe + dynamic import, `POST /api/maintenance/run` (SSE, one
+`{"step"}` frame per step, one op at a time), and `papermind maintain`
+(preserving the non-zero exit gate). **Private-only and strippable** — four
+paths (`maintenance/`, `api/routes/maintenance.py`, `static/js/maintenance.js`,
+`tests/js/maintenance.test.js`) go at publish (PUBLISHING.md STRIP STEP 4;
+strippability rehearsed before Phase 1 landed: the public build boots with
+zero maintenance routes and both ratchets stay green). Ten steps: the read
+quartet (`pdfnames`/`links`/`attachments`/`library` — the last a view of the
+CACHED audit scan, snapshot age disclosed), the Phase 3 audits
+(`pathdrift`/`latexrefs`/`tagcheck`, thresholds measured against the live
+vault before being set) + the `latex` build sweep (temp-dir artifacts only),
+and the opt-in write pair `readmes` (journal-less by decision;
+`log_vault_write` per file) / `batchtags` (binds the batch loop extracted to
+the public `tagging/batch.py` over in-process route transports). Workstream B:
+the biblio PDF **renamer** on the pdfnames findings — strict `- → _` rule
+(PATTERN tightened in the same commit), proposals from the mapped bib record
+only, every proposal verified to round-trip through the bridge's author+year
+parser (unmapping is the failure that matters), duplicate-shaped names refused
+toward the duplicates report, journalled `rename_attachment` ops with revert.
+Live parity vs the old checkers was byte-identical before decommission;
+`scripts/vault_maintain/` was then `git rm`'d (recover from history).
+Deferred: bridge bib-side alias keys for the ö→oe table forms; reference
+rewriting on rename (v1 refuses). Details: CLAUDE.md → Module Ownership
+(`maintenance/`) + Known Issues (2026-08-21).
+
+## 2026-08-19 — `papermind tagging batch --include-tagged` (the under-tagged cohort)
+
+`tagging_batch_cmd` filters its work list through `_untagged(row, wanted)`,
+true only when a requested, PRESENT target carries **zero** tags. That is right
+for a coverage campaign and wrong for a *quality* one: a paper carrying a single
+placeholder — or a single real-but-coarse tag — is already "tagged", so
+`--keys-file` narrowed the rows and the gate then silently dropped every one of
+them ("To process: 0").
+
+`--include-tagged` drops the gate. It **requires** an explicit
+`--keys`/`--keys-file` selection and raises a `UsageError` without one, before
+the inventory fetch — the house posture that an *empty or unset* selection is
+never "everything" (`_parse_targets`, `_read_key_selection`); without the
+refusal the flag would re-propose the whole library, ~6 000 paid calls.
+
+Re-proposing a tagged paper is safe by construction: the propose prompt never
+shows the model the paper's own app-written tags (`from_record(exclude_keywords=…)`,
+2026-08-12) and `apply-all` **unions**, so the existing tag survives. Pinned
+beside `TestTaggingBatchTargets` with the UsageError and an already-tagged row
+reaching the work list only with the flag.
+
+## 2026-08-19 — Manual bibliography link picker (closes the assign-to-any-key deferral)
+
+The maintainer: "manually search the Zotero entries and link one to a PDF that
+I know for a fact are mapped." The registered deferral read *"the deck has no
+'assign to an arbitrary key' verb — a `none` row that IS in the bib under a
+spelling no ladder rung catches can only be linked by hand outside the deck"*;
+the measured example is a transliterated surname (`von_kaenel.pdf` →
+`vonkanel2019`). Both registry entries are removed (single-registry rule).
+
+`audit.js::_openKeyPicker` is a type-ahead over the cached scan's citation
+keys, offered from three places: the accession deck card (`[link to…]`, key
+**`L`**, added to the keys legend), every accession TABLE row the ladder did
+not resolve to a bib key, and — since the component dropped in for the cost of
+one `case` — the **ambiguous** deck, where the right key may be none of the
+bridge's candidates and the candidate list alone cannot express that. It
+searches citation key + title + first author + year, accent- and case-folded
+(`foldText`, so "eluard" finds "Éluard"), ANDs its tokens, shows at most 20
+with a true-count line, and is a real `role="listbox"` with
+`aria-activedescendant`: arrows move, Enter picks, Escape closes and returns
+focus to the control that opened it. Its keydown handler `stopPropagation`s —
+without that, typing "smith" into a picker mounted inside a deck would drive
+the deck's single-letter verbs (`s` = skip).
+
+**No new write surface, and no provenance lie.** The link is the existing
+`POST /api/audit/mapping {pdf, citation_key}` behind the same `confirmInline`
+(naming both sides and the one file it touches), undoable through the same
+`clear` verb with the same decided/undo bookkeeping. It deliberately omits
+`source`, so the route stores `"manual"`: a human-picked key is hand curation,
+and annotating it `accession` would make the Batch-3 pairings board credit the
+resolver for a decision it never made — permanently, and invisibly, at the next
+scan. `_accMappingWrite`/`_accMappingWriteFromDeck` gained a `manual` flag for
+exactly that; the ambiguous deck's `_ambigWrite` already sent no `source`.
+
+**Data source: the existing `GET /api/audit/inventory`**, fetched once per
+scan into a module cache keyed on the scan identity token (two concurrent
+opens share one in-flight promise). A dedicated `GET /api/audit/keys?q=` would
+ship a smaller payload, but it would add a route with its own gating, its own
+404-without-scan contract and its own tests — and would put a server
+round-trip in the path of every keystroke, which is worse than one fetch for a
+type-ahead. The inventory route already serves exactly this snapshot and the
+Inventory tab already pays for it on every visit.
+
+Pinned by nine cases in `tests/js/accessionDeck.test.js` (opens from the real
+`L` keypress; accent-insensitive narrowing incl. the transliterated surname;
+AND-of-tokens; Enter confirms then posts a body asserted to have NO `source`;
+arrow selection changes which key is written; Escape restores focus; the
+picker's keys never reach the deck; the link round-trips through `clear`; the
+table verb is offered on unresolved / candidate / no-match rows and NOT on a
+row already resolved to a key) plus one in `auditAmbigDeck.test.js` (assigns a
+key that is not among the row's candidates). 583 JS green, ruff clean.
+
+## 2026-08-19 — A→Z sort + per-table filter, as ONE shared primitive
+
+The maintainer: "one would wish to be able to filter or re-order across the
+different tables by A to Z." `ui.js::installTableControls` (feature-blind,
+dependency-free — the `confirmInline`/`runTour` precedent) gives every report
+table a clickable-header sort with `aria-sort` and one small filter box.
+Covers the Inventory board, both drift reports, `tag_harmony`, `tag_hygiene`
+(all three of its tables), read/unread `unzoterod` including the accession
+ranked table and its two review lists, duplicates/near-duplicates, and the
+tagging inventory table. Decks are out of scope.
+
+**It moves DOM nodes; it does not re-render** — a deliberate inversion of the
+obvious design. Every one of these tables is painted from a rows array by a
+pure string builder, so "sort the array and re-render" looks natural; it would
+also destroy per-row state that lives in the DOM and nowhere else. The tagging
+table's write cell holds a text `<input>` a user may be mid-token in, and a
+sort click would have discarded it silently. Reordering the existing `<tr>`
+nodes (`tbody.appendChild(fragment)`) preserves bindings, checkbox state and
+carets by construction — there is no rehydration step to get wrong — and
+filtering hides rows rather than re-rendering, so it cannot re-enter the
+owner's seeding/wiring passes (`_acc.seeded`, `_wireRowActions`, the
+`_accessionAttach` handover) on every keystroke.
+
+Details: comparison is accent- and case-folded on both sides (`foldText`
+mirrors `audit/search.py::fold` — NFD, drop combining marks, casefold; the
+vault is bilingual FR/EN), so "Éluard" sorts under E; columns whose values all
+parse as numbers sort numerically (keys extracted ONCE per sort, not per
+comparison — at 6k rows a comparator that re-read cells would do O(n log n)
+DOM work for one pass of data); blanks sink in BOTH directions ("no value" is
+not the smallest value); the filter ANDs its whitespace tokens, is debounced
+200 ms, discloses "N of M rows" and announces through the STATIC announcer
+(never a freshly-minted live region per table); a header with no visible text
+of its own (the verb columns, the `sr-only` select column) is not sortable,
+and `data-sort="off"` opts one out; verb-button labels are excluded from both
+the sort key and the filter haystack, so "open" does not select every row;
+`data-sort-value` carries the true key where the visible text would sort wrong
+(formatted byte sizes, a count followed by buttons, an em-dash for "unknown");
+and a `td.cell-title[title]` contributes its FULL value to the haystack, since
+searching only the 90-character visible slice answers "no match" for a word
+that is genuinely in the row (other `title` attributes are explanatory tooltip
+prose and are deliberately excluded).
+Wire-once is a DATASET MARKER on the table, never a module flag — a module
+boolean stays true after the node is replaced and silently leaves the new
+table unwired (the audit search-bar defect class). audit.js remembers each
+table's sort/filter per report so the accession body's repaint-on-every-write
+cannot silently undo a sort the user set; a cross-report search jump onto a
+row a live filter is hiding clears the filters first, rather than scrolling to
+a hidden row and appearing to do nothing.
+
+New `tests/js/tableSort.test.js` (18) pins the fold, numeric ordering, blanks
+sinking, aria-sort exclusivity, non-sortable headers, AND-of-tokens filtering
+with its count and empty state, verb labels excluded, the wire-once marker
+against a replaced node, and — the design's whole point — that a checked box
+and a live listener survive a sort because the node is the SAME node. Plus
+integration pins in `auditTagHarmony.test.js` (selection survives a sort and a
+filter, strip mounted above the scrollport) and `accessionDeck.test.js` (an
+unticked bulk row is never re-seeded, and a sort survives the write that
+repaints the body). 569 JS green, ruff clean.
+
+## 2026-08-19 — Audit UX pass: hierarchy over prose, focus that survives a write
+
+The maintainer's verdict on the accession deep-review batches ("adequate but
+the UI/UX could be improved"), taken as a focused pass rather than a
+redesign. **The accession panel had no CSS at all** — `.audit-acc-panel`,
+`.audit-acc-actions`, `.audit-acc-rule` and `#audit-acc-review` were class
+names with no rules, so five review-driven clarifications had landed as one
+undifferentiated muted run above the buttons. Now: the risk-bounding sentence
+("Only a DOI, or a title and one surname, ever leaves this machine") stays on
+the surface and the reference detail (which catalogs, the polite-pool email,
+the bib-first rule) collapses behind a `<details>` — collapsed by default, or
+the pass buys nothing. **Evidence is a chip**: `_accTierLine` splits the
+GRADE from the provenance run, and the chip is *toned* by whether an
+identifier resolved the row (`chip-id`) or a title did (`chip-weak`) — the
+bulk-select boundary rendered per row instead of only stated once in the rule
+line. **Review-list headers** split the name + count from the `[all]`/`[none]`
+verbs instead of running them together inside one `<h4>`.
+
+**The Inventory pairings board**: the `[detail]` drawer was a run of `<p>`s
+with no shared left edge — now a two-column definition grid (`<dl>`), so the
+four facets (PDFs / Zotero / Note / Tags) are scannable; and the `[view]`
+preview mounts as the *second* child of a layout container, which the
+wide-window grid (`.audit-inv-layout.has-preview`, ≥1100px) lays out as a
+SIDE panel. It used to be inserted as the body's first child — a 65vh block
+that pushed every row off screen, so "look at this pair" and "keep my place
+in the list" were mutually exclusive. Its close bar is sticky either way.
+
+**Two registered paper cuts, fixed together** (the registry note said "fix
+both or neither"): a table-view mapping write dropped focus to `<body>`, so a
+keyboard user working down the rows restarted every subsequent Tab from the
+top of the page. The accession table re-renders wholesale, so its writes now
+register an ORDERED selector chain consumed after the render (`_accFocusAfter`
+/ `_accRowFocus` — a verb that no longer exists, `[link]` became `[undo]`,
+still lands in the same row); the ambiguous table disables its own button, so
+`_focusAfterRowWrite` moves to the next row's primary verb, falling back to a
+still-live verb in the same row. Both writes also announce through the static
+announcer, which the ambiguous table never did. **Count-aware skeleton**: the
+report body's `Loading…` collapsed a 72vh pane to one line and snapped back to
+a thousands-row table; `_skeletonHtml` sizes shimmer rows from the cached scan
+summary (capped at 14) and carries `aria-busy`, with the bars `aria-hidden`.
+
+Pinned by `tests/js/accessionDeck.test.js` (chip tone per tier, disclosure
+collapsed by default, focus after a table undo and after the bulk link — the
+last two proven red against the un-restored render),
+`auditInventoryBoard.test.js` (drawer read per `<dl>` facet, preview DOM order
++ `has-preview` hook), `auditAmbigDeck.test.js` (a new table-view describe:
+focus moves to the next row, and stays in-row on the last one), and four new
+`contrastTokens.test.js` pairs for the chip/disclosure/`<dl>` surfaces.
+544 JS green, ruff clean.
+
+## 2026-08-19 — Accession deep-review Batch 4: batch narration, Settings section, mapping provenance
+
+The review's optional tail. **Batch narration:** `resolve_queries` gains a
+best-effort `progress_cb` seam (called per source call, a broken callback
+never fails a resolution) which the batch worker maps to `{"info"}` frames
+("Identifying 3/50 (name.pdf): querying crossref…") — the polite-pacing
+sleeps (~3.4 s/PDF) no longer read as dead air, and each frame feeds the
+SSE stall guard. **Settings "Accession · online identification" section:**
+the five knobs that had `/api/config` validators but no controls
+(contact email, per-source checkboxes over the registry, max candidates,
+timeout, batch cap) — the enable toggle deliberately stays on the report
+beside its egress disclosure; an all-unticked sources save sends nothing
+(`[]` means "full registry" server-side, the opposite of what unticking
+says). **Mapping provenance:** mapping.json gains an additive
+`sources: {rel: label}` map — the accession UI's link writes annotate
+`source: "accession"` (route-allowlisted; any other label 400s), plain
+hand curation stores nothing (legacy file shape byte-compatible),
+no-match/clear/hand-re-curation drop the label, and `build_bridge` stamps
+`accession` / `accession_hash` into `source_per_pdf`, so the Batch-3
+pairings board distinguishes accession-made links from hand ones at the
+next scan. `_load_mapping_full` returns a 4-tuple; `save_mapping` prunes
+labels to matched rels. Pinned by
+`tests/audit/test_bridge_mapping.py` (annotation round-trip through
+build_bridge, legacy shape, label lifecycle ×4),
+`test_audit.py::test_mapping_source_annotation_is_allowlisted_and_persisted`,
+`tests/accession/test_candidates.py::TestProgressCallback`, and the
+updated exact-body assertions in `tests/js/accessionDeck.test.js`.
+415 audit/accession py + 529 JS green, ruff clean.
+
+## 2026-08-19 — Accession deep-review Batch 3: the Inventory pairings board
+
+The maintainer's request v ("a board, and a precise overview of each paired
+PDF↔Zotero, with in-app PDF preview like tagging's V"), built as shape (i)
+of the review's scoping: the Inventory tab IS the board, extended rather
+than a 13th report tab. `serialize.inventory_records` additively ships
+per-PDF match provenance (`pdf_paths[].source` looked up from
+`bridge.source_per_pdf` — recorded since the bridge existed, serialized
+never; the `match_sources` union hid which rung matched which file), a
+`note` path payload and a light `zotero` block (item key/type, group
+routing for the deep link, reading-note count; no abstract by design).
+`audit.js` adds a per-PDF `[view]` — the blob-URL preview idiom copied from
+the decks, panel above the table, toggled off on re-click, torn down on
+report switch (`auditInvTeardown`) — and a per-row `[detail]` drawer:
+per-PDF pairing lines ("matched via doi" + view/open/reveal), the Zotero
+item with `[open in Zotero]` (zotero://select, group-aware), the note, and
+per-surface tags; absent surfaces read "none", never an empty cell.
+Read-only throughout — every verb goes through `POST /api/audit/reveal` or
+the existing `/api/audit/pdf` read. Pinned by
+`tests/js/auditInventoryBoard.test.js` (blob transport + toggle/revoke,
+drawer content + collapse, absent-surface wording, group deep link) and
+`tests/audit/test_tag_coverage.py::TestInventoryRowPairDetail`. 529 JS +
+324 audit-py green.
+
+## 2026-08-19 — Accession deep-review Batch 2: server-side provenance + source-quality additives
+
+The small engine/route half of the review's sources lane, all additive on
+the wire. `Resolution.consulted` records every source actually CALLED
+(clean-dry included — previously unreconstructable; empty ⇒ the offline bib
+fast path, so zero-egress is provable client-side; pre-field cache entries
+parse to `[]`). `/rows` discloses the resolved `accession_sources` subset +
+`contact_email_set`, and each cached row carries its `queried_at` stamp —
+the panel's egress label is now built from the server's source list (a
+narrowed config no longer overstates what leaves; a configured Crossref
+email is disclosed), cells render "cached · N d ago", and tier lines carry
+an "asked Crossref, Europe PMC" tooltip. **Masthead guard**
+(`candidates.py`): a title-search record whose title equals its own
+container is dropped with a note — the page-1 extractor's
+masthead-as-title failure scored such records 1.0 ("The New England
+Journal of Medicine", live). **Crossref `subtitle`** joins into the title
+(`_SELECT` + `_parse_work`), ending the "Bipolarity from ancient to modern
+times:" stub class — future identifications only; cached rows need
+[re-identify]. guide.md explains the ladder order (bib-first offline →
+primaries → rescue) and the ⚠-badge → re-identify loop. Pinned in
+`tests/accession/test_candidates.py` (consulted ×3, masthead ×2),
+`test_sources.py` (subtitle), `test_accession_route.py` (envelope + age,
+email never in the payload), `tests/js/accessionDeck.test.js`
+(server-built label, cache age, consulted tooltip). 85 py accession tests
++ 525 JS green, ruff clean.
+
+## 2026-08-19 — Accession deep-review Batch 1: the display-layer pass (client-only, reaches every cached row)
+
+From the maintainer-requested five-lane review
+(`docs/review_2026-08-19_accession_ui_tags_sources.md`). Everything here is
+`audit.js`-side by design: resolutions are cached in `accession_cache.json`
+and re-served, so render-time fixes reach all ~576 already-identified rows
+instantly while engine fixes would not. **Title honesty:** a
+`filename_only` row (48% of the live cache — surname+year search, zero
+title scoring) no longer leads with an arbitrary same-surname paper's
+title; it states the candidate count and defers to the deck. `title_only`
+rows are prefixed "maybe:" and their tier reads "title guess — verify".
+`_accCleanTitle` strips JATS markup/entities, trims subtitle-stub colons
+and ellipsizes the old mid-word slices at every render site (display only,
+never matching). **Provenance surfaced:** the payload's always-shipped
+`Candidate.source`, `scores[0]`, `notes` and `from_cache` now render — "via
+Crossref · match 0.93 · cached" on cells/lists/status lines, a "⚠ N source
+note(s)" badge so a degraded lookup is distinct from a genuine no-match
+(they are cached, and only [re-identify] retries them), and the offline
+zero-egress bib hit says so. **Selection & effect clarity:** the bulk
+lists state the default-check rule in the DOM ("DOI-backed rows are
+pre-checked…"); the Re-links list gains the matched-title column the
+eyeball step needed; decided table rows carry a confirm-gated `[undo]`
+(posts mapping `clear`; the bulk confirm's "undoable per PDF" promise now
+has an affordance where it was made) and an undo re-checks an
+identifier-grade row; counters read "looked up" vs "linked / marked"; the
+batch button says "Identify next N of M unresolved"; write/copy success
+lines carry the snapshot caveat and the BBT-re-export loop-closer;
+disabled-state table cells explain themselves; batch crash rows render
+their stored `error`. **Tag-harmony relabel (the review's critique-ii
+verdict — no data bug, one misleading column):** "→ Finder" read as "tags
+IN Finder"; headers are now "Add to note / Add to Finder / Add to Zotero",
+the meta line says the cells list what each surface is *missing*, and every
+cell's tooltip discloses the surface's current tags (serialized all along,
+displayed nowhere). Pinned in `tests/js/accessionDeck.test.js`
+(+8: title honesty, provenance, notes badge, rule sentence, matched-title,
+row undo round-trip, disabled hint) and `tests/js/auditTagHarmony.test.js`
+(+2: headers, current-tag tooltips). 524 JS tests green.
+
+## 2026-08-19 — Accession review (same day): three server fixes, four UI fixes, one doc-truth fix
+
+The two-lens adversarial review of the accession range (`98be416..41c052b`;
+`docs/accession_review_prompt_2026-08-19.md`, deleted per the plan-docs
+rule). Fixed, each with a red-proven regression test: the batch's
+`_ACCESSION_GATE` leak when the context build crashes between acquire and
+the SSE guard; the batch continuing egress after a scan starts mid-run
+(now stops between PDFs — "nothing runs during a scan" holds past t=0);
+`CrossrefSource._parse_work` crashing the whole resolution on a malformed
+record shape; no batch cancel affordance (now `[cancel]` → AbortController,
+finished lookups stay cached); the clipboard dead-end on a refused
+`navigator.clipboard` (the `_pickCopy` textarea fallback); the accession
+deck's `with-pdf` grid never matching its `#audit-acc-*` children
+(auto-placement instead of the named areas — selectors extended,
+source-ratcheted) plus the undefined `.mono` class; identify outcomes not
+reaching the static announcer; and the README's "most resolutions are
+answered offline" over-claim (the live batch answered 546 of 576 over the
+network). Residual notes + refutations in Known Issues → *Deferred from
+the 2026-08-19 accession review*. Suites 2,073 py / 514 JS, ruff clean.
+
+## 2026-08-19 — Accession Phase 3: the "PDFs Without Zotero" extension (first user-visible release)
+
+The report gains the accession surfaces, no new tab: `/api/accession/rows` /
+`identify` / `batch` (`api/routes/accession.py` — egress gates in order:
+`accession_enabled` (default off) → never during a scan → cached scan → the
+path is one of that scan's orphans; single-flight 429; linking reuses
+`POST /api/audit/mapping`, no new write surface), six validated config keys,
+and the `audit.js` `_acc*` UI: an Identification column on the ranked table,
+the disclosure-labelled enable toggle, a confirm-gated batch, the **bulk
+review lists** (Re-links → mapping writes; Accessions → copy DOIs for
+Zotero's Add Item by Identifier) where only identifier tiers default checked
+and `title_filename` is listed unchecked, and a keyboard **review deck**
+below the bulk bar (ambig-deck idioms: confirmInline everywhere,
+peek-not-pop undo via mapping `clear`, blob-URL PDF panel).
+`test_accession_route.py` + `tests/js/accessionDeck.test.js`. The live
+full-library batch (all 576 orphans through the real pipeline, 33 min at
+polite pacing) closed the plan: **30 links / 415 candidate sets / 52
+margin-refused / 79 none** — Phase 4 shipped by construction (rung 5 + the
+French rescue sources are in the engine and ran), **Phase 5 measured and
+declined** (the no-text class no longer exists; the residue is catalog
+coverage, not extraction — 60 of the 79 `none` rows had a good title no
+keyless catalog holds, only 13 were extraction-abstained), Phase 6 awaits a
+user-side Zotero capture. Follow-ups from the batch: a per-row
+**re-identify** verb (`force` bypasses the cache consult, never the store —
+theses.fr 400'd 45 calls it answered 200 minutes later, and a cached
+degraded resolution could otherwise never improve) and select-all/none on
+the review lists. Registry updated; the plan doc is deleted per the
+plan-docs rule.
+
+## 2026-08-19 — Accession Phase 2: the `accession/` keyless resolver (headless)
+
+The core package behind the coming "PDFs Without Zotero" extension: ranked
+query building from what a PDF discloses about itself (`identify.py` — the
+page-1 title extractor is author-anchored and was calibrated against 4,024
+mapped PDFs' own bib records, 21.8% → **61.6%** of emissions ≥0.65 with
+median 0.934), five keyless sources behind one protocol (`sources.py` —
+Crossref / Europe PMC / arXiv / HAL / theses.fr, shapes verified live and
+recorded as fixtures; hardened HTTP mirroring `tagging/zotero_write.py`),
+evidence-tier scoring with margin refusal and a bib-before-network guarantee
+(`candidates.py`), and a sha256-keyed resolution memo (`cache.py`). No route,
+no UI, no config keys yet; README documents the egress conditions beside the
+Tavily note. The measurement also found and fixed a **Phase 1 bug**: PDF text
+layers leave control characters inside captured DOIs (BMJ page-1 DOIs ended
+in a literal backspace), so `normalise_doi` now strips Unicode category-C
+characters and the bridge's DOI join re-normalises memoised values — 3 live
+orphans heal into links at the next scan. Suite: `tests/accession/`
+(hermetic by construction — an autouse tripwire fails any test that reaches
+the network) + control-char regressions in `tests/audit/test_bridge_doi.py`,
+proven red pre-fix.
+
+## 2026-08-18 — review fix batches (A–J)
+
+Fixes for the 2026-08-18 adversarial review (`fdb2aa9..b46dd75` + UX/a11y
+lanes), one commit per batch; each defect fix ships with a test proven red
+against the pre-fix code.
+
+**Batch A — deckgen/docgen citation pass.** The HIGH: a **no-template CLI deck
+emitted an undefined `\refline`** and could not compile — only
+`assemble_with_template` injects `REFLINE_PROVIDECOMMAND`, and the CLI bound
+`footer_mode="refline"` unconditionally (the integration tests pinned the
+broken output; they now pin the compilable `\vfill` form). Also: the citation
+pass's debris cleanup is now **sentinel-scoped to the exact tag-removal
+sites** — the frame-global regexes collapsed correct French « mot : » spacing,
+tabular alignment runs, and punctuation-initial indentation on tag-free lines;
+a body with **no complete frame keeps its `(source:)` tags** instead of having
+attribution deleted with nowhere to move it; `relevant_bib_keys` **accent-folds
+both sides** before tokenizing (the ASCII tokenizer split `dépression` into
+`pression`, which the word-boundary anchor then rejected — French queries
+matched nothing); the augment op-rules' doubled `{{…}}` escapes (appended
+*after* `.format()`, so they reached the model verbatim — Known Issues item 9)
+are single braces in both `deckgen/prompts.py` and `docgen/prompts.py`;
+`latex_escape_metadata` escapes backslash (source names are model output);
+a frame that already carries a source footer has new names **merged** into it
+across augment cycles instead of stacking a second footer; and the
+between-frames comment, `rewrite_source_tags` docstring, `_short_authors`
+docstring and `_BIB_AND_RE` brace comment now describe what the code does.
+Deliberately NOT fixed: the pre-upgrade checkpoint salt (stale checkpoints
+resume with raw tags once, then self-clear).
+
+**Batch B — driver/CLI truthfulness.** The HIGH: `core/driver.py::
+tagging_inventory`'s response whitelist stripped `scanned_at`, so the CLI
+batch's snapshot-staleness disclosure — the age stamp, the stale warning, the
+rescan remedy — was dead end-to-end against a healthy server, always printing
+the misdirecting "scan time unknown (older server?)" fallback; its tests
+passed because they mocked `cli.main.tagging_inventory` above the driver. The
+field is forwarded, and a **response-projection ratchet**
+(`TestDriverResponseProjections`, mocked at `_http_json`) now pins every field
+a CLI consumer reads. The batch's model-disclosure line reads the new
+`driver.tagging_model_info()` (one `/api/config` GET) instead of
+`get_status()`, whose `/api/obsidian/status` GET destructively drained the
+GUI's one-shot vault status feed on every run. `--keys-file` reads
+`utf-8-sig` (a BOM glued invisibly to the first key) and a non-UTF-8 file is
+a `UsageError`, not a traceback; the missing-keys diagnostic blames the
+client-side `has_pdf` filter when that is what removed a key, instead of
+"outside scope". The key-selection tests' propose mock used the route's
+unwrapped shape where the driver returns `{"proposal": {…}}`, so they only
+ever exercised the skip path — fixed, with a would-apply assertion proving
+the propose path runs. `ensure_server_info` now probes `/api/health` on a
+foreign record's claimed port before deferring to its live pid (post-crash
+pid reuse permanently disabled the self-heal); a live pid that ANSWERS the
+probe is still never stolen.
+
+**Batch C — `scanned_at` is the snapshot's own build time.** The served value
+was the manager's last-finalise time, which lied in exactly the two states
+where staleness matters: `start_scan` zeroes `_finished_at` while deliberately
+keeping the previous inventory live (mid-scan, real data served with
+`scanned_at: 0` — and `tagging.js` cleared the user's row selection twice for
+one snapshot, stamp T→0→T2), and `_finalise` stamps unconditionally even on an
+errored scan with `inv=None` (a stale snapshot reported freshly scanned,
+silencing the CLI staleness warning in the case it was built for). The
+`Inventory` now carries `built_at`, stamped at construction; both
+`/api/audit/summary` and `/api/tagging/inventory` serve it — one atomic read
+of one object, no torn pair of lock acquisitions. The route tests pin the
+mid-scan and stale-after-error semantics against real manager time state
+instead of a mocked `get_scan_times` (which had pinned plumbing while the
+semantics were broken).
+
+**Batch D — tagging journal/restore concurrency.** The batch restore
+plain-saved the phase-2 manifest after a lost op-lock — the clobber class the
+write path's merge-save had already fixed — silently dropping any op a new
+lock owner appended during the lapse; it now goes through
+`save_merged(prefer_ours=<this batch's ops>)`, which keeps the in-memory
+`reverted` flips (plain disk-wins would discard them, leaving reverted stores
+double-revertible) without clobbering foreign ops. `save_merged` distinguishes
+corrupt content (safe to overwrite — the disk copy is already lost) from a
+**transient `OSError` read** (`JournalTransientReadError`, e.g. an unmounted
+archive volume — refused with a loud log; callers keep the in-memory manifest
+and retry at the next checkpoint), and its docstring stops claiming
+resurrection is "effectively never" (an op a new owner legitimately spent
+during the lapse IS re-appendable, bounded by the note-revert's hash check).
+The verbatim-duplicate `_bump_save`/`_tick` closures in retire + harmonize are
+hoisted into one `_BatchJournalKeeper` (with a route-level lock-lost test for
+the retire copy). `_harmonize_plan` reports a selected key whose row yields
+zero writable ids in `unresolved_keys` instead of shrinking `records` without
+attribution, a malformed key value is a 400 naming it (not a silent drop), and
+`_HARMONIZE_MAX_KEYS` is checked post-coercion/dedup so 2001 duplicates of one
+key are one write, not a refusal. The three comments (and the phase-4
+user-facing failure string) claiming an un-run Zotero ADD's revert "would
+remove tags it never added" are corrected — `_revert_zotero_prepare`'s
+after-equality check conservatively skips that case; the real hazard is a
+journal claiming a write that did not happen. The vacuous `writes = {}`
+assertion in `test_propagates_a_finder_tag_into_the_note` is wired to real
+patches on the disabled targets' writers.
+
+**Batch E — audit engine/report honesty.** `tag_harmony` carries
+`finder_platform` (the `tag_coverage` precedent) and the renderer caveats the
+→ Finder column off macOS — Finder xattrs read empty there, so every union tag
+looked "missing in Finder" with no disclosure. `OrphanZoteroItem` regains
+`library_type`/`group_id` (additive) and the orphan rows forward them, so the
+`[Zotero]` verb deep-links group-library items via
+`zotero://select/groups/<id>/items/<key>` instead of a personal-library URL
+that selects nothing; "an entire uncovered group library" joins the bucket's
+documented causes. The harmony search-corpus detail no longer renders a
+dangling " · " for a bib-less record, and the cancelled-scan orphan test's
+docstring stops describing pre-`49afa1d` code as current.
+
+**Batch F — audit.js state machines.** Harmonize gets a real in-flight busy
+gate (`_harmonySetAllDisabled`, retire's `_retireSetAllDisabled` twin): the
+apply used to disable only the button while any checkbox change re-armed it
+from selection size, so a second concurrent run was two clicks away. The
+harmonize/retire status hosts (and their undo buttons) are report-identity
+aware — a mid-stream tab switch no longer sprays them into a foreign report.
+`_loadSummary` gets a `makeLatestGate` (superseded on scan-identity reset, so
+a straddling fetch cannot repaint the previous scan's tiles) and a **visible**
+"summary unavailable" state on non-404 failures. The first-scan milestone
+burns its one-shot `localStorage` flag only after the count actually renders.
+The audit Cancel button is re-armed on every new scan (one successful cancel
+used to leave it permanently dead). A per-report 404 renders an in-body empty
+state that keeps the tablist + search bar when a scan exists (2026-08-12
+adjudicated #4 — a skip-duplicates scan's Duplicates tab made every other
+report unreachable). The search 202 "Preparing search index…" retry loop is
+capped (~30 s) with an actionable escalation message.
+
+**Batch G — state-feedback parity.** Single Paper preserves already-streamed
+text on both Stop and mid-stream error (2026-08-12 adjudicated #2 — a
+90%-streamed map-reduce summary was erased; the note rides the notices strip
+so exports stay clean, and a kept partial is exportable). Plain chat records a
+kept partial into `_history` as an `[interrupted]` assistant turn with the
+user turn kept (adjudicated #5 — a visible exchange left no trace, so
+follow-ups were sent contextless), and a retry after a kept partial no longer
+double-renders the question (the wire copy re-asks it; history keeps one
+rendition) — the same double-bubble fixed in vault chat. `deck.js` gains the
+retry boundary `docgen.js` already had, on generate and augment (the
+checkpoint makes retry cheap). The tagging deck messages the busy-window
+no-ops for `P`/`A`/`⌫` (previously silent dead keys for up to 60 s) and its
+60 s apply abort says "timed out — the write MAY have landed" (CLI-parity
+honesty) instead of asserting flat network failure. The refactor plan stream
+gets a Stop button (read-only server-side, always safe); Revert-all's frozen
+line now states its duration honestly (per-op progress needs an SSE
+conversion — recorded as a deferral). Parity set: docgen says why
+Preview/Compile are absent when latexmk is missing, renders "no change
+produced" as guidance not error, the tagging table shows "applying…"
+in-flight, `config.js` model-selection saves surface failures, and the audit
+status poll phrases transient failures instead of dumping raw exceptions. The
+dead `#settings-status` region is wired: a visible "Saved ✓" tick per clean
+save and a visible NOT-persisted notice on transport failure.
+
+**Batch H — accessibility.** `#obsidian-status-msg` ships `role="status"` in
+the static markup (it was minted at write time, textContent first — the
+same-tick WebKit hazard `liveRegions.test.js` exists to prevent — and was
+unpinned) and index start/completion announce through `announceStatus` (a
+multi-hour run used to end silently; the activity bar is not, and must not
+become, a live region). The six agent-trace activity logs lose `aria-live` —
+a deck run's ~50–100 per-iteration lines monopolized the SR queue (the audit
+search overlay's deliberate "no aria-live" precedent) — pinned NOT-live like
+`#pull-status`; harmonize/retire per-op announcements throttle to every 25th
+op + the final one, visible text unthrottled. The ambiguous-PDF table's
+per-row `<select>` and `[assign]`/`[not in bib]`/`[reveal]` verbs get
+row-context accessible names (the deck view of the same report already had
+them), and the row-context sweep covers the Zotero/Finder drift verbs, the
+tagging table verbs, both Restore surfaces' revert rows, the
+exclusions-modal Remove buttons and the orphan `[open]`/`[reveal]`.
+Ambig-deck candidates carry `aria-pressed` and `1`–`9` announces which
+candidate was selected; tokenfield chip commits/removals announce. The
+command palette backs its `aria-modal` claim with the real background inert
+(`openModal`'s mechanism, modal-aware on close). Send buttons park focus on
+the input before disabling themselves (focus no longer drops to `<body>`),
+and the tour's `scrollIntoView` honors `prefers-reduced-motion`.
+
+**Batch I — hierarchy & responsiveness.** The audit sticky headers are real:
+`.audit-report-body` is a bounded vertical scrollport (72vh) so
+`th { position: sticky }` engages — previously the whole pane scrolled and two
+screens into a 6,000-row report the headers, tablist, search bar and Run Scan
+were all gone; `.audit-table-scroll` (harmony's wrapper, now also on
+`tag_hygiene` and both drift tables) is a full scrollport (66vh) so its wide
+tables get sticky headers too while the toolbar/status/undo stay anchored on
+both axes; the tagging sub-view keeps its overflow opt-out (type-ahead
+dropdown). `.inline-confirm-strip` wraps (`white-space: normal` — the per-tag
+× confirm rendered as one unwrappable line inside a table cell). One primary
+per tab: deck/docgen's second and third `.btn-primary` demoted to outline, and
+refactor's Rendered/Diff/Formatting-fix view toggles use the `.theme-switch`
+segmented pattern (selected = `.active` + `aria-pressed`, never a filled CTA).
+The two tag tabs are renamed per the both-sides naming precedent — "Tag
+Harmony" → **"Note vs Finder vs Zotero Tags"**, "Tag Hygiene" → **"Tag
+Spellings & Vocabulary"** — paired across `_REPORT_LABELS`, the tab captions,
+the search-group headers and `guide.md`. Actionable dashboard tiles
+(unmapped/ambiguous/tagged-nowhere/orphans/dead-mapping) warn-tint their value
+when non-zero; the harmonize undo says "N paper(s)" instead of journal-op
+counts; the three placeholder-only inputs gain visible format hints; and the
+tablist group dots stop reusing the N/F/Z target-identity color tokens.
+
+**Batch J — registry closure.** Known Issues updated: adjudicated items #2,
+#4, #5 and #9 struck as FIXED (batches G/F/G/A, each with the fix and its pin
+named, the #3 precedent), the Settings-tiering entry carries the review's
+drop-tiering-keep-filter recommendation, and a new *Deferred from the
+2026-08-18 review* section records every deliberately-unfixed residue
+(checkpoint salt, revert-all → SSE, harmonize protected-op growth disclosure,
+sidebar collapse, deck/docgen nested-scroll walls, skeletons, the declined
+sticky first column, and the `_batchtags_facts` second-consumer hygiene note).
+`docs/code_review_2026-08-18.md` and its batch prompt are deleted per the
+plan-docs rule (git history keeps them; last carrying commit `6e2272a`).
+
+## 2026-08-13 (review fixes: the journal cap was fiction, and eight smaller truths)
+
+The adversarial review of the tag-harmony range (`fbb3b40..b2ceb5f`), every
+claim re-verified with a red test before fixing. One HIGH, everything else
+proportionate.
+
+**The HIGH — `journal.prune`'s cap budget counted ops it could never evict**,
+so the entry below's claim that `_HARMONIZE_MAX_NOTE_OPS` "bounds the batch by
+what `journal.prune` can RETAIN" was false: with the live manifest holding
+4,105 never-evictable applied finder/zotero ops against `_MAX_OPS` = 200,
+`over` was permanently positive and EVERY note op — harmonize batches, deck
+Accepts, apply-note-tags — was evicted, snapshot included, by the very next
+tagging write's prune. Worse, `_restore_batch` counts only surviving ops, so a
+gutted undo reported itself complete ("3/3 reverted" for a 10-op batch). The
+budget now counts EVICTABLE ops only: note ops get a genuine 200-deep
+retention window and age out oldest-first, the harmonize bound actually keeps
+a batch inside half of it, and the confirm dialog's "undoable in one click" is
+true within that window. (Two tests that had pinned the defective accounting
+incidentally were rewritten to the new semantics; proven red against the old
+code.)
+
+**Cancelled scans stop lying about the library** (the 2026-08-12 adjudicated
+finding 3, implemented as decided): the records loop no longer `break`s on
+cancel — it skips only the per-record annotation reads — so a cancelled scan's
+cached inventory carries every record and `tag_coverage`'s denominators, the
+reports and the widget describe the whole library, not a hash-order-arbitrary
+subset.
+
+**The lock-lost checkpoint merges instead of clobbering.** Both batch routes
+(retire, harmonize) saved the manifest after a lapsed op-lock TTL — necessary
+(the pending op records describe writes that already LANDED; dropping them
+destroys their undo) but a blind overwrite of a manifest another writer may
+now own. `journal.save_merged` reloads from disk and re-appends only our
+missing ops; the comments and retire's failure message, which both claimed
+saves stop entirely, now describe what actually happens.
+
+**Smaller, in one breath:** the dashboard drops its cached tiles when tab
+re-entry sees a scan finished outside the GUI's poll loop (CLI/MCP);
+`/api/audit/summary` carries an additive `scanned_at` so the vault-maintenance
+GUI stops fetching the full tagging inventory to read one float; the tagging
+picker's selection is genuinely snapshot-keyed now (its comment claimed so; a
+rescan clears it, scope/view toggles keep it); a successful harmonize spends
+its selection instead of re-arming a no-op three-store pass; the harmony undo
+gained retire's cancel affordance and its own anchored ratchet
+(`auditHarmonyUndo.test.js` — it had shipped untested); the wide harmony table
+scrolls in its own container so the toolbar and undo button stay visible; the
+driver's `_tagging_model` mirrors the route's 120-char truncation so its
+"cannot drift" docstring is honest; and the help glossary's "four of them can
+hold tags" is corrected to five (three writable). The `find_harmony`-per-
+corpus-build cost is recorded in Known Issues rather than fixed.
+
+## 2026-08-13 (tag harmony: see the surfaces, name them, merge them additively)
+
+Five phases turning "my tags are scattered across four places and I cannot see
+where" into a dashboard, a shared vocabulary, a three-way report and one
+confirmed, undoable additive merge.
+
+**Phase 1 — the surfaces are countable now.** No count of "papers carrying a
+tag, and where" existed anywhere: not a report, not a summary key, not a CLI
+check. `serialize.tag_coverage` adds one, as a pure pass over the already-joined
+records. Every writable surface reports `*_present` beside `*_tagged`, because
+the number without its denominator is the Tag Hygiene floor-as-total failure
+again — "1 200 note-tagged" means nothing until you know whether 1 300 or 6 000
+records have a note. `finder_is_floor` and `finder_platform` ride the payload so
+no client can render the Finder figure without its two caveats. Deliberately NOT
+added: a "needs harmonizing" count, which needs the fingerprint and the synonym
+map — a cheap set-difference would disagree with the report over every accent.
+
+Two orphan buckets came with it. A reference note whose stem is in neither the
+bib nor the bridge, and a Zotero item no record claimed, were both discarded in
+LOCAL VARIABLES during the scan: uncounted, not merely unrendered. They are
+`Inventory.notes_without_record` / `.zotero_items_without_record` now, with
+their own tabs and search entries.
+
+`GET /api/audit/summary` gives the dashboard its own feed. The tiles used to be
+a by-product of the Inventory TAB, so a dashboard describing the whole library
+stayed blank for anyone who clicked another tab first. Two live bugs fixed on
+the way: that blankness, and a first-scan milestone reading
+`status.record_count || status.counts.records` — neither field has ever existed
+in the status payload, so it always rendered its countless fallback and the
+one-shot flag made that permanent.
+
+**Phase 2 — "Zotero note" meant two different things.** It reads equally well as
+the child note inside Zotero and the vault note named after a citation key, and
+the drift reports are exactly where that costs you. The help guide gained a
+glossary (Bib entry · Zotero item · Zotero child note · Reference note · Biblio
+PDF · Record), and both drift tabs now NAME THEIR SIDES: "Tag Drift" →
+**Zotero vs Note Tags**, "Finder Tag Drift" → **Finder vs Note Tags**.
+
+**Phase 3a — the comparison nobody could make.** The two existing drift reports
+are pairwise, and Finder vs Zotero was compared NOWHERE; Tag Hygiene reads all
+five stores but aggregates globally by tag, so "paper X has this tag in Finder
+but not Zotero" was underivable. `tag_harmony` answers it per record. Three
+scope decisions: writable surfaces only (child-note tags and bib keywords are
+read-only everywhere, so unioning them would propagate tags no writer could take
+back); **no ≥1-Finder-tag gate** — `finder_tag_drift`'s asymmetric gate is right
+for its own question but would have excluded the commonest harmonize case, a
+tagged note and an untagged PDF; and actionable rows only, since this report is
+what a bulk selection is built from.
+
+**Phase 3b — `POST /api/tagging/harmonize`.** The client sends KEYS ONLY; the
+union, its vocabulary resolution and the writes are all server-side. The
+two-step resolution order is the correctness core: `_vocab_id_resolver` maps
+each drift surface to the exact `_tags.md` id sharing its canonical key (the
+report compares by OpenRefine fingerprint, the writers gate on the LITERAL id
+under `nfc().lower()`), then `_canonicalise_tags` re-gates it. Without the first
+step every accented or hyphenated tag is dropped as out-of-vocabulary while the
+row reappears at every scan — the unresolvable-row loop `apply-tag-drift`
+already had to be fixed for once. The test for it is verified RED with the
+bridge disabled.
+
+Lock choreography is `retire-tag`'s four phases verbatim, which meant giving the
+three ADD writers the `batch_id=`/`defer_save=` plumbing their removal twins
+already had and splitting `_zotero_commit_locked` into `_zotero_journal` +
+`_zotero_patch`. **One asymmetry matters:** an un-run removal reverts by
+re-adding tags that were never removed (idempotent), whereas an un-run ADD would
+revert by removing tags nobody added — so a cancelled or failed PATCH is flipped
+to `failed`, never left `applied`. Selection-driven and capped at 2 000 keys
+because the journal is the binding constraint: every write rewrites a ~3 MB
+manifest. Out-of-vocabulary tags are skipped and named, never auto-added.
+
+**Phase 4 — pick the subset, and see the model.** `papermind tagging batch`
+gained `--keys` / `--keys-file`; the tagging table gained a checkbox column and
+a **Copy keys** export that writes exactly that file format. Before this the
+only narrowing was `--limit`, a head slice by year — so repeated runs
+re-proposed the same oldest papers, since no tag write refreshes the snapshot
+the selection reads. An EMPTY selection is a usage error, not "the whole
+library" (the empty-vs-unset distinction that already inverted `--targets`).
+
+And the model is named where the money is spent: propose returns additive
+`provider`/`model`, the batch prints them before starting, `papermind status`
+prints `Tagging Model:` when it differs from the chat model — it reported only
+the chat model, which is wrong precisely when `tagging_propose_model` is set —
+and the Vault Sync panel shows model + snapshot age in its batchtags sub-frame.
+
+Also fixed: `auditRetireUndo`'s `undoBlock()` searched the whole file for the
+first `/api/tagging/restore`, so the moment a second batch-undo existed it
+retargeted onto the new code and would have stopped guarding retire while still
+passing. A ratchet that can drift onto a different function pins nothing.
+
+**Post-review fixes.** An adversarial review of the write path found five
+divergences from the retire template, all fixed: (a) the ADD writers gated
+their journal saves on `defer_save` alone where the removal twins use
+`shared and defer_save`, so a `manifest=None, defer_save=True` caller would
+have pruned (unlinking other ops' snapshots), written the vault, and persisted
+NOTHING — latent, since both current callers pass a shared manifest, but a trap
+invisible at the call site; (b) `_HARMONIZE_MAX_NOTE_OPS` now bounds the batch
+by what `journal.prune` can RETAIN, because `protect_batch_id` guards only the
+batch's own prune and note ops are evictable — a 500-paper harmonize would have
+had its undo silently gutted by the next unrelated tag write while the button
+still offered it; (c) Zotero ops were ticked in both phase 2 and phase 3, so
+`[done/total]` overshot; (d) `total` counted (record, target) pairs while the
+message called them tag writes; (e) `zotero_items_without_record` trusted a
+claim set populated inside the loop that breaks on cancel, so a cancelled scan
+reported joined items as orphans — the BBT-key join is recomputed from
+`all_keys` instead, which no cancel can truncate. Both behavioural fixes have
+regression tests verified RED against the pre-fix code.
+
+Gates: 1 937 pytest + 237 CI-only + 460 vitest + ruff + the compile sweep.
+
+## 2026-08-13 (deck prompt cost, citation artifacts, presets, server-discovery self-heal)
+
+Four fixes from one expensive deck run: a 50,421-token prompt billed at $2.51 a
+request, slides littered with raw filenames, and a CLI that reported the app was
+not running while it plainly was.
+
+**The candidate-reference block was mostly surnames.** `bib_candidates_block`
+rendered the BibTeX `author` field verbatim. Measured on the maintainer's
+6,141-entry `_master.bib`, **30 entries (0.5%) held 29% of every author character**
+— the largest 45,344 — and one of them selected into a 12-key block made that
+block **42,871 chars (~10.7k tokens), 94% surnames**, which the agent loop then
+re-sent on every iteration of every section. Worse, `relevant_bib_keys` scored by
+bare substring over `key + author + title`, so a 40k-char surname list acted as a
+*token sponge*: the Global-Burden-of-Disease paper visible in the failing run
+entered a regression lecture's candidates on `aire` and `ratio` alone, both
+matched **inside** surnames, tying on score with genuinely relevant sources and
+winning the alphabetical tiebreak. Mega-author papers were therefore
+*preferentially* selected, then dumped.
+
+Both halves are fixed by one change: the author (3 names + "et al.") and title
+(200 chars) are bounded in `_parse_bib_into`, so the shortened value feeds the
+relevance haystack **and** the rendered block. Safe because those two functions
+are the only consumers of the values; every other caller uses keys. Key matching
+stays unanchored (a BBT key is a run-together camelCase compound — anchoring it
+would lose every real hit), while author/title match at a word-boundary prefix,
+keeping `regression` → `regressions` but rejecting mid-word fragments. Measured
+over four realistic section seeds: **46,112 → 8,902 chars, 81% smaller**, and the
+regression seed now surfaces four actual methods papers instead of an
+air-pollution study. The per-`.bib` parse cache also drops 1.29 MB → 170 KB.
+`docgen` inherits all of it — same two functions.
+
+**Decks no longer carry raw filenames.** The section prompt tells the model to
+attribute claims as `(source: note-name.md)`; that string is now treated as a
+machine-readable **contract** with a deterministic consumer,
+`deckgen/latex.py::rewrite_source_tags`. It works because a Better-BibTeX vault
+names reference notes by citation key — **1,229 of 1,232 Zotero note filenames are
+verbatim `_master.bib` keys** — so a hit is a dict lookup, not a guess: it becomes
+`\citefoot{key}` (`\autocite` for articles), while sources with no key are lifted
+out of the bullets into one grouped `\refline{Source : …}` footer per frame
+(a `\footnote` for prose, which has no frames). Pure, idempotent, indentation
+preserving, and a no-op returning the input object when no tag is present, so a
+citations-off deck is byte-identical to before. Unticking citations passes an
+empty index, so that toggle still means "no `\citefoot`" while the tidying
+still happens. The generate path emits a matching `\providecommand{\refline}`
+into the deck it assembles; the augment path, which overwrites a file the user
+owns, falls back to the macro-free `\vfill{\tiny…}` form rather than edit that
+file's preamble. Wired via two mechanisms: a `post_process` hook on `generate_section` (covering
+generate + salvage for both document classes, bound by the deck route, the
+docgen route **and** the standalone `python -m deckgen` CLI, so no surface is
+left emitting raw filenames) and four direct calls in the augment workers. Two
+`test_cli_integration.py` assertions flipped from the raw tag to the footer,
+which proves the content survived *and* that the pass ran. This replaces a
+hand-run cleanup prompt the maintainer had been firing at finished decks.
+
+**Two of those hand-written prompts ship as optional chips**, distilled to one or
+two sentences each — the workflow scaffolding they carried ("act as an expert",
+"ask for confirmation", "run make", "report in a table") is all already provided
+by the app's own preview/confirm/compile surfaces. A Beamer-audit set on the deck
+augment instruction field and an OCR-cleanup chip in Note Refactor's free-prompt,
+both through the existing `renderExampleChips` primitive (so a typed draft is
+appended to, never clobbered).
+
+**`server.json` now self-heals.** The 2026-08-12 lead — the GUI serving happily
+while its discovery file was absent, silently disabling every CLI/MCP write — is
+still **unexplained and stays open**; this makes it survivable rather than
+pretending to fix it. `ensure_server_info()` re-asserts this process's
+registration from `/api/health`'s cache-miss path, so a vanished record is
+restored within one 15 s UI poll instead of lasting the process's lifetime. It is
+deliberately narrow: a no-op unless this process actually registered, and it
+never overwrites a record naming a live *other* pid, since `clear_server_info`'s
+pid gate depends on nobody stealing another server's claim. `launch.py` now logs
+the write site explicitly (the original investigation could only *infer* it was
+reached, which is what left "never written" and "written then removed"
+indistinguishable), and `papermind status` says what is actually broken plus both
+workarounds instead of a bare "not running".
+
+Gates: 1,881 pytest + 237 CI-only + 424 JS, ruff clean.
+
+## 2026-08-12d (review remediation: `2f8ed8d..bc2e65d`)
+
+A six-seam review of the previous 20 commits, each finding put through a
+refutation pass and a concrete reproduction before it was believed. Seven
+batches, most severe first; every fix landed with a test verified red against
+the pre-fix code.
+
+**Writes that did the wrong thing.** `papermind tagging batch` drops the Finder
+target from a PDF-less row, so `--targets finder --no-pdf-entries` emptied the
+list on every row — and `driver.tagging_apply` tested `if targets:`, omitting
+the key entirely, which the server reads as "every target ON". The user's
+restriction inverted into note + Zotero writes across the library (journalled
+and reversible, but real). The driver now distinguishes an explicit empty
+selection (all-false) from an unset one (`None`), which also closes it for MCP
+clients sending `"targets": []`; the CLI narrows targets at *selection* time so
+an impossible combination costs zero LLM calls; and an unknown target name is
+rejected in both commands instead of silently mapping every real target to
+false. `("note", "finder", "zotero")` became one constant, because that tuple
+decides what a `targets` dict means on the wire.
+
+**The Zotero join's remaining hole.** `d534384` made the identity authoritative
+(BBT citation key) after the title heuristic mis-directed 10 real tag writes,
+but its fallback still matched against every item including keyed ones, first
+wins. With a stale bib key plus a title collision, a record joined onto a paper
+that already belonged to another record — the reproduction shows `smith2020`
+resolving to Owen's item. The fallback now runs as a second pass and refuses to
+guess three ways (ambiguous title, already-claimed item, two records contending),
+with a `zotero_title_refused` counter so refusals are legible. Excluding keyed
+items outright was rejected: all 6194 items here are keyed, so that would have
+made the fallback dead code.
+
+**Honest reporting.** The batch's "resumable by construction" claim was exactly
+backwards — "already tagged" comes from the audit scan snapshot, which no tag
+write updates — so the inventory now carries `scanned_at` (via a new
+*non-draining* `get_scan_times`, never `get_status_payload`) and the batch
+prints the snapshot's age plus the rescan remedy. A wedged provider no longer
+sweeps the library at ~1/s: consecutive propose failures back off and abort.
+
+**Smaller, same shape.** Retire-tag matched candidates with `.lower()` while the
+writer it feeds is NFC-insensitive, so an NFD-stored Finder tag survived a retire
+that reported success. A symlinked `biblio_articles/` 400'd every path-addressed
+removal (containment pre-filter compared a realpath against an unresolved root).
+The deck offered a Finder toggle on cards with no PDF, promising a write the
+server then skipped, and never showed that a proposal came from metadata alone —
+the field the route sends for exactly that purpose. `begin_index_run` published
+its epoch before clearing the stop flag, so a Cancel could release the run's
+op-lock and then be erased.
+
+**Tooling + the deferral registry.** `sync_readmes --prune` verified only
+containment, not authorship, so a hand-written `readme_*.md` in the destination
+was deleted; it now requires the generated frontmatter. `audit_zotero_tag_writes`
+counted already-reverted ops as outstanding (exit 1 forever) and reported removal
+ops with add-semantics, inverting every derived field. The trust-check parity test
+exercised only one of the two deliberate copies despite its name — it now stubs
+tkinter and runs both. The three vault checkers in `docs/` moved into
+`scripts/vault_maintain/` with their hardcoded iCloud path scrubbed, so they carry
+the publish strip *and* the scrub rather than relying on the strip alone. Finally,
+the nine 2026-08-08 leads whose verifiers were cut off are now adjudicated —
+**all nine confirmed**, three reframed, recorded with file:line and repro as a
+ready-to-implement queue rather than re-litigable leads.
+
+## 2026-08-12c (vault indexing: "Update index" appeared to need two clicks)
+
+Clicking **Index** flashed "Indexing complete." and restored the idle buttons;
+clicking it a second time appeared to start the run. Confirmed from
+`chatekld.log`: two clicks, **one** `Starting Obsidian vault indexing…`. The
+first click always started the run — the UI reported the *previous* run's
+outcome, and the second click 503'd into `refreshIndexState`, which re-attached
+to the run already in flight.
+
+`POST /api/obsidian/index` returned 200 before the state transition, which lived
+on the spawned daemon thread (after an `_emit` that writes to the log file).
+`vault.js` polls `/api/obsidian/status` with **zero delay** on that 200 — every
+later poll is on a 2 s timer, so the first is the only racy one — and it lost
+reliably, because `get_status`'s lazy recovery materialises `"done"` into
+`_index_state` (the prewarm poller does that at launch), so the poll took the
+early-return fast path with no disk I/O at all. Beyond the false "complete", the
+same window served a **stale `error_code`/`error_detail`** against the new run
+and hid Pause/Cancel for the ~40 s the store takes to open.
+
+The route now calls `obsidian_manager.begin_index_run(op_epoch)` between
+`try_acquire_lock` and `t.start()`, so the status is non-terminal for every
+client (GUI, CLI, MCP) before the 200 is written. `index_vault` skips its own
+identical preamble for that epoch — not a tidy-up: re-running it would
+`_stop_event.clear()` away a Cancel landing in the admission gap, and since the
+route also publishes `_index_op_epoch`, such a cancel now releases *this*
+acquisition rather than a stale one. `op_epoch=0` (direct callers) can never
+latch, so their path is byte-identical. `abort_index_run` reverts the admission
+if the thread never starts.
+
+Client-side, a matching **run-started latch**: a terminal state seen before any
+running state is treated as the previous run's leftover and repolled at 400 ms,
+bounded at 5 attempts so a run that really did fail before the first poll still
+terminates within ~2 s.
+
+Pinned by `smoke_test.py::test_30d` (state is `scanning` at `t.start()`, and a
+real status GET after the POST reports the run with the stale error record
+cleared), `test_vault_regressions.py::TestIndexRunAdmission` (admission,
+epoch-guarded abort, the preamble skip preserving a gap Cancel, direct-call
+parity) and `tests/js/vaultFirstPoll.test.js` (5 cases). All four were verified
+to fail against the pre-fix code.
+
+## 2026-08-12b (review of the repatriation range: Zotero join + coverage)
+
+A deep review of `6357b65..81ab37d` refuted its three flagged risks (`rec=None`
+deref, `resolve_biblio_pdf_rel` traversal, the xattr sweep's iCloud cost — all
+sound; the sweep is pure `getxattr(2)` at 0.21 ms/file, and the tree has zero
+dataless files) and found one write-affecting bug plus nine smaller issues.
+
+**The Zotero join was by title, and it was wrong.** `_master.bib` ↔ Zotero
+matched on normalized title, first-occurrence-wins, although Better BibTeX
+*derives* the bib key from the item's own `citationKey` field. Measured: 23
+Zotero items claimed by 2+ bib keys, 51 records affected — four different
+papers titled "Schizophrenia" (Owen 2016, Marder 2019, Leucht 2025, Jauhar
+2022) all resolving to one item. `apply-zotero-tags` writes to
+`rec.zotero_item.item_key`, so three of those four tagged the wrong paper.
+Joining on the key instead: **all 6122 records join, none fall through to
+title, 553 previously-unjoined records gain their item and 31 mis-joins are
+corrected**. `scripts/vault_maintain/audit_zotero_tag_writes.py` (read-only)
+re-derives the correct item for every journalled Zotero op — exact, since each
+op records both the citation key and the item key it wrote to — and finds **10
+mis-directed writes** across 1937 ops.
+
+**Two features that had shipped server-side but never reached the screen.**
+`unmapped_rows` (Tag Hygiene's PDFs-with-no-citation-key bucket) was computed
+on every GET and discarded by the client, so the on-screen "outside the
+vocabulary" figure stayed the floor-presented-as-total that work was written to
+remove — while this file and CLAUDE.md recorded it CLOSED. Likewise `?scope=all`
+was never requested by the UI, leaving all 2081 PDF-less records invisible
+however writable they were. Both now render, with a toolbar toggle for the
+latter; `retire-tag` was blind the same way on the write side and now reaches
+those PDFs through the existing path-addressed writer.
+
+**Reconciliation, measured in-process (read-only).** PDFs close exactly: 5765
+total − 353 skip-prefix = 5412 active = 4159 mapped + 968 unmapped + 269
+ambiguous + 16 confirmed-no-match, zero overlap, zero unaccounted; 4041 records
+hold 4159 PDFs because 100 have more than one. Notes: 1447 `.md`, 1232 under
+`Z_Zotero_Notes/`, 215 thematic notes outside the audit **by design**, 1229
+records joined, 3 orphans (a template plus two stale BBT `…a` suffixes).
+Zotero: the apparent "72-item gap" was a net of 653 unjoined items and 553
+bib-only records — after the key join the residual is a clean 72 items carrying
+a citationKey no bib entry uses.
+
+Also: the propose prompt is pinned by a golden string (the old test compared
+`build_messages` against itself with the exemplar knob off, so an edited
+literal would have moved every call together and still passed); the classifier
+no longer sees its own tags as `EXISTING KEYWORDS` (19% of classifiable
+PDF-less records); the tagging manifest serializes compactly (4.76 MB/143 ms →
+2.91 MB/28 ms, five-fold, inside the op-lock); `build_vault_sync_app.sh --dest`
+must end in `.app` before its `rm -rf`; `sync_readmes.py` refuses to `--prune`
+outside the vault; the `batchtags` CLI flag pair no longer has a silently-empty
+combination and the Vault Sync panel probes `/api/health` before running it.
+
+## 2026-08-12 (vault-maintenance repatriation + tagging reaches the whole library)
+
+**Maintenance tooling consolidated into one home.** The vault held three of the
+seven `maintain.sh` step scripts and this checkout the other four, with no
+stated rule. That split cost a second resolution path plus a per-step error
+message, and had produced a real bug: vault commit `84fd52e` pruned
+`.website-deploy` from the attachment audit's walks but the link checker — same
+folder, same walk shape — never got the fix, so deploy-repo files stayed in its
+target map where they could satisfy a genuinely broken link. `sync_readmes.py`,
+`audit_attachments.py` and `check_vault_links.py` moved into
+`scripts/vault_maintain/`, rewired onto `vault_paths.py`; the prune set is now
+one shared `vault_paths.PRUNE_DIRS` so the two walks cannot diverge again. The
+vault keeps only `maintain.sh`.
+
+- **The link checker's docstring became true.** It claimed to check "internal
+  wikilinks across vault" while walking `medecine_sciences/` only — 134 of 1447
+  notes, 9%. Merged with the vault-wide audit written during the 2026-08-11
+  documentation pass: Obsidian-shaped resolution (full rel path, then basename,
+  each ± `.md`), markdown links as well as wikilinks, and code stripped first so
+  an `![](image.png)` *example* in documentation is not counted as breakage.
+  703 → 4513 references checked, still 0 broken. The index-completeness check is
+  unchanged.
+- `sync_readmes.py` wrote its mirrors to `Path(__file__).parent` — correct while
+  it lived *in* the mirror folder, silently wrong once moved. The destination is
+  resolved now and must pre-exist. Its entry point was also discarding
+  `main()`'s return code, so a setup error exited 0.
+
+**Publish flow: STRIP STEP 3.** `scripts/vault_maintain/` (and the now-deleted
+`scripts/batch_tagging/`) are withheld from the public mirror. Three tree
+references would otherwise have dangled there, one fatally — `smoke_test.py`
+imports `check_tex` and would have shipped a suite that fails at import; it now
+skips when the directory is absent. Also scrubbed three personal absolute-path
+literals (macOS username, full iCloud vault path, vault name) that had been
+reintroduced in `orphan_tagger.py` the day after an audit certified the tree
+clean of exactly those.
+
+**Tagging now reaches the entries it never could.** Three boundaries fell, all
+of them the same boundary: the subsystem addressed everything *by citation key*
+via the audit's `Record` join, so anything outside that join was invisible even
+where it was perfectly writable.
+
+- **Path-addressed removal.** `remove-tags` accepts `pdf_rel` as an alternative
+  to `citation_key` (never both). A biblio PDF the bridge never mapped has no
+  `Record` and so could not be named at all. `resolve_biblio_pdf_rel` is the one
+  place in the subsystem where a filesystem path comes from the client and
+  carries `/api/tagging/pdf`'s full discipline, with containment narrowed to the
+  biblio dir — a write is a stronger reason to be narrow than a read. The
+  journalled op keeps its shape, so the revert needed no change.
+- **Tag Hygiene stopped under-reporting.** It iterated `inv.records.values()`,
+  so unmapped PDFs contributed none of their tags: a direct sweep of all 5765
+  biblio PDFs found 5 distinct out-of-vocabulary Finder tags where the report
+  showed 2. Now a separate `unmapped_rows` bucket with its own
+  `--max-hygiene-unmapped` bar — separate, not folded in, so `--max-hygiene`
+  keeps the meaning it has had since the runner shipped. The five tags were then
+  stripped through the new address form (8 PDFs, journalled, reversible); both
+  dimensions read 0 and `maintain.sh` passes all five default steps.
+- **`ZoteroItem.abstract`** read from Zotero SQLite (`_master.bib` has none;
+  BBT does not export one), and **metadata-mode propose**: no PDF, or a PDF with
+  no usable text, now classifies from abstract + bibliographic fields instead of
+  answering `no_text`. The prompt's source line is parametrised so the PDF path
+  stays byte-identical and metadata is labelled as metadata — the system prompt
+  tells the model to return `[]` when the text is "too thin to tell", so
+  mislabelling would push it toward refusing the case the path exists for.
+- **Inventory `?scope=all`** surfaces PDF-less records (`has_pdf` on every row).
+  Opt-in, because it multiplies the row count. `tagging.js` degrades the Finder
+  column, its verb, the PDF panel and the snippet; `_taggedScore` became a
+  *fraction of the targets a row has*, since as a count it ranked by how many
+  targets exist as much as by how tagged they are.
+
+**`papermind tagging batch`** replaces `scripts/batch_tagging/`, deleted. The old
+script wrote frontmatter and Finder xattrs directly — vocabulary-gated, but with
+no journal, no `log_vault_write` trail, no atomic write, no op-lock and no
+confirm beyond `--dry-run`. Every batch write now goes through the app's
+confirm-gated, journalled, reversible endpoints. Resumable by construction;
+`maintain.sh`'s `batchtags` step therefore requires the running app and says so
+when it is absent.
+
+**`Vault Sync.app` is reproducible.** The launcher bundle was a hand-compiled
+artifact on the Desktop, in neither repo, with nothing recording its source.
+`scripts/vault_maintain/build_vault_sync_app.sh` now compiles, ad-hoc signs and
+verifies it into `~/Applications`; the bundle is gitignored. It builds through a
+temp dir and swaps, because `osacompile` writes *into* an existing bundle rather
+than replacing it — recompiling over a live app can leave stale files beside a
+signature that no longer matches.
+
+Measured on the live library, correcting an earlier estimate: **2081** records
+have no local PDF (not ~4100 — that figure came from a bib-keywords proxy
+measuring a different set), and **1155 of them (55%)** carry enough metadata to
+classify.
+
+## 2026-08-11 (vault-maintenance: library audit step + GUI input fix)
+
+- **`scripts/vault_maintain/audit_library.py`** — new pass/fail runner over the
+  audit engine, wired into the vault's `maintain.sh` as the `library` step
+  (default on, ~8.5–9 s over 6 119 records / 5 762 PDFs). Four dimensions, three
+  of them sharing a **single** `build_inventory` call: `note_tag_drift`
+  (actionable = tags missing
+  from the note or spelled two ways; the note-only direction is context, since
+  `batchtags` produces it by design), `zotero_no_pdf` (a ceiling at 2 200 —
+  ~2 080 entries have no local PDF on purpose — not a demand for zero),
+  `duplicates_biblio`, and `tag_hygiene` (which had **no CLI at all**, only
+  `GET /api/audit/reports/tag_hygiene`). Counts print even when passing.
+  Exists because every `check_*` in `audit/scan.py` returns 0 unconditionally,
+  so wiring `python -m audit --check` in would give a permanently green step;
+  `scan.py` keeps its contract untouched. A failed Zotero read or an unreadable
+  `_tags.md` is reported as the finding it is, never as a clean zero.
+- **`maintain_gui.py`** — a non-numeric `jobs` / `md limit` / `pdf limit` was
+  dropped silently (`if jobs.isdigit()`), so a typo fell back to the checker's
+  default with no signal. It now logs a warning naming the field and the
+  rejected value; the log is cleared *before* the command is built so the
+  warning survives.
+
+## 2026-08-10 (plan trees deleted)
+
+- **`docs/` removed from the repo** (maintainer request): both plan trees
+  (`docs/fix_plans_2026-07-30/`, `docs/feature_plans_2026-08-05/`) were
+  shipped work whose every still-open item is mirrored in CLAUDE.md Known
+  Issues (verified by the 2026-08-09 Phase-2 sweep). Recover from git history
+  if needed (last commit carrying them: `5991666`). CLAUDE.md's "Active
+  plan set" pointer replaced with the plans-deleted-after-shipping rule;
+  the PUBLISHING.md strip step is moot while `docs/` stays empty (its
+  re-check-before-publish rule remains).
 
 ## 2026-08-09 (Phase 2 consolidation — docs truth pass + UI/UX pass)
 
@@ -799,7 +5043,7 @@ all fixed in five commits:
   aria-hidden containment glyph, no glyph leaking into the search-panel group
   headings, zero-suppression, delegated cross-links) and by the containment
   invariant `unread.rows ⊆ read.rows` plus the three counts in
-  `test_audit.py::TestReportsServeFromCache`.
+  `test_audit.py::TestUnzoterodReportsUseCache::test_reports_serve_from_cache_without_disk_reads`.
 
 ## 2026-07-30 (fix-plan Plan 9: `rag/vault.py` decomposition, 6,300 → 5,143 lines)
 

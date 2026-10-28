@@ -27,7 +27,7 @@ function tabFor(report) {
 describe('un-Zotero\'d PDF tabs: naming and ordering', () => {
     it('names the superset tab for what it holds, not for "read"', () => {
         const { label } = tabFor('read_unzoterod');
-        expect(label).toContain('PDFs Without Zotero');
+        expect(label).toContain('Unmapped PDFs');
         // The old name claimed a filter the report has never applied.
         expect(label).not.toMatch(/Read PDFs Missing Zotero/);
     });
@@ -61,7 +61,7 @@ describe('un-Zotero\'d PDF tabs: naming and ordering', () => {
         // only the bare label — the aria-label reuses the exact string the
         // search-panel group headings already use (2026-08-04 audit).
         const { html } = tabFor('unread_unzoterod');
-        expect(html).toContain('aria-label="PDFs Without Zotero · Unread Only"');
+        expect(html).toContain('aria-label="Unmapped PDFs · Unread Only"');
     });
 });
 
@@ -76,8 +76,8 @@ describe('un-Zotero\'d PDF tabs: search-panel labels', () => {
         const values = [...block[0].matchAll(/^\s*\w+:\s*'([^']*)'/gm)].map(m => m[1]);
         expect(values.length).toBeGreaterThan(5);
         expect(values.some(v => v.includes('↳'))).toBe(false);
-        expect(values).toContain('PDFs Without Zotero · Unread Only');
-        expect(values).toContain('PDFs Without Zotero');
+        expect(values).toContain('Unmapped PDFs · Unread Only');
+        expect(values).toContain('Unmapped PDFs');
     });
 });
 

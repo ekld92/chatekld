@@ -34,16 +34,20 @@ class ModelPricing:
     cached_input: Optional[float] = None
 
 
-# Multiplier applied to Anthropic cache-WRITE tokens
+# Multiplier applied to reported cache-WRITE tokens
 # (usage.cache_creation_input_tokens): a 5-minute-TTL cache write bills at
 # 1.25× the model's input rate (per platform.claude.com prompt-caching docs,
-# 2026-07). Only the Anthropic adapter populates that field, so the term is
-# inert for every other provider. The 1-hour TTL (2×) is not used by the app.
+# 2026-07). GPT-6.1 Sol reports the same 1.25x write premium; the OpenAI
+# adapter captures it only for that model. It is inert for other providers. The 1-hour TTL (2×) is not used by the app.
 ANTHROPIC_CACHE_WRITE_MULTIPLIER = 1.25
 
 PRICING_TABLE: dict[str, ModelPricing] = {
     # OpenAI — published list prices as of early 2026; treat as defaults
     # that the user can override via llm_pricing_overrides.
+    "gpt-6.1-sol": ModelPricing(input=2.00, output=10.00, cached_input=0.10),
+    "gpt-5.6-sol": ModelPricing(input=4.00, output=20.00, cached_input=0.40),
+    "gpt-5.6-terra": ModelPricing(input=2.00, output=12.00, cached_input=0.20),
+    "gpt-5.6-luna": ModelPricing(input=0.20, output=1.20, cached_input=0.02),
     "gpt-5": ModelPricing(input=1.25, output=10.00, cached_input=0.125),
     "gpt-5-mini": ModelPricing(input=0.25, output=2.00, cached_input=0.025),
     "gpt-5-nano": ModelPricing(input=0.05, output=0.40, cached_input=0.005),
@@ -60,20 +64,20 @@ PRICING_TABLE: dict[str, ModelPricing] = {
     "o3-mini": ModelPricing(input=1.10, output=4.40),
 
     # Anthropic — per platform.claude.com pricing, re-verified 2026-07-04
-    # (Track 5.5). The Opus tier dropped to $5/$25 with Opus 4.5 (2025-11);
-    # the old $15/$75 only applies to Claude 3 Opus. cached_input is the
-    # cache-READ rate = 0.1× input (the write premium is the module-level
-    # ANTHROPIC_CACHE_WRITE_MULTIPLIER, not a per-model column). Sonnet 5's
-    # $3/$15 is the list price (an intro $2/$10 runs through 2026-08-31 —
-    # use llm_pricing_overrides to cost at intro rates). Retired-model
-    # entries are kept so historical usage records still cost out correctly.
+    # Updated 2026-09-23 from official pricing: newer families have different
+    # cache-read ratios (Fable 5.1 is 0.025×, Opus 5.5 is 0.05×). The module
+    # multiplier applies to 5-minute cache writes. Historical rows remain
+    # for older usage records.
     "claude-fable-5": ModelPricing(input=10.00, output=50.00, cached_input=1.00),
+    "claude-fable-5-1": ModelPricing(input=10.00, output=50.00, cached_input=0.25),
+    "claude-opus-5-5": ModelPricing(input=4.00, output=20.00, cached_input=0.20),
+    "claude-opus-5": ModelPricing(input=5.00, output=25.00, cached_input=0.50),
     "claude-mythos-5": ModelPricing(input=10.00, output=50.00, cached_input=1.00),
     "claude-opus-4-8": ModelPricing(input=5.00, output=25.00, cached_input=0.50),
     "claude-opus-4-7": ModelPricing(input=5.00, output=25.00, cached_input=0.50),
     "claude-opus-4-6": ModelPricing(input=5.00, output=25.00, cached_input=0.50),
     "claude-opus-4-5": ModelPricing(input=5.00, output=25.00, cached_input=0.50),
-    "claude-sonnet-5": ModelPricing(input=3.00, output=15.00, cached_input=0.30),
+    "claude-sonnet-5": ModelPricing(input=2.00, output=10.00, cached_input=0.20),
     "claude-sonnet-4-6": ModelPricing(input=3.00, output=15.00, cached_input=0.30),
     "claude-sonnet-4-5": ModelPricing(input=3.00, output=15.00, cached_input=0.30),
     "claude-haiku-4-5": ModelPricing(input=1.00, output=5.00, cached_input=0.10),
@@ -91,6 +95,9 @@ PRICING_TABLE: dict[str, ModelPricing] = {
     # >200k-prompt long-context tier (higher $/Mtok) is not modelled; these
     # single-rate rows under-report very large-context calls.
     "gemini-2.5-pro": ModelPricing(input=1.25, output=10.00, cached_input=0.31),
+    "gemini-3.8-flash": ModelPricing(input=0.75, output=3.75, cached_input=0.075),
+    "google/gemini-3.8-flash": ModelPricing(input=0.75, output=3.75, cached_input=0.075),
+    "gemini-3.6-flash": ModelPricing(input=0.75, output=3.75, cached_input=0.075),
     "gemini-2.5-flash": ModelPricing(input=0.30, output=2.50, cached_input=0.075),
     "gemini-2.5-flash-lite": ModelPricing(input=0.10, output=0.40, cached_input=0.025),
     "gemini-2.0-flash": ModelPricing(input=0.10, output=0.40, cached_input=0.025),
@@ -98,21 +105,15 @@ PRICING_TABLE: dict[str, ModelPricing] = {
     "gemini-1.5-pro": ModelPricing(input=1.25, output=5.00, cached_input=0.3125),
     "gemini-1.5-flash": ModelPricing(input=0.075, output=0.30, cached_input=0.01875),
 
-    # DeepSeek — verified vs api-docs.deepseek.com/quick_start/pricing,
-    # 2026-07-12, RE-verified 2026-07-13 (audit #12 suspected a transcription
-    # slip): the ~2% cache-hit rates ARE correct — DeepSeek V4 prices cache
-    # hits at ~98% off input, far below the ~10-25% ratio other providers
-    # use; do not "fix" them upward. (cache-miss input / output; cached_input
-    # = cache-hit rate.) The deepseek-chat / deepseek-reasoner alias rows were
-    # dropped 2026-07-30: the ids retired at the provider's 2026-07-24 sunset
-    # and the 3→4 config migration resets any persisted selection, so no new
-    # call can carry them (historical usage records store cost at write time).
-    "deepseek-v4-flash": ModelPricing(input=0.14, output=0.28, cached_input=0.0028),
-    "deepseek-v4-pro": ModelPricing(input=0.435, output=0.87, cached_input=0.003625),
+    # DeepSeek — rechecked 2026-09-23. Current Flash is V4.1; the old V4
+    # Flash id is only a temporary alias. Published pricing changes by time
+    # of day, so these static rows use peak rates to avoid under-reporting.
+    "deepseek-flash": ModelPricing(input=0.30, output=1.20, cached_input=0.006),
+    "deepseek-v4-pro": ModelPricing(input=1.32, output=3.96, cached_input=0.044),
 
-    # Z.AI / Zhipu GLM — verified vs docs.z.ai/guides/overview/pricing,
-    # 2026-07-12. glm-4.7-flash and glm-4.5-flash are free-tier ($0).
+    # Z.AI / Zhipu GLM — verified 2026-09-23; the Flash rows are free tier.
     "glm-5.2": ModelPricing(input=1.40, output=4.40, cached_input=0.26),
+    "glm-5.3": ModelPricing(input=1.40, output=4.40, cached_input=0.26),
     "glm-5": ModelPricing(input=1.00, output=3.20, cached_input=0.20),
     "glm-4.7": ModelPricing(input=0.60, output=2.20, cached_input=0.11),
     "glm-4.7-flash": ModelPricing(input=0.0, output=0.0),
@@ -121,11 +122,8 @@ PRICING_TABLE: dict[str, ModelPricing] = {
     "glm-4.5-air": ModelPricing(input=0.20, output=1.10, cached_input=0.03),
     "glm-4.5-flash": ModelPricing(input=0.0, output=0.0),
 
-    # OpenRouter — verified against its public GET /api/v1/models (per-model
-    # pricing, USD/token converted to USD/Mtok), 2026-08-08. Ids are the
-    # aggregator's namespaced form and priced EXACTLY as listed there (the
-    # anthropic/claude-sonnet-5 row is OpenRouter's current $2/$10 intro rate,
-    # deliberately different from the direct-API "claude-sonnet-5" row above).
+    # OpenRouter — verified against public GET /api/v1/models on 2026-09-23;
+    # per-token prices converted to USD per million tokens.
     # A ":variant" suffix (:free, :batch) has its OWN price — hence the
     # explicit :free row at $0 and the namespaced-id guard in
     # estimate_cost_usd (no base-id fallback for vendor/model ids).
@@ -133,11 +131,11 @@ PRICING_TABLE: dict[str, ModelPricing] = {
     "anthropic/claude-sonnet-5": ModelPricing(input=2.00, output=10.00, cached_input=0.20),
     "openai/gpt-5.4-mini": ModelPricing(input=0.75, output=4.50, cached_input=0.075),
     "openai/gpt-5.4": ModelPricing(input=2.50, output=15.00, cached_input=0.25),
-    "google/gemini-3.6-flash": ModelPricing(input=1.50, output=7.50, cached_input=0.15),
+    "google/gemini-3.6-flash": ModelPricing(input=0.75, output=3.75, cached_input=0.075),
     "google/gemini-2.5-pro": ModelPricing(input=1.25, output=10.00, cached_input=0.125),
-    "deepseek/deepseek-v4-flash": ModelPricing(input=0.14, output=0.28, cached_input=0.028),
-    "meta-llama/llama-4-maverick": ModelPricing(input=0.20, output=0.80),
-    "moonshotai/kimi-k2.6": ModelPricing(input=0.5795, output=2.44, cached_input=0.0976),
+    "deepseek/deepseek-v4-flash": ModelPricing(input=0.08554, output=0.17108, cached_input=0.017108),
+    "meta-llama/llama-4-maverick": ModelPricing(input=0.1875, output=0.6525),
+    "moonshotai/kimi-k2.6": ModelPricing(input=0.95, output=4.00, cached_input=0.16),
     "nvidia/nemotron-3-super-120b-a12b:free": ModelPricing(input=0.0, output=0.0),
 }
 
@@ -152,6 +150,7 @@ def estimate_cost_usd(model: str, usage: LLMUsage, overrides: Optional[dict] = N
     shape ``{"model_id": {"input": <usd_per_mtoken>, "output": <usd_per_mtoken>}}``.
     """
     pricing = None
+    custom_pricing = False
     if overrides and model in overrides:
         try:
             # cached_input MUST be float()ed inside this guard too: a quoted
@@ -165,6 +164,7 @@ def estimate_cost_usd(model: str, usage: LLMUsage, overrides: Optional[dict] = N
                 output=float(overrides[model]["output"]),
                 cached_input=None if raw_cached is None else float(raw_cached),
             )
+            custom_pricing = True
         except (KeyError, TypeError, ValueError):
             pricing = None
     if pricing is None:
@@ -182,11 +182,16 @@ def estimate_cost_usd(model: str, usage: LLMUsage, overrides: Optional[dict] = N
         pricing = PRICING_TABLE.get(model.split(":")[0])
     if pricing is None:
         return 0.0
+    # Explicit overrides are final per-token rates; do not scale them again.
+    if model == "gpt-6.1-sol" and usage.input_tokens > 272_000 and not custom_pricing:
+        pricing = ModelPricing(input=pricing.input * 2, output=pricing.output * 1.5,
+                               cached_input=pricing.cached_input * 2
+                               if pricing.cached_input is not None else None)
     cost = (usage.output_tokens / 1_000_000) * pricing.output
     # Cache accounting (Track 5.5). ``input_tokens`` is the TOTAL prompt size
     # (the adapters normalise Anthropic's exclusive counts — see
     # LLMUsage's field notes); the cached subset bills at the model's
-    # cached_input (read) rate and the Anthropic cache-write subset at
+    # cached_input (read) rate and the reported cache-write subset at
     # 1.25× input. ``getattr`` default keeps legacy call sites passing a
     # pre-field LLMUsage (or a test stub) costing out as before.
     cached = usage.cached_input_tokens
@@ -283,8 +288,11 @@ class UsageTracker:
         # key and triggers a re-parse.
         self._disk_cache: list[UsageRecord] = []
         self._disk_cache_key: Optional[tuple[int, int]] = None
+        # Incremental summary folds, one per `since_iso` window (perf plan
+        # Phase 4.1). See _disk_fold.
+        self._folds: dict[Optional[str], dict] = {}
 
-    def configure(self, log_path: str) -> None:
+    def configure(self, log_path: Optional[str]) -> None:
         """Point the tracker at *log_path* and drop the parsed-disk cache.
 
         Resetting the cache forces the next :meth:`summary` to re-read the new file
@@ -294,6 +302,13 @@ class UsageTracker:
             self._log_path = log_path
             self._disk_cache = []
             self._disk_cache_key = None
+            self._folds = {}
+
+    @property
+    def log_path(self) -> Optional[str]:
+        """The JSONL this tracker appends to, or ``None`` when unconfigured."""
+        with self._lock:
+            return self._log_path
 
     def record(
         self,
@@ -304,6 +319,7 @@ class UsageTracker:
         latency_ms: int,
         stream: bool,
         success: bool = True,
+        billable: Optional[bool] = None,
         error_category: str = "",
         pricing_overrides: Optional[dict] = None,
         workflow: str = "",
@@ -314,7 +330,8 @@ class UsageTracker:
         ``self._lock``; the (slower, fallible) file append is done AFTER releasing
         the lock — snapshotting ``log_path`` first — so disk I/O never serialises
         every concurrent recorder. A failed request is recorded with ``cost=0.0``
-        (no charge for a call that produced nothing) and a fresh ``uid`` is minted
+        (no charge for a call that produced nothing), unless ``billable``
+        explicitly preserves reported or estimated usage on failure. A fresh ``uid`` is minted
         for cross-store de-duplication. A disk-write failure is swallowed (the
         in-memory ring still has it); recording must never break the caller's path.
 
@@ -339,7 +356,7 @@ class UsageTracker:
         # adapters' stream `finally` blocks, so ANY exception out of the cost
         # estimator turns a successful generation into a reported failure.
         try:
-            cost = estimate_cost_usd(model, usage, pricing_overrides) if success else 0.0
+            cost = estimate_cost_usd(model, usage, pricing_overrides) if (success if billable is None else billable) else 0.0
         except Exception:  # noqa: BLE001 — costing must never break recording
             cost = 0.0
         usage.estimated_cost_usd = cost
@@ -425,18 +442,10 @@ class UsageTracker:
         ``since_iso`` is an ISO-8601 cutoff; records older than that are
         skipped. Use ``None`` for the lifetime total.
         """
-        summary = UsageSummary()
         # De-dup the in-memory ring against the on-disk JSONL by per-record
         # uid (not (timestamp, provider), which could collide two distinct
         # requests and under-count one when a disk write failed).
-        seen: set[str] = set()
-
-        for record in self._disk_records():
-            if since_iso and record.timestamp < since_iso:
-                continue
-            if record.uid:
-                seen.add(record.uid)
-            self._accumulate(summary, record)
+        summary, seen = self._disk_fold(since_iso)
 
         with self._lock:
             recent = list(self._recent)
@@ -448,6 +457,93 @@ class UsageTracker:
             self._accumulate(summary, record)
 
         return summary
+
+    # PERF (2026-09-02): the on-disk window is kept as a FOLD, not a list.
+    # Before: _disk_records parsed the whole JSONL — up to _MAX_LOG_BYTES
+    #   (10 MB) live plus the same again rotated — into UsageRecord
+    #   dataclasses, held them for the process lifetime, and summary()
+    #   re-folded all of them on every call. The cache key is the log's
+    #   (size, mtime_ns) and EVERY LLM call appends, so any /api/usage poll
+    #   during generation re-read and re-parsed everything. Measured on a
+    #   synthetic 20 000-record log (5.0 MB): 128.6 ms per summary() and
+    #   28.2 MB of retained records.
+    # Change: per-window incremental folds. Each remembers the byte offset it
+    #   has consumed of the live log, the rotated file's signature, the
+    #   accumulated UsageSummary and a BOUNDED tail of disk uids; a later
+    #   summary() parses only the bytes appended since. Same log: 128.6 ms
+    #   cold, 0.6 ms per poll while appending, 1.5 MB retained.
+    # Safe because:
+    #   The fold accumulates exactly what the full pass accumulated, in the
+    #   same order, through the same _accumulate. Anything that could
+    #   invalidate an offset — a rotation, a shrunk or replaced live log, a
+    #   changed rotated file, a reconfigure — falls back to a full re-fold,
+    #   so the incremental path is only ever taken for a pure append. The
+    #   ring de-dup is unchanged in kind: the ring holds at most _RING_SIZE
+    #   (500) records, so a uid it shares with disk is necessarily among the
+    #   last _FOLD_UID_TAIL (1 000) disk uids.
+    # Preserves: "Uid de-dup against the ring and the read-both-generations
+    #   rotation window" — the rotated generation is still read first and in
+    #   full, and a rotation resets the fold rather than skipping records.
+    # Lock/thread contract: the module lock is taken only around the fold
+    #   dict's read and write, never across the file read or the parse.
+    # Pinned by: test_llm.py::TestUsageFold (red before the change:
+    #   "20000 != 3" records parsed by the second summary()).
+    def _disk_fold(self, since_iso: Optional[str]) -> tuple[UsageSummary, set]:
+        """``(summary, seen_uids)`` for the on-disk window, folded incrementally."""
+        with self._lock:
+            log_path = self._log_path
+            cached = self._folds.get(since_iso)
+        if not log_path:
+            return UsageSummary(), set()
+
+        rot_path = log_path + _ROTATED_SUFFIX
+        rot_sig = _file_sig(rot_path)
+        live_sig = _file_sig(log_path)
+
+        reusable = (
+            cached is not None
+            and cached["rot_sig"] == rot_sig
+            and live_sig is not None
+            and cached["live_sig"] is not None
+            # A live log that shrank (rotation, truncation, replacement) or
+            # whose inode changed cannot be an append of the one we folded.
+            and live_sig[0] >= cached["live_sig"][0]
+            and live_sig[2] == cached["live_sig"][2]
+        )
+        if reusable and cached is not None and live_sig == cached["live_sig"]:
+            return _copy_summary(cached["summary"]), set(cached["uid_tail"])
+
+        if reusable and cached is not None:
+            summary = _copy_summary(cached["summary"])
+            uid_tail = deque(cached["uid_tail"], maxlen=_FOLD_UID_TAIL)
+            offset = cached["offset"]
+            paths: tuple[tuple[str, int], ...] = ((log_path, offset),)
+        else:
+            summary = UsageSummary()
+            uid_tail = deque(maxlen=_FOLD_UID_TAIL)
+            paths = ((rot_path, 0), (log_path, 0))
+
+        end_offset = 0
+        for path, start in paths:
+            consumed, records = _read_records_from(path, start)
+            if path == log_path:
+                end_offset = consumed
+            for record in records:
+                if record.uid:
+                    uid_tail.append(record.uid)
+                if since_iso and record.timestamp < since_iso:
+                    continue
+                self._accumulate(summary, record)
+
+        with self._lock:
+            self._folds[since_iso] = {
+                "rot_sig": rot_sig,
+                "live_sig": _file_sig(log_path),
+                "offset": end_offset,
+                "summary": summary,
+                "uid_tail": deque(uid_tail, maxlen=_FOLD_UID_TAIL),
+            }
+        return _copy_summary(summary), set(uid_tail)
 
     def _disk_records(self) -> list[UsageRecord]:
         """Return the on-disk records, re-parsing only when the file changed."""
@@ -527,17 +623,41 @@ class UsageTracker:
         """
         if size <= _MAX_LOG_BYTES:
             return
-        try:
-            os.replace(log_path, log_path + _ROTATED_SUFFIX)
-        except OSError:
-            logger.debug("could not rotate usage log %s", log_path, exc_info=True)
-            return
+        # DURABILITY (2026-09-02, performance plan Phase 5): re-stat UNDER the
+        # lock before rotating.
+        # Before: two recorders whose appends both crossed the cap each ran
+        #   os.replace(log, log.1). The first moved the full generation aside;
+        #   the second then moved the NEW, nearly-empty live log over it,
+        #   destroying every record the first had just preserved.
+        # Change: the size is re-read inside the lock and the rotation is
+        #   skipped when the live log is already under the cap — i.e. when
+        #   someone else has just rotated it.
+        # Safe because: the check and the rename are now one critical section,
+        #   so at most one rotation happens per generation; a rotation that
+        #   loses the race simply does nothing, which is what the caller's
+        #   best-effort contract already allows.
+        # Pinned by: test_llm.py::TestUsageRotationRace.
         with self._lock:
+            try:
+                if os.stat(log_path).st_size <= _MAX_LOG_BYTES:
+                    return          # another recorder rotated it already
+            except OSError:
+                return
+            try:
+                os.replace(log_path, log_path + _ROTATED_SUFFIX)
+            except OSError:
+                logger.debug("could not rotate usage log %s", log_path,
+                             exc_info=True)
+                return
             # The parsed-disk cache is keyed on the LIVE file's (size, mtime),
             # which the rotation just invalidated; drop it so the next summary
-            # re-reads both generations instead of trusting a stale parse.
+            # re-reads both generations instead of trusting a stale parse. The
+            # incremental folds key on the same signatures and would fall back
+            # to a full re-fold on their own; dropping them is cheaper than
+            # reasoning about it.
             self._disk_cache = []
             self._disk_cache_key = None
+            self._folds = {}
 
     @staticmethod
     def _accumulate(summary: UsageSummary, record: UsageRecord) -> None:
@@ -693,6 +813,70 @@ CANCELLED_ERROR_CATEGORY = "cancelled"
 #: that suffix. One generation is kept and BOTH are read by the summary, so a
 #: rotation never punches a hole in a reporting window. 10 MB is ~40k records —
 #: far more than the 500-record ring or any realistic /api/usage window.
+#: Disk uids retained per fold for the ring de-dup. The ring holds at most
+#: UsageTracker._RING_SIZE (500) records, so a uid shared between ring and
+#: disk is always inside this tail; the doubled bound is pure headroom.
+_FOLD_UID_TAIL = 1000
+
+
+def _file_sig(path: str):
+    """``(size, mtime_ns, inode)`` for *path*, or None when it does not exist."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns, st.st_ino)
+
+
+def _copy_summary(summary: "UsageSummary") -> "UsageSummary":
+    """A deep-enough copy: callers mutate the per-provider/model sub-dicts."""
+    out = UsageSummary(
+        total_requests=summary.total_requests,
+        total_input_tokens=summary.total_input_tokens,
+        total_output_tokens=summary.total_output_tokens,
+        total_cost_usd=summary.total_cost_usd,
+    )
+    out.by_provider = {k: dict(v) for k, v in summary.by_provider.items()}
+    out.by_model = {k: dict(v) for k, v in summary.by_model.items()}
+    return out
+
+
+def _read_records_from(path: str, offset: int) -> tuple[int, list["UsageRecord"]]:
+    """Parse JSONL from *offset*; return ``(new_offset, records)``.
+
+    Tolerant in exactly the way :meth:`UsageTracker._iter_disk_records` is: a
+    truncated final line, a bad JSON line or a schema-drifted row is skipped,
+    never fatal. A partial trailing line (a crash mid-append) leaves the
+    offset BEFORE it, so the next call re-reads it once it is complete.
+    """
+    records: list[UsageRecord] = []
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            data = fh.read()
+    except OSError:
+        return offset, records
+    consumed = offset
+    for raw in data.split(b"\n"):
+        line_len = len(raw) + 1
+        if consumed + line_len > offset + len(data):
+            # The trailing fragment has no newline yet: leave it unconsumed.
+            break
+        consumed += line_len
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        try:
+            records.append(UsageRecord(**parsed))
+        except TypeError:
+            continue
+    return consumed, records
+
+
 _MAX_LOG_BYTES = 10 * 1024 * 1024
 _ROTATED_SUFFIX = ".1"
 

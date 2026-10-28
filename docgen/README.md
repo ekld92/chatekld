@@ -1,12 +1,12 @@
-# docgen — vault → LaTeX article / report **or** Markdown note
+# docgen — LaTeX reports and Markdown reports / slides
 
-`docgen` is the **prose sibling of [`deckgen`](../deckgen/README.md)**: it turns a
-topic + free-form instructions into a grounded long-form document instead of a slide
-deck. Like `deckgen`'s core it is **app-independent** (it never imports the Flask app);
-unlike `deckgen` it has **no standalone CLI** — it is driven only through the app's
+`docgen` shares the engine of [`deckgen`](../deckgen/README.md): it turns a
+topic + free-form instructions into a grounded LaTeX report, Markdown report, or
+Markdown slide deck. Like `deckgen`'s core it is **app-independent** (it never imports the Flask app);
+it has **no module-specific executable**. CHERQAiN CLI and MCP generation use the app's HTTP
 `/api/docgen/*` blueprint ([`api/routes/docgen.py`](../api/routes/docgen.py)).
 
-It produces one of two kinds:
+Studio offers the following outputs:
 
 - **LaTeX article/report** (`\documentclass{article}`, prose `\section`s — not slides):
   **emit-only**, exactly like the deck. Scaffolds a compile-ready `<slug>/<slug>.tex` +
@@ -14,11 +14,20 @@ It produces one of two kinds:
   and opt-in **Compile & Auto-Fix**.
 - **Markdown note written into your vault**: a NEW long-form `.md` note (`# Title` +
   `## sections`) under a sub-folder you choose. It **never overwrites** an existing note
-  and is **journalled + reversible** from Note Refactor → Restore — the app's third
-  vault-write path (via [`refactor/create_note.py`](../refactor/create_note.py)).
+  and is **journalled + reversible** from **Settings → History and Restore**
+  (via [`vault_history/create_note.py`](../vault_history/create_note.py)).
+- **Markdown slide deck**: the same new-file workflow with slide-specific prompts
+  and `---` separators. Its checkpoint identity is distinct from a report.
 
-Both grounding rules from the deck carry over: the vault is the **sole** source, claims
-cite their source note inline as `(source: note-name.md)`, and nothing is invented.
+In **Studio → Augment → Markdown**, previews contain additions only; a separate
+confirmation appends them to the existing document. The original bytes are
+preserved in a restore snapshot. This is not a replacement or rewriting tool.
+Source changes or a server restart require a fresh preview. Unapplied previews
+are temporary; uncertain apply outcomes retain evidence for History and Restore.
+
+The deck grounding rules carry over: prompts require vault sources and inline
+citations such as `(source: note-name.md)`. Generated claims and citations still
+need review; prompt instructions do not establish factual correctness.
 
 ## Built on deckgen's engine
 
@@ -39,13 +48,14 @@ duplicating it:
 
 ## Module map
 
+- `markdown_slides.py` — slide-specific Markdown hooks and checkpoint identity.
 - `article.py` — the `ARTICLE` `DocClassStrategy`: `sanitize_article_section` (a `\section`
   gate, not a frame gate), `assemble_article`, `validate_article`
   (= article structural check + `validate_common`); re-exports the substrate.
 - `prompts.py` — prose **article** outline / section / augment prompts + message builders
-  (see [PROMPTS.md §8a-8c](../PROMPTS.md)).
+  (see `docgen/prompts.py`).
 - `markdown.py` — the **Markdown** kind: heading-gated `sanitize_markdown_section`,
-  `assemble_markdown`, Markdown prompts (PROMPTS.md §8d-8e), and the outline/section bindings.
+  `assemble_markdown`, Markdown prompts (`docgen/prompts.py`), and the outline/section bindings.
 - `generate.py` — binds `deckgen.outline`/`sections` to the article hooks.
 - `review.py` — `screen_article_repair`, the augment/compile safety gate (pure; the
   structural floor is "≥1 `\section`" instead of the deck's "≥1 frame").
@@ -62,5 +72,4 @@ app-side.
 `docgen_*` config keys mirror `deck_*` (temperature, max sections 1-30, agent iterations,
 per-section attempts/backoff/max-tokens, resume) and are set in the LLM Settings window's
 **"Report / Article · generation"** section. Augment and Compile & Auto-Fix reuse the
-`deck_agent_*` / `deck_compile_*` / `deck_review_*` knobs. See the root
-[README](../README.md#config-keys) and [CLAUDE.md](../CLAUDE.md) for the full contract.
+`deck_agent_*` / `deck_compile_*` / `deck_review_*` knobs. See [`core/README.md`](../core/README.md#config-keys-configjson) and [`CLAUDE.md`](../CLAUDE.md) for the full contract.

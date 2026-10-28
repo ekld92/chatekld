@@ -31,12 +31,19 @@ const REFUSAL =
     + "would now come from 'lm_studio'. Refusing to touch the index.";
 
 /**
- * Mock fetch: index POSTs are recorded (bodies parsed); the FIRST status poll
- * answers with `statusPayload`, later polls park forever so the test stays in
- * control of the poll loop.
+ * Mock fetch: index POSTs are recorded (bodies parsed); the first status poll
+ * answers `scanning`, the second with `statusPayload`, later polls park forever
+ * so the test stays in control of the poll loop.
+ *
+ * The `scanning` poll is not scaffolding — it is what the real server returns
+ * now that `POST /api/obsidian/index` publishes the run state before its 200
+ * (2026-08-12). The client's run-started latch deliberately ignores a terminal
+ * state seen before any running state, because that is the PREVIOUS run's
+ * leftover; serving the error on poll #1 would exercise a shape the server can
+ * no longer produce.
  */
 function mockVaultFetch(state) {
-    let statusServed = false;
+    let statusPolls = 0;
     return vi.fn((url, opts = {}) => {
         const u = String(url);
         if (u.includes('/api/obsidian/index')) {
@@ -44,8 +51,14 @@ function mockVaultFetch(state) {
             return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true }) });
         }
         if (u.includes('/api/obsidian/status')) {
-            if (!statusServed) {
-                statusServed = true;
+            statusPolls += 1;
+            if (statusPolls === 1) {
+                return Promise.resolve({
+                    ok: true, status: 200,
+                    json: async () => ({ state: 'scanning', messages: [], warnings: [] }),
+                });
+            }
+            if (statusPolls === 2) {
                 return Promise.resolve({
                     ok: true, status: 200, json: async () => state.statusPayload,
                 });
@@ -62,15 +75,23 @@ describe('vault indexing error detail (2026-07-29)', () => {
     beforeEach(async () => {
         mountVaultDom();
         vi.resetModules();
+        vi.useFakeTimers();
         state = { indexPosts: [], statusPayload: {} };
         vi.stubGlobal('fetch', mockVaultFetch(state));
         vault = await import('../../static/js/vault.js');
     });
-    afterEach(() => vi.unstubAllGlobals());
+    afterEach(() => {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+    });
 
     async function runToError(statusPayload) {
         state.statusPayload = { messages: [], warnings: [], ...statusPayload };
-        await vault.indexVault();
+        await vault.indexVault();          // poll #1 → scanning (run observed)
+        // Poll #2 carries the payload, one steady-state poll interval later.
+        // Advanced explicitly rather than waited out, so the file stays fast
+        // and does not depend on the interval's exact value.
+        await vi.advanceTimersByTimeAsync(2100);
         await vi.waitFor(() => {
             expect(document.getElementById('vault-error-boundary').textContent)
                 .not.toBe('');

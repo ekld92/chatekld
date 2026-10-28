@@ -2,7 +2,7 @@
 
 `deckgen` is a **standalone CLI** that turns a topic + free-form instructions into a
 LaTeX **Beamer** lecture deck, grounded in your indexed Obsidian vault. It does this
-entirely by driving the **running ChatEKLD app** over its local HTTP API — it adds no
+entirely by driving the **running CHERQAiN app** over its local HTTP API — it adds no
 retrieval, embedding, or LLM code of its own and **never imports the app**.
 
 It **emits `.tex` only** (you compile it yourself), cites sources as **plain prose**
@@ -68,7 +68,7 @@ whole-deck turn would.
 > **Start fresh** (body `force_fresh`) to discard saved progress and regenerate. The `job_key` hashes
 > only the content-determining inputs, so tweaking a sampling/retry knob still resumes the same deck.
 
-> **Why a sanitize/assemble step?** ChatEKLD's `system_prompt` is a *prefix* over its own
+> **Why a sanitize/assemble step?** CHERQAiN's `system_prompt` is a *prefix* over its own
 > answer template (it keeps the grounding + safety preamble), so the model's output cannot
 > be guaranteed to be pure Beamer. `deckgen` therefore steers the model *and* strips/wraps
 > the result itself in [`assemble.py`](assemble.py).
@@ -82,7 +82,7 @@ pip install -r deckgen/requirements.txt   # just `requests`
 
 ## Usage
 
-The ChatEKLD app binds to a **dynamic port** (logged as `Starting Flask on port N` in
+The CHERQAiN app binds to a **dynamic port** (logged as `Starting Flask on port N` in
 `chatekld.log`). Pass it with `--port`, or `--base-url`; with neither, `deckgen` tries to
 auto-discover the port from the log.
 
@@ -120,7 +120,7 @@ cd <slug> && make view                          # template mode: build with your
 
 ## Template mode (custom Beamer templates with custom functions)
 
-With `--template <path.tex>` (or the in-app **Deck Generator** window), deckgen:
+With `--template <path.tex>` (or the in-app **Studio → Slide deck → Generate → LaTeX** view), deckgen:
 
 - splits your template into `preamble` / opening scaffold (title + outline frames) /
   closing tail (`split_template`) and **reuses the preamble verbatim** — your document
@@ -177,10 +177,10 @@ Commented-out `\usepackage` / `\addbibresource` lines are ignored. The in-app wi
 
 ## Augment mode (deepen / extend an existing deck) — in-app only
 
-The Deck Generator window also **augments a deck that already exists** (one deckgen produced,
+**Studio → Slide deck → Augment → LaTeX** also **augments a deck that already exists** (one deckgen produced,
 or hand-written) from a free-text instruction: *deepen* a section, *add a table*, or *add a
-new section*. Like generation it is vault-grounded and **emit-only with a preview**, mirroring
-Note Refactor's preview-then-confirm write model. The deckgen **core stays app-independent**
+new section*. Like generation it is vault-grounded: the preview writes nothing to the target,
+and applying it requires a separate confirmation. The deckgen **core stays app-independent**
 ([`augment.py`](augment.py) is pure; the model call + the disk write live in
 `api/routes/deck.py`, alongside the integrity-review call).
 
@@ -326,7 +326,7 @@ at the repo root (which *is* hermetic).
   candidate set; `validate` flags invented keys but cannot guarantee the *right* key was
   chosen. Plain-prose `(source: note.md)` otherwise.
 - Output quality depends on the model honoring the steering prompt; small local models may
-  fall back to plain RAG (ChatEKLD surfaces a capability warning — `deckgen` echoes it).
+  fall back to plain RAG (CHERQAiN surfaces a capability warning — `deckgen` echoes it).
 - Cross-section coherence is best-effort; the whole outline is passed into each section
   call to reduce drift/overlap, but it is not eliminated.
 
@@ -344,7 +344,7 @@ Captured from a 2026-06-19 design review on **offline batch generation** (e.g. "
   - *(B) One prompt → N topics* — add a thin pre-step (one local LLM call: "propose N
     teaching topics on X as a JSON list") that feeds each topic into path (A). This is
     the only piece not already present; it belongs **outside** the app-independent core
-    (wrap `ChatEKLDClient` / `InProcessChatRunner`), e.g. a `deckgen` batch subcommand or
+    (wrap `CHERQAiNClient` / `InProcessChatRunner`), e.g. a `deckgen` batch subcommand or
     a separate script.
 - **Two hard prerequisites for an offline run:**
   1. *A running, indexed Obsidian vault that actually covers every topic.* Outlines and

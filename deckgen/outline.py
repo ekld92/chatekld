@@ -1,6 +1,6 @@
 """Outline phase: ask the agent for a lecture outline and parse it robustly.
 
-The model is asked for a JSON array, but ChatEKLD's prompt template means we
+The model is asked for a JSON array, but CHERQAiN's prompt template means we
 cannot guarantee pure JSON output. ``parse_outline`` therefore tries JSON first
 (extracting the first balanced ``[...]`` span) and falls back to parsing a
 markdown/numbered heading+bullet list before giving up.
@@ -19,7 +19,7 @@ from .prompts import OUTLINE_SYSTEM_PROMPT, build_outline_message
 # without the HTTP dependency installed. Type hints below are strings thanks to
 # ``from __future__ import annotations``.
 if TYPE_CHECKING:  # type-only — never imported at runtime, so the core stays requests-free
-    from .client import ChatEKLDClient
+    from .client import CHERQAiNClient
     from .result import ChatResult
 
 
@@ -83,7 +83,7 @@ def _emit_info(on_event, text: str) -> None:
 
 
 def request_outline(
-    client: ChatEKLDClient,
+    client: CHERQAiNClient,
     *,
     topic: str,
     instructions: str,

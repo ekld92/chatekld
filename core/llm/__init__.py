@@ -1,4 +1,4 @@
-"""Provider-agnostic LLM layer for ChatEKLD.
+"""Provider-agnostic LLM layer for CHERQAiN.
 
 This package exposes a small, uniform LLM interface that wraps both the
 existing local providers (Ollama, LM Studio) and the new online providers

@@ -49,7 +49,7 @@ def test_corrupt_mapping_is_preserved_before_overwrite(tmp_path: Path) -> None:
     bridge.add_match(mapping, pdf, "keyA", vault)
 
     # The new mapping parses and holds the new entry.
-    matches, _no, _h = bridge._load_mapping_full(mapping)
+    matches, _no, _h, _src = bridge._load_mapping_full(mapping)
     assert matches.get("keyA")
     # The corrupt original was preserved, not lost.
     preserved = list(vault.glob("mapping.json.corrupt-*"))

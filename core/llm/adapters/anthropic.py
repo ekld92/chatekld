@@ -13,11 +13,12 @@ import logging
 import os
 import re
 import threading
+from collections import OrderedDict
 import time
 from typing import Iterator, Optional
 
 from core.llm.base import LLMProvider, StreamingResponse, looks_like_quota
-from core.llm.retry import parse_retry_after_s, retry_with_backoff
+from core.llm.retry import check_request_dispatch, parse_retry_after_s, retry_with_backoff
 from core.llm.tool_schema import (
     build_anthropic_messages,
     jsonschema_to_anthropic_tool,
@@ -32,6 +33,7 @@ from core.llm.types import (
     LLMUsage,
 )
 from core.llm.usage import CANCELLED_ERROR_CATEGORY, usage_tracker
+from core.llm.parameter_cache import is_rejected, remember_rejected
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +50,23 @@ logger = logging.getLogger(__name__)
 # stale-auth risk and no need to fingerprint the key here. The listing call
 # (_fetch_live_models) keeps its own short-lived client (different, shorter
 # timeout, rare + TTL-cached) and is intentionally left uncached.
-_client_cache: dict = {}
+# PERF (2026-09-02): bounded LRU, mirroring core/providers/lms.py.
+# Before: a plain dict with no eviction. The keyspace is small in normal use,
+#   but a rotated API key mints a new entry whose predecessor is never
+#   dropped, stranding that client's idle httpx/openai connection pool for
+#   the process lifetime.
+# Change: an OrderedDict capped at _CLIENT_CACHE_MAX (8), LRU-evicted.
+# Safe because: an evicted client is not closed here — a concurrent call may
+#   still be streaming on it; dropping the reference lets GC close it once the
+#   in-flight call ends (the lms.py rule, quoted). A cache miss constructs
+#   exactly the client the miss path constructed before.
+# Preserves: key-rotation safety — the key composition is untouched, so a new
+#   key still yields a new client rather than reusing stale auth.
+# Lock/thread contract: unchanged; every read/write stays inside
+#   _client_cache_lock.
+# Pinned by: test_llm.py::TestOnlineClientCacheBound.
+_CLIENT_CACHE_MAX = 8
+_client_cache: OrderedDict = OrderedDict()
 _client_cache_lock = threading.Lock()
 
 # Active models only (per platform.claude.com; newest generations added
@@ -58,6 +76,9 @@ _client_cache_lock = threading.Lock()
 # because those models are retired and now 404: 3.5 Sonnet (2025-10),
 # 3 Opus (2026-01), 3.5 Haiku (2026-02).
 CURATED_MODELS: list[str] = [
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-opus-5",
     "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
@@ -85,6 +106,7 @@ _SAMPLING_REMOVED_MODEL_PREFIXES = (
     "claude-mythos-5",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-5",
     "claude-sonnet-5",
 )
 
@@ -99,6 +121,14 @@ def _sampling_params_removed(model: str) -> bool:
     return (model or "").lower().startswith(_SAMPLING_REMOVED_MODEL_PREFIXES)
 
 
+def _supports_effort(model: str) -> bool:
+    """Families whose official docs support output_config.effort."""
+    return (model or "").lower().startswith((
+        "claude-fable-5", "claude-opus-5", "claude-opus-4-7",
+        "claude-opus-4-8", "claude-sonnet-5",
+    ))
+
+
 def _strip_rejected_sampling_param(payload: dict, message: str, healed: set) -> str:
     """Reactive self-heal for a sampling-param 400: mutate *payload*, retry.
 
@@ -110,6 +140,19 @@ def _strip_rejected_sampling_param(payload: dict, message: str, healed: set) -> 
     better than the terminal 400 the user otherwise sees, and it absorbs the
     next family's parameter drift without an adapter update.
     """
+    if ("output_config" in payload and "output_config" not in healed
+            and re.search(r"\b(?:output_config|effort)\b", message or "")):
+        healed.add("output_config")
+        payload.pop("output_config", None)
+        return "dropped unsupported output_config.effort"
+    if ("temperature" in payload and "top_p" in payload
+            and "top_p" not in healed
+            and "both" in (message or "").lower()
+            and "temperature" in (message or "").lower()
+            and "top_p" in (message or "").lower()):
+        healed.add("top_p")
+        payload.pop("top_p", None)
+        return "dropped top_p; keeping temperature"
     for candidate in _STRIPPABLE_SAMPLING_PARAMS:
         if candidate in healed or candidate not in payload:
             continue
@@ -124,6 +167,9 @@ _STOP_REASON_MAP: dict[str, FinishReason] = {
     "stop_sequence": FinishReason.STOP,
     "max_tokens": FinishReason.LENGTH,
     "tool_use": FinishReason.TOOL_USE,
+    "refusal": FinishReason.CONTENT_FILTER,
+    "model_context_window_exceeded": FinishReason.LENGTH,
+    "pause_turn": FinishReason.OTHER,
 }
 
 
@@ -254,6 +300,10 @@ class AnthropicProvider(LLMProvider):
             if client is None:
                 client = httpx.Client(timeout=self.timeout_s)
                 _client_cache[key] = client
+                while len(_client_cache) > _CLIENT_CACHE_MAX:
+                    _client_cache.popitem(last=False)  # evict LRU; GC closes it
+            else:
+                _client_cache.move_to_end(key)
             return client
 
     def supports_embeddings(self) -> bool:
@@ -336,6 +386,8 @@ class AnthropicProvider(LLMProvider):
             "messages": build_anthropic_messages(request),
             "stream": stream,
         }
+        if request.reasoning_effort and _supports_effort(request.model):
+            payload["output_config"] = {"effort": "low"}
         if request.system_prompt:
             # Prompt caching (Track 5.5, 2026-07-04): the system prompt goes as
             # a block array with a cache_control breakpoint instead of a bare
@@ -366,7 +418,10 @@ class AnthropicProvider(LLMProvider):
         if not _sampling_params_removed(request.model):
             if request.temperature is not None:
                 payload["temperature"] = min(float(request.temperature), 1.0)
-            if request.top_p is not None:
+            if request.top_p is not None and not (
+                request.model.startswith("claude-haiku-4-5")
+                and request.temperature is not None
+            ):
                 payload["top_p"] = request.top_p
         if request.stop:
             payload["stop_sequences"] = request.stop
@@ -388,6 +443,9 @@ class AnthropicProvider(LLMProvider):
                 payload["tool_choice"] = {"type": "none"}
             else:
                 payload["tool_choice"] = {"type": "tool", "name": choice}
+        for param in ("temperature", "top_p", "top_k", "output_config"):
+            if is_rejected(self.name, self._base_url(), request.model, param):
+                payload.pop(param, None)
         return payload
 
     def generate(self, request: LLMRequest) -> LLMResponse:
@@ -407,6 +465,7 @@ class AnthropicProvider(LLMProvider):
 
         def _do_call() -> LLMResponse:
             while True:
+                check_request_dispatch(request, start)
                 try:
                     # Cached shared client (keep-alive) instead of a per-call pool.
                     client = self._client()
@@ -433,8 +492,11 @@ class AnthropicProvider(LLMProvider):
                 # doesn't know yet) gets that param stripped and ONE
                 # immediate retry — not a transient, so no backoff.
                 if err.category is ErrorCategory.INVALID_REQUEST:
+                    before = set(healed)
                     fix = _strip_rejected_sampling_param(payload, err.message, healed)
                     if fix:
+                        for param in healed - before:
+                            remember_rejected(self.name, self._base_url(), request.model, param)
                         logger.info(
                             "anthropic param heal for %s: %s (retrying once)",
                             request.model, fix,
@@ -474,6 +536,11 @@ class AnthropicProvider(LLMProvider):
                 latency_ms=latency_ms,
                 tool_calls=tool_calls,
             )
+            if tool_calls:
+                response.provider_state = {
+                    "provider": self.name, "model": request.model,
+                    "content": blocks,
+                }
             usage_tracker.record(
                 provider=self.name,
                 model=request.model,
@@ -533,6 +600,7 @@ class AnthropicProvider(LLMProvider):
             finish_reason = FinishReason.STOP
             stream_error: LLMError | None = None
             cancelled = False
+            terminal_seen = False
             try:
                 # nullcontext wraps the CACHED client so the streaming block's
                 # structure/indentation is unchanged, but the shared client is NOT
@@ -540,6 +608,7 @@ class AnthropicProvider(LLMProvider):
                 # keep-alive survives for the next call.
                 with contextlib.nullcontext(self._client()) as client:
                     while True:  # re-entered only by the pre-token param heal below
+                        check_request_dispatch(request, start)
                         with client.stream(
                             "POST",
                             f"{self._base_url()}/v1/messages",
@@ -560,10 +629,13 @@ class AnthropicProvider(LLMProvider):
                                 # the whole stream here can never replay
                                 # already-yielded text.
                                 if err.category is ErrorCategory.INVALID_REQUEST:
+                                    before = set(healed)
                                     fix = _strip_rejected_sampling_param(
                                         payload, err.message, healed,
                                     )
                                     if fix:
+                                        for param in healed - before:
+                                            remember_rejected(self.name, self._base_url(), request.model, param)
                                         logger.info(
                                             "anthropic param heal for %s: %s (retrying once)",
                                             request.model, fix,
@@ -606,6 +678,8 @@ class AnthropicProvider(LLMProvider):
                                     stop_reason = (data.get("delta") or {}).get("stop_reason")
                                     if stop_reason:
                                         finish_reason = _STOP_REASON_MAP.get(stop_reason, FinishReason.STOP)
+                                elif ev_type == "message_stop":
+                                    terminal_seen = True
                                 elif ev_type == "error":
                                     # Anthropic can emit an in-stream error event
                                     # (e.g. overloaded_error) and then close the
@@ -618,6 +692,10 @@ class AnthropicProvider(LLMProvider):
                                         data, self.name, request.model,
                                     )
                         break  # normal completion — the while exists only for the heal retry
+                if not terminal_seen:
+                    raise LLMError(category=ErrorCategory.NETWORK,
+                                   message="Provider stream interrupted before its completion marker",
+                                   provider=self.name, model=request.model)
             except GeneratorExit:
                 # Consumer abandoned the stream (client disconnect) — marked,
                 # not failed. See CANCELLED_ERROR_CATEGORY. Anthropic reports

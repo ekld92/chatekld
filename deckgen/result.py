@@ -1,7 +1,7 @@
 """The accumulated outcome of one chat turn.
 
 Lives in its own module (no third-party imports) so both the HTTP
-:class:`~deckgen.client.ChatEKLDClient` and the in-process
+:class:`~deckgen.client.CHERQAiNClient` and the in-process
 :class:`~deckgen.inprocess.InProcessChatRunner` can produce the same shape
 without the in-process path having to import ``requests``.
 """

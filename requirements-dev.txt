@@ -16,11 +16,16 @@ ruff>=0.12,<0.13
 pytest>=9.0,<10.0
 pytest-asyncio>=1.3,<1.4
 
-# Track 7.5 tooling. mypy is ADVISORY (permissive config in pyproject.toml — not a
-# suite gate, and NOT a pre-commit hook; run it standalone with `mypy`). pre-commit
+# Mypy is enforced by the CI ratchet (permissive configuration, explicit legacy
+# ceilings). It is not a pre-commit hook. pre-commit
 # runs the local commit hooks (`ruff check`, gitleaks secret scan, whitespace/EOF
 # hygiene). Minor-line pins like the other dev tools: mypy's inference and
 # pre-commit's hook behaviour shift between minors, and a silent upgrade could turn a
 # clean local run noisy on a fresh checkout. Neither is needed to RUN the app.
 mypy>=1.14,<1.15
 pre-commit>=4.0,<5.0
+
+# Enforced supply-chain/static-security gates. These are development/CI tools,
+# not runtime dependencies; exact validated versions live in constraints.txt.
+pip-audit>=2.10,<2.11
+bandit>=1.9,<1.10

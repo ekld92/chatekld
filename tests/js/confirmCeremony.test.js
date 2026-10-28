@@ -49,6 +49,70 @@ describe('confirmInline primitive (Track 6e)', () => {
         expect(document.querySelector('.inline-confirm-strip')).toBeNull();
     });
 
+    it('optional checkbox passes checkboxChecked to onConfirm', () => {
+        const anchor = document.getElementById('anchor');
+        const onConfirm = vi.fn();
+        const strip = ui.confirmInline(anchor, {
+            message: 'Unmap?',
+            confirmLabel: 'Unmap',
+            checkbox: { label: 'Also trash Zotero links', defaultChecked: true },
+            onConfirm,
+        });
+        const cb = strip.querySelector('input[type="checkbox"]');
+        expect(cb).toBeTruthy();
+        expect(cb.checked).toBe(true);
+        strip.querySelectorAll('button')[1].click();
+        expect(onConfirm).toHaveBeenCalledWith({ checkboxChecked: true });
+
+        const onConfirm2 = vi.fn();
+        const strip2 = ui.confirmInline(anchor, {
+            message: 'Unmap?',
+            confirmLabel: 'Unmap',
+            checkbox: { label: 'Also trash Zotero links', defaultChecked: true },
+            onConfirm: onConfirm2,
+        });
+        strip2.querySelector('input[type="checkbox"]').checked = false;
+        strip2.querySelectorAll('button')[1].click();
+        expect(onConfirm2).toHaveBeenCalledWith({ checkboxChecked: false });
+    });
+
+    /* 2026-09-03 UI review. Cancel and Escape both restore focus to the anchor;
+     * CONFIRM did not, so a keyboard user who committed a write landed on
+     * <body> and had to Tab from the top of the document to reach the next row.
+     * The accession panel solved this for itself with an explicit focus chain
+     * (_accFocusAfter), which is what shows it matters — but every other
+     * consumer (the tagging table's per-tag remove, the audit harmony rows, the
+     * refactor per-image archive) had no such handling.
+     *
+     * The rule is deliberately conservative: focus returns to the anchor only
+     * when the anchor SURVIVED the write and nothing else claimed focus during
+     * onConfirm. A consumer that moves focus itself, or that re-renders the
+     * anchor away, is left exactly as it was. */
+    it('Confirm returns focus to the anchor when it survives the write', () => {
+        const anchor = document.getElementById('anchor');
+        ui.confirmInline(anchor, { message: 'Sure?', onConfirm: () => {} });
+        document.querySelector('.inline-confirm-actions button:last-child').click();
+        expect(document.activeElement).toBe(anchor);
+    });
+
+    it('a consumer that moves focus itself is not overridden', () => {
+        const anchor = document.getElementById('anchor');
+        const other = document.createElement('button');
+        document.body.appendChild(other);
+        ui.confirmInline(anchor, { message: 'Sure?', onConfirm: () => other.focus() });
+        document.querySelector('.inline-confirm-actions button:last-child').click();
+        expect(document.activeElement).toBe(other);
+    });
+
+    it('an anchor removed by the write leaves focus alone (no throw)', () => {
+        const anchor = document.getElementById('anchor');
+        ui.confirmInline(anchor, { message: 'Sure?', onConfirm: () => anchor.remove() });
+        expect(() => {
+            document.querySelector('.inline-confirm-actions button:last-child').click();
+        }).not.toThrow();
+        expect(anchor.isConnected).toBe(false);
+    });
+
     it('re-invoking replaces the open strip instead of stacking', () => {
         const anchor = document.getElementById('anchor');
         ui.confirmInline(anchor, { message: 'a', confirmLabel: 'A', onConfirm: () => {} });
@@ -97,10 +161,10 @@ describe('Revert all requires the ceremony (Track 6e)', () => {
         document.body.innerHTML = `
           <div id="sr-status-announcer" role="status"></div>
           <div id="sr-error-announcer" role="alert"></div>
-          <div id="refactor-restore-modal"><div class="modal">
-            <div id="refactor-restore-status" role="status"></div>
-            <div id="refactor-restore-list"></div>
-            <div><button id="refactor-restore-all">Revert all</button></div>
+          <div id="history-restore-modal"><div class="modal">
+            <div id="history-restore-status" role="status"></div>
+            <div id="history-restore-list"></div>
+            <div><button id="history-restore-all">Revert all</button></div>
           </div></div>
         `;
         vi.resetModules();
@@ -114,7 +178,7 @@ describe('Revert all requires the ceremony (Track 6e)', () => {
             ok: true, status: 200,
             json: async () => ({ reverted: 2, ops: [] }),
         });
-        const refactor = await import('../../static/js/refactor.js');
+        const refactor = await import('../../static/js/history.js');
 
         refactor.revertAll();
         // No write yet — only the ceremony strip appeared.
@@ -124,7 +188,7 @@ describe('Revert all requires the ceremony (Track 6e)', () => {
 
         strip.querySelectorAll('button')[1].click();          // confirm
         await new Promise((r) => setTimeout(r, 20));
-        const calls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/refactor/restore'));
+        const calls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/history/restore'));
         expect(calls.length).toBe(1);
         // B8 (2026-07-13): restore is now server-side confirm-gated, so the
         // client sends confirm: true alongside the revert-all flag.
@@ -160,7 +224,7 @@ describe('destructive-defaults markup + deck wiring ratchet (Track 6e)', () => {
         // and "Apply to the article" overwrites a user .tex — both must arm the
         // Track 6e ceremony before writing.
         const src = readFileSync(resolve(root, 'static/js/docgen.js'), 'utf-8');
-        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,400}?_runMarkdown\(topic, scope\)/);
+        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,400}?_runMarkdown\(topic, scope, forceFresh\)/);
         expect(src).not.toMatch(/onclick[\s\S]{0,40}_runMarkdown/);
         expect(src).toMatch(/confirmInline\(applyBtn,[\s\S]{0,400}?_applyAugment\(aug, applyBtn\)/);
         expect(src).not.toMatch(/addEventListener\('click',\s*\(\)\s*=>\s*_applyAugment/);
@@ -217,16 +281,19 @@ describe('destructive-defaults markup + deck wiring ratchet (Track 6e)', () => {
         // The deck view was built precisely because the table assigned a key
         // on one unconfirmed click; the kept table must not retain the defect.
         const src = readFileSync(resolve(root, 'static/js/audit.js'), 'utf-8');
-        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,400}?_assignAmbiguous\(btn\)/);
-        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,400}?_markNoMatch\(btn\)/);
+        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,700}?_assignAmbiguous\(btn\)/);
+        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,700}?_markState\(btn, state\)/);
         expect(src).not.toMatch(/if \(action === 'pick-key'\) \{ await _assignAmbiguous/);
     });
 
-    it('refactor.js gates Approve & apply and Archive through confirmInline (2026-07-22 E11)', () => {
-        const src = readFileSync(resolve(root, 'static/js/refactor.js'), 'utf-8');
-        expect(src).toMatch(/confirmInline\(apply,[\s\S]{0,400}?_applyStaged\(/);
-        expect(src).toMatch(/confirmInline\(btn,[\s\S]{0,600}?_doArchive\(/);
-        // The bespoke archive confirm box (its own DOM + ordering) is gone.
-        expect(src).not.toMatch(/refactor-archive-confirm/);
+
+    it('pendingReview.js confirm-gates confirm/reject/undo, not defer/skip', () => {
+        const src = readFileSync(resolve(root, 'static/js/pendingReview.js'), 'utf-8');
+        expect(src).toMatch(/action === 'confirm'[\s\S]{0,400}?confirmInline\(btn,/);
+        expect(src).toMatch(/action === 'reject'[\s\S]{0,400}?confirmInline\(btn,/);
+        expect(src).toMatch(/action === 'undo'[\s\S]{0,400}?confirmInline\(btn,/);
+        // Skip stays immediate — must not wrap defer in confirmInline.
+        expect(src).not.toMatch(/action === 'defer'[\s\S]{0,200}?confirmInline/);
+        expect(src).toMatch(/max-width: 900px/);
     });
 });

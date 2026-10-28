@@ -1,0 +1,25 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Audited synthetic fixtures and removed third-party bundle history"
+regexTarget = "secret"
+regexes = [
+  '''tvly-testkey123456789''',
+  '''AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ-_1234567''',
+  '''0123456789abcdef0123456789abcdef\.aBcDeFgHiJkLmNoPqRsTuVwX''',
+  '''pvscHmnXiVG3pzsF5Dd0reJY''',
+  '''sk-proj-SECRETSECRETSECRET123456''',
+  '''sk-or-v1-0123456789abcdef0123456789abcdef''',
+  '''myranEmergency2025''',
+  '''owenSchizophrenia2016''',
+  '''marderSchizophrenia2019''',
+  '''leuchtSchizophrenia2025''',
+  '''jauharSchizophrenia2022''',
+]
+paths = [
+  # This committed 2026-03-10 .app was removed. Findings are upstream LiteLLM
+  # documentation/example placeholders, and public artifacts never carry its
+  # history. Keeping the path exception explicit avoids masking future source.
+  '''^PaperMind_2026-03-10\.app/''',
+]

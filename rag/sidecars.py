@@ -1,7 +1,7 @@
 """Retrieval-cache sidecars: the BM25 retriever and the wikilink note→note graph.
 
-Extracted from ``rag/vault.py`` (Plan 9, step 2) as a **move + re-export**: the
-bodies below are byte-identical to the ones they replace, and
+Originally extracted from ``rag/vault.py`` (Plan 9, step 2) as a move/re-export;
+2026-10-01 adds serialized counts and process-local mutation fingerprints.
 ``ObsidianVaultManager`` picks them up by inheriting :class:`RetrievalCacheMixin`,
 so ``obsidian_manager._get_bm25_retriever(...)`` /
 ``ObsidianVaultManager._build_wikilink_graph`` and every existing test patch
@@ -10,7 +10,7 @@ target keep working unchanged.
 Both caches follow ONE documented discipline (``rag/CLAUDE.md`` → *Retrieval
 caches*); co-locating them makes that discipline enforceable:
 
-* cached in memory by docstore size, double-checked under a per-cache build lock;
+* cached in memory by index identity, mutation epoch and docstore size, double-checked under a per-cache build lock;
 * the docstore snapshot is taken under ``_index_mutation_lock``, the expensive
   build (tokenise / regex-sweep) runs OUTSIDE it so it can never stall the indexer;
 * a process-cold miss consults an on-disk sidecar under the index dir, validated
@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from urllib.parse import unquote
@@ -39,6 +40,8 @@ from urllib.parse import unquote
 from core.constants import VAULT_MD_EXTS
 from core.utils import nfc
 from rag.storage_io import _write_json_atomic
+from rag.docstore_access import node_count
+from core.perf_metrics import measured, measured_lock, span
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +116,7 @@ def _closest_note_by_dir(candidates: list[str], note_dir: str) -> str:
 class _WikilinkGraph:
     """Immutable note→note adjacency derived from the vault docstore.
 
-    Built once per indexing run (cached by docstore size) from the ``.md``
+    Built per observed mutation generation from the ``.md``
     nodes' link text — never from the filesystem — so it adds no reindex and
     no re-embedding.  ``outbound`` holds the notes a note links TO;
     ``backlinks`` the notes that link INTO it; ``neighbors`` is their
@@ -208,10 +211,52 @@ class RetrievalCacheMixin:
     through ``self`` back into ``rag/vault.py``.
     """
 
-    def _invalidate_retrieval_caches(self) -> None:
+    # Host-owned fields: declare the mixin seam without allocating another store.
+    _index: Any
+    _index_mutation_lock: threading.Lock
+    _bm25_build_lock: threading.Lock
+    _wikilink_build_lock: threading.Lock
+    _bm25_retriever: Any
+    _wikilink_index: Optional[_WikilinkGraph]
+
+    def _replace_index(self, idx):
+        """Publish under the caller's existing rw-write lock.
+
+        A scalar epoch also detects identity reuse after cleanup, without
+        retaining a reference to a retired index/docstore and its full nodes.
+        """
+        self._index_generation = getattr(self, "_index_generation", 0) + 1
+        self._index = idx
+
+    @contextmanager
+    def _mutate_index(self):
+        """Existing mutation lock, with an epoch even on partial failures.
+
+        No build lock is acquired here. Checkpoints do not mutate the node
+        collection and keep their existing lock/invalidation discipline.
+        """
+        with measured_lock(self._index_mutation_lock, "index.mutation"):
+            try:
+                yield
+            finally:
+                self._docstore_generation = getattr(self, "_docstore_generation", 0) + 1
+
+    def _cache_fingerprint(self, idx=None):
+        # Index and docstore replacement are visible even at constant count.
+        idx = self._index if idx is None else idx
+        if idx is None or getattr(idx, "docstore", None) is None:
+            return None
+        return (id(idx), id(idx.docstore),
+                getattr(self, "_docstore_generation", 0),
+                getattr(self, "_index_generation", 0), node_count(idx.docstore))
+
+    def _invalidate_retrieval_caches(self, *, persistent: bool = True) -> None:
         """Drop the cached BM25 retriever and wikilink graph (in memory AND
         their on-disk sidecars) so the next chat rebuilds against the
         freshly-persisted docstore.
+
+        ``persistent=False`` clears process memory only when switching vaults;
+        existing sidecars remain available when that vault is reopened.
 
         Called after each successful ``idx.storage_context.persist(...)`` —
         both the mid-run checkpoint and the final persist — so concurrent
@@ -219,17 +264,19 @@ class RetrievalCacheMixin:
         reranker is unaffected: it depends on the model name only, not on
         index contents.
         """
-        with self._bm25_build_lock:
+        with measured_lock(self._bm25_build_lock, "cache.bm25.lock"):
             self._bm25_retriever = None
             self._bm25_cached_doc_count = -1
-            shutil.rmtree(self._bm25_sidecar_dir(), ignore_errors=True)
-        with self._wikilink_build_lock:
+            if persistent:
+                shutil.rmtree(self._bm25_sidecar_dir(), ignore_errors=True)
+        with measured_lock(self._wikilink_build_lock, "cache.wikilink.lock"):
             self._wikilink_index = None
             self._wikilink_cached_doc_count = -1
-            try:
-                os.remove(self._wikilink_sidecar_path())
-            except OSError:
-                pass
+            if persistent:
+                try:
+                    os.remove(self._wikilink_sidecar_path())
+                except OSError:
+                    pass
 
     def _load_bm25_sidecar(self, live_count: int, top_k: int) -> Optional[Any]:
         """Try to mmap-load the persisted BM25 retriever from the sidecar.
@@ -294,37 +341,56 @@ class RetrievalCacheMixin:
             return
         sidecar = self._bm25_sidecar_dir()
         index_meta = self._read_index_meta() or {}
+        # DURABILITY (2026-09-02, performance plan Phase 5): persist to a
+        # SIBLING directory, then swap.
+        # Before: the existing sidecar was rmtree'd and only then rebuilt in
+        #   place, so from the first line onwards there was a window — the
+        #   whole persist of a large index — in which a crash, or simply a
+        #   concurrent cold launch, found NO sidecar and paid the full
+        #   re-tokenise the sidecar exists to avoid.
+        # Change: build in `<sidecar>.new`, then replace the live directory.
+        #   The old one is only removed once the new one is complete.
+        # Safe because: the meta file is still written LAST inside the new
+        #   directory, so the self-invalidation rule above is untouched; a
+        #   failed build removes only the staging directory and leaves the
+        #   previous sidecar standing, which is strictly better than the old
+        #   behaviour (which left none). The swap is a rename within the same
+        #   parent, so a reader sees the old or the new tree, never a mixture.
+        # Pinned by: test_vault_regressions.py::TestBm25SidecarSwap.
+        staging = sidecar + ".new"
         try:
-            shutil.rmtree(sidecar, ignore_errors=True)
-            os.makedirs(sidecar, exist_ok=True)
-            retriever.persist(sidecar)
+            shutil.rmtree(staging, ignore_errors=True)
+            os.makedirs(staging, exist_ok=True)
+            retriever.persist(staging)
             _write_json_atomic(
-                os.path.join(sidecar, _BM25_SIDECAR_META_FILENAME),
+                os.path.join(staging, _BM25_SIDECAR_META_FILENAME),
                 {
                     "doc_count": doc_count,
                     "indexed_at": index_meta.get("indexed_at"),
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
+            shutil.rmtree(sidecar, ignore_errors=True)
+            os.replace(staging, sidecar)
             logger.info("BM25 retriever persisted to sidecar (%d nodes).", doc_count)
         except Exception as exc:
             # Best-effort: a failed persist only costs the next launch a
-            # rebuild.  Remove the partial sidecar so the loader cannot
-            # trip over it.
+            # rebuild. Remove the STAGING tree; the previous sidecar (if any)
+            # is left in place — a stale sidecar self-invalidates on load,
+            # and having one beats having none.
             logger.warning("Could not persist BM25 sidecar: %s", exc)
-            shutil.rmtree(sidecar, ignore_errors=True)
+            shutil.rmtree(staging, ignore_errors=True)
 
+    @measured("cache.bm25")
     def _get_bm25_retriever(self, top_k: int,
                             stage_cb: Optional[Callable[[str], None]] = None) -> Optional[Any]:
         """Return a cached BM25Retriever sized to *top_k*, or None if BM25
         is unavailable.
 
-        Caches the retriever by docstore size so a vault with N chunks
-        rebuilds at most once per indexing run.  The size fingerprint is
-        cheap and catches every append (the dominant Obsidian workflow);
-        same-size delete+insert races are tolerated as eventually-correct —
-        the indexer's explicit ``_invalidate_retrieval_caches`` call after
-        persist resyncs the BM25 view to the docstore.
+        Caches by index/docstore identity, mutation/publication generations
+        and serialized node count. Same-count replacements invalidate the
+        in-memory fingerprint too; publication explicitly invalidates the
+        persisted sidecar through ``_invalidate_retrieval_caches``.
 
         Process-cold misses consult the on-disk sidecar first
         (``_load_bm25_sidecar``): a previous build persisted there is
@@ -334,8 +400,8 @@ class RetrievalCacheMixin:
         the sidecar (``_persist_bm25_sidecar``) unless an indexing run is
         active.
 
-        Docstore reads that materialise the dict (``len(docs)`` for the
-        miss path, ``list(docs.values())`` for the snapshot) are taken
+        Counts use the localized serialized-store accessor; only rebuilds
+        materialize nodes. Those snapshots are taken
         under ``_index_mutation_lock`` so an in-flight ``idx.insert`` /
         ``idx.delete_ref_doc`` from the streaming indexer cannot mutate
         the dict during iteration and raise
@@ -348,38 +414,39 @@ class RetrievalCacheMixin:
         from .engine import BM25Retriever
         if BM25Retriever is None or self._index is None:
             return None
-        docstore = getattr(self._index, "docstore", None)
-        docs = getattr(docstore, "docs", None) if docstore else None
-        if not docs:
+        with measured_lock(self._index_mutation_lock, "index.cache"):
+            fingerprint = self._cache_fingerprint()
+        if fingerprint is None or not fingerprint[-1]:
             return None
-        # Fast path: ``len()`` of a CPython dict is an O(1) atomic field
-        # read, so the size-fingerprint heuristic does not need the
-        # mutation lock here.  A torn count just re-enters the slow path,
-        # which double-checks under the build lock.
-        current_count = len(docs)
+        current_count = fingerprint[-1]
         cached = self._bm25_retriever
-        if cached is not None and self._bm25_cached_doc_count == current_count:
+        if (cached is not None and self._bm25_cached_doc_count == current_count
+                and getattr(self, "_bm25_fingerprint", fingerprint) == fingerprint):
             # Retune race fix (improvement plan 2026-07-04, item 2.7): this
             # fast path used to write ``cached.similarity_top_k = top_k`` here
             # — with NO lock — while a concurrent chat could be mid-retrieval
             # on the SAME shared object under ``_index_mutation_lock`` (a deck
             # run's vault_search k=12 retuned a concurrent user chat k=8
             # mid-flight). Tuning now happens in exactly ONE place: the
-            # engine's ``_build_retrieval_pipeline`` sets ``similarity_top_k``
-            # to the per-query breadth INSIDE the same mutation-lock hold that
-            # runs the retrieval, so no other request can interleave a write
-            # between tune and use. This fetch is read-only on purpose — do
+            # engine's ``_build_retrieval_pipeline`` now shallow-copies the
+            # cached helper and tunes only its request-local facade (AP-09). This fetch is read-only on purpose — do
             # not "restore" the convenience retune. Invariant (pinned by
             # ``TestSharedRetunerRace``): fetching a cached BM25/reranker
             # never mutates its tuning fields.
             return cached
 
-        with self._bm25_build_lock:
+        with measured_lock(self._bm25_build_lock, "cache.bm25.lock"):
+            with measured_lock(self._index_mutation_lock, "index.cache"):
+                fingerprint = self._cache_fingerprint()
+            if fingerprint is None or not fingerprint[-1]:
+                return None
+            current_count = fingerprint[-1]
             # Double-check under the build lock so two concurrent chats do
             # not both rebuild against the same docstore size.
             if (
                 self._bm25_retriever is not None
                 and self._bm25_cached_doc_count == current_count
+                and getattr(self, "_bm25_fingerprint", fingerprint) == fingerprint
             ):
                 # Read-only return (item 2.7) — see the fast path above: the
                 # build lock is NOT the lock that serialises retrieval, so a
@@ -390,10 +457,15 @@ class RetrievalCacheMixin:
             # Validated against the live docstore count and the index
             # meta stamp; any mismatch or load error deletes the sidecar
             # and falls through to the build below.
-            loaded = self._load_bm25_sidecar(len(docs), top_k)
+            loaded = (self._load_bm25_sidecar(current_count, top_k)
+                      if fingerprint[2] == 0
+                      and getattr(self, "_bm25_fingerprint", fingerprint)[:2] == fingerprint[:2]
+                      and getattr(self, "_bm25_fingerprint", fingerprint)[3] == fingerprint[3]
+                      else None)
             if loaded is not None:
                 self._bm25_retriever = loaded
-                self._bm25_cached_doc_count = len(docs)
+                self._bm25_cached_doc_count = current_count
+                self._bm25_fingerprint = fingerprint
                 return loaded
             # Snapshot the docstore under _index_mutation_lock so an
             # in-flight indexer insert/delete cannot mutate the dict while
@@ -403,9 +475,16 @@ class RetrievalCacheMixin:
             # ``list(docs.values())`` and ``len(docs)`` would let us cache
             # an N-node retriever under an N+1 fingerprint, missing a
             # subsequent re-check.
-            with self._index_mutation_lock:
-                nodes = list(docs.values())
-                snapshot_count = len(docs)
+            with measured_lock(self._index_mutation_lock, "index.cache"):
+                idx = self._index
+                if idx is None:
+                    return None
+                fingerprint = self._cache_fingerprint(idx)
+                if fingerprint is None:
+                    return None
+                with span("docstore.snapshot"):
+                    nodes = list(idx.docstore.docs.values())
+                snapshot_count = len(nodes)
             if not nodes:
                 return None
             # Build BM25 outside the mutation lock — tokenisation + index
@@ -433,10 +512,11 @@ class RetrievalCacheMixin:
                 threading.Thread(target=_hb, name="bm25-build-heartbeat",
                                  daemon=True).start()
             try:
-                retriever = BM25Retriever.from_defaults(
-                    nodes=nodes,
-                    similarity_top_k=top_k,
-                )
+                with span("cache.bm25.build"):
+                    retriever = BM25Retriever.from_defaults(
+                        nodes=nodes,
+                        similarity_top_k=top_k,
+                    )
             except Exception as exc:
                 logger.warning("BM25 retriever build failed: %s", exc)
                 return None
@@ -444,11 +524,15 @@ class RetrievalCacheMixin:
                 hb_stop.set()
             self._bm25_retriever = retriever
             self._bm25_cached_doc_count = snapshot_count
+            self._bm25_fingerprint = fingerprint
             # Persist for the next launch (skipped while indexing is
             # active — see the helper).  Adds a one-off full-corpus write
             # after a fresh build; prewarm normally absorbs this off the
             # chat path.
-            self._persist_bm25_sidecar(retriever, snapshot_count)
+            with measured_lock(self._index_mutation_lock, "index.cache"):
+                still_current = self._cache_fingerprint() == fingerprint
+            if still_current:
+                self._persist_bm25_sidecar(retriever, snapshot_count)
             return retriever
 
     @staticmethod
@@ -553,6 +637,7 @@ class RetrievalCacheMixin:
             _accept(match.group(1).split(" ", 1)[0])
         return out
 
+    @measured("cache.wikilink.build")
     def _build_wikilink_graph(self, nodes: list) -> _WikilinkGraph:
         """Assemble the note→note adjacency from a docstore node snapshot.
 
@@ -702,11 +787,12 @@ class RetrievalCacheMixin:
             except OSError:
                 pass
 
+    @measured("cache.wikilink")
     def _get_wikilink_index(self) -> Optional[_WikilinkGraph]:
         """Return the cached note→note wikilink graph, building it on demand.
 
-        Mirrors ``_get_bm25_retriever``'s discipline: cached by docstore size
-        so a vault with N chunks rebuilds at most once per indexing run,
+        Mirrors ``_get_bm25_retriever``'s discipline: cached by index identity,
+        mutation epoch and docstore count,
         double-checked under ``_wikilink_build_lock``, and the docstore
         snapshot taken under ``_index_mutation_lock`` so an in-flight indexer
         insert/delete cannot mutate the dict mid-iteration.  The build itself
@@ -721,42 +807,66 @@ class RetrievalCacheMixin:
         """
         if self._index is None:
             return None
-        docstore = getattr(self._index, "docstore", None)
-        docs = getattr(docstore, "docs", None) if docstore else None
-        if not docs:
+        with measured_lock(self._index_mutation_lock, "index.cache"):
+            fingerprint = self._cache_fingerprint()
+        if fingerprint is None or not fingerprint[-1]:
             return None
-        current_count = len(docs)
+        current_count = fingerprint[-1]
         cached = self._wikilink_index
-        if cached is not None and self._wikilink_cached_doc_count == current_count:
+        if (cached is not None and self._wikilink_cached_doc_count == current_count
+                and getattr(self, "_wikilink_fingerprint", fingerprint) == fingerprint):
             return cached
-        with self._wikilink_build_lock:
+        with measured_lock(self._wikilink_build_lock, "cache.wikilink.lock"):
+            with measured_lock(self._index_mutation_lock, "index.cache"):
+                fingerprint = self._cache_fingerprint()
+            if fingerprint is None or not fingerprint[-1]:
+                return None
+            current_count = fingerprint[-1]
             # Double-check under the build lock so two concurrent chats do not
             # both rebuild against the same docstore size.
             if (
                 self._wikilink_index is not None
                 and self._wikilink_cached_doc_count == current_count
+                and getattr(self, "_wikilink_fingerprint", fingerprint) == fingerprint
             ):
                 return self._wikilink_index
             # Sidecar first: a hit avoids the O(N) node-list copy and the
-            # regex sweep entirely.  The unlocked len(docs) matches the BM25
-            # caller's discipline; the loader's doc_count + indexed_at gates
-            # keep a racing mutation from ever validating a stale graph.
-            loaded = self._load_wikilink_sidecar(current_count)
+            # regex sweep entirely. Mutated in-process generations cannot
+            # reuse disk sidecars; count + indexed_at still validate legacy
+            # sidecars on a cold load. A racing mutation makes this fingerprint
+            # stale, forcing the next lookup to rebuild (eventual consistency).
+            loaded = (self._load_wikilink_sidecar(current_count)
+                      if fingerprint[2] == 0
+                      and getattr(self, "_wikilink_fingerprint", fingerprint)[:2] == fingerprint[:2]
+                      and getattr(self, "_wikilink_fingerprint", fingerprint)[3] == fingerprint[3]
+                      else None)
             if loaded is not None:
                 self._wikilink_index = loaded
                 self._wikilink_cached_doc_count = current_count
+                self._wikilink_fingerprint = fingerprint
                 return loaded
             # Snapshot the docstore under _index_mutation_lock so an in-flight
             # indexer insert/delete cannot mutate the dict while we iterate;
             # record the size from the same locked window so the fingerprint
             # matches the exact snapshot we built from.
-            with self._index_mutation_lock:
-                nodes = list(docs.values())
-                snapshot_count = len(docs)
+            with measured_lock(self._index_mutation_lock, "index.cache"):
+                idx = self._index
+                if idx is None:
+                    return None
+                fingerprint = self._cache_fingerprint(idx)
+                if fingerprint is None:
+                    return None
+                with span("docstore.snapshot"):
+                    nodes = list(idx.docstore.docs.values())
+                snapshot_count = len(nodes)
             if not nodes:
                 return None
             graph = self._build_wikilink_graph(nodes)
             self._wikilink_index = graph
             self._wikilink_cached_doc_count = snapshot_count
-            self._persist_wikilink_sidecar(graph, snapshot_count)
+            self._wikilink_fingerprint = fingerprint
+            with measured_lock(self._index_mutation_lock, "index.cache"):
+                still_current = self._cache_fingerprint() == fingerprint
+            if still_current:
+                self._persist_wikilink_sidecar(graph, snapshot_count)
             return graph

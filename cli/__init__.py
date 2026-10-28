@@ -1,1 +1,1 @@
-"""CLI Package for ChatEKLD / PaperMind."""
+"""CLI Package for CHERQAiN."""

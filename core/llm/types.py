@@ -72,8 +72,8 @@ class ToolSchema:
 class ToolCall:
     """A single tool invocation produced by the model.
 
-    ``id`` is provider-supplied for OpenAI/Anthropic and synthesised by
-    the Gemini adapter (Gemini ties responses back by name, not id).
+    ``id`` is provider-supplied for OpenAI/Anthropic and for Gemini calls
+    with a functionCall id; older Gemini calls receive a synthetic local id.
     ``arguments`` is the parsed JSON object; ``raw_arguments`` keeps the
     original JSON string for debugging and provider round-tripping.
     ``thought_signature`` is Gemini-only: Gemini 3.x attaches an opaque
@@ -89,6 +89,9 @@ class ToolCall:
     arguments: dict[str, Any] = field(default_factory=dict)
     raw_arguments: str = ""
     thought_signature: str = ""
+    # Gemini functionCall.id is optional; synthetic ids are for local result
+    # routing only and must not be emitted as provider-supplied ids.
+    provider_assigned_id: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,9 @@ class ToolTurn:
 
     calls: list[ToolCall] = field(default_factory=list)
     results: list[ToolResult] = field(default_factory=list)
+    # Opaque assistant state returned by an online provider for tool replay.
+    # The producing provider/model is recorded inside it by the adapter.
+    provider_state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -140,6 +146,8 @@ class LLMRequest:
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
+    # Explicit opt-in only; None preserves each provider's own default.
+    reasoning_effort: Optional[str] = None
     stop: Optional[list[str]] = None
 
     timeout_s: Optional[float] = None
@@ -149,7 +157,8 @@ class LLMRequest:
     # workflow id (see ``core.prompt_capture.WORKFLOWS``) whose system prompt
     # this request carries. The shared send seams in ``core.llm.factory`` read
     # it to record the effective prompt for the read-only ``/api/prompts``
-    # panel. Empty on requests from paths that capture directly (or not at all).
+    # panel and attribute usage records. Directly captured requests may set
+    # metadata["prompt_capture_recorded"] to retain their richer capture.
     workflow: str = ""
 
     tools: list[ToolSchema] = field(default_factory=list)
@@ -168,9 +177,9 @@ class LLMUsage:
     # ``cached_input_tokens`` the cache-served subset of it (OpenAI reports
     # this shape natively; the Anthropic adapter re-adds its cache_read /
     # cache_creation counts, which the API excludes from input_tokens).
-    # ``cache_creation_input_tokens`` is the Anthropic cache-WRITE count --
-    # billed at 1.25x the input rate (5-min TTL) by estimate_cost_usd; 0
-    # everywhere else.
+    # ``cache_creation_input_tokens`` is the reported cache-WRITE subset
+    # (Anthropic and GPT-6.1 Sol), billed at 1.25x input by estimate_cost_usd.
+    # Zero when the provider does not report cache writes.
     cached_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     estimated_cost_usd: float = 0.0
@@ -199,6 +208,7 @@ class LLMResponse:
     raw: Optional[Any] = None
     error: Optional["LLMError"] = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    provider_state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

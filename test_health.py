@@ -21,8 +21,9 @@ def client():
 
     # Each test starts with a cold health cache — the TTL would otherwise
     # serve one test's payload to the next.
-    status_mod._health_cache["payload"] = None
-    status_mod._health_cache["at"] = 0.0
+    # The health cache became a _TtlSingleFlight (2026-09-02): same TTL, plus
+    # collapse of concurrent misses onto one probe.
+    status_mod._HEALTH_CACHE.clear()
 
     with mock.patch("api.security.origin_is_local", return_value=True):
         yield app.test_client()
@@ -156,3 +157,28 @@ def test_api_health_ttl_cache_collapses_probes(client):
     # request after the first is served from the cache.
     assert calls["n"] == 1
     assert real_compute is not None  # silence linters about the unused ref
+
+
+def test_api_health_self_heals_the_server_discovery_record(client):
+    """A missing server.json silently disables every CLI/MCP write while the app
+    is up (2026-08-12, cause unknown). /api/health re-asserts it so the outage
+    lasts one poll rather than the process's lifetime."""
+    with mock.patch.object(status_mod, "_compute_health", return_value={
+        "status": "ok", "details": {}
+    }), mock.patch.object(status_mod, "ensure_server_info") as ensure:
+        assert client.get("/api/health").status_code == 200
+        assert ensure.call_count == 1
+        # Served from the TTL cache -> no repeated filesystem work.
+        assert client.get("/api/health").status_code == 200
+        assert ensure.call_count == 1
+
+
+def test_api_health_survives_a_failing_self_heal(client):
+    """Discovery is best-effort: it must never take the health probe down."""
+    with mock.patch.object(status_mod, "_compute_health", return_value={
+        "status": "ok", "details": {}
+    }), mock.patch.object(status_mod, "ensure_server_info",
+                          side_effect=OSError("read-only fs")):
+        r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.get_json()["status"] == "ok"

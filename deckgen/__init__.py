@@ -1,6 +1,6 @@
 """deckgen — external orchestrator that turns a topic + the Obsidian vault into a Beamer .tex deck.
 
-This package is intentionally DECOUPLED from the ChatEKLD application: it talks to
+This package is intentionally DECOUPLED from the CHERQAiN application: it talks to
 the running app only over its local HTTP API and never imports any app module. Do
 not add imports of ``app``/``api``/``core``/``rag``/``services``/``audit`` here — the
 decoupling guard (``grep -rn "deckgen" app.py api/ core/ rag/ services/ audit/``)

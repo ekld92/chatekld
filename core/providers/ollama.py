@@ -110,6 +110,12 @@ _client_cache_lock = threading.Lock()
 # explicit ``None`` ("leave the SDK default / unbounded").
 _USE_CONFIG_TIMEOUT = object()
 
+#: Hard ceiling for a STATUS/LISTING probe, deliberately independent of
+#: ``local_request_timeout_s`` (a generation knob that defaults to 0 = no
+#: bound). A polled liveness route must never be able to park a Waitress
+#: worker for longer than a human waits for a badge to turn red.
+PROBE_TIMEOUT_S = 3.0
+
 
 def _ollama_client(host: str, timeout: Optional[float]) -> "ollama.Client":
     """Return a cached ``ollama.Client`` for *(host, timeout)*, creating it once.
@@ -183,7 +189,8 @@ class OllamaProvider(Provider):
             timeout = local_request_timeout()
         return _ollama_client(self.host, timeout)
 
-    def check_running(self) -> tuple[bool, str]:
+    def check_running(self, *, timeout_s: float | None = PROBE_TIMEOUT_S
+                      ) -> tuple[bool, str]:
         """Reachability probe against OUR resolved host: ``(True, "")`` on success.
 
         Uses ``self._client().list()`` (host-bound), NOT the module-level
@@ -191,21 +198,53 @@ class OllamaProvider(Provider):
         produced the split-brain where the status badge probed one endpoint while
         generation/embedding used another. Now the probe and generation share one
         host, so a green badge means generation will actually reach a server.
+
+        # PERF (2026-09-02): an unbounded liveness probe on a polled route.
+        #   Before:    the probe used the client's CONFIG timeout, i.e.
+        #              `local_request_timeout_s`, which DEFAULTS TO 0 = leave
+        #              the SDK default = unbounded. /api/status polls this every
+        #              15 s from app.js, so a wedged Ollama parked one of the
+        #              32 Waitress workers per poll, for as long as it stayed
+        #              wedged. LM Studio's sibling probe has been 3 s bounded
+        #              since it was written; this one was the odd one out.
+        #   Change:    a hard `PROBE_TIMEOUT_S` (3 s) default, independent of
+        #              the generation knob. `timeout_s=None` restores the
+        #              config-driven behaviour for any caller that wants it.
+        #   Safe because:
+        #              a liveness probe that has not answered in 3 s has
+        #              answered: the badge's question is "is a server there",
+        #              and `ollama list` against a live local server is a
+        #              sub-millisecond call. The failure surfaces exactly as any
+        #              other probe failure already did, `(False, str(exc))`.
+        #   Preserves: the host-bound-client rule above — the probe and
+        #              generation still resolve ONE host, so a green badge still
+        #              means generation will reach a server.
+        #   Lock/thread contract:
+        #              unchanged; no lock. The (host, timeout) client cache
+        #              gains one entry, well inside its LRU of 8.
+        #   Pinned by: test_status_routes.py::TestProbeBounds
         """
         try:
-            self._client().list()
+            self._client(timeout=timeout_s).list()
             return True, ""
         except Exception as e:
             return False, str(e)
 
-    def get_models(self) -> tuple[list[str], str]:
+    def get_models(self, *, timeout_s: Any = _USE_CONFIG_TIMEOUT
+                   ) -> tuple[list[str], str]:
         """List installed model tags from OUR resolved host, or ``([], error)``.
 
         Host-bound via ``self._client()`` for the same reason as
         :meth:`check_running` — see that method's note on the split-brain fix.
+
+        Unlike the probe this keeps the CONFIG timeout by default, because
+        ``resolve_model`` calls it on the generation path where a 3 s ceiling
+        would be a new failure mode rather than a bound. ``/api/models`` passes
+        ``PROBE_TIMEOUT_S`` explicitly, since a model list nobody can render in
+        three seconds is a dead backend.
         """
         try:
-            resp = self._client().list()
+            resp = self._client(timeout=timeout_s).list()
             return [m.model for m in resp.models], ""
         except Exception as e:
             return [], str(e)

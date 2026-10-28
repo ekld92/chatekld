@@ -1,0 +1,46 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns="http://www.w3.org/2005/Atom">
+  <id>https://arxiv.org/api/etgBixj/9xtlnS1WWJnrKKSKNlM</id>
+  <title>arXiv Query: search_query=&amp;id_list=2103.14030&amp;start=0&amp;max_results=1</title>
+  <updated>2026-08-18T22:33:34Z</updated>
+  <link href="https://arxiv.org/api/query?search_query=&amp;start=0&amp;max_results=1&amp;id_list=2103.14030" type="application/atom+xml"/>
+  <opensearch:itemsPerPage>1</opensearch:itemsPerPage>
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2103.14030v2</id>
+    <title>Swin Transformer: Hierarchical Vision Transformer using Shifted Windows</title>
+    <updated>2021-08-17T16:41:34Z</updated>
+    <link href="https://arxiv.org/abs/2103.14030v2" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2103.14030v2" rel="related" type="application/pdf" title="pdf"/>
+    <summary>This paper presents a new vision Transformer, called Swin Transformer, that capably serves as a general-purpose backbone for computer vision. Challenges in adapting Transformer from language to vision arise from differences between the two domains, such as large variations in the scale of visual entities and the high resolution of pixels in images compared to words in text. To address these differences, we propose a hierarchical Transformer whose representation is computed with \textbf{S}hifted \textbf{win}dows. The shifted windowing scheme brings greater efficiency by limiting self-attention computation to non-overlapping local windows while also allowing for cross-window connection. This hierarchical architecture has the flexibility to model at various scales and has linear computational complexity with respect to image size. These qualities of Swin Transformer make it compatible with a broad range of vision tasks, including image classification (87.3 top-1 accuracy on ImageNet-1K) and dense prediction tasks such as object detection (58.7 box AP and 51.1 mask AP on COCO test-dev) and semantic segmentation (53.5 mIoU on ADE20K val). Its performance surpasses the previous state-of-the-art by a large margin of +2.7 box AP and +2.6 mask AP on COCO, and +3.2 mIoU on ADE20K, demonstrating the potential of Transformer-based models as vision backbones. The hierarchical design and the shifted window approach also prove beneficial for all-MLP architectures. The code and models are publicly available at~\url{https://github.com/microsoft/Swin-Transformer}.</summary>
+    <category term="cs.CV" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2021-03-25T17:59:31Z</published>
+    <arxiv:primary_category term="cs.CV"/>
+    <author>
+      <name>Ze Liu</name>
+    </author>
+    <author>
+      <name>Yutong Lin</name>
+    </author>
+    <author>
+      <name>Yue Cao</name>
+    </author>
+    <author>
+      <name>Han Hu</name>
+    </author>
+    <author>
+      <name>Yixuan Wei</name>
+    </author>
+    <author>
+      <name>Zheng Zhang</name>
+    </author>
+    <author>
+      <name>Stephen Lin</name>
+    </author>
+    <author>
+      <name>Baining Guo</name>
+    </author>
+  </entry>
+</feed>

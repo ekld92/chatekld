@@ -46,6 +46,11 @@ def render_context(
 
 def _render_one(idx: int, chunk: RetrievedChunk) -> str:
     source = chunk.source.strip() or "unknown"
+    # Paper label (rag.engine._label_nodes): "Smith et al., 2020, Title [key]".
+    # Absent ⇒ the line is byte-identical to the unlabelled render.
+    paper = (chunk.metadata or {}).get("paper")
+    if isinstance(paper, str) and paper.strip():
+        source = f"{source}, {paper.strip()}"
     text = (chunk.text or "").strip()
     return f"[{idx}] {source}\n{text}"
 

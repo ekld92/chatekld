@@ -466,3 +466,318 @@ def _merge_unvalidated(text: str, fm, wanted: list[str]):
     new_lines = lines[:insert_at] + new_item_lines + lines[insert_at:]
     new_body = "\n".join(new_lines)
     return text[:fm.start()] + open_fence + new_body + close_fence + text[fm.end():], list(to_add), ""
+
+
+# --- the `pdf:` wikilink list (2026-09-07) ----------------------------------
+#
+# A reference note names its Zotero item in frontmatter; this names its FILE.
+# Written in ONE shape and only by the app, which is what makes it safely
+# rewritable when the file is renamed: `maintenance/rename.py` refuses to
+# rename a PDF referenced from any note, and without a machine-recognisable
+# shape that refusal is the only safe answer. A hand-written embed anywhere
+# else in the vault still refuses the rename — this narrows the refusal, it
+# does not remove it.
+#
+# The value is a block sequence of double-quoted wikilinks:
+#
+#     pdf:
+#       - "[[smith_2020.pdf]]"
+#
+# Quoted because `[[x]]` is YAML flow-sequence syntax: unquoted, it parses as
+# a nested list and the round-trip guard below refuses the write rather than
+# storing something Obsidian and PyYAML disagree about.
+
+PDF_LINK_KEY = "pdf"
+
+#: One wikilink item, anchored. The rewriter matches this and nothing else —
+#: a hand-edited entry that no longer has the shape is left alone and makes
+#: the rename refuse, which is the safe direction.
+_PDF_LINK_ITEM_RE = re.compile(r'^(\s*-\s*)"\[\[([^\[\]"|]+)\]\]"\s*$')
+
+_PDF_BLOCK_RE = re.compile(
+    r"(?m)^pdf:[ \t]*\n(?:(?:[ \t]+-[ \t]*.*\n?)|(?:[ \t]*\n))*")
+_PDF_INLINE_RE = re.compile(r"(?m)^pdf:[ \t]*\S.*$")
+
+
+def _frontmatter_minus(text: str, key: str) -> dict | None:
+    """The frontmatter mapping without *key*, or ``None`` when unusable."""
+    fm = _FM_RE.match(text)
+    if not fm:
+        return None
+    try:
+        data = yaml.safe_load(fm.group(2))
+    except Exception:
+        return None
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        return None
+    data.pop(key, None)
+    return data
+
+
+def read_pdf_links(text: str) -> list[str]:
+    """The entries of the note's ``pdf:`` list, in order, as written — a
+    basename, or a vault-relative path for an ambiguous name.
+
+    Only entries in the app's exact shape are returned. Anything else in the
+    list is deliberately invisible here, so a caller cannot conclude "I can
+    rewrite all of this" from a list it only partly understands.
+    """
+    fm = _FM_RE.match(text)
+    if not fm:
+        return []
+    # Only the items UNDER `pdf:` (2026-09-18: scanning every frontmatter
+    # line read a `related_notes:` list of the same shape as this one, so
+    # 10 live notes reported a "stale" pdf list they never had).
+    block = _PDF_BLOCK_RE.search(fm.group(2))
+    if not block:
+        return []
+    out: list[str] = []
+    for line in block.group(0).split("\n")[1:]:
+        m = _PDF_LINK_ITEM_RE.match(line)
+        if m:
+            out.append(m.group(2))
+    return out
+
+
+def pdf_list_is_clean(text: str) -> bool:
+    """True when every item under ``pdf:`` has the app's shape.
+
+    The rename path's gate: a list carrying a hand-written entry is not one
+    this app may rewrite, so the rename refuses instead.
+    """
+    fm = _FM_RE.match(text)
+    if not fm:
+        return True
+    body = fm.group(2)
+    if _PDF_INLINE_RE.search(body):
+        return False          # `pdf: something` — a scalar or flow list
+    block = _PDF_BLOCK_RE.search(body)
+    if not block:
+        return True
+    for line in block.group(0).split("\n")[1:]:
+        if not line.strip():
+            continue
+        if not _PDF_LINK_ITEM_RE.match(line):
+            return False
+    return True
+
+
+def set_pdf_links(text: str, names: list[str]):
+    """Write the note's ``pdf:`` list. ``(new_text, None)`` or ``(None, reason)``.
+
+    Replaces an existing block, appends when absent, and REMOVES the key when
+    *names* is empty. Guarded like :func:`merge_tags_into_frontmatter`: the
+    result must parse, every sibling key must be byte-identical, and the
+    parsed list must equal what was asked for — so a splice that mangled a
+    neighbour, or produced YAML meaning something else, refuses rather than
+    writes.
+
+    Refuses a list this app did not write (``dirty_list``): rewriting a
+    hand-edited entry is exactly the risk the shape exists to avoid.
+    """
+    for n in names:
+        if not n or any(c in n for c in '[]"|\n\r'):
+            return None, "invalid_name"
+    fm = _FM_RE.match(text)
+    if not fm:
+        return None, "no_frontmatter"
+    before = _frontmatter_minus(text, PDF_LINK_KEY)
+    if before is None:
+        return None, "frontmatter_unparseable"
+    if not pdf_list_is_clean(text):
+        return None, "dirty_list"
+    body = fm.group(2)
+    block = "".join(f'  - "[[{n}]]"\n' for n in names)
+    replacement = f"{PDF_LINK_KEY}:\n{block}" if names else ""
+    existing = _PDF_BLOCK_RE.search(body)
+    if existing:
+        new_body = body[:existing.start()] + replacement + body[existing.end():]
+    elif _PDF_INLINE_RE.search(body):
+        return None, "dirty_list"
+    elif names:
+        new_body = (body.rstrip("\n") + "\n" if body.strip() else "") + replacement
+    else:
+        return text, None                      # nothing to remove
+    new_body = new_body.rstrip("\n")
+    new_text = fm.group(1) + new_body + fm.group(3) + text[fm.end():]
+    after = _frontmatter_minus(new_text, PDF_LINK_KEY)
+    if after is None or after != before:
+        return None, "roundtrip_failed"
+    if read_pdf_links(new_text) != list(names):
+        return None, "roundtrip_failed"
+    return new_text, None
+
+
+def pdf_link_points_at(entry: str, basename: str,
+                       vault_rel: str | None = None) -> bool:
+    """Whether one ``pdf:`` entry names the file *basename* at *vault_rel*.
+
+    An entry is either a bare basename (``smith_2020.pdf``) or, when that
+    basename is ambiguous in the vault, the file's vault-relative path
+    (``Z_attachments/biblio_articles/smith_2020.pdf``, 2026-09-18). A bare
+    entry matches by name; a path entry matches ONLY the exact path, so a
+    note linking another file of the same name is never taken for a
+    reference to this one. The renamer's classifier and its rewriter both
+    ask this one question, so they cannot disagree.
+    """
+    if "/" not in entry:
+        return entry == basename
+    return vault_rel is not None and entry == vault_rel
+
+
+def ambiguous_pdf_basenames(vault_root) -> set[str]:
+    """Folded basenames of every ``.pdf`` that occurs more than once in the vault.
+
+    A bare ``[[x.pdf]]`` resolves by name, so when two files share it Obsidian
+    may open either. Hidden directories are skipped (Obsidian does not index
+    them). Folded with NFC + casefold: over-counting only writes a path where
+    a bare name would have done, never the reverse.
+    """
+    import os
+    import unicodedata
+
+    seen: dict[str, int] = {}
+    for _root, dirs, files in os.walk(str(vault_root)):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.lower().endswith(".pdf"):
+                key = unicodedata.normalize("NFC", name).casefold()
+                seen[key] = seen.get(key, 0) + 1
+    return {k for k, n in seen.items() if n > 1}
+
+
+def expected_pdf_links(pdf_paths, vault_root, ambiguous: set[str]) -> list[str]:
+    """The ``pdf:`` entries a record's mapped PDFs should produce, sorted.
+
+    A unique basename is written bare; an ambiguous one (see
+    :func:`ambiguous_pdf_basenames`) as its vault-relative path, so a name
+    that becomes ambiguous later reads ``stale`` and is caught.
+    """
+    import os
+    import unicodedata
+
+    root = os.path.realpath(str(vault_root))
+    out: set[str] = set()
+    for p in pdf_paths or ():
+        name = os.path.basename(str(p))
+        if unicodedata.normalize("NFC", name).casefold() in ambiguous:
+            rel = os.path.relpath(os.path.realpath(str(p)), root)
+            if not rel.startswith(".."):
+                out.add(rel.replace(os.sep, "/"))
+                continue
+        out.add(name)
+    return sorted(out)
+
+
+def rewrite_pdf_link(text: str, old_name: str, new_name: str,
+                     old_rel: str | None = None):
+    """Swap one file's entry inside the ``pdf:`` list.
+
+    ``(new_text, changed, reason)``. Used by the rename path, which has
+    already refused anything it cannot recognise, so a ``reason`` here means
+    the note changed under it and the rename must refuse too. A bare entry
+    stays bare; a path entry (see :func:`pdf_link_points_at`) keeps its
+    directory and gains the new basename.
+    """
+    names = read_pdf_links(text)
+    if not any(pdf_link_points_at(n, old_name, old_rel) for n in names):
+        return text, False, None
+    if not pdf_list_is_clean(text):
+        return None, False, "dirty_list"
+
+    def _swap(n: str) -> str:
+        if not pdf_link_points_at(n, old_name, old_rel):
+            return n
+        return new_name if "/" not in n else n.rsplit("/", 1)[0] + "/" + new_name
+
+    out, reason = set_pdf_links(text, [_swap(n) for n in names])
+    if out is None:
+        return None, False, reason
+    return out, True, None
+
+
+# --- `aliases:` (record merge, annual cleanup T8, 2026-09-17) -----------------
+#
+# When a duplicate Zotero record is merged away, its citation key survives as
+# an Obsidian alias on the kept note so every `[[oldKey]]` link still resolves.
+# Same discipline as the `pdf:` list above: edit ONE key, keep every sibling
+# byte-identical, and refuse rather than reformat when the shape is not one
+# of the four this understands (absent / block list / flow list / scalar).
+
+ALIASES_KEY = "aliases"
+_ALIASES_BLOCK_RE = re.compile(
+    r"(?m)^aliases:[ \t]*\n(?:(?:[ \t]+-[ \t]*.*\n?)|(?:[ \t]*\n))*")
+_ALIASES_INLINE_RE = re.compile(r"(?m)^aliases:[ \t]*(\S.*)$")
+
+
+def read_aliases(text: str) -> list[str]:
+    """The note's ``aliases`` as a list of strings (``[]`` when absent or unparseable)."""
+    fm = _FM_RE.match(text)
+    if not fm:
+        return []
+    try:
+        data = yaml.safe_load(fm.group(2))
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw = data.get(ALIASES_KEY)
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [str(x) for x in raw if x is not None]
+    return []
+
+
+def add_aliases(text: str, names: list[str]):
+    """Add *names* to the note's ``aliases`` list. ``(new_text, added, None)``
+    or ``(None, [], reason)``.
+
+    Guarded like :func:`set_pdf_links`: the result must parse, every sibling
+    key must be byte-identical, and the parsed list must equal the old list
+    plus exactly the names added — a splice that mangled a neighbour or
+    produced YAML meaning something else refuses rather than writes.
+    """
+    for n in names:
+        if not n or any(c in n for c in '[]"|\n\r:#'):
+            return None, [], "invalid_name"
+    fm = _FM_RE.match(text)
+    if not fm:
+        return None, [], "no_frontmatter"
+    before = _frontmatter_minus(text, ALIASES_KEY)
+    if before is None:
+        return None, [], "frontmatter_unparseable"
+    current = read_aliases(text)
+    added = [n for n in names if n not in current and n not in current[:0]]
+    added = list(dict.fromkeys(added))
+    if not added:
+        return text, [], None
+    body = fm.group(2)
+    wanted = current + added
+    block_re = _ALIASES_BLOCK_RE.search(body)
+    inline = _ALIASES_INLINE_RE.search(body)
+    if block_re:
+        block = "".join(f"  - {n}\n" for n in wanted)
+        new_body = body[:block_re.start()] + f"{ALIASES_KEY}:\n{block}" + body[block_re.end():]
+    elif inline:
+        flow = "[" + ", ".join(_yaml_quote(n) if _needs_quote(n) else n for n in wanted) + "]"
+        new_body = body[:inline.start()] + f"{ALIASES_KEY}: {flow}" + body[inline.end():]
+    else:
+        block = "".join(f"  - {n}\n" for n in wanted)
+        new_body = (body.rstrip("\n") + "\n" if body.strip() else "") + f"{ALIASES_KEY}:\n{block}"
+    new_body = new_body.rstrip("\n")
+    new_text = fm.group(1) + new_body + fm.group(3) + text[fm.end():]
+    after = _frontmatter_minus(new_text, ALIASES_KEY)
+    if after is None or after != before:
+        return None, [], "roundtrip_failed"
+    if read_aliases(new_text) != wanted:
+        return None, [], "roundtrip_failed"
+    return new_text, added, None
+
+
+def _needs_quote(value: str) -> bool:
+    return not re.fullmatch(r"[A-Za-z0-9_.\-]+", value or "")

@@ -1,0 +1,16 @@
+{
+  "response":{
+    "numFound":1,
+    "start":0,
+    "maxScore":4.9665184,
+    "numFoundExact":true,
+    "docs":[{
+      "title_s":["Ensuring mental health care during the SARS-CoV-2 epidemic in France: A narrative review"],
+      "authFullName_s":["Astrid Chevance","D. Gourion","N. Hoertel","P.-M. Llorca","Pierre Thomas","R. Bocher","M.-R. Moro","V. Laprévote","A. Benyamina","P. Fossati","M. Masson","E. Leaune","M. Leboyer","Raphaël Gaillard"],
+      "uri_s":"https://hal.science/hal-04357576v1",
+      "docType_s":"ART",
+      "doiId_s":"10.1016/j.encep.2020.04.005",
+      "producedDateY_i":2020
+    }]
+  }
+}

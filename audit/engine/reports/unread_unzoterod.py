@@ -13,6 +13,7 @@ from pathlib import Path
 from ...config import Settings
 from ...core import pdf_annotations
 from ...core.pdf_annotations import AnnotationsResult, ErrorKind
+from ..bridge import zotero_unclaimed
 from ..inventory import Inventory
 
 
@@ -39,6 +40,11 @@ class UnreadUnzoterodReport:
     ambiguous_count: int = (
         0  # diagnostic — pdfs the bridge couldn't decide between multiple keys
     )
+    #: Excluded for the same reason as in ``read_unzoterod`` (2026-09-20).
+    #: This report is documented as a strict SUBSET of that one, so anything
+    #: the superset drops has to be dropped here too or the two disagree.
+    zotero_unclaimed_count: int = 0
+    error: str | None = None
 
 
 def find(
@@ -60,8 +66,14 @@ def find(
     to a lazy disk read (see :func:`read_unzoterod.find` for the same pattern).
     """
     rep = UnreadUnzoterodReport(threshold=settings.annotations_read_threshold)
+    if inv.zotero_error:
+        rep.error = "Zotero observation is unavailable; absence cannot be established. Refresh the configured Zotero source and run a new scan."
+        return rep
     rep.ambiguous_count = len(inv.bridge.ambiguous_pdfs)
     for p in inv.bridge.unmapped_pdfs:
+        if zotero_unclaimed(inv.bridge, p):
+            rep.zotero_unclaimed_count += 1
+            continue
         res = annotations.get(p) if annotations else None
         if res is None:
             res = pdf_annotations.read_annotations(p)

@@ -23,6 +23,8 @@ nothing into the vault — only the regenerable marker under ``obsidian_cache/``
 
 from __future__ import annotations
 
+from core.extraction_status import TextRead, status_of
+
 import json
 import logging
 import threading
@@ -50,20 +52,30 @@ _MIN_USEFUL_CHARS = 40
 _FRESH_EXTRACT_LOCK = threading.Lock()
 
 
-def _cache_probe(manager, pdf_path: Path, vault_root: Path):
-    """Resolve ``(marker_path, has_real_cache)`` for *pdf_path*, or (None, False).
+def _cache_probe(manager, pdf_path: Path, vault_root: Path, signature=None):
+    """Resolve ``(marker_path, has_real_cache, signature)``, or (None, False, None).
 
     ``has_real_cache`` is True when a whole-file, legacy or per-range cache
     file exists for the document's current digest — the marker must never
-    shadow real (possibly OCR'd) text. Any failure resolves to (None, False):
-    the caller just skips the negative-cache fast path.
+    shadow real (possibly OCR'd) text. Any failure resolves to
+    ``(None, False, None)``: the caller just skips the negative-cache fast
+    path. The computed ``signature`` rides back out so the read below reuses
+    it instead of hashing the file a second time (perf plan Phase 3.5); the
+    indexer re-validates it against a fresh stat before trusting it.
     """
     try:
         try:
             rel = pdf_path.relative_to(vault_root).as_posix()
         except ValueError:
             rel = None
-        sig = manager._pdf_file_signature(pdf_path, manager._persisted_pdf_signatures(), rel)
+        # The re-probe under _FRESH_EXTRACT_LOCK asks a different question
+        # (did the thread ahead of us write a cache?) about the SAME bytes, so
+        # it reuses the first probe's fingerprint — re-validated against a
+        # fresh stat by the manager, and recomputed if the file moved under us.
+        sig = manager._reuse_pdf_signature(pdf_path, signature) if signature else None
+        if sig is None:
+            sig = manager._pdf_file_signature(
+                pdf_path, manager._persisted_pdf_signatures(), rel)
         cache_file = manager._pdf_cache_file(vault_root, sig)
         legacy_file = manager._legacy_pdf_cache_file(vault_root, sig)
         digest = str(sig["sha256"])
@@ -71,9 +83,9 @@ def _cache_probe(manager, pdf_path: Path, vault_root: Path):
         has_real = cache_file.exists() or legacy_file.exists()
         if not has_real:
             has_real = any(cache_file.parent.glob(f"{digest}-p*.txt"))
-        return marker, has_real
+        return marker, has_real, sig
     except Exception:  # noqa: BLE001 — probe is best-effort
-        return None, False
+        return None, False, None
 
 
 def read_pdf_text(pdf_path: Path, vault_root: Path, max_chars: int,
@@ -91,7 +103,8 @@ def read_pdf_text(pdf_path: Path, vault_root: Path, max_chars: int,
     """
     from rag.vault import obsidian_manager
 
-    marker, has_real_cache = _cache_probe(obsidian_manager, Path(pdf_path), Path(vault_root))
+    marker, has_real_cache, sig = _cache_probe(
+        obsidian_manager, Path(pdf_path), Path(vault_root))
     if (marker is not None and not has_real_cache and marker.exists()
             and _marker_covers(marker, fresh_max_pages)):
         # Known no-text-layer document (and still no real cache): fast-fail.
@@ -101,18 +114,19 @@ def read_pdf_text(pdf_path: Path, vault_root: Path, max_chars: int,
         # Cache hit (or an unprobeable path — best-effort, as before): no
         # extraction will run, so no serialisation is needed.
         return _read_capped(obsidian_manager, pdf_path, vault_root, max_chars,
-                            fresh_max_pages, marker, has_real_cache)
+                            fresh_max_pages, marker, has_real_cache, sig)
 
     # Fresh-extract path: serialise, then RE-probe — while this thread waited,
     # the extraction it queued behind may have written the cache or the
     # .notext marker, making this call a cheap read instead of a second scan.
     with _FRESH_EXTRACT_LOCK:
-        marker, has_real_cache = _cache_probe(obsidian_manager, Path(pdf_path), Path(vault_root))
+        marker, has_real_cache, sig = _cache_probe(
+            obsidian_manager, Path(pdf_path), Path(vault_root), signature=sig)
         if (marker is not None and not has_real_cache and marker.exists()
                 and _marker_covers(marker, fresh_max_pages)):
             return "", False
         return _read_capped(obsidian_manager, pdf_path, vault_root, max_chars,
-                            fresh_max_pages, marker, has_real_cache)
+                            fresh_max_pages, marker, has_real_cache, sig)
 
 
 def _marker_covers(marker: Path, fresh_max_pages: int) -> bool:
@@ -125,32 +139,41 @@ def _marker_covers(marker: Path, fresh_max_pages: int) -> bool:
     ignores the marker and re-extracts; a still-empty result rewrites it with
     the deeper count. Unreadable/legacy markers (no field) are treated as
     depth 0 — one bounded re-scan, after which the rewrite self-heals them.
+    Pre-status markers are also rechecked once: they may have been written
+    after an OCR failure, before that failure was distinguished from no text.
     """
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
-        scanned = int(data.get("pages_scanned", 0))
+        scanned = int(data.get("pages_scanned", 0)) if data.get("schema") == 2 else 0
     except Exception:  # noqa: BLE001
         scanned = 0
     return scanned >= int(fresh_max_pages)
 
 
 def _read_capped(manager, pdf_path, vault_root, max_chars, fresh_max_pages,
-                 marker, has_real_cache) -> tuple[str, bool]:
+                 marker, has_real_cache, signature=None) -> tuple[str, bool]:
     """The read + negative-cache + cap tail of :func:`read_pdf_text`."""
     try:
-        text, truncated = manager._read_pdf_text(
+        result = manager._read_pdf_text(
             Path(pdf_path), Path(vault_root),
             char_budget=int(max_chars),
             fresh_max_pages=int(fresh_max_pages),
             use_markitdown=False,
+            signature=signature,
         )
     except Exception:
         return "", False
+    text, truncated = result
     if not isinstance(text, str):
         return "", False
     text = text.strip()
 
-    if marker is not None and not has_real_cache and len(text) < _MIN_USEFUL_CHARS:
+    extraction_status = status_of(result)
+    known_extraction_failure = bool(
+        extraction_status.failed_pages or extraction_status.truncated_pages
+    )
+    if (marker is not None and not has_real_cache
+            and len(text) < _MIN_USEFUL_CHARS and not known_extraction_failure):
         # A fresh page-bounded extract just ran (a non-empty cache would have
         # short-circuited it) and found nothing usable: remember that so the
         # next call skips the scan entirely. Regenerable cache — the atomic
@@ -158,11 +181,12 @@ def _read_capped(manager, pdf_path, vault_root, max_chars, fresh_max_pages,
         try:
             manager._atomic_write_text(
                 marker,
-                json.dumps({"ts": time.time(), "pages_scanned": int(fresh_max_pages)}),
+                json.dumps({"schema": 2, "ts": time.time(),
+                            "pages_scanned": int(fresh_max_pages)}),
             )
         except Exception:  # noqa: BLE001 — the marker is an optimisation only
             logger.debug("could not write .notext marker for %s", pdf_path, exc_info=True)
 
     if len(text) > max_chars:
-        return text[:max_chars], True
-    return text, bool(truncated)
+        return TextRead(text[:max_chars], True, extraction_status)
+    return TextRead(text, bool(truncated), extraction_status)

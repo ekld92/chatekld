@@ -116,10 +116,4 @@ describe('language + roving tabindex (Track 6c)', () => {
         expect(document.querySelector('.example-chips-label').lang).toBe('');
     });
 
-    it('refactor listbox uses a roving tabindex (source ratchet)', () => {
-        const src = readFileSync(resolve(root, 'static/js/refactor.js'), 'utf-8');
-        expect(src).toContain('entry.tabIndex = -1;');
-        expect(src).toContain('el.tabIndex = on ? 0 : -1;');
-        expect(src).not.toContain('entry.tabIndex = 0;');
-    });
 });

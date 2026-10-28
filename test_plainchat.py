@@ -39,7 +39,11 @@ def _provider_yielding(tokens, *, raise_at_end=None):
             if raise_at_end is not None:
                 raise raise_at_end
 
-        return SimpleNamespace(response_gen=gen())
+        from core.llm.types import LLMResponse
+        return SimpleNamespace(
+            response_gen=gen(),
+            final=LLMResponse(provider="test", model=request.model),
+        )
 
     return SimpleNamespace(stream=stream, captured=captured)
 

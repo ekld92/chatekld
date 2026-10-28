@@ -23,9 +23,12 @@ import json
 import logging
 import os
 import threading
-from typing import Any, Callable, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
-from core.constants import OBSIDIAN_INDEX_VERSION
+if TYPE_CHECKING:
+    from core.utils import ReaderWriterLock
+
+from rag.docstore_access import node_count
 from rag.lancedb_store import (
     VECTOR_BACKEND_LANCEDB,
     lancedb_delete_ids,
@@ -54,6 +57,11 @@ class _PersistTarget(NamedTuple):
     provider_name: str
     vault: str
     embed_provider_name: str
+    #: The run's op-lock acquisition token. Both persist paths heartbeat around
+    #: their (long, unheartbeated before 2026-09-02) checkpoint write; 0 means
+    #: "no lock held" and every heartbeat is inert, which is what direct/test
+    #: callers pass.
+    op_epoch: int = 0
 
 class IndexBuildMixin:
     """The eight ``index_vault`` phases, mixed into :class:`ObsidianVaultManager`.
@@ -64,7 +72,55 @@ class IndexBuildMixin:
     (``_write_index_meta``, ``_persist_index_checkpoint``,
     ``_archive_old_index_dir``, ``_build_index_for_backend``, …) is owned by the
     manager and resolved through ``self``.
+
+    The ``TYPE_CHECKING`` block below DECLARES the host-class members these
+    methods reach through ``self``. It has no runtime effect (type-only declarations)
+    and exists so mypy can check this file rather than reporting one
+    "IndexBuildMixin has no attribute" per use — the class of error that made
+    69 of this file's findings noise, and would have hidden a real typo among
+    them. Anything added here must actually exist on ``ObsidianVaultManager``.
     """
+
+    if TYPE_CHECKING:  # pragma: no cover - declarations, never executed
+        _status_lock: threading.Lock
+        _rw_lock: ReaderWriterLock
+        _index_mutation_lock: threading.Lock
+        _stop_event: threading.Event
+        _pause_requested: bool
+        _bm25_postindex_generation: int
+        _bm25_fingerprint: tuple[int, int, int, int, int]
+        _emit: Callable[[str], None]
+        _heartbeat_or_stop: Callable[[int], None]
+        _replace_index: Callable[[Any], None]
+
+        def _record_index_error(self, code: str, detail: str) -> None: ...
+        def _embed_batch_size(self) -> int: ...
+        @staticmethod
+        def _prev_embed_provider(prev_meta: Optional[dict]) -> str: ...
+        def _read_index_meta(self) -> Optional[dict]: ...
+        def _indexed_chunk_count_hint(self) -> int: ...
+        def _index_dir_has_vector_data(self, index_dir: str) -> bool: ...
+        def _migrate_legacy_caches(self) -> None: ...
+        def _archive_old_index_dir(self, prev_meta: dict, *, protected: bool = False) -> str: ...
+        def _resolve_fresh_backend(self) -> str: ...
+        def _build_index_for_backend(self, *, fresh: bool, backend: str, embed_model: Any) -> Any: ...
+        def _resolve_existing_backend(self, prev_meta: Optional[dict]) -> str: ...
+        def _set_prewarm(self, status: str, message: str = '', generation: int | None = None) -> None: ...
+        def _persist_index_checkpoint(self, idx: Any, backend: str = 'simple') -> None: ...
+        def _write_index_meta(
+            self, path: str, embed_name: str, provider_name: str, *, partial: bool,
+            phase: str, has_vector_data: bool, inserted_this_run: int,
+            vector_backend: str = 'simple', vault_path: Optional[str] = None,
+            embed_provider: str = '',
+        ) -> None: ...
+        def _write_index_manifest(self, counts: dict[str, int], vault_path: str) -> None: ...
+        def _invalidate_retrieval_caches(self, *, persistent: bool = True) -> None: ...
+        def _index_has_vector_data(self, idx: Any) -> bool: ...
+        def _get_bm25_retriever(
+            self, top_k: int, stage_cb: Optional[Callable[[str], None]] = None,
+        ) -> Optional[Any]: ...
+        def _bm25_sidecar_dir(self) -> str: ...
+        def _cache_fingerprint(self, idx: Any = None) -> tuple[int, int, int, int, int] | None: ...
 
     def _index_prepare_embedding(
         self, llm_name: str, embed_name: str, provider_name: str,
@@ -90,18 +146,19 @@ class IndexBuildMixin:
         else:
             self._emit(f"LLM: {llm_name} | Embeddings: {embed_name} ({provider_name})")
 
-        # Preflight: a reachable local backend that simply has not pulled the
-        # embed model otherwise fails per-chunk and only surfaces a GENERIC abort
-        # ~87 s later (the consecutive-failure breaker's backoff window). Probe
-        # the installed-model list and fail fast with an ACTIONABLE message. Only
-        # aborts when the backend is reachable (no list error) and returns a
-        # non-empty list that lacks the model by exact or base-name match — so an
-        # unreachable backend (empty list + error) falls through to the existing
-        # init/insert error paths rather than mis-reporting "not installed".
+        # Availability is admission evidence, not a reason to mutate caches and
+        # discover failure later during insertion. No store opens on failure.
         try:
             _installed, _list_err = provider.get_models()
         except Exception:
             _installed, _list_err = [], "probe failed"
+        if _list_err or not _installed:
+            msg = f"ERROR: Local embedding provider '{embed_provider_name}' is unavailable or reports no installed models."
+            self._emit(msg)
+            self._record_index_error("embedding_unavailable", msg)
+            with self._status_lock:
+                self._index_state = "error"
+            return None
         if not _list_err and _installed:
             _base = embed_name.split(":")[0]
             if embed_name not in _installed and not any(
@@ -197,6 +254,7 @@ class IndexBuildMixin:
         force_fresh: bool,
         *,
         index_dir: str,
+        op_epoch: int = 0,
     ) -> Optional[tuple[Any, str, bool, str]]:
         """Decide incremental-vs-fresh, run the identity gates, open/build the
         index and publish it — the whole rw-write-locked setup phase.
@@ -212,192 +270,30 @@ class IndexBuildMixin:
         # indexing can use the in-progress index instead of blocking on a
         # multi-hour run.  The insert loop below runs without the rw lock.
         with self._rw_lock.write_lock():
-            os.makedirs(index_dir, exist_ok=True)
-            meta_path = os.path.join(index_dir, "obsidian_meta.json")
-            is_incremental = False
-            prev_meta: dict = {}
-            if os.path.exists(meta_path):
-                try:
-                    with open(meta_path) as f:
-                        prev_meta = json.load(f)
-                except Exception:
-                    prev_meta = {}
-                embed_changed = bool(prev_meta.get("embed")) and prev_meta.get("embed") != embed_name
-                # An index that recorded NO embed model cannot be safely
-                # extended: we can't prove its existing vectors match the
-                # current model, and a silent mix corrupts similarity search.
-                # Treat it like a model change (rebuild), not a free incremental.
-                embed_unknown = not bool(prev_meta.get("embed"))
-                has_vector_data = self._index_dir_has_vector_data(index_dir)
-                if (
-                    prev_meta.get("version") == OBSIDIAN_INDEX_VERSION
-                    and has_vector_data
-                    and not embed_changed
-                    and not embed_unknown
-                ):
-                    is_incremental = True
-                elif has_vector_data and (embed_changed or embed_unknown):
-                    # Mixing incompatible vectors into the store would corrupt
-                    # similarity search silently — force a rebuild.  Gated on
-                    # has_vector_data: a paused_scan with no persisted vectors
-                    # has nothing to be incompatible with.
-                    if embed_changed:
-                        self._emit(
-                            f"WARNING: Existing index was built with embedding "
-                            f"model '{prev_meta['embed']}', but the current model is '{embed_name}'. "
-                            "New chunks would have incompatible vector representations; "
-                            "starting a fresh vector index."
-                        )
-                    else:
-                        self._emit(
-                            "WARNING: Existing index did not record its embedding "
-                            "model, so it cannot be safely extended; starting a "
-                            "fresh vector index."
-                        )
-
-            # Item 2.8a follow-up (2026-07-05): the reindex/writer path must
-            # honor the promotion marker the READERS enforce. A store torn by
-            # a crash mid-promotion would otherwise be loaded incrementally
-            # (the hash-skip can never repair its stranded chunks) and then
-            # sealed by this run's fresh "complete" marker — defeating the
-            # exact recovery the load-time integrity error tells the user to
-            # take. Degrade a torn store to a fresh rebuild instead.
-            if is_incremental and not self._incremental_store_is_intact(prev_meta):
-                is_incremental = False
-                self._emit(
-                    "WARNING: the existing index checkpoint was interrupted "
-                    "mid-promotion (mixed-generation store); rebuilding the "
-                    "vector index from scratch to guarantee consistency."
-                )
-
-            # Explicit rebuild opt-in (2026-07-27). Placed BEFORE the
-            # identity gates so they never fire on a run the user already
-            # approved: dropping straight to the shared not-incremental
-            # branch is byte-identical to what a version bump does, so
-            # there is no second code path to keep in sync. `protect_archive`
-            # marks the resulting .bak as user-approved-rebuild fallout so
-            # the retention sweep cannot evict it behind a couple of
-            # unrelated version-bump archives (see _prune_old_index_backups).
-            protect_archive = False
-            if is_incremental and force_fresh:
-                is_incremental = False
-                protect_archive = True
-                self._emit(
-                    "Rebuilding the vector index from scratch (explicitly "
-                    "requested); the previous index is moved aside, not deleted."
-                )
-
-            # A1 (2026-07-13): refuse a cross-vault incremental. The meta now
-            # records the vault it was built from; if the recorded path is
-            # present and differs from the vault we are indexing now, the
-            # existing chunks belong to a DIFFERENT vault and extending them
-            # would fuse two vaults' content into one store. A missing/blank
-            # recorded path is a pre-fix index (grandfathered): adopt it for
-            # the current vault silently — the field is stamped at the next
-            # persist below. `vault` arrives resolved (same as _write_index_meta).
-            if is_incremental:
-                prev_vault = str(prev_meta.get("vault_path") or "")
-                if prev_vault and vault and prev_vault != vault:
-                    is_incremental = False
-                    # A vault switch is an unambiguous user action with an
-                    # unambiguous outcome (the other vault's index is useless
-                    # here), so this one still rebuilds automatically — but
-                    # its archive is protected: switching back and forth
-                    # between two vaults must not grind the FIRST vault's
-                    # index out of the retention window.
-                    protect_archive = True
-                    self._emit(
-                        "WARNING: the existing index was built from a different "
-                        "vault; rebuilding the vector index from scratch so the "
-                        "two vaults' content cannot be mixed."
-                    )
-
-            # Embed-BACKEND gate (2026-07-26; turned from a silent rebuild
-            # into a REFUSAL 2026-07-27).
-            #
-            # Why the gate exists: `embed` (checked above) pins the model
-            # NAME, but the same name served by ollama vs LM Studio can be a
-            # differently quantized/pooled build, so its vectors are not
-            # comparable — exactly the silent similarity-search corruption
-            # the embed-model gate exists to prevent. Extending such an index
-            # incrementally must not happen.
-            #
-            # Why it must not rebuild on its own: the trigger is NOT a
-            # deliberate "re-embed my vault" action. `resolve_embed_provider`
-            # returns the CHAT provider unchanged whenever it is local and
-            # only falls back to `embed_provider` when the chat provider is
-            # online, so the resolved backend flips on routine chat-dropdown
-            # moves the user reads as unrelated: ollama <-> lm_studio, and
-            # lm_studio -> any online provider (which falls back to the
-            # untouched default "ollama"). Auto-rebuilding there spends hours
-            # of embedding on a real vault (measured: 411 823 chunks / 5.4 GB)
-            # with no confirmation, silently flips the vector backend as a
-            # side effect (the fresh branch calls `_resolve_fresh_backend()`,
-            # i.e. the config knob, where an incremental inherits the index's
-            # own), and archives the old index — so the THIRD such toggle used
-            # to prune the last good copy. Refusing costs one failed run;
-            # rebuilding costs the index.
-            #
-            # Precedent for the shape: the LanceDB-missing preflight above
-            # refuses with an actionable message rather than proceeding into
-            # a destructive fresh build. Same contract here — nothing is
-            # archived, nothing is deleted, nothing is re-embedded, and the
-            # message names both recovery routes (put the provider back, or
-            # opt in explicitly).
-            #
-            # Grandfathering (item 2, 2026-07-27) is resolved by
-            # `_prev_embed_provider`: a missing `embed_provider` falls back
-            # to the recorded `provider` when THAT is local. See that helper
-            # for why an online recorded provider is not usable as a proxy.
-            # An index that yields no usable previous name at all is still
-            # adopted silently and stamped at the next persist, so the
-            # upgrade forces no reindex — the invariant this gate inherited
-            # from the A1 vault_path stamp.
-            #
-            # Deliberately subordinate to the two gates above: after a vault
-            # switch (or an approved force_fresh) the old vectors are being
-            # discarded anyway, so refusing over their backend would block a
-            # rebuild the user already asked for, for no protective gain.
-            if is_incremental:
-                prev_ep = self._prev_embed_provider(prev_meta)
-                if prev_ep and embed_provider_name and prev_ep != embed_provider_name:
+            from rag.index_admission import index_admission
+            admission = index_admission(self, index_dir, vault, embed_name,
+                                        embed_provider_name, force_fresh=force_fresh)
+            if not admission["ready"]:
+                msg = (f"ERROR: Index update refused: {admission['reason']}. "
+                       "Restore compatible settings or explicitly confirm Rebuild from scratch.")
+                if admission["reason"] == "embed_backend_mismatch":
+                    previous = self._prev_embed_provider(self._read_index_meta() or {})
                     chunks = self._indexed_chunk_count_hint()
-                    scale = (
-                        f"all {chunks:,} indexed chunks"
-                        if chunks else "every chunk in the vault"
-                    )
-                    msg = (
-                        f"ERROR: the existing index was embedded through "
-                        f"'{prev_ep}', but embeddings would now come from "
-                        f"'{embed_provider_name}'. The same embedding model "
-                        f"name can yield differently-quantized vectors across "
-                        f"local backends, so the two cannot be mixed — and "
-                        f"continuing would mean re-embedding {scale} from "
-                        f"scratch (hours of compute). Refusing to touch the "
-                        f"index. Either switch the provider back to "
-                        f"'{prev_ep}' in Settings and reindex, or — if you "
-                        f"really do want a full rebuild — use the app's "
-                        f"“Rebuild from scratch” action (headless callers: "
-                        f"reindex with force_fresh). The previous index is "
-                        f"archived, not deleted."
-                    )
-                    self._emit(msg)
-                    # The machine code is what lets the client swap the
-                    # useless Retry (this gate re-fails identically) for a
-                    # confirm-gated force_fresh rebuild (2026-07-29 audit
-                    # 0.1: the refusal's recovery instructions previously
-                    # never survived to the screen).
-                    self._record_index_error("embed_backend_mismatch", msg)
-                    with self._status_lock:
-                        self._index_state = "error"
-                        self._current_phase = "error"
-                    # Returning from inside the rw write lock is safe: the
-                    # context manager releases it, the op-lock is released by
-                    # the admitting route's `finally`, and the outer `finally`
-                    # still runs gc.collect(). Nothing has been written yet —
-                    # this gate sits before the archive/build branch.
-                    return None
-
+                    scale = f"all {chunks:,} indexed chunks" if chunks else "every chunk in the vault"
+                    msg = (f"ERROR: Existing index was embedded through '{previous}', but the selected "
+                           f"backend is '{embed_provider_name}'. Refusing to change {scale}. "
+                           f"Either switch the provider back to '{previous}' or explicitly confirm "
+                           "Rebuild from scratch. The existing index is unchanged.")
+                self._emit(msg)
+                self._record_index_error(admission["reason"], msg)
+                with self._status_lock:
+                    self._index_state = "error"
+                    self._current_phase = "error"
+                return None
+            meta_path = os.path.join(index_dir, "obsidian_meta.json")
+            prev_meta = self._read_index_meta() or {}
+            is_incremental = admission["mode"] == "incremental"
+            protect_archive = bool(force_fresh)
             if not is_incremental:
                 if self._index_dir_has_vector_data(index_dir):
                     self._migrate_legacy_caches()
@@ -419,11 +315,34 @@ class IndexBuildMixin:
                 )
             else:
                 vector_backend = self._resolve_existing_backend(prev_meta)
+                # PERF (2026-09-02): one long, unheartbeated, silent window.
+                #   Before:    loading an existing store is a single call that
+                #              parses the whole docstore/index-store — minutes
+                #              on a large vault — inside the rw write lock and
+                #              with NO heartbeat against the op-lock's
+                #              3600 s TTL and NO status line. A stall here read
+                #              as a hang, and a TTL lapse went unnoticed.
+                #   Change:    a stage line before, and `_heartbeat_or_stop`
+                #              after, so the wait reads as a stage and a lost
+                #              lock aborts the run instead of continuing as a
+                #              second concurrent writer.
+                #   Safe because:
+                #              a heartbeat only refreshes a deadline; the load
+                #              itself is untouched, and `op_epoch == 0` (every
+                #              direct/test caller) makes both calls inert.
+                #   Preserves: "A `False` heartbeat sets the stop event, never
+                #              discarded" — `_heartbeat_or_stop` is the shared
+                #              helper that does exactly that.
+                #   Lock/thread contract:
+                #              unchanged; still inside the rw write lock.
+                #   Pinned by: test_vault_regressions.py::TestLongPhasesHeartbeat
+                self._emit("Loading the existing index from disk…")
                 idx = self._build_index_for_backend(
                     fresh=False, backend=vector_backend, embed_model=embed_model
                 )
+                self._heartbeat_or_stop(op_epoch)
 
-            self._index = idx
+            self._replace_index(idx)
             # Once the indexer publishes self._index, prewarm has nothing
             # left to do — chat will use this index directly.  Mark ready
             # so the UI banner clears even when the user reaches a populated
@@ -442,6 +361,7 @@ class IndexBuildMixin:
         provider_name = target.provider_name
         vault = target.vault
         embed_provider_name = target.embed_provider_name
+        op_epoch = target.op_epoch
 
         def _persist_callback(manifest_counts_so_far: dict[str, int]) -> None:
             """Mid-run checkpoint — bounds re-work on crash to the persist cadence.
@@ -453,9 +373,16 @@ class IndexBuildMixin:
             lock that serialises inserts protects against future LlamaIndex
             changes that touch internal state during serialisation.
             """
+            # PERF (2026-09-02): the checkpoint persist is one unheartbeated
+            # window against a 3600 s TTL (it re-serialises and re-validates
+            # the ENTIRE store). Same treatment as the store load above: a
+            # stage line so a stall reads as a stage, and a heartbeat after so
+            # a lapse aborts rather than continuing as a second writer.
+            self._emit("Saving a checkpoint of the index…")
             with self._rw_lock.write_lock():
                 with self._index_mutation_lock:
                     self._persist_index_checkpoint(idx, vector_backend)
+                self._heartbeat_or_stop(op_epoch)
                 self._write_index_meta(
                     meta_path,
                     embed_name,
@@ -486,7 +413,7 @@ class IndexBuildMixin:
         # Crash-drift recovery (lancedb only): the binary store is durable
         # on insert while the docstore is persisted at the checkpoint
         # cadence, so a hard crash can leave the vector table *ahead* of the
-        # docstore. Detect that with two O(1) counts; when the table has
+        # docstore. Detect that with two backend counts; when the table has
         # more rows than the docstore has nodes, re-process this run with
         # delete-before-insert so resumed chunks replace their orphan rows
         # instead of duplicating them. No-op for fresh builds and the simple
@@ -495,8 +422,8 @@ class IndexBuildMixin:
         if vector_backend == VECTOR_BACKEND_LANCEDB and is_incremental:
             try:
                 vec_rows = lancedb_table_count(index_dir)
-                node_count = len(idx.docstore.docs)
-                if vec_rows > node_count:
+                live_node_count = node_count(idx.docstore)
+                if vec_rows > live_node_count:
                     lancedb_upsert = True
                     self._emit(
                         "Detected an interrupted previous run (vector store ahead of "
@@ -525,7 +452,7 @@ class IndexBuildMixin:
                                 f"WARNING: could not reconcile {len(orphans)} LanceDB "
                                 f"orphan rows ({detail}); a full reindex will resync."
                             )
-                elif 0 <= vec_rows < node_count:
+                elif 0 <= vec_rows < live_node_count:
                     self._emit(
                         "WARNING: vector store has fewer rows than docstore nodes "
                         "(possible torn write); a full reindex will fully resync."
@@ -554,9 +481,12 @@ class IndexBuildMixin:
         # Final phase: persist and update meta under a brief write lock.
         # The persist is also serialised against the chat retrieval path
         # via the mutation lock — see _persist_callback for the rationale.
+        # Stage line + heartbeat for the same reason as the mid-run one.
+        self._emit("Saving the index…")
         with self._rw_lock.write_lock():
             with self._index_mutation_lock:
                 self._persist_index_checkpoint(idx, vector_backend)
+            self._heartbeat_or_stop(target.op_epoch)
             has_vector_data = bool(manifest_counts) or self._index_has_vector_data(idx)
             if self._stop_event.is_set() and has_vector_data:
                 self._emit(
@@ -582,6 +512,24 @@ class IndexBuildMixin:
                     else ("paused_scan" if is_paused else "idle")
                 )
             )
+            # DURABILITY (2026-09-02, performance plan Phase 5): the manifest
+            # is written BEFORE the meta that advertises it.
+            # Before: the meta file — the one every loader reads first, and
+            #   whose `phase: done` is what makes an index look complete — was
+            #   written first, so a crash in the gap left a "done" index whose
+            #   indexed-materials manifest was missing or stale. The materials
+            #   route then falls back to parsing the whole docstore (the very
+            #   cost Phase 2 removed from the request thread).
+            # Change: swap the two writes. Both are already atomic; only the
+            #   order changes.
+            # Safe because: the manifest is self-describing and harmless on its
+            #   own — a manifest newer than its meta is exactly what an
+            #   interrupted run should leave, and the next run rewrites it.
+            #   Nothing between the two writes reads either.
+            # Lock/thread contract: unchanged; both stay inside the same brief
+            #   write-lock hold.
+            # Pinned by: test_vault_regressions.py::TestFinalPersistWriteOrder.
+            self._write_index_manifest(manifest_counts, vault)
             self._write_index_meta(
                 meta_path,
                 embed_name,
@@ -594,7 +542,6 @@ class IndexBuildMixin:
                 vault_path=vault,
                 embed_provider=embed_provider_name,
             )
-            self._write_index_manifest(manifest_counts, vault)
 
     def _index_kick_bm25_rebuild(
         self, *, load_config: Callable[[], dict],
@@ -612,15 +559,48 @@ class IndexBuildMixin:
         # The build-lock discipline in _get_bm25_retriever makes a chat
         # arriving mid-rebuild simply queue on the lock and reuse the
         # result.
+        with self._status_lock:
+            self._bm25_postindex_generation += 1
+            generation = self._bm25_postindex_generation
+            self._bm25_postindex_status = 'unknown'
         if not self._stop_event.is_set():
             try:
                 if load_config().get("vault_hybrid_enabled", True):
+                    with self._status_lock:
+                        self._bm25_postindex_status = 'preparing'
+
+                    def warm() -> None:
+                        status = 'unknown'
+                        try:
+                            retriever = self._get_bm25_retriever(top_k=8)
+                            meta = self._read_index_meta() or {}
+                            with open(os.path.join(self._bm25_sidecar_dir(), 'sidecar_meta.json'), encoding='utf-8') as f:
+                                sidecar = json.load(f)
+                            with self._index_mutation_lock:
+                                fingerprint = self._cache_fingerprint()
+                                current = fingerprint == self._bm25_fingerprint
+                            if (retriever is not None and current and fingerprint
+                                    and meta.get('indexed_at') and sidecar.get('indexed_at') == meta['indexed_at']
+                                    and sidecar.get('doc_count') == fingerprint[-1]):
+                                status = 'ready'
+                        except Exception:  # noqa: BLE001 — best-effort warm; never claim readiness
+                            logger.debug('Post-index BM25 status unavailable', exc_info=True)
+                        with self._status_lock:
+                            if self._bm25_postindex_generation == generation:
+                                self._bm25_postindex_status = status
+
                     threading.Thread(
-                        target=lambda: self._get_bm25_retriever(top_k=8),
+                        target=warm,
                         name="bm25-postindex-rebuild",
                         daemon=True,
                     ).start()
+                else:
+                    with self._status_lock:
+                        self._bm25_postindex_status = 'disabled'
             except Exception:  # noqa: BLE001 — a failed warm just defers to the chat path
+                with self._status_lock:
+                    if self._bm25_postindex_generation == generation:
+                        self._bm25_postindex_status = 'unknown'
                 logger.debug("post-index BM25 rebuild kick failed", exc_info=True)
 
     def _index_report_outcome(

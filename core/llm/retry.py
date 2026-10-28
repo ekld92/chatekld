@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable, Mapping, Optional, TypeVar
 
-from core.llm.types import ErrorCategory, LLMError
+from core.llm.types import ErrorCategory, LLMError, LLMRequest
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +110,20 @@ def retry_with_backoff(
     """
     attempt = 0
     delay = base_delay_s
+    last_error: LLMError | None = None
     while True:
+        cancelled = should_cancel is not None and should_cancel()
+        expired = deadline_monotonic_s is not None and time.monotonic() >= deadline_monotonic_s
+        if cancelled or expired:
+            if last_error is not None:
+                raise last_error
+            raise LLMError(category=ErrorCategory.TIMEOUT,
+                           message="Request cancelled before dispatch" if cancelled else "Request deadline expired before dispatch")
         attempt += 1
         try:
             return fn()
         except LLMError as err:
+            last_error = err
             if attempt >= max_attempts or not is_transient(err):
                 raise
             # Jitter (±25 %) BEFORE the cap, so max_delay_s is an honest
@@ -174,3 +183,17 @@ def retry_with_backoff(
                         break
                     time.sleep(min(1.0, remaining_sleep))
             delay *= 2
+
+
+def check_request_dispatch(request: LLMRequest, started: float) -> None:
+    """Guard every transport attempt, including immediate parameter-heal retries."""
+    should_cancel = (request.metadata or {}).get("should_cancel")
+    cancelled = callable(should_cancel) and should_cancel()
+    expired = (request.timeout_s is not None and request.timeout_s > 0
+               and time.monotonic() >= started + request.timeout_s)
+    if cancelled or expired:
+        raise LLMError(
+            category=ErrorCategory.TIMEOUT,
+            message="Request cancelled before dispatch" if cancelled else "Request deadline expired before dispatch",
+            model=request.model,
+        )

@@ -4,7 +4,7 @@
         --provider ollama --model qwen2.5 --audience "medical students" \
         --port 5050 --out schizophrenia.tex
 
-Drives the running ChatEKLD app over its local HTTP API to produce a Beamer .tex
+Drives the running CHERQAiN app over its local HTTP API to produce a Beamer .tex
 deck grounded in the indexed Obsidian vault. Emits the .tex only — compile it
 yourself (e.g. ``latexmk -pdf schizophrenia.tex``).
 """
@@ -16,8 +16,15 @@ import re
 import sys
 from typing import Optional
 
-from .assemble import DeckMeta, assemble, assemble_with_template, validate
-from .client import ChatEKLDClient, DeckgenClientError, resolve_base_url
+from .assemble import (
+    BEAMER,
+    DeckMeta,
+    assemble,
+    assemble_with_template,
+    rewrite_source_tags,
+    validate,
+)
+from .client import CHERQAiNClient, DeckgenClientError, resolve_base_url
 from .outline import OutlineError, request_outline
 from .scaffold import ScaffoldError, scaffold_deck, slugify
 from .sections import generate_section
@@ -109,7 +116,7 @@ def _build_parser() -> argparse.ArgumentParser:
     """
     p = argparse.ArgumentParser(
         prog="python -m deckgen",
-        description="Generate a Beamer .tex lecture deck from the ChatEKLD Obsidian vault.",
+        description="Generate a Beamer .tex lecture deck from the CHERQAiN Obsidian vault.",
     )
     p.add_argument("--topic", required=True, help="Lecture topic, e.g. 'Schizophrenia'.")
     p.add_argument("--instructions", default="",
@@ -130,7 +137,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Upper bound on outline sections.")
 
     p.add_argument("--base-url", default=None, help="Full API base URL, e.g. http://127.0.0.1:5050.")
-    p.add_argument("--port", type=int, default=None, help="ChatEKLD port (loopback).")
+    p.add_argument("--port", type=int, default=None, help="CHERQAiN port (loopback).")
 
     p.add_argument("--out", default=None,
                    help="Output .tex path ('-' for stdout). Default: <topic-slug>.tex")
@@ -160,7 +167,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _preflight(client: ChatEKLDClient, verbose: bool) -> None:
+def _preflight(client: CHERQAiNClient, verbose: bool) -> None:
     """Probe vault status and warn (never abort) about a missing/in-progress index.
 
     A SystemExit fires only if the app is entirely unreachable; an unusable or
@@ -171,7 +178,7 @@ def _preflight(client: ChatEKLDClient, verbose: bool) -> None:
     try:
         status = client.status()
     except DeckgenClientError as exc:
-        raise SystemExit(f"deckgen: cannot reach ChatEKLD: {exc}")
+        raise SystemExit(f"deckgen: cannot reach CHERQAiN: {exc}")
     state = str(status.get("state", "")).lower()
     vault = status.get("vault_path") or "(unset)"
     if verbose:
@@ -204,8 +211,8 @@ def main(argv: Optional[list] = None) -> int:
     except DeckgenClientError as exc:
         raise SystemExit(f"deckgen: {exc}")
 
-    _eprint(f"deckgen: using ChatEKLD at {base_url}")
-    client = ChatEKLDClient(base_url)
+    _eprint(f"deckgen: using CHERQAiN at {base_url}")
+    client = CHERQAiNClient(base_url)
     _preflight(client, args.verbose)
 
     # Optional: house-style template mode -------------------------------------
@@ -280,6 +287,22 @@ def main(argv: Optional[list] = None) -> int:
                 macros_block=macros_block,
                 cite_mode=cite_mode,
                 candidate_bib_block=candidate_block,
+                # Same deterministic citation pass the in-app route runs, so a
+                # CLI-generated deck is not the one surface still shipping raw
+                # "(source: note.md)" filenames in its bullets. Empty index when
+                # citations are off => tidy into a footer, never a \citefoot.
+                post_process=lambda body: rewrite_source_tags(
+                    body,
+                    template.bib_index if (template is not None
+                                           and cite_mode == "bib") else {},
+                    cite_macro=BEAMER.cite_macro,
+                    # Only assemble_with_template injects REFLINE_PROVIDECOMMAND;
+                    # the no-template assemble() scaffold defines no \refline, so
+                    # that path must use the macro-free footer form or every
+                    # footer is an undefined control sequence at compile time.
+                    footer_mode=(BEAMER.footer_mode if template is not None
+                                 else "vfill"),
+                ),
                 on_event=on_event,
             )
         except DeckgenClientError as exc:

@@ -36,6 +36,9 @@ class TestVaultIndexingRegressions(unittest.TestCase):
         from llama_index.core.embeddings import MockEmbedding
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=2)
 
@@ -240,6 +243,9 @@ class TestVaultIndexingRegressions(unittest.TestCase):
         from rag.vault import ObsidianVaultManager
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, name):
                 return f"embedding:{name}"
 
@@ -289,6 +295,9 @@ class TestVaultIndexingRegressions(unittest.TestCase):
         from llama_index.core.embeddings import MockEmbedding
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=2)
 
@@ -1031,6 +1040,9 @@ class TestVaultIndexingRegressions(unittest.TestCase):
         release_signal = threading.Event()
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=2)
 
@@ -1086,6 +1098,9 @@ class TestVaultIndexingRegressions(unittest.TestCase):
         from llama_index.core.embeddings import MockEmbedding
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=2)
 
@@ -1112,7 +1127,7 @@ class TestVaultIndexingRegressions(unittest.TestCase):
             manager = ObsidianVaultManager()
             manager.restore_vault_path(vault_dir)
 
-            def stop_during_scan(_vault, op_epoch=0):
+            def stop_during_scan(_vault, op_epoch=0, **_options):
                 manager.pause_indexing()
                 return []
 
@@ -1363,13 +1378,16 @@ class TestVaultIndexingRegressions(unittest.TestCase):
             # b.pdf's signature and forcing a re-hash on the next run.
             self.assertEqual(saved, seed)
 
-    def test_embed_change_forces_fresh_index_when_vector_data_present(self):
+    def test_embed_change_refuses_without_rebuild_confirmation(self):
         """Changing the embedding model between runs must force a rebuild
         (with a warning + .bak archive) instead of silently going incremental."""
         from rag.vault import ObsidianVaultManager, OBSIDIAN_INDEX_VERSION
         from llama_index.core.embeddings import MockEmbedding
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=2)
 
@@ -1418,7 +1436,7 @@ class TestVaultIndexingRegressions(unittest.TestCase):
 
             # Stop after the setup phase so the test focuses on the
             # incremental-decision branch, not the streaming indexer.
-            def stop_after_setup(_vault, op_epoch=0):
+            def stop_after_setup(_vault, op_epoch=0, **_options):
                 manager.request_stop()
                 return []
 
@@ -1435,17 +1453,11 @@ class TestVaultIndexingRegressions(unittest.TestCase):
                 manager.index_vault("llm", "embed-B", provider_name="ollama")
                 join_post_index_daemons()
 
-            self.assertTrue(
-                any("embedding" in m.lower() and "embed-A" in m and "embed-B" in m for m in messages),
-                f"expected embed-mismatch warning, got: {messages}",
-            )
-            siblings = [p.name for p in Path(index_dir).parent.iterdir()]
-            self.assertTrue(
-                any(s.startswith(Path(index_dir).name + ".bak.") for s in siblings),
-                f"expected a .bak.* archive of the old index dir, got: {siblings}",
-            )
-            new_meta = json.loads(Path(index_dir, "obsidian_meta.json").read_text(encoding="utf-8"))
-            self.assertEqual(new_meta.get("embed"), "embed-B")
+            self.assertTrue(any("embed_model_mismatch" in m for m in messages))
+            self.assertEqual(manager.get_status(), "error")
+            self.assertFalse(any(p.name.startswith(Path(index_dir).name + ".bak.")
+                                 for p in Path(index_dir).parent.iterdir()))
+            self.assertEqual(json.loads(Path(index_dir, "obsidian_meta.json").read_text())["embed"], "embed-A")
 
     def _run_vault_identity_gate(self, seed_meta_extra: dict, provider_name: str = "ollama",
                                  force_fresh: bool = False, seed_manifest_chunks: int = 0):
@@ -1465,6 +1477,9 @@ class TestVaultIndexingRegressions(unittest.TestCase):
         from llama_index.core.embeddings import MockEmbedding
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=2)
 
@@ -1503,6 +1518,7 @@ class TestVaultIndexingRegressions(unittest.TestCase):
             "phase": "done",
             "has_vector_data": True,
             "inserted_this_run": 5,
+            "vault_path": vault_dir,
         }
         meta.update(seed_meta_extra)
         Path(index_dir, "obsidian_meta.json").write_text(json.dumps(meta), encoding="utf-8")
@@ -1527,7 +1543,7 @@ class TestVaultIndexingRegressions(unittest.TestCase):
         manager = ObsidianVaultManager()
         manager.restore_vault_path(vault_dir)
 
-        def stop_after_setup(_vault, op_epoch=0):
+        def stop_after_setup(_vault, op_epoch=0, **_options):
             manager.request_stop()
             return []
 
@@ -1548,38 +1564,25 @@ class TestVaultIndexingRegressions(unittest.TestCase):
             join_post_index_daemons()
         return messages, index_dir, manager
 
-    def test_vault_switch_forces_fresh_index(self):
+    def test_vault_switch_requires_explicit_rebuild(self):
         """A1 (2026-07-13): an index whose meta records a DIFFERENT vault must not
         be extended incrementally — it rebuilds (warning + .bak archive) and the
         rebuilt meta stamps the current vault's identity."""
         messages, index_dir, manager = self._run_vault_identity_gate(
             {"vault_path": "/some/other/vault"}
         )
-        self.assertTrue(
-            any("different vault" in m.lower() for m in messages),
-            f"expected vault-mismatch warning, got: {messages}",
-        )
-        siblings = [p.name for p in Path(index_dir).parent.iterdir()]
-        self.assertTrue(
-            any(s.startswith(Path(index_dir).name + ".bak.") for s in siblings),
-            f"expected a .bak.* archive of the old index dir, got: {siblings}",
-        )
-        new_meta = json.loads(Path(index_dir, "obsidian_meta.json").read_text(encoding="utf-8"))
-        self.assertEqual(new_meta.get("vault_path"), manager.get_vault_path())
+        self.assertTrue(any("vault_identity_mismatch" in m for m in messages))
+        self.assertEqual(manager.get_status(), "error")
+        self.assertFalse(any(p.name.startswith(Path(index_dir).name + ".bak.")
+                             for p in Path(index_dir).parent.iterdir()))
+        self.assertEqual(json.loads(Path(index_dir, "obsidian_meta.json").read_text())["vault_path"], "/some/other/vault")
 
-    def test_missing_vault_path_in_meta_adopts_current_vault(self):
-        """A1 grandfathering: a pre-fix meta with no vault_path is adopted for the
-        current vault (no forced rebuild — no warning, no .bak archive)."""
-        messages, index_dir, _m = self._run_vault_identity_gate({})
-        self.assertFalse(
-            any("different vault" in m.lower() for m in messages),
-            f"unexpected vault-mismatch warning, got: {messages}",
-        )
-        siblings = [p.name for p in Path(index_dir).parent.iterdir()]
-        self.assertFalse(
-            any(s.startswith(Path(index_dir).name + ".bak.") for s in siblings),
-            f"unexpected .bak.* archive (should have adopted), got: {siblings}",
-        )
+    def test_missing_vault_path_requires_explicit_rebuild(self):
+        messages, index_dir, manager = self._run_vault_identity_gate({"vault_path": ""})
+        self.assertTrue(any("vault_identity_mismatch" in m for m in messages))
+        self.assertEqual(manager.get_status(), "error")
+        self.assertFalse(any(p.name.startswith(Path(index_dir).name + ".bak.")
+                             for p in Path(index_dir).parent.iterdir()))
 
     def test_embed_change_during_paused_scan_does_not_warn(self):
         """A paused_scan (no persisted vectors) followed by an embed-model
@@ -1588,6 +1591,9 @@ class TestVaultIndexingRegressions(unittest.TestCase):
         from llama_index.core.embeddings import MockEmbedding
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=2)
 
@@ -1628,7 +1634,7 @@ class TestVaultIndexingRegressions(unittest.TestCase):
             messages: list[str] = []
             manager.set_status_callback(messages.append)
 
-            def stop_after_setup(_vault, op_epoch=0):
+            def stop_after_setup(_vault, op_epoch=0, **_options):
                 manager.request_stop()
                 return []
 
@@ -1885,7 +1891,7 @@ class TestEmbedProviderStamping(unittest.TestCase):
         self.assertIsNone(manager._index)
         self._assert_untouched(index_dir, "")   # meta still has no embed_provider
 
-    def test_online_recorded_provider_is_not_used_as_proxy(self):
+    def test_online_recorded_provider_cannot_prove_embedding_identity(self):
         """An ONLINE recorded `provider` tells us nothing about which LOCAL
         backend served the embeddings (resolve_embed_provider ignores it and
         consults the separate embed_provider CONFIG key), so it must NOT be
@@ -1893,19 +1899,21 @@ class TestEmbedProviderStamping(unittest.TestCase):
         messages, index_dir, _m = self._run_gate(
             {"provider": "openai"}, provider_name="lm_studio",
         )
+        self.assertTrue(any("missing_embedding_identity" in m for m in messages))
         self.assertEqual(
             self._refusals(messages), [],
             f"an online recorded provider must not trigger a refusal, got: {messages}",
         )
         self.assertEqual(self._baks(index_dir), [])
 
-    def test_no_usable_previous_name_adopts_silently(self):
+    def test_no_usable_previous_name_refuses_without_rebuilding(self):
         """Neither field usable (no embed_provider, blank provider) ⇒ the
         pre-fix grandfathering contract holds: adopt, don't refuse, don't
         rebuild. This is what guarantees the upgrade forces no reindex."""
         messages, index_dir, _m = self._run_gate(
             {"provider": ""}, provider_name="lm_studio",
         )
+        self.assertTrue(any("missing_embedding_identity" in m for m in messages))
         self.assertEqual(
             self._refusals(messages), [],
             f"unexpected refusal on a blank recorded provider, got: {messages}",
@@ -2547,15 +2555,23 @@ class TestConfigVaultSync(unittest.TestCase):
         cover online_timeout_s so the app never kills a still-legal (and
         billed) online call before its own provider bound."""
         from api.sse import online_aware_floor_s
-        from core.constants import SSE_SINGLE_SHOT_FLOOR_S
-        self.assertEqual(online_aware_floor_s({}), SSE_SINGLE_SHOT_FLOOR_S)
-        self.assertEqual(online_aware_floor_s(None), SSE_SINGLE_SHOT_FLOOR_S)
+        self.assertEqual(online_aware_floor_s({}), 360)
+        self.assertEqual(online_aware_floor_s(None), 360)
         self.assertEqual(online_aware_floor_s({"online_timeout_s": 60}),
-                         SSE_SINGLE_SHOT_FLOOR_S)
-        self.assertEqual(online_aware_floor_s({"online_timeout_s": 500}), 500)
-        # Garbage degrades to the plain floor, never a crash.
+                         360)
+        # Since 2026-09-02 the widened floor budgets the whole RETRY ladder,
+        # not one attempt: the adapters retry online_max_retries times, each
+        # bounded by the same timeout, so an outer of 500 against an inner of
+        # 3 x 500 was the chain break this widening exists to close (see
+        # tests/test_sse_timeout_chain.py).
+        self.assertGreaterEqual(online_aware_floor_s({"online_timeout_s": 500}),
+                                500)
+        self.assertEqual(
+            online_aware_floor_s({"online_timeout_s": 500,
+                                  "online_max_retries": 0}), 500)
+        # Malformed timeout uses the default complete retry budget, never a crash.
         self.assertEqual(online_aware_floor_s({"online_timeout_s": "junk"}),
-                         SSE_SINGLE_SHOT_FLOOR_S)
+                         360)
 
     def test_chat_emits_info_event_when_indexing_in_progress(self):
         """When indexing is in flight the chat SSE must lead with an info
@@ -3338,12 +3354,11 @@ class TestVaultChatLiveControls(unittest.TestCase):
         from llama_index.core.postprocessor import SimilarityPostprocessor
         engine = self._make_engine(similarity_cutoff=0.55)
         with patch("rag.engine.load_config") as lc, \
-             patch("rag.engine.VectorIndexRetriever"), \
-             patch("rag.engine.RetrieverQueryEngine") as qengine_cls:
+             patch("rag.engine.VectorIndexRetriever"):
             lc.return_value = {"context_window": 32768}
-            qengine_cls.from_args.return_value.query.return_value = "ok"
-            engine.query("hello")
-            postprocessors = qengine_cls.from_args.call_args.kwargs["node_postprocessors"]
+            _retriever, postprocessors, _llm = engine._build_retrieval_pipeline(
+                lc.return_value
+            )
             self.assertEqual(len(postprocessors), 1)
             self.assertIsInstance(postprocessors[0], SimilarityPostprocessor)
             self.assertAlmostEqual(postprocessors[0].similarity_cutoff, 0.55)
@@ -3428,14 +3443,19 @@ class TestVaultChatLiveControls(unittest.TestCase):
 
             engine.query("hello")
 
-            self.assertEqual(bm25.similarity_top_k, 5)
+            # Request tuning happens on a shallow facade so concurrent chats
+            # cannot mutate the shared cached BM25 instance.
+            self.assertNotEqual(bm25.similarity_top_k, 5)
             fusion_kwargs = fusion_cls.call_args.kwargs
-            self.assertEqual(fusion_kwargs["retrievers"], [dense_cls.return_value, bm25])
+            request_bm25 = fusion_kwargs["retrievers"][1]
+            self.assertIsNot(request_bm25, bm25)
+            self.assertEqual(request_bm25.similarity_top_k, 5)
+            self.assertIs(fusion_kwargs["retrievers"][0], dense_cls.return_value)
             self.assertEqual(fusion_kwargs["similarity_top_k"], 5)
             self.assertEqual(fusion_kwargs["num_queries"], 1)
             self.assertEqual(fusion_kwargs["mode"], "reciprocal_rerank")
             qengine_kwargs = qengine_cls.from_args.call_args.kwargs
-            self.assertIs(qengine_kwargs["retriever"], fusion_cls.return_value)
+            self.assertEqual(qengine_kwargs["node_postprocessors"], [])
 
     def test_query_expansion_sets_num_queries_for_local_provider(self):
         # Stage 6: opt-in multi-query expansion drives the fusion retriever's
@@ -3510,9 +3530,10 @@ class TestVaultChatLiveControls(unittest.TestCase):
             engine.query("hello")
 
             self.assertEqual(retriever_cls.call_args.kwargs["similarity_top_k"], 24)
-            self.assertEqual(reranker.top_n, 6)
+            self.assertNotEqual(reranker.top_n, 6)
             postprocessors = qengine_cls.from_args.call_args.kwargs["node_postprocessors"]
-            self.assertEqual(postprocessors, [reranker])
+            # Reranking already ran on detached nodes before synthesis.
+            self.assertEqual(postprocessors, [])
 
     def test_route_clamps_out_of_range_values(self):
         from api.routes.vault import _resolve_chat_params
@@ -3969,6 +3990,77 @@ class TestVaultChatBM25Manager(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertEqual(json.loads(meta_path.read_text())["doc_count"], 4)
 
+    def test_bm25_warm_is_kicked_after_the_terminal_state_is_published(self):
+        """The 2026-09-02 perf review's silent, intermittent sidecar loss.
+
+        The post-index warm thread ends in ``_persist_bm25_sidecar``, which
+        BAILS unless ``_index_state`` is ``idle`` or ``done`` (correctly — a
+        mid-run persist would churn a full-corpus write at every checkpoint).
+        The kick ran one line BEFORE ``_index_report_outcome`` flipped the
+        state, so on a fast run the warm built the retriever and wrote no
+        sidecar: the next cold launch paid the full re-tokenise the sidecar
+        exists to avoid, and it failed silently and intermittently.
+
+        Asserted at the kick rather than through the daemon because the defect
+        is a race — a thread assertion would only reproduce it sometimes,
+        which is exactly how it stayed invisible.
+        """
+        from rag.vault import ObsidianVaultManager
+        from llama_index.core.embeddings import MockEmbedding
+
+        class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
+            def get_embedding(self, _name):
+                return MockEmbedding(embed_dim=2)
+
+        class FakeStorageContext:
+            def persist(self, persist_dir):
+                Path(persist_dir).mkdir(parents=True, exist_ok=True)
+
+        class FakeStorageContextFactory:
+            @staticmethod
+            def from_defaults(*_args, **_kwargs):
+                return FakeStorageContext()
+
+        class FakeVectorStoreIndex:
+            def __init__(self):
+                self.inserted = []
+                self.storage_context = FakeStorageContext()
+
+            @classmethod
+            def from_documents(cls, *_args, **_kwargs):
+                return cls()
+
+            def insert(self, doc):
+                self.inserted.append(doc)
+
+        observed = []
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as vault_dir:
+            Path(vault_dir, "note.md").write_text("# H\n\nBody", encoding="utf-8")
+            manager = ObsidianVaultManager()
+            manager.restore_vault_path(vault_dir)
+
+            def _record_kick(**_kw):
+                with manager._status_lock:
+                    observed.append(manager._index_state)
+
+            with (
+                patch("rag.vault.get_provider", return_value=FakeProvider()),
+                patch("rag.vault.StorageContext", FakeStorageContextFactory),
+                patch("rag.vault.VectorStoreIndex", FakeVectorStoreIndex),
+                patch.object(manager, "_index_kick_bm25_rebuild",
+                             side_effect=_record_kick),
+            ):
+                manager.index_vault("llm", "embed", provider_name="ollama")
+                join_post_index_daemons()
+
+        self.assertEqual(observed, ["done"])
+        # Quoting _persist_bm25_sidecar's own guard: anything outside this set
+        # means the warm thread builds the retriever and writes nothing.
+        self.assertIn(observed[0], ("idle", "done"))
+
     def test_bm25_sidecar_not_persisted_while_indexing(self):
         from llama_index.core.schema import TextNode
 
@@ -4422,6 +4514,29 @@ class TestVaultPrewarm(unittest.TestCase):
         from rag.vault import ObsidianVaultManager
         return ObsidianVaultManager()
 
+    def test_wikilink_prewarm_reports_its_own_stage(self):
+        manager = self._fresh_manager()
+        manager._index = object()  # already loaded disposable stand-in
+        observed = []
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "docstore.json").write_text("{}", encoding="utf-8")
+            with (
+                patch("rag.vault.OBSIDIAN_INDEX_DIR", td),
+                patch("rag.vault.load_config", return_value={
+                    "vault_hybrid_enabled": False,
+                    "vault_reranker_enabled": True,
+                    "vault_reranker_model": "fixture-reranker",
+                    "vault_wikilink_expansion": True,
+                }),
+                patch.object(manager, "_get_reranker", side_effect=lambda **kw:
+                             observed.append(manager.get_prewarm_state()[0])),
+                patch.object(manager, "_get_wikilink_index", side_effect=lambda:
+                             observed.append(manager.get_prewarm_state()[0])),
+            ):
+                manager.prewarm()
+        self.assertEqual(observed, ["loading_reranker", "building_wikilinks"])
+        self.assertEqual(manager.get_prewarm_state()[0], "ready")
+
     def test_prewarm_skips_when_no_docstore_on_disk(self):
         manager = self._fresh_manager()
         with tempfile.TemporaryDirectory() as td:
@@ -4578,7 +4693,11 @@ class TestEngineRetrieveExtraction(unittest.TestCase):
         self.assertEqual(legacy.postprocess_nodes.call_count, 2)
 
     def test_retrieve_public_method_calls_build_pipeline_and_returns_chunks(self):
-        node = MagicMock(text="y", score=0.5, metadata={"source": "n.md"})
+        from llama_index.core.schema import NodeWithScore, TextNode
+
+        node = NodeWithScore(
+            node=TextNode(text="y", metadata={"source": "n.md"}), score=0.5
+        )
         engine, retriever, postprocessor, llm = self._engine_with_mocks([node])
         with patch.object(
             engine, "_build_retrieval_pipeline",
@@ -5396,7 +5515,7 @@ class TestPdfRangeSplitting(unittest.TestCase):
         self.assertEqual(extract_mock.call_count, 0)
         self.assertEqual(len(docs), 3)
 
-    def test_truncated_range_yielded_but_not_cached(self):
+    def test_truncated_range_withheld_and_not_cached(self):
         """An incompletely-extracted range (e.g. scanned pages beyond the OCR
         limit) is still yielded but NOT cached, so the next run retries instead
         of permanently serving the partial."""
@@ -5407,8 +5526,8 @@ class TestPdfRangeSplitting(unittest.TestCase):
             ),
         )
         # Both ranges extracted and yielded (better partial than nothing)…
-        self.assertEqual(extract_mock.call_count, 2)
-        self.assertEqual(len(docs), 2)
+        self.assertEqual(extract_mock.call_count, 1)
+        self.assertEqual(len(docs), 0)
         # …but nothing cached, so a resumed run re-extracts.
         cache_parent = self.manager._pdf_cache_file(
             self.vault_root, self.signature
@@ -5417,7 +5536,7 @@ class TestPdfRangeSplitting(unittest.TestCase):
         docs2, extract_mock2 = self._run_loader(
             1500, lambda *a, **kw: self._fake_sections("x", truncated=True)
         )
-        self.assertEqual(extract_mock2.call_count, 2)
+        self.assertEqual(extract_mock2.call_count, 1)
 
     def test_full_range_ocr_max_pages_passed(self):
         """The loader must let the OCR fallback cover the whole 1000-page range
@@ -5443,7 +5562,7 @@ class TestPdfRangeSplitting(unittest.TestCase):
 
         docs, extract_mock = self._run_loader(2500, extract_then_stop)
         self.assertEqual(extract_mock.call_count, 1)
-        self.assertEqual(len(docs), 1)
+        self.assertEqual(len(docs), 0)
         cache_parent = self.manager._pdf_cache_file(
             self.vault_root, self.signature
         ).parent
@@ -6287,6 +6406,95 @@ class TestWikilinkExpansionRetriever(unittest.TestCase):
         )
 
 
+class TestArchivePruneOffTheWriteLock(unittest.TestCase):
+    """PERF (2026-09-02): the archive size walk + prune must not hold the rw
+    write lock.
+
+    ``_archive_old_index_dir`` did the rename and then, still under the write
+    lock, ran a bounded 5 s size walk and an UNBOUNDED ``rmtree`` of up to tens
+    of GB of archives. Every chat read is a writer-preference reader on that
+    lock and waits with no timeout, so a rebuild could stall retrieval for the
+    whole sweep. The rename stays; the sweep moved to a daemon.
+    """
+
+    def test_the_sweep_runs_with_the_write_lock_free(self):
+        """Discriminator: how long the WRITE-LOCK FRAME takes.
+
+        The sweep is made to block for 3 s. Pre-fix it ran inline, so the frame
+        — and therefore every chat read waiting on that lock — lasted the whole
+        3 s. Post-fix the frame returns immediately and the sweep finishes on
+        its own thread.
+        """
+        import os
+        import threading
+        import time
+
+        from rag.vault import obsidian_manager
+
+        started = threading.Event()
+        gate = threading.Event()
+
+        def _slow_prune(keep=2):
+            started.set()
+            gate.wait(3)          # bounded, so the pre-fix inline path unwedges
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index_dir = os.path.join(tmp, "obsidian_storage")
+            os.makedirs(index_dir)
+            (Path(index_dir) / "docstore.json").write_text("{}", encoding="utf-8")
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir), \
+                 patch.object(obsidian_manager, "_prune_old_index_backups",
+                              _slow_prune), \
+                 patch("rag.vault._dir_size_note", return_value=""):
+                # Exactly the caller's frame: the archive happens WHILE the
+                # write lock is held (rag/build.py::_setup_index).
+                t0 = time.monotonic()
+                with obsidian_manager._rw_lock.write_lock():
+                    bak = obsidian_manager._archive_old_index_dir({})
+                frame_s = time.monotonic() - t0
+                self.assertTrue(bak)
+                gate.set()
+                self.assertTrue(started.wait(5), "the sweep never ran at all")
+                join_post_index_daemons()
+
+        self.assertLess(frame_s, 1.0,
+                        f"the rw write lock was held for {frame_s:.1f}s of sweep")
+
+    def test_the_rename_still_happens_under_the_lock(self):
+        """The half that must NOT move: the rename is the atomic decision."""
+        import os
+
+        from rag.vault import obsidian_manager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index_dir = os.path.join(tmp, "obsidian_storage")
+            os.makedirs(index_dir)
+            (Path(index_dir) / "docstore.json").write_text("{}", encoding="utf-8")
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir), \
+                 patch.object(obsidian_manager, "_prune_old_index_backups"), \
+                 patch("rag.vault._dir_size_note", return_value=""):
+                with obsidian_manager._rw_lock.write_lock():
+                    bak = obsidian_manager._archive_old_index_dir({})
+                    # Already renamed by the time the frame ends.
+                    self.assertTrue(os.path.isdir(bak))
+                    self.assertFalse(os.path.isdir(index_dir))
+            join_post_index_daemons()
+
+    def test_failed_archive_preserves_existing_index(self):
+        from rag.vault import obsidian_manager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index_dir = Path(tmp) / "obsidian_storage"
+            index_dir.mkdir()
+            original = index_dir / "docstore.json"
+            original.write_text("retained", encoding="utf-8")
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", str(index_dir)), \
+                 patch("rag.vault.os.rename", side_effect=OSError("simulated")):
+                with self.assertRaisesRegex(RuntimeError, "rebuild refused"):
+                    obsidian_manager._archive_old_index_dir({})
+            self.assertEqual(original.read_text(encoding="utf-8"), "retained")
+
+
 class TestIndexBackupPrune(unittest.TestCase):
     """R1: ``_archive_old_index_dir`` archives the whole prior index to a
     timestamped ``.bak`` sibling on every version bump; ``_prune_old_index_backups``
@@ -6807,6 +7015,9 @@ class TestQueryEmbedBound(unittest.TestCase):
         captured = {}
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, name, **kwargs):
                 captured.update(kwargs)
                 raise _StopBuild()   # abort construction right after capture
@@ -6948,9 +7159,7 @@ class TestSharedRetunerRace(unittest.TestCase):
         self.assertEqual(fake_reranker.top_n, 50)          # untouched
 
     def test_engine_pipeline_is_the_one_tuning_writer(self):
-        """The locked pipeline build sets both fields to per-query values —
-        proving tuning still happens (in the right place) after the fetch
-        paths went read-only."""
+        """Pipeline tuning uses request-local facades, never shared caches."""
         from types import SimpleNamespace
         from rag import engine as engine_mod
 
@@ -6958,6 +7167,9 @@ class TestSharedRetunerRace(unittest.TestCase):
         fake_reranker = SimpleNamespace(top_n=1)
 
         class FakeProvider:
+            def get_models(self):
+                return ["embed", "embed-A", "embed-B"], None
+
             def get_embedding(self, name, **kwargs):
                 return object()
             def get_llm(self, name, **kwargs):
@@ -6988,13 +7200,23 @@ class TestSharedRetunerRace(unittest.TestCase):
         eng.primer_enabled = False
         eng._provider = FakeProvider()
 
+        captured: dict = {}
+
+        def _fusion(**kwargs):
+            captured.update(kwargs)
+            return object()
+
         with patch.object(engine_mod, "VectorIndexRetriever", return_value=object()), \
-             patch.object(engine_mod, "QueryFusionRetriever", return_value=object()):
-            eng._build_retrieval_pipeline(cfg={})
+             patch.object(engine_mod, "QueryFusionRetriever", side_effect=_fusion):
+            _retriever, posts, _llm = eng._build_retrieval_pipeline(cfg={})
 
         # breadth = min(max(8*4, 20), 50) = 32; final top_n = top_k = 8.
-        self.assertEqual(fake_bm25.similarity_top_k, 32)
-        self.assertEqual(fake_reranker.top_n, 8)
+        self.assertEqual(fake_bm25.similarity_top_k, 1)
+        self.assertEqual(fake_reranker.top_n, 1)
+        self.assertIsNot(captured["retrievers"][1], fake_bm25)
+        self.assertEqual(captured["retrievers"][1].similarity_top_k, 32)
+        self.assertIsNot(posts[0], fake_reranker)
+        self.assertEqual(posts[0].top_n, 8)
 
 
 class TestCheckpointPromotionMarker(unittest.TestCase):
@@ -7500,7 +7722,7 @@ class TestFinalPersistCacheInvalidationLockOrder(unittest.TestCase):
 
         class FakeProvider:
             def get_models(self):
-                return [], "probe skipped"
+                return ["embed"], None
             def get_embedding(self, _name):
                 return MockEmbedding(embed_dim=2)
 
@@ -7555,7 +7777,7 @@ class TestFinalPersistCacheInvalidationLockOrder(unittest.TestCase):
                 patch("rag.vault.VectorStoreIndex", EmptyFakeIndex),
                 patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir),
                 patch.object(manager, "_load_vault_documents",
-                             side_effect=lambda _v, op_epoch=0: (
+                             side_effect=lambda _v, op_epoch=0, **_options: (
                                  manager.pause_indexing(), [])[1]),
                 patch.object(manager._rw_lock, "write_lock", TracingWriteLock()),
                 patch.object(manager, "_invalidate_retrieval_caches",
@@ -7674,3 +7896,457 @@ class TestArchiveSizeDisclosure(unittest.TestCase):
             # Budget already exhausted when the first directory is visited.
             with mock.patch("rag.vault._DIR_SIZE_WALK_BUDGET_S", -1):
                 self.assertEqual(_dir_size_note(d), "")
+
+
+class TestIndexRunAdmission(unittest.TestCase):
+    """The route-published admission state (2026-08-12).
+
+    DEFECT PINNED: `POST /api/obsidian/index` returned 200 while the status was
+    still the PREVIOUS run's terminal state (the transition lived on the spawned
+    thread), so the client's zero-delay first poll read a leftover "done",
+    declared the vault complete and stopped polling a run that had just started.
+    `begin_index_run` publishes it synchronously; `index_vault` then SKIPS its
+    own identical preamble for that epoch, which is what keeps a Cancel landing
+    in the gap from being erased by the preamble's `_stop_event.clear()`.
+    """
+
+    def setUp(self):
+        from rag.vault import obsidian_manager
+        self.mgr = obsidian_manager
+        self._saved = (
+            self.mgr._index_state, self.mgr._current_phase,
+            self.mgr._index_op_epoch, self.mgr._index_run_begun_epoch,
+            self.mgr._index_error_code, self.mgr._index_error_detail,
+            self.mgr._pause_requested, self.mgr._stop_event.is_set(),
+        )
+
+    def tearDown(self):
+        (self.mgr._index_state, self.mgr._current_phase,
+         self.mgr._index_op_epoch, self.mgr._index_run_begun_epoch,
+         self.mgr._index_error_code, self.mgr._index_error_detail,
+         self.mgr._pause_requested, stop_set) = self._saved
+        self.mgr._stop_event.set() if stop_set else self.mgr._stop_event.clear()
+
+    def test_begin_publishes_state_and_clears_the_previous_error(self):
+        self.mgr._index_state = "done"
+        self.mgr._index_error_code = "embed_backend_mismatch"
+        self.mgr._index_error_detail = "stale refusal"
+        self.mgr._stop_event.set()
+        self.mgr._pause_requested = True
+
+        self.mgr.begin_index_run(42)
+
+        self.assertEqual(self.mgr.get_status(), "scanning")
+        self.assertEqual(self.mgr._current_phase, "initialising")
+        self.assertEqual(self.mgr._index_error_code, "")
+        self.assertEqual(self.mgr._index_error_detail, "")
+        # The epoch is published here so a Cancel in the gap releases THIS
+        # acquisition rather than a stale one.
+        self.assertEqual(self.mgr._index_op_epoch, 42)
+        self.assertFalse(self.mgr._stop_event.is_set())
+        self.assertFalse(self.mgr._pause_requested)
+
+    def test_a_cancel_racing_the_admission_is_not_erased(self):
+        """A Cancel that lands INSIDE begin_index_run must keep its stop flag.
+
+        `cancel_indexing` reads `_index_op_epoch` under `_status_lock` and then
+        releases that epoch's op-lock acquisition. While the reset of
+        `_stop_event` happened AFTER the lock was dropped, this interleaving
+        was possible:
+
+            begin: publish epoch E, release the status lock
+            cancel: read E, set _stop_event, RELEASE the op-lock for E
+            begin: _stop_event.clear()   <- the cancel disappears
+
+        leaving the run marked live with its lock already handed back — it kept
+        going through store-open/archive (tens of seconds, and that phase can
+        rename the previous index dir) until the first heartbeat noticed the
+        lock was gone. Clearing inside the lock, before the epoch is published,
+        makes the two orderings mutually exclusive.
+
+        The assertion is on ORDER rather than on a live race: what a canceller
+        can act on is the published epoch, so the question is simply whether
+        the epoch is already visible when the clear runs. (A thread-based
+        reproduction would also deadlock now that the clear holds the lock.)
+        """
+        self.mgr._index_op_epoch = 0
+        self.mgr._stop_event.set()
+        epoch_at_clear = []
+        real_clear = self.mgr._stop_event.clear
+
+        def _record_then_clear():
+            # Read the field directly: taking `_status_lock` here would
+            # deadlock against the caller, which is itself the point — the
+            # clear now happens inside the hold.
+            epoch_at_clear.append(self.mgr._index_op_epoch)
+            real_clear()
+
+        with patch.object(self.mgr._stop_event, "clear",
+                          side_effect=_record_then_clear):
+            self.mgr.begin_index_run(31)
+
+        self.assertEqual(epoch_at_clear, [0],
+                         "the epoch was published before the stop flag was "
+                         "cleared, so a Cancel could release this run's lock "
+                         "and then have its stop flag erased")
+        self.assertEqual(self.mgr._index_op_epoch, 31)
+        self.assertFalse(self.mgr._stop_event.is_set())
+
+    def test_abort_only_reverts_its_own_admission(self):
+        self.mgr.begin_index_run(7)
+        self.mgr.abort_index_run(6)          # someone else's epoch → no-op
+        self.assertEqual(self.mgr.get_status(), "scanning")
+        self.mgr.abort_index_run(7)
+        self.assertEqual(self.mgr._index_state, "idle")
+        self.assertEqual(self.mgr._current_phase, "idle")
+
+    def test_index_vault_skips_the_preamble_for_an_already_begun_epoch(self):
+        """A Cancel between the route's admission and the thread's first line
+        must survive: re-running the preamble would clear `_stop_event` and the
+        run would proceed as if nothing had been cancelled."""
+        self.mgr.begin_index_run(9)
+        self.mgr._stop_event.set()           # Cancel lands in the gap
+
+        with patch.object(self.mgr, "_vault_path", None):
+            # Bails at the vault-path gate — far enough to prove the preamble
+            # ran (or didn't) without touching an index.
+            self.mgr.index_vault("llm", "embed", op_epoch=9)
+
+        self.assertTrue(self.mgr._stop_event.is_set(),
+                        "the gap Cancel was erased by index_vault's preamble")
+
+    def test_direct_call_still_runs_the_preamble(self):
+        """Direct callers (tests, eval scripts, in-process CLI) pass op_epoch=0
+        and must keep the pre-2026-08-12 behaviour byte-for-byte."""
+        self.mgr.begin_index_run(0)          # cannot latch: epoch 0 is falsy
+        self.mgr._stop_event.set()
+        self.mgr._index_error_code = "index_failed"
+
+        with patch.object(self.mgr, "_vault_path", None):
+            self.mgr.index_vault("llm", "embed", op_epoch=0)
+
+        self.assertFalse(self.mgr._stop_event.is_set())
+        # The vault-path gate records its own error over the cleared one.
+        self.assertEqual(self.mgr._index_error_code, "index_failed")
+        self.assertEqual(self.mgr._index_state, "error")
+
+
+class TestCancelDoesNotClobberFinalMeta(unittest.TestCase):
+    """The 2026-09-02 perf review's silent index-metadata revert.
+
+    ``cancel_indexing`` read, edited and rewrote ``obsidian_meta.json`` under
+    ``_status_lock``, while the indexing thread's ``_write_index_meta`` held
+    only the rw write lock — two writers, no shared serialisation. A cancel
+    that read the file before the run's final persist and wrote it back after
+    silently reverted ``phase``, ``has_vector_data`` and ``embed_provider`` to
+    the mid-run values.
+
+    ``embed_provider`` is the one that costs: the incremental gate REFUSES a
+    run whose recorded local backend differs from the current one, and adopts
+    silently when the field is empty — so reverting it to "" turns the refusal
+    into an unnoticed adoption, and a genuinely switched backend then mixes two
+    vector spaces in one index. The other two make a complete index look
+    partial.
+    """
+
+    def _meta(self, d, **over):
+        payload = {
+            "version": 1, "indexed_at": "2026-09-01T00:00:00+00:00",
+            "embed": "e", "provider": "lm_studio", "partial": True,
+            "phase": "embedding", "has_vector_data": False,
+            "inserted_this_run": 7, "vector_backend": "simple",
+            "vault_path": "/v", "embed_provider": "",
+        }
+        payload.update(over)
+        path = Path(d, "obsidian_meta.json")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_a_cancel_cannot_revert_the_runs_final_meta_write(self):
+        import threading as _threading
+        from rag.vault import ObsidianVaultManager
+
+        with tempfile.TemporaryDirectory() as index_dir:
+            meta_path = self._meta(index_dir)
+            manager = ObsidianVaultManager()
+            manager._index_state = "embedding"
+            manager._current_phase = "embedding"
+
+            real_load = json.load
+            threads = []
+
+            def racing_load(fp, *a, **kw):
+                # cancel_indexing has just READ the file. The indexing thread's
+                # final persist lands right here, in the gap before cancel
+                # writes its edited copy back.
+                prev = real_load(fp, *a, **kw)
+                if not threads:
+                    t = _threading.Thread(target=lambda: manager._write_index_meta(
+                        meta_path, "nomic-embed", "lm_studio",
+                        partial=False, phase="done", has_vector_data=True,
+                        inserted_this_run=1234, vector_backend="lancedb",
+                        vault_path="/v", embed_provider="lm_studio",
+                    ))
+                    threads.append(t)
+                    t.start()
+                    # Pre-fix this returns at once and the final meta is on
+                    # disk before cancel overwrites it. Post-fix the writer
+                    # queues behind the meta-write lock this call holds, so the
+                    # join times out and it lands afterwards — authoritative.
+                    t.join(timeout=0.5)
+                return prev
+
+            with (
+                patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir),
+                patch("rag.vault.json.load", racing_load),
+            ):
+                manager.cancel_indexing()
+            for t in threads:
+                t.join(timeout=5)
+                self.assertFalse(t.is_alive())
+
+            meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+
+        self.assertEqual(meta["phase"], "done")
+        self.assertTrue(meta["has_vector_data"])
+        self.assertEqual(meta["inserted_this_run"], 1234)
+        self.assertEqual(meta["vector_backend"], "lancedb")
+        # The field whose loss defeats the embed-backend refusal outright.
+        self.assertEqual(meta["embed_provider"], "lm_studio")
+        self.assertFalse(meta["partial"])
+        # …and the cancel still did its own job.
+        self.assertEqual(manager._index_state, "idle")
+
+    def test_a_cancel_with_no_concurrent_write_still_clears_partial(self):
+        from rag.vault import ObsidianVaultManager
+
+        with tempfile.TemporaryDirectory() as index_dir:
+            meta_path = self._meta(index_dir)
+            manager = ObsidianVaultManager()
+            manager._index_state = "embedding"
+            manager._current_phase = "embedding"
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir):
+                manager.cancel_indexing()
+            meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+
+        self.assertFalse(meta["partial"])
+        self.assertEqual(meta["phase"], "idle")
+        # Unknown/other keys survive a cancel.
+        self.assertEqual(meta["vault_path"], "/v")
+        self.assertEqual(manager._index_state, "idle")
+
+
+class TestManifestFallbackSingleFlight(unittest.TestCase):
+    """PERF (2026-09-02): the manifest recovery must parse the docstore once.
+
+    When ``indexed_materials.json`` is missing, the materials route and the
+    agent's ``vault_list_materials`` tool BOTH parsed ``docstore.json`` —
+    several hundred MB on a real vault — with nothing serialising them, and
+    both then wrote the manifest.
+    """
+
+    def setUp(self):
+        # getattr, not a direct call: these tests must fail on their CLAIMS
+        # when run against the pre-memo manager, not on a missing helper.
+        from rag.vault import obsidian_manager
+        self._inv = getattr(obsidian_manager,
+                            "_invalidate_manifest_fallback_memo", lambda: None)
+        self._inv()
+        self.addCleanup(self._inv)
+
+    def _docstore(self, tmp, n=50):
+        import os
+        refs = {f"d{i}": {"metadata": {"source": f"/v/n{i}.md"}} for i in range(n)}
+        with open(os.path.join(tmp, "docstore.json"), "w", encoding="utf-8") as f:
+            json.dump({"docstore/ref_doc_info": refs}, f)
+
+    def test_concurrent_callers_parse_once(self):
+        import os
+        import threading
+
+        from rag.vault import obsidian_manager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._docstore(tmp)
+            # Counted at json.load, which BOTH the pre- and post-change code
+            # reach — a counter on the new private helper would make this red
+            # mean only "that helper is new".
+            parses = []
+            real_load = json.load
+
+            def _counted(fp, *a, **kw):
+                name = getattr(fp, "name", "")
+                if str(name).endswith("docstore.json"):
+                    parses.append(name)
+                    time.sleep(0.2)      # widen the window a racer could use
+                return real_load(fp, *a, **kw)
+
+            results = []
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", tmp), \
+                 patch("rag.vault.json.load", _counted), \
+                 patch.object(obsidian_manager, "get_vault_path",
+                              return_value="/v"):
+                self._inv()
+                # The route and the agent tool, at the same moment.
+                threads = [threading.Thread(
+                    target=lambda: results.append(
+                        obsidian_manager._build_index_manifest_from_docstore()))
+                    for _ in range(4)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(10)
+                # …and a later caller after the manifest write failed.
+                os.remove(os.path.join(tmp, "indexed_materials.json"))
+                results.append(obsidian_manager._build_index_manifest_from_docstore())
+                self._inv()
+
+            self.assertEqual(len(parses), 1,
+                             f"{len(parses)} concurrent whole-docstore parses")
+            self.assertEqual(len(results), 5)
+            self.assertTrue(all(r == results[0] for r in results))
+            self.assertEqual(len(results[0]["materials"]), 50)
+
+    def test_an_edited_docstore_is_reparsed(self):
+        from rag.vault import obsidian_manager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._docstore(tmp, n=3)
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", tmp), \
+                 patch.object(obsidian_manager, "get_vault_path",
+                              return_value="/v"):
+                self._inv()
+                first = obsidian_manager._build_index_manifest_from_docstore()
+                time.sleep(0.01)
+                self._docstore(tmp, n=7)      # a reindex rewrote it
+                second = obsidian_manager._build_index_manifest_from_docstore()
+                self._inv()
+        self.assertEqual(len(first["materials"]), 3)
+        self.assertEqual(len(second["materials"]), 7)
+
+
+class TestLongPhasesHeartbeat(unittest.TestCase):
+    """PERF (2026-09-02): the three longest single windows were unheartbeated.
+
+    LanceDB compaction ran under the mutation lock with no bound, no heartbeat
+    and no status line; the store load and the checkpoint persist were each one
+    unheartbeated window against a 3600 s op-lock TTL. A stall read as a hang,
+    and a lapsed TTL went unnoticed — so the run kept writing as a second
+    concurrent writer, which is exactly what ``_heartbeat_or_stop`` exists to
+    prevent.
+    """
+
+    def test_each_long_phase_beats_and_announces(self):
+        import inspect
+
+        import rag.build as build_mod
+        import rag.vault as vault_mod
+
+        cases = [
+            (inspect.getsource(build_mod.IndexBuildMixin._index_open_store),
+             "Loading the existing index from disk", "store load"),
+            (inspect.getsource(build_mod.IndexBuildMixin._index_make_persist_callback),
+             "Saving a checkpoint of the index", "mid-run checkpoint"),
+            (inspect.getsource(build_mod.IndexBuildMixin._index_finalise_persist),
+             "Saving the index", "final persist"),
+            (inspect.getsource(vault_mod.ObsidianVaultManager._index_documents_streaming),
+             "Compacting the vector store", "lancedb compaction"),
+        ]
+        for src, stage_line, label in cases:
+            with self.subTest(phase=label):
+                self.assertIn(stage_line, src,
+                              f"{label} has no stage line — a stall reads as a hang")
+                self.assertIn("_heartbeat_or_stop(", src,
+                              f"{label} does not heartbeat the op-lock")
+
+    def test_a_lost_lock_during_compaction_stops_the_run(self):
+        """`_heartbeat_or_stop` must SET the stop event, never discard False."""
+        from rag.vault import obsidian_manager
+
+        obsidian_manager._stop_event.clear()
+        self.addCleanup(obsidian_manager._stop_event.clear)
+        with patch.object(obsidian_manager._op_lock, "heartbeat",
+                          return_value=False):
+            obsidian_manager._heartbeat_or_stop(42)
+        self.assertTrue(obsidian_manager._stop_event.is_set(),
+                        "a lost op-lock did not abort the run")
+
+    def test_a_direct_caller_holding_no_lock_is_inert(self):
+        from rag.vault import obsidian_manager
+
+        obsidian_manager._stop_event.clear()
+        self.addCleanup(obsidian_manager._stop_event.clear)
+        with patch.object(obsidian_manager._op_lock, "heartbeat") as hb:
+            obsidian_manager._heartbeat_or_stop(0)
+        hb.assert_not_called()
+        self.assertFalse(obsidian_manager._stop_event.is_set())
+
+
+class TestPhase5WriteOrdering(unittest.TestCase):
+    """DURABILITY (2026-09-02, performance plan Phase 5): two write orders.
+
+    * The BM25 sidecar was rmtree'd and only then rebuilt IN PLACE, so from
+      the first line onwards there was a window — the whole persist of a large
+      index — with no sidecar at all.
+    * The index meta (whose ``phase: done`` is what makes an index look
+      complete) was written BEFORE the manifest it advertises, so a crash in
+      the gap left a "done" index with a missing or stale manifest and sent
+      the materials route back to parsing the whole docstore.
+    """
+
+    def test_a_failed_sidecar_persist_leaves_the_previous_one_standing(self):
+        from llama_index.core.schema import TextNode
+        from rag.vault import ObsidianVaultManager
+
+        with tempfile.TemporaryDirectory() as index_dir:
+            nodes = {f"n{i}": TextNode(text=f"text {i} common", id_=f"n{i}")
+                     for i in range(3)}
+
+            def _manager():
+                m = ObsidianVaultManager()
+                m._index = MagicMock()
+                m._index.docstore.docs = nodes
+                return m
+
+            with patch("rag.vault.OBSIDIAN_INDEX_DIR", index_dir):
+                first = _manager()._get_bm25_retriever(top_k=2)
+                self.assertIsNotNone(first)
+                sidecar = Path(index_dir, "bm25_index")
+                self.assertTrue((sidecar / "sidecar_meta.json").exists())
+                before = sorted(p.name for p in sidecar.iterdir())
+
+                # A persist that blows up mid-way must not have destroyed the
+                # sidecar that was already there.
+                m = _manager()
+                retriever = MagicMock()
+                retriever.persist.side_effect = OSError("disk full")
+                m._persist_bm25_sidecar(retriever, doc_count=3)
+
+                self.assertTrue(sidecar.is_dir(), "the sidecar was destroyed")
+                self.assertEqual(sorted(p.name for p in sidecar.iterdir()), before)
+                self.assertFalse(Path(str(sidecar) + ".new").exists(),
+                                 "the staging tree was left behind")
+
+    def test_the_manifest_is_written_before_the_meta_that_advertises_it(self):
+        from types import SimpleNamespace
+
+        from rag.vault import ObsidianVaultManager
+        order = []
+        manager = ObsidianVaultManager()
+        target = SimpleNamespace(
+            idx=MagicMock(), vector_backend="simple",
+            meta_path="/tmp/meta.json", embed_name="e", provider_name="ollama",
+            vault="/tmp/vault", embed_provider_name="ollama", op_epoch=0,
+        )
+        with patch.object(manager, "_persist_index_checkpoint"), \
+                patch.object(manager, "_heartbeat_or_stop", return_value=True), \
+                patch.object(manager, "_index_has_vector_data", return_value=True), \
+                patch.object(manager, "_emit"), \
+                patch.object(manager, "_write_index_meta",
+                             side_effect=lambda *a, **k: order.append("meta")), \
+                patch.object(manager, "_write_index_manifest",
+                             side_effect=lambda *a, **k: order.append("manifest")):
+            manager._index_finalise_persist(
+                target, added=1, skipped=0, manifest_counts={"a.md": 1})
+        self.assertEqual(order, ["manifest", "meta"],
+                         "the meta advertised a manifest that was not there yet")

@@ -1,20 +1,37 @@
+from core.branding import env_value
+from core.env_files import load_dotenv_file
 import os
 import sys
 from pathlib import Path
 
-# --- Application Paths ---
-def _get_base_dir():
-    """Returns the persistent data directory for ChatEKLD.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_LOADED_REPO_DOTENV = False
 
-    ``CHATEKLD_BASE_DIR`` overrides the platform default.  The test suite
+
+# --- Application Paths ---
+def _default_base_dir() -> str:
+    """Returns the persistent data directory for CHERQAiN.
+
+    ``CHERQAIN_BASE_DIR`` (legacy fallback: ``CHATEKLD_BASE_DIR``) overrides
+    the platform default. The test suite
     sets it (in conftest.py, before any app import) to a per-session temp
     directory so tests never read or write the user's real config, index,
-    or feedback files.
+    or feedback files. When neither variable is already in the process
+    environment, a checkout ``.env`` at the repository root is consulted first
+    (``override=False``) so ``CHERQAIN_BASE_DIR`` defined in ``.env`` takes
+    effect before ``BASE_DIR`` is bound.
     """
-    override = os.environ.get("CHATEKLD_BASE_DIR", "").strip()
+    global _LOADED_REPO_DOTENV
+    override = env_value("CHATEKLD_BASE_DIR", "").strip()
+    if not override and not getattr(sys, "frozen", False):
+        _LOADED_REPO_DOTENV = load_dotenv_file(_REPO_ROOT / ".env", override=False)
+        override = env_value("CHATEKLD_BASE_DIR", "").strip()
+    else:
+        _LOADED_REPO_DOTENV = False
     if override:
-        os.makedirs(override, mode=0o700, exist_ok=True)
-        return override
+        expanded = os.path.expanduser(override)
+        os.makedirs(expanded, mode=0o700, exist_ok=True)
+        return expanded
     if sys.platform == "darwin":
         base = os.path.expanduser("~/Library/Application Support/ChatEKLD")
     elif sys.platform == "win32":
@@ -25,7 +42,24 @@ def _get_base_dir():
     os.makedirs(base, mode=0o700, exist_ok=True)
     return base
 
-BASE_DIR = _get_base_dir()
+
+_get_base_dir = _default_base_dir
+
+
+def _resolve_storage_path(legacy_env_name: str, default_path: str) -> str:
+    override = env_value(legacy_env_name, "").strip()
+    if override:
+        return os.path.expanduser(override)
+    return default_path
+
+
+BASE_DIR = _default_base_dir()
+if not _LOADED_REPO_DOTENV:
+    # A process-environment BASE_DIR override (e.g. conftest.py's disposable
+    # CHATEKLD_BASE_DIR) prevented consulting the checkout .env above, but if
+    # BASE_DIR itself contains a .env (such as a user's packaged-app
+    # Application Support/ChatEKLD/.env), load it before binding sub-paths.
+    load_dotenv_file(os.path.join(BASE_DIR, ".env"), override=False)
 # Single source of truth for the application log path. launch.py (frozen + `python
 # launch.py`) and app.py's dev `__main__` handler both write here, and the in-app
 # log viewer (`GET /api/log/tail`) reads it, so all three agree on one location
@@ -35,9 +69,17 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 FEEDBACK_FILE = os.path.join(BASE_DIR, "feedback.jsonl")
 OLLAMA_PID_FILE = os.path.join(BASE_DIR, "ollama.pid")
 REPORT_TYPES_FILE = os.path.join(BASE_DIR, "report_types.json")
-OBSIDIAN_INDEX_DIR = os.path.join(BASE_DIR, "obsidian_storage")
-OBSIDIAN_CACHE_DIR = os.path.join(BASE_DIR, "obsidian_cache")
-DB_PATH = os.path.join(BASE_DIR, "uploads.db")
+OBSIDIAN_INDEX_DIR = _resolve_storage_path("CHATEKLD_INDEX_DIR", os.path.join(BASE_DIR, "obsidian_storage"))
+OBSIDIAN_CACHE_DIR = _resolve_storage_path("CHATEKLD_CACHE_DIR", os.path.join(BASE_DIR, "obsidian_cache"))
+DB_PATH = _resolve_storage_path("CHATEKLD_DB_PATH", os.path.join(BASE_DIR, "uploads.db"))
+
+# Request parsing budgets. Ordinary API requests contain configuration, paths,
+# or prompts and must never inherit the PDF uploader's hundreds-of-megabytes
+# allowance. The upload envelope gets 1 MiB above the exact file cap for
+# multipart headers/boundaries; the streamed PDF writer independently enforces
+# PDF_LIMIT_SIZE_MB against file bytes, including unknown-length transfers.
+DEFAULT_REQUEST_MAX_BYTES = 2 * 1024 * 1024
+UPLOAD_REQUEST_OVERHEAD_BYTES = 1024 * 1024
 
 # Stable tiktoken BPE-vocab cache.  tiktoken otherwise caches to
 # ``$TMPDIR/data-gym-cache``, which macOS evicts after a few days of non-use —
@@ -70,7 +112,7 @@ DEFAULT_VISION_MODEL = "qwen3-vl:4b"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5"
 DEFAULT_GOOGLE_MODEL = "gemini-2.5-flash"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
 DEFAULT_ZAI_MODEL = "glm-4.7"
 # OpenRouter ids are namespaced vendor/model (":variant" suffixes allowed);
 # the default mirrors DEFAULT_ANTHROPIC_MODEL's tier through the aggregator.
@@ -145,11 +187,76 @@ PDF_EXTRACT_TIMEOUT_S = 600
 # PDF_EXTRACT_TIMEOUT_S wall clock).
 PDF_MAX_PAGES = 20_000
 
+# --- Plain Chat attachments (2026-08-29) ------------------------------------
+# Files a user attaches to ONE Plain Chat turn. Deliberately a NARROWER set
+# than VAULT_IMAGE_EXTS: an attachment is extracted to text on upload, so the
+# list is exactly what this app can actually read — a PDF through the paper
+# extractor, a raster image through the vision model, and plain text/Markdown
+# read directly. Formats with no extraction path (.svg, .heic, .tiff, .gif)
+# are refused by NAME rather than accepted and then silently yielding nothing.
+CHAT_ATTACHMENT_TEXT_EXTS = frozenset({".md", ".txt"})
+CHAT_ATTACHMENT_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg"})
+CHAT_ATTACHMENT_PDF_EXTS = frozenset({".pdf"})
+CHAT_ATTACHMENT_EXTS = (
+    CHAT_ATTACHMENT_TEXT_EXTS | CHAT_ATTACHMENT_IMAGE_EXTS | CHAT_ATTACHMENT_PDF_EXTS
+)
+
+# Per-file upload ceiling. Far below PDF_LIMIT_SIZE_MB (500) because this is a
+# conversational aside, not the Single Paper workflow: a 500 MB PDF belongs in
+# the tab that has map-reduce and a progress stream, not in a chat turn whose
+# only bound is the SSE consumer timeout.
+CHAT_ATTACHMENT_LIMIT_SIZE_MB = 64
+
+# How many files may ride one turn, and how many extracted characters the whole
+# request may carry. The per-file cap is the `chat_attachment_max_chars` config
+# knob; these two bound the total, because N files each inside their own cap can
+# still add up to a prompt no model will accept. Over the total the request is
+# REFUSED with the figures named — never silently trimmed, the same policy
+# _validate_messages applies to a malformed turn.
+CHAT_ATTACHMENT_MAX_PER_MESSAGE = 4
+CHAT_ATTACHMENT_REQUEST_MAX_CHARS = 240_000
+
+# Per-file extracted-text cap (the `chat_attachment_max_chars` default).
+# Measured over 400 cached PDF extractions from the maintainer's own library
+# (2026-08-29): median 43,916 characters, p90 108,073, max 3.6M. 120,000 keeps
+# roughly nine papers in ten whole; a longer one is truncated and the truncation
+# is disclosed BOTH to the user at upload time and to the model inside the
+# wrapper, so neither is misled about seeing the whole document.
+DEFAULT_CHAT_ATTACHMENT_MAX_CHARS = 120_000
+
+# Orphan sweep. The Plain Chat transcript is ephemeral (lost on reload), so an
+# attachment whose conversation was abandoned has no owner left to delete it.
+# Rows older than this are dropped on the next upload.
+CHAT_ATTACHMENT_TTL_S = 24 * 60 * 60
+
+
 # --- Prompt Limits ---
 # Single-paper and vault-chat custom system prompts share the same cap so
 # the UI behaves consistently across both tabs.
 SYSTEM_PROMPT_LIMIT = 4000
 VAULT_SYSTEM_PROMPT_LIMIT = SYSTEM_PROMPT_LIMIT
+
+# --- Accession (keyless bibliographic resolution) ---
+# The ceiling on `accession_batch_max`, the number of PDFs one confirmed bulk
+# identification may cover. ONE definition, because it is validated in two
+# places that cannot import each other: `POST /api/config` persists the knob
+# and `api/routes/accession.py` re-reads it at call time. They carried 7500
+# and 500 respectively, so a persisted value above 500 was accepted by the
+# config route and then silently clamped by the route that uses it — a
+# setting that appeared to save and did nothing. Deliberately NOT taken from
+# `accession/`: loading the config route must never pull in the network
+# module (the ACCESSION_SOURCE_NAMES literal-copy rule).
+ACCESSION_BATCH_MAX_CEILING = 7500
+ACCESSION_BATCH_MAX_DEFAULT = 50
+
+# --- Biblio Tagging write targets ---
+# The three stores a tag write can reach, in the order every payload lists them.
+# One definition because the tuple decides what a `targets` dict means on the
+# wire: the server treats an OMITTED key as ON, so a client that builds this
+# mapping from a different (or misspelled) set silently inverts the user's
+# choice rather than failing. Consumers: core/driver.py, api/routes/tagging.py
+# (apply-all / remove-tags / retire-tag), mcp_server/server.py, cli/main.py.
+TAGGING_TARGETS = ("note", "finder", "zotero")
 
 # --- SSE consumer stall-guard timing (shared by every streaming chat route) ---
 # The vault chat (single-shot + agent), Deck Generator, and Plain Chat SSE
@@ -178,18 +285,6 @@ VAULT_IMAGE_EXTS = frozenset({
     ".svg", ".bmp", ".tiff", ".tif", ".heic",
     ".ico", ".img",
 })
-
-# --- Note Refactor (Phase 2 vault writes) ---
-# In-vault folder (per refactor scope) that holds the small PNG thumbnails the
-# archiver writes when it moves a full-res original out of the vault. It is
-# auto-added to the user's vault_exclude_dirs on first thumbnail write so the
-# indexer never describes thumbnails; the note→thumb embed is a note-relative
-# markdown path, which the resolver's direct is_file probe resolves even though
-# the dir is excluded.  Leading underscore keeps it visually grouped/sorted.
-REFACTOR_THUMBS_DIRNAME = "_thumbs"
-# Longest-side ceiling (px) for those thumbnails; overridable per-user via the
-# refactor_thumb_max_side config key (clamped 96–1024 in api/routes/config.py).
-DEFAULT_REFACTOR_THUMB_MAX_SIDE = 384
 
 # --- Path Validation ---
 EXACT_BLOCKED = frozenset([

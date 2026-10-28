@@ -7,6 +7,8 @@ Uses bibtexparser to load the master bib file, extracting
 from __future__ import annotations
 
 import re
+import threading
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +38,11 @@ class BibEntry:
     # stripped) — additive 2026-08-05, feeds the near-duplicate identifier
     # tier (two entries sharing a DOI = record-level duplicate candidate).
     doi: str | None = None
+    # Raw ``"Last, First"`` editors — additive 2026-09-23, so the renamer can
+    # say "editors only" about an edited book instead of calling it unmapped
+    # (CLI proof run, finding 7a). Nothing names a file after an editor.
+    editors: list[str] = field(default_factory=list)
+    corporate_authors: list[str] = field(default_factory=list)
 
 
 def normalise_doi(raw: str) -> str | None:
@@ -44,8 +51,16 @@ def normalise_doi(raw: str) -> str | None:
     Returns ``None`` for anything that does not look like a ``10.xxxx/...``
     DOI after stripping — a malformed field must not create a spurious
     identifier-match key.
+
+    Control and format characters are dropped anywhere in the string
+    (2026-08-19): PDF text extraction leaves them INSIDE captured
+    identifiers — measured live, BMJ page-1 DOIs came out as
+    ``10.1136/bmj.l4378\\x08`` (a literal backspace, which ``\\s`` does not
+    cover, so the regex capture keeps it) — and a poisoned key silently
+    fails every join forever while printing identically in any log.
     """
-    s = (raw or "").strip()
+    s = "".join(
+        c for c in (raw or "") if unicodedata.category(c)[0] != "C").strip()
     for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/",
                    "http://dx.doi.org/", "doi:"):
         if s.lower().startswith(prefix):
@@ -105,6 +120,11 @@ def parse_bib(path: Path) -> list[BibEntry]:
     except OSError:
         return []
 
+    return parse_bib_text(text)
+
+
+def parse_bib_text(text: str) -> list[BibEntry]:
+    """Parse an already captured bibliography without reopening its path."""
     parser = BibTexParser(common_strings=True)
     parser.ignore_nonstandard_types = False
     parser.homogenize_fields = True  # Lowercase field names
@@ -133,12 +153,66 @@ def parse_bib(path: Path) -> list[BibEntry]:
                 title=title,
                 year=year,
                 authors=authors,
+                corporate_authors=[_strip_braces(part) for part in
+                    re.split(r"\s+and\s+", entry.get("author", ""))
+                    if part.strip().startswith("{") and part.strip().endswith("}")],
                 keywords=keywords,
                 doi=normalise_doi(_strip_braces(entry.get("doi", ""))),
+                editors=_split_authors(entry.get("editor", "")),
             )
         )
 
     return entries
+
+
+#: Stat-keyed memo behind :func:`parse_bib_keys`. Module-scoped and tiny (one
+#: frozenset of citation keys per bib file), stdlib-only, so the vendored tree's
+#: "depends on audit/config.py alone" rule is untouched.
+_KEYS_MEMO: dict[str, tuple[tuple, frozenset]] = {}
+_KEYS_MEMO_LOCK = threading.Lock()
+
+
+def parse_bib_keys(path: Path) -> frozenset[str]:
+    """The bib's citation keys, memoised on the file's ``(size, mtime_ns)``.
+
+    # PERF (2026-09-02): a full bib parse per validation.
+    #   Before:    `POST /api/audit/mapping` re-parsed the WHOLE bibliography
+    #              on every triage click, only to test one citation key for
+    #              membership. Measured on a 6141-entry / 7.2 MB `_master.bib`
+    #              (the maintainer's): 3900 ms per request, on a Waitress
+    #              worker, for a set-membership test. The private maintenance
+    #              renamer does the same thing per rename.
+    #   Change:    a frozenset of keys memoised on the file's
+    #              (size, mtime_ns). Measured 3900 ms -> 0.001 ms on a hit.
+    #   Safe because:
+    #              the answer is derived purely from that file, and an edit
+    #              moves both size and mtime_ns — so the live-bib rejection
+    #              guarantee stands: a key removed from the bibliography is
+    #              rejected on the next click without a rescan, exactly as
+    #              before. A `frozenset` is returned, not the parsed entry
+    #              list, so no caller can mutate shared state.
+    #   Preserves: "the live-bib rejection guarantee stays because mtime is the
+    #              key" — and `parse_bib` itself is untouched, so every other
+    #              consumer (the scan, which needs the entries) is unchanged.
+    #   Lock/thread contract:
+    #              a short module lock around the dict only; the parse runs
+    #              OUTSIDE it, so two concurrent misses may both parse (a
+    #              wasted parse, never a wrong answer or a blocked thread).
+    #   Pinned by: test_audit.py::TestBibKeyMemo
+    """
+    try:
+        st = path.stat()
+        sig = (str(path), st.st_size, st.st_mtime_ns)
+    except OSError:
+        return frozenset()
+    with _KEYS_MEMO_LOCK:
+        hit = _KEYS_MEMO.get(sig[0])
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+    keys = frozenset(e.citation_key for e in parse_bib(path))
+    with _KEYS_MEMO_LOCK:
+        _KEYS_MEMO[sig[0]] = (sig, keys)
+    return keys
 
 
 def index_by_key(entries: list[BibEntry]) -> dict[str, BibEntry]:
@@ -149,3 +223,28 @@ def index_by_key(entries: list[BibEntry]) -> dict[str, BibEntry]:
 def iter_entries(path: Path) -> Iterator[BibEntry]:
     """Stream the parsed entries (convenience wrapper over :func:`parse_bib`)."""
     yield from parse_bib(path)
+
+
+def institution_acronym(name: str) -> str | None:
+    """Use a recorded acronym, or the explicitly supported WHO identity."""
+    cleaned = name.strip().strip("{}").strip()
+    if cleaned.casefold() in {"world health organization", "who"}:
+        return "WHO"
+    if "," in cleaned:
+        return None
+    match = re.fullmatch(r".+\s+\(([A-Z][A-Z0-9]{1,11})\)", cleaned)
+    if match:
+        return match[1]
+    return None
+
+
+def naming_author(entry) -> str | None:
+    """An individual first; otherwise an evidenced institutional acronym."""
+    authors = list(entry.authors or [])
+    corporate = set(getattr(entry, "corporate_authors", []) or [])
+    individuals = [author for author in authors
+                   if author not in corporate and not institution_acronym(author)]
+    if individuals:
+        return individuals[0]
+    return next((acronym for author in authors
+                 if (acronym := institution_acronym(author))), None)

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-create_app_icon.py — Generate ChatEKLD app icon from a source image.
+create_app_icon.py — Generate CHERQAiN app icon from a source image.
 
 Produces all required PNG sizes for macOS iconutil to convert into
 an .icns file. Uses Pillow for processing.
 
-Usage (called automatically by build_macos_app.sh):
+Usage (called automatically by install_and_build.sh):
     python3 create_app_icon.py <output_iconset_dir>
 """
 
@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except ImportError:
     print("Pillow is not installed. Install it with: pip install Pillow")
     sys.exit(1)
@@ -32,7 +32,7 @@ ICON_SIZES = [
     ("icon_512x512@2x",   1024),
 ]
 
-SOURCE_IMAGE_PATH = Path(__file__).parent / "static" / "img" / "daphne.png"
+SOURCE_IMAGE_PATH = Path(__file__).parent / "static" / "img" / "cherqain-cat.png"
 
 def process_icon(source_img: Image.Image, size: int) -> Image.Image:
     """Resize and square the source image for macOS icon requirements.
@@ -44,19 +44,9 @@ def process_icon(source_img: Image.Image, size: int) -> Image.Image:
     Returns:
         PIL.Image.Image: The processed RGBA icon at the requested size.
     """
-    # Create a square version of the source image by adding transparency padding
-    # rather than cropping, to ensure the whole character is visible.
-    width, height = source_img.size
-    max_dim = max(width, height)
-    
-    # Create transparent canvas
-    square_img = Image.new("RGBA", (max_dim, max_dim), (0, 0, 0, 0))
-    # Paste source image centered
-    offset = ((max_dim - width) // 2, (max_dim - height) // 2)
-    square_img.paste(source_img, offset)
-    
-    # Resize to target size with high-quality resampling
-    return square_img.resize((size, size), Image.Resampling.LANCZOS)
+    # Face-centered crop: retain the ears and eyes in this portrait source.
+    return ImageOps.fit(source_img, (size, size), Image.Resampling.LANCZOS,
+                        centering=(0.5, 0.05))
 
 def main() -> None:
     if len(sys.argv) != 2:

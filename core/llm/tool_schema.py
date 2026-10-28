@@ -8,8 +8,8 @@ tools and emitting tool calls:
 * **Anthropic** uses ``{"name", "description", "input_schema"}`` and
   returns ``input`` already parsed.
 * **Gemini** declares functions via ``{"function_declarations": [...]}``
-  and returns ``functionCall.args`` as an object, with no provider-side
-  ID — the adapter synthesises one.
+  and returns ``functionCall.args`` as an object. A provider-assigned id is
+  echoed when present; otherwise the adapter synthesises a local id.
 
 Keeping the conversions in one module makes the adapters thin and the
 serialisation logic unit-testable without an HTTP mock.
@@ -165,7 +165,10 @@ def parse_gemini_function_call(
         return None
     if not isinstance(args, dict):
         return None
-    call_id = f"call_{uuid.uuid4().hex[:12]}"
+    provider_id = raw.get("id")
+    call_id = provider_id or f"call_{uuid.uuid4().hex[:12]}"
+    if not isinstance(call_id, str):
+        return None
     try:
         raw_args = json.dumps(args)
     except (TypeError, ValueError):
@@ -173,10 +176,13 @@ def parse_gemini_function_call(
     return ToolCall(
         id=call_id, name=name, arguments=args, raw_arguments=raw_args,
         thought_signature=thought_signature or "",
+        provider_assigned_id=bool(provider_id),
     )
 
 
-def build_openai_messages(request: LLMRequest) -> list[dict[str, Any]]:
+def build_openai_messages(
+    request: LLMRequest, *, provider_name: str = "openai",
+) -> list[dict[str, Any]]:
     """Build OpenAI-shape ``messages`` including tool history.
 
     Also used by the local adapter for Ollama (0.4+) and LM Studio's
@@ -192,7 +198,7 @@ def build_openai_messages(request: LLMRequest) -> list[dict[str, Any]]:
             msgs.append({"role": role, "content": content})
     for turn in request.tool_history:
         if turn.calls:
-            msgs.append({
+            assistant = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [
@@ -206,7 +212,14 @@ def build_openai_messages(request: LLMRequest) -> list[dict[str, Any]]:
                     }
                     for c in turn.calls
                 ],
-            })
+            }
+            state = turn.provider_state
+            if (state.get("provider") == provider_name
+                    and state.get("model") == request.model):
+                for key in ("reasoning_content", "reasoning_details"):
+                    if key in state:
+                        assistant[key] = state[key]
+            msgs.append(assistant)
         for r in turn.results:
             msgs.append({
                 "role": "tool",
@@ -235,19 +248,22 @@ def build_anthropic_messages(request: LLMRequest) -> list[dict[str, Any]]:
             msgs.append({"role": role, "content": content})
     for turn in request.tool_history:
         if turn.calls:
-            blocks: list[dict[str, Any]] = []
-            for c in turn.calls:
-                blocks.append({
-                    "type": "tool_use",
-                    "id": c.id,
-                    "name": c.name,
-                    "input": c.arguments or {},
-                })
+            state = turn.provider_state
+            if (state.get("provider") == "anthropic"
+                    and state.get("model") == request.model
+                    and isinstance(state.get("content"), list)):
+                blocks = state["content"]
+            else:
+                blocks = [
+                    {"type": "tool_use", "id": c.id, "name": c.name,
+                     "input": c.arguments or {}}
+                    for c in turn.calls
+                ]
             msgs.append({"role": "assistant", "content": blocks})
         if turn.results:
             result_blocks: list[dict[str, Any]] = []
             for r in turn.results:
-                block = {
+                block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": r.tool_call_id,
                     "content": r.content,
@@ -262,10 +278,9 @@ def build_anthropic_messages(request: LLMRequest) -> list[dict[str, Any]]:
 def build_gemini_contents(request: LLMRequest) -> list[dict[str, Any]]:
     """Build Gemini-shape ``contents`` including tool history.
 
-    Gemini ties responses back to calls by ``name`` rather than ID, so
-    we look up the call name within each turn when emitting the
-    ``functionResponse`` block. Tool errors are signalled by placing the
-    body under an ``error`` key instead of ``content``.
+    Gemini function responses carry the provider-assigned call ID when one
+    was supplied, plus the matching name. We look up that name within each
+    turn. Tool errors use an ``error`` key instead of ``content``.
     """
     contents: list[dict[str, Any]] = []
     for msg in request.messages:
@@ -285,9 +300,12 @@ def build_gemini_contents(request: LLMRequest) -> list[dict[str, Any]]:
         if turn.calls:
             call_parts: list[dict[str, Any]] = []
             for c in turn.calls:
-                part: dict[str, Any] = {
-                    "functionCall": {"name": c.name, "args": c.arguments or {}}
+                function_call: dict[str, Any] = {
+                    "name": c.name, "args": c.arguments or {},
                 }
+                if c.provider_assigned_id:
+                    function_call["id"] = c.id
+                part: dict[str, Any] = {"functionCall": function_call}
                 # Gemini 3.x REQUIRES the thoughtSignature captured from the
                 # model's functionCall part to be echoed back verbatim on that
                 # part — omitting it 400s the second tool turn. Older Gemini
@@ -305,12 +323,12 @@ def build_gemini_contents(request: LLMRequest) -> list[dict[str, Any]]:
                     response_body = {"error": r.content}
                 else:
                     response_body = {"content": r.content}
-                parts.append({
-                    "functionResponse": {
-                        "name": name,
-                        "response": response_body,
-                    }
-                })
+                function_response: dict[str, Any] = {
+                    "name": name, "response": response_body,
+                }
+                if any(c.id == r.tool_call_id and c.provider_assigned_id for c in turn.calls):
+                    function_response["id"] = r.tool_call_id
+                parts.append({"functionResponse": function_response})
             contents.append({"role": "user", "parts": parts})
     if not contents:
         contents.append({"role": "user", "parts": [{"text": ""}]})

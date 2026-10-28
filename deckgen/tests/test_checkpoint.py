@@ -1,6 +1,8 @@
 """Unit tests for deckgen/checkpoint.py (pure: tmp dir, no app, no server)."""
 import os
 
+import pytest
+
 from deckgen import checkpoint
 from deckgen.assemble import SectionOutput
 from deckgen.outline import Section
@@ -47,7 +49,7 @@ def test_manifest_roundtrip(tmp_path):
     d = str(tmp_path)
     jk = _key()
     sections = [Section(title="Intro", points=["a", "b"]), Section(title="Methods", points=[])]
-    m = checkpoint.new_manifest(job_key=jk, topic="T", slug="hf", out_dir="/decks", sections=sections)
+    m = checkpoint.new_manifest(context={"vault_root": str(tmp_path), "embed_provider": "ollama"}, job_key=jk, topic="T", slug="hf", out_dir="/decks", sections=sections)
     assert checkpoint.completed_count(m) == 0
 
     checkpoint.set_section(m, 1, SectionOutput(title="Intro", body="\\section{Intro}", placeholder=False))
@@ -81,13 +83,14 @@ def test_load_is_tolerant(tmp_path):
     import json
     with open(os.path.join(d, f"{jk}.json"), "w", encoding="utf-8") as fh:
         json.dump({"version": 999, "job_key": jk}, fh)
-    assert checkpoint.load(d, jk) is None
+    with pytest.raises(ValueError, match="legacy"):
+        checkpoint.load(d, jk)
 
 
 def test_delete_and_prune(tmp_path):
     d = str(tmp_path)
     jk = _key()
-    m = checkpoint.new_manifest(job_key=jk, topic="T", slug="s", out_dir="/d", sections=[])
+    m = checkpoint.new_manifest(context={"vault_root": str(tmp_path), "embed_provider": "ollama"}, job_key=jk, topic="T", slug="s", out_dir="/d", sections=[])
     checkpoint.save(d, m)
     assert checkpoint.load(d, jk) is not None
     checkpoint.delete(d, jk)
@@ -96,7 +99,7 @@ def test_delete_and_prune(tmp_path):
 
     # Prune keeps only the newest max_keep files.
     for i in range(15):
-        mi = checkpoint.new_manifest(job_key=f"k{i:02d}", topic="T", slug="s", out_dir="/d", sections=[])
+        mi = checkpoint.new_manifest(context={"vault_root": str(tmp_path), "embed_provider": "ollama"}, job_key=f"k{i:02d}", topic="T", slug="s", out_dir="/d", sections=[])
         checkpoint.save(d, mi)
         os.utime(os.path.join(d, f"k{i:02d}.json"), (1000 + i, 1000 + i))  # ascending mtime
     checkpoint.prune(d, max_keep=10)

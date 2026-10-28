@@ -48,6 +48,13 @@ _EMBED_TIMEOUT_S = 30.0
 # propose prompt's full 6k chars would only slow the call down.
 _PAPER_EMBED_MAX_CHARS = 2000
 
+#: Exemplar pool bound: only the newest this many journal-tagged keys are
+#: ranked. The prompt shows tagging_fewshot_k of them (default 3), so a deeper
+#: pool buys a marginally better ranking for a linearly growing embed cost.
+_EXEMPLAR_MAX_CANDIDATES = 200
+#: Entries retained in the on-disk title-vector cache.
+_TITLE_CACHE_MAX = 2000
+
 _MEMO_LOCK = threading.Lock()
 _GLOSS_MEMO: dict = {"key": None, "vectors": None}
 # Serialises the whole miss path (disk read → batch embed → disk write → memo
@@ -202,6 +209,66 @@ def mine_journal_exemplars(vault_root: Path, cfg: dict) -> list[dict]:
     return list(by_key.values())
 
 
+def _title_cache_file(vault_root: Path) -> Path:
+    from core.constants import OBSIDIAN_CACHE_DIR
+    return (Path(OBSIDIAN_CACHE_DIR) / "tagging" / _vault_key(Path(vault_root))
+            / "title_embeds.json")
+
+
+def title_embeddings(cfg: dict, vault_root: Path, cands: list[dict],
+                     embedder) -> dict[str, list[float]]:
+    """``{citation_key: vector}`` for each candidate's title, disk-cached.
+
+    Keyed by the embed model and, per entry, by the TITLE the vector was
+    built from — so a bib title edit or an embed-model switch re-embeds that
+    key and nothing else. Only misses reach the provider. Raises on embed
+    failure (the caller owns degradation, as for glosses).
+    """
+    model = _embed_model_name(cfg)
+    cache_file = _title_cache_file(Path(vault_root))
+    cached: dict = {}
+    try:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("model") == model:
+            entries = data.get("entries")
+            if isinstance(entries, dict):
+                cached = entries
+    except (OSError, ValueError, TypeError):
+        cached = {}
+
+    out: dict[str, list[float]] = {}
+    misses: list[dict] = []
+    for c in cands:
+        hit = cached.get(c["key"])
+        if (isinstance(hit, dict) and hit.get("title") == c["title"]
+                and isinstance(hit.get("vec"), list)):
+            out[c["key"]] = hit["vec"]
+        else:
+            misses.append(c)
+    if misses:
+        embs = embedder.get_text_embedding_batch([c["title"] for c in misses])
+        for c, vec in zip(misses, embs):
+            out[c["key"]] = [float(x) for x in vec]
+        entries = dict(cached)
+        for c in misses:
+            entries[c["key"]] = {"title": c["title"], "vec": out[c["key"]]}
+        if len(entries) > _TITLE_CACHE_MAX:
+            # Bounded file: the keys this call needs are kept first, the rest
+            # fill the remainder. No LRU metadata is stored — the cache is
+            # regenerable and one re-embed is the whole cost of an eviction.
+            keep = {c["key"]: entries[c["key"]] for c in cands if c["key"] in entries}
+            for k2, v2 in entries.items():
+                if len(keep) >= _TITLE_CACHE_MAX:
+                    break
+                keep.setdefault(k2, v2)
+            entries = keep
+        try:
+            _atomic_write_json(cache_file, {"model": model, "entries": entries})
+        except OSError:
+            logger.debug("title-embedding cache write failed", exc_info=True)
+    return out
+
+
 def _select_exemplars(cfg, vault_root, inv, paper_text, k,
                       embedder) -> list[tuple[str, list[str]]]:
     """Top-*k* ``(title, accepted_tags)`` pairs, similarity-ranked.
@@ -209,6 +276,36 @@ def _select_exemplars(cfg, vault_root, inv, paper_text, k,
     Titles come from the audit inventory (no PDF re-reads); similarity is
     title-embedding ↔ paper-text cosine, degrading to recency when the embed
     call fails mid-way.
+
+    # PERF (2026-09-02): the exemplar pool is capped and its title vectors
+    #   are disk-cached.
+    # Before: every citation key the journal ever touched was embedded on
+    #   EVERY propose. Measured with a counting fake embedder over a journal
+    #   holding 3 000 tagged keys: 3 000 titles embedded per proposal, all of
+    #   them inside the 30 s construction bound the propose gate is held
+    #   across — which is why the field behaviour was a timeout followed by
+    #   the recency fallback, i.e. the whole budget spent to reach the answer
+    #   the fallback gives for free.
+    # Change: the pool is truncated to the newest _EXEMPLAR_MAX_CANDIDATES
+    #   (200) by op timestamp BEFORE anything is embedded, and each title's
+    #   vector is cached on disk by (embed model, title) the way glosses are.
+    #   Same journal: 200 embedded on the first proposal, 0 on the next
+    #   (warm cache), against 3 000 every time.
+    # Safe because:
+    #   The cap is applied to the RANKING POOL, never to the k exemplars the
+    #   prompt receives; k stays whatever tagging_fewshot_k says. Both the
+    #   similarity sort and the recency fallback run over the same truncated
+    #   pool, so the two paths still agree on which papers were considered.
+    #   A title-vector cache miss is indistinguishable from today's behaviour
+    #   for that key.
+    # Preserves: "Degradation stays total. Nothing here may block a
+    #   proposal." — every new failure mode (unreadable cache, embed error)
+    #   still raises into propose_context's single try/except, which returns
+    #   (vocab, []). k <= 0 still returns [] before any work.
+    # Lock/thread contract: no lock taken or released; runs on the propose
+    #   worker thread as before.
+    # Pinned by: test_tagging.py::TestExemplarPoolBound (red before the
+    #   change: "3000 != 200").
     """
     if k <= 0:
         return []
@@ -221,11 +318,16 @@ def _select_exemplars(cfg, vault_root, inv, paper_text, k,
         c["title"] = title or c["key"]
     if not cands:
         return []
+    # Newest-first, then truncate: the pool an unbounded journal offers is
+    # dominated by keys tagged months ago, and embedding them costs the whole
+    # budget for a ranking the recency fallback approximates anyway.
+    cands.sort(key=lambda c: c["ts"], reverse=True)
+    del cands[_EXEMPLAR_MAX_CANDIDATES:]
     try:
         q = embedder.get_query_embedding(paper_text[:_PAPER_EMBED_MAX_CHARS])
-        vecs = embedder.get_text_embedding_batch([c["title"] for c in cands])
-        for c, v in zip(cands, vecs):
-            c["score"] = _cosine(q, v)
+        vectors = title_embeddings(cfg, Path(vault_root), cands, embedder)
+        for c in cands:
+            c["score"] = _cosine(q, vectors[c["key"]])
         cands.sort(key=lambda c: c["score"], reverse=True)
     except Exception:  # noqa: BLE001 — similarity is best-effort
         logger.debug("exemplar similarity ranking degraded to recency", exc_info=True)

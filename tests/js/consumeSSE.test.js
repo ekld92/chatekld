@@ -72,3 +72,31 @@ describe('consumeSSE — onError-once + abort identity', () => {
         expect(onError).not.toHaveBeenCalled();
     });
 });
+
+
+describe('completion marker integrity', () => {
+    it('preserves tokens but reports an EOF before DONE exactly once', async () => {
+        mockSSEFetch(['data: {"token":"partial"}\n\n']);
+        const onToken = vi.fn(), onDone = vi.fn(), onError = vi.fn();
+        await consumeSSE('/x', {}, {onToken, onDone, onError});
+        expect(onToken).toHaveBeenCalledWith('partial');
+        expect(onDone).not.toHaveBeenCalled();
+        expect(onError).toHaveBeenCalledTimes(1);
+        expect(onError.mock.calls[0][0]).toContain('interrupted');
+    });
+    it('accepts split CRLF frames and an explicit terminal without final newline', async () => {
+        mockSSEFetch(['data: {"token":"OK"}\r', '\n\r\ndata: [DONE]']);
+        const onToken = vi.fn(), onDone = vi.fn(), onError = vi.fn();
+        await consumeSSE('/x', {}, {onToken, onDone, onError});
+        expect(onToken).toHaveBeenCalledWith('OK');
+        expect(onDone).toHaveBeenCalledTimes(1);
+        expect(onError).not.toHaveBeenCalled();
+    });
+    it('keeps the opt-out for callers validating their own business terminal', async () => {
+        mockSSEFetch(['data: {"result":{"done":true}}\n\n']);
+        const onOther = vi.fn(), onError = vi.fn();
+        await consumeSSE('/x', {requireDone:false}, {onOther, onError});
+        expect(onOther).toHaveBeenCalledWith({result:{done:true}});
+        expect(onError).not.toHaveBeenCalled();
+    });
+});

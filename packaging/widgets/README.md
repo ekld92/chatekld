@@ -1,4 +1,4 @@
-# ChatEKLD desktop widgets
+# CHERQAiN desktop widgets
 
 Two optional companions that surface a **paper of the day**, one completable
 suggestion ("Tag 10 papers") and a **notion of the day** from your library, on
@@ -68,7 +68,7 @@ your Mac switches to Dark Mode.
 
 Then hold that modifier and click the card: the **title** opens the paper's
 note in Obsidian (or the app, when the paper has no note), and the **"Tag N
-papers"** line opens ChatEKLD. Until you do this, the card is display-only
+papers"** line opens CHERQAiN. Until you do this, the card is display-only
 and the clicks simply never arrive — nothing breaks. SwiftBar's menu is
 clickable with no setup at all, so it stays the reliable action surface.
 
@@ -81,8 +81,8 @@ clickable with no setup at all, so it stays the reliable action surface.
   update this widget" line instead of misrendering a newer schema. Fields
   added within version 1 are additive: an older copy of a widget ignores
   them and keeps working.
-- "Open ChatEKLD" resolves the app by bundle id (`com.chatekld.app`), not by
-  name — the app installs under a dated name (`ChatEKLD_<build-date>.app`), so
-  `open -a ChatEKLD` would fail.
+- "Open CHERQAiN" resolves the app by bundle id (`com.chatekld.app`), not by
+  name — the app installs under a dated name (`CHERQAiN_<build-date>.app`), so
+  `open -a CHERQAiN` would fail.
 - The snapshot is regenerable app data: deleting `widget.json` costs one
   Refresh click (or the next scan), nothing else.

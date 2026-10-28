@@ -113,6 +113,9 @@ def test_no_text_pdfs_are_counted_not_silent(tmp_path):
     rep = find_near_duplicates(
         s, None, [], pdf_text_provider=lambda p: texts.get(p))
     assert rep.no_text_count == 2  # one unreadable + one too-thin
+    # The count alone could not tell a reviewer WHICH files were never
+    # compared (annual cleanup A6 blind spot, 2026-09-17).
+    assert sorted(p.name for p in rep.no_text_paths) == ["scan.pdf", "thin.pdf"]
 
 
 def test_no_provider_skips_text_tiers_entirely(tmp_path):
@@ -220,6 +223,22 @@ def test_dismissed_group_is_filtered_and_counted(tmp_path):
     rep2 = find_near_duplicates(
         s, inv, [], pdf_text_provider=None, dismissed={c.pair_id})
     assert rep2.candidates == [] and rep2.dismissed_count == 1
+    # A dismissal can only be re-verified if the dismissed group is visible.
+    (hidden,) = rep2.dismissed_candidates
+    assert hidden.pair_id == c.pair_id and hidden.citation_keys == c.citation_keys
+
+
+def test_dismissed_file_group_keeps_its_paths(tmp_path):
+    s = _settings(tmp_path)
+    a = _pdf(tmp_path, "a.pdf", b"A-bytes")
+    b = _pdf(tmp_path, "b.pdf", b"B-bytes")
+    texts = {a: _PAGE, b: _PAGE}
+    rep = find_near_duplicates(s, None, [], pdf_text_provider=lambda p: texts.get(p))
+    (c,) = rep.candidates
+    rep2 = find_near_duplicates(s, None, [], pdf_text_provider=lambda p: texts.get(p),
+                                dismissed={c.pair_id})
+    (hidden,) = rep2.dismissed_candidates
+    assert rep2.candidates == [] and sorted(hidden.paths) == sorted([a, b])
 
 
 def test_dup_decisions_roundtrip_add_clear(tmp_path, monkeypatch):
@@ -351,4 +370,10 @@ def test_serializer_shape_and_json(tmp_path):
     (row,) = payload["rows"]
     assert row["kind"] == "page1_text" and row["pair_id"] == "page1_text:x+y"
     assert payload["no_text_count"] == 3 and payload["dismissed_count"] == 1
+    assert payload["dismissed_rows"] == [] and payload["no_text_paths"] == []
+    rep.dismissed_candidates = [c]
+    rep.no_text_paths = [a]
+    payload = serialize.report_near_duplicates(rep, SimpleNamespace(vault_root=tmp_path))
+    assert [r["pair_id"] for r in payload["dismissed_rows"]] == ["page1_text:x+y"]
+    assert [p["name"] for p in payload["no_text_paths"]] == ["a.pdf"]
     json.dumps(payload)

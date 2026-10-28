@@ -8,11 +8,13 @@
  * per-request; the server re-resolves them body → persisted paper_* → default.
  */
 import { secureFetch, consumeSSE } from './api.js';
-import { showTaskError, clearTaskError, copyToClipboard, announceStatus, announceError } from './ui.js';
+import { showTaskError, clearTaskError, copyToClipboard, announceStatus, announceError, taskBegin, taskUpdate, taskEnd, makeAnswerRenderer } from './ui.js';
 import { getActiveProvider } from './config.js';
 
 let _currentUploadId = null;
 let _currentFilename = 'summary';
+let _summaryText = ''; // Raw model Markdown: copy/export must not scrape rendered DOM.
+let _summaryRenderer = null;
 // Provenance of the LAST generated summary (the {"meta"}/{"usage"} SSE frames);
 // stamped into exports. Cleared on reset/upload alongside _currentFilename.
 let _lastSummaryMeta = null;
@@ -106,7 +108,7 @@ export function wireUploadDropzone() {
 export async function uploadPDF() {
     const fileInput = document.getElementById('pdf-upload');
     const file = fileInput.files[0];
-    if (!file) return;
+    if (!file || _summaryAbortController || _uploadAbortController) return;
 
     const content = document.getElementById('document-summary-content');
     content.innerHTML = '<div class="upload-spinner"></div><div>Extracting content…</div>';
@@ -122,6 +124,8 @@ export async function uploadPDF() {
     if (_uploadAbortController) { try { _uploadAbortController.abort(); } catch (_) {} }
     const uploadCtrl = new AbortController();
     _uploadAbortController = uploadCtrl;
+    taskBegin('read-upload', 'Read — extracting PDF');
+    document.getElementById('summarise-btn').disabled = true;
 
     try {
         const resp = await fetch('/api/upload', {
@@ -144,6 +148,11 @@ export async function uploadPDF() {
                 secureFetch('/api/upload/' + encodeURIComponent(prevId), { method: 'DELETE' })
                     .catch(() => { /* best-effort cleanup */ });
             }
+            _summaryText = '';
+            _lastSummaryMeta = null;
+            _lastSummaryUsage = null;
+            taskUpdate('read-upload', {message: 'Paper processed. Ready to summarise.'});
+            taskEnd('read-upload', 'completed');
             _currentUploadId = data.upload_id;
             _currentFilename = data.filename || file.name || 'summary';
             content.textContent = 'Paper processed. Ready to summarise.';
@@ -151,11 +160,13 @@ export async function uploadPDF() {
             document.getElementById('export-summary-btn').disabled = true;
             document.getElementById('export-summary-md-btn').disabled = true;
         } else {
-            content.textContent = 'Upload failed: ' + data.error;
+            throw new Error(data.error || 'No upload identifier returned.');
         }
     } catch (e) {
-        if (e.name === 'AbortError') return;   // C5/#47: cancelled upload — stay quiet
-        content.textContent = 'Upload error: ' + e.message;
+        if (_uploadAbortController !== uploadCtrl) return;
+        taskUpdate('read-upload', {message: e.name === 'AbortError' ? 'Upload cancelled.' : e.message});
+        taskEnd('read-upload', e.name === 'AbortError' ? 'cancelled' : 'failed');
+        if (e.name !== 'AbortError') content.textContent = 'Upload error: ' + e.message;
     } finally {
         if (_uploadAbortController === uploadCtrl) _uploadAbortController = null;
     }
@@ -164,12 +175,11 @@ export async function uploadPDF() {
 /**
  * Stream a summary of the uploaded PDF. Sends the content/instruction inputs plus
  * the generation knobs (read by id), then consumes the SSE `{token}`/`{error}`
- * stream into the summary pane. An in-flight summarisation is aborted first
- * (single AbortController) so re-clicking Summarise can't interleave two streams.
+ * stream into the summary pane. Repeated launches are ignored while busy.
  * Enables the export buttons only once non-empty text has actually arrived.
  */
 export async function summarisePDF() {
-    if (!_currentUploadId) return;
+    if (!_currentUploadId || _summaryAbortController || _uploadAbortController) return;
     
     const content = document.getElementById('document-summary-content');
     clearTaskError(document.getElementById('doc-error-boundary'));
@@ -198,8 +208,13 @@ export async function summarisePDF() {
     // late finally nulled B's controller, and a third run could no longer
     // abort B (two streams writing the same pane). The finally below only
     // clears the field if it still owns it (identity check).
+    _summaryText = '';
+    const renderer = makeAnswerRenderer(content);
+    _summaryRenderer = renderer;
     const controller = new AbortController();
     _summaryAbortController = controller;
+    const ownsView = () => _summaryAbortController === controller && !controller.signal.aborted;
+    taskBegin('read-summary', 'Read — generating summary');
 
     // C5/#18 (2026-07-13): a dedicated Stop button so a long (map-reduce)
     // summary can be cancelled WITHOUT discarding the uploaded paper — the only
@@ -214,6 +229,7 @@ export async function summarisePDF() {
         stopBtn.setAttribute('aria-label', 'Stop generating the summary');
         btn.parentElement.insertBefore(stopBtn, btn.nextSibling);
     }
+    stopBtn.textContent = 'Stop';
     stopBtn.style.display = '';
     stopBtn.disabled = false;
     stopBtn.onclick = () => { controller.abort(); stopBtn.disabled = true; stopBtn.textContent = 'Stopping…'; };
@@ -236,8 +252,10 @@ export async function summarisePDF() {
     const systemPrompt = document.getElementById('doc-system-prompt').value.trim();
     if (systemPrompt) payload.system_prompt = systemPrompt;
 
+    // Hoisted out of the try so the catch can tell "partial streamed text"
+    // from "nothing arrived" — the vault/plainchat interrupted-partial pattern.
+    let receivedText = false;
     try {
-        let receivedText = false;
         _lastSummaryMeta = null;
         _lastSummaryUsage = null;
         await consumeSSE('/api/summarise', {
@@ -253,7 +271,8 @@ export async function summarisePDF() {
                 // bibliography strip, fallback) that must persist beside the
                 // finished summary — dropping it made a partial summary read
                 // as complete.
-                if (!msg) return;
+                if (!ownsView() || !msg) return;
+                taskUpdate('read-summary', {message: String(msg)});
                 const transient = /(…|\.\.\.)\s*$/.test(String(msg).trim());
                 if (transient) {
                     if (stageEl) { stageEl.hidden = false; stageEl.textContent = msg; }
@@ -266,39 +285,82 @@ export async function summarisePDF() {
                 }
             },
             onToken: (token) => {
+                if (!ownsView()) return;
                 if (!receivedText) content.textContent = '';
-                content.textContent += token;
-                receivedText = true;
+                _summaryText += token;
+                renderer.update(_summaryText);
+                receivedText = _summaryText.trim() !== '';
             },
             onOther: (frame) => {
                 // Export provenance (2026-07-22): the server resolves the
                 // generation params body → paper_* config, so this frame is
                 // the authoritative record of what ran.
+                if (!ownsView()) return;
                 if (frame && frame.meta) _lastSummaryMeta = frame.meta;
                 if (frame && frame.usage) _lastSummaryUsage = frame.usage;
             },
             onError: (err) => { throw new Error(err); }
         });
 
+        if (!ownsView()) return;
+        renderer.flush();
+        taskUpdate('read-summary', {message: receivedText ? 'Summary ready.' : 'No summary was generated.'});
+        taskEnd('read-summary', receivedText ? 'completed' : 'failed');
         if (!receivedText) content.textContent = 'No summary was generated. Please try again.';
-        const canExport = !(!receivedText || !content.textContent.trim());
+        const canExport = receivedText;
         exportBtn.disabled = !canExport;
         exportMdBtn.disabled = !canExport;
         announceStatus(receivedText ? 'Summary ready.' : 'No summary was generated.');
     } catch (e) {
+        if (_summaryAbortController !== controller) return;
+        taskUpdate('read-summary', {message: e.name === 'AbortError' ? 'Summary cancelled; any partial text is kept.' : e.message});
+        taskEnd('read-summary', e.name === 'AbortError' ? 'cancelled' : (receivedText ? 'partial' : 'failed'));
+        // 2026-08-12 adjudicated #2: both failure branches used to DESTROY
+        // already-streamed text — Stop overwrote the pane, an error blanked
+        // it — erasing a 90%-streamed map-reduce summary and re-spending the
+        // whole generation on retry. Preserve any partial (the vault /
+        // plainchat "⚠ interrupted" pattern); the note goes into the
+        // persistent notices strip so exports of the pane stay clean.
+        renderer.flush();
+        const partial = receivedText && _summaryText.trim() !== '';
+        const note = (msg) => {
+            if (!noticesEl) return;
+            noticesEl.hidden = false;
+            const line = document.createElement('div');
+            line.textContent = msg;
+            noticesEl.appendChild(line);
+        };
         if (e.name === 'AbortError') {
             // C5/#18: user Stop — keep the upload, show a non-error notice.
-            content.textContent = 'Summary cancelled. The paper is still loaded — click Summarise to try again.';
-            announceStatus('Summary cancelled.');
+            if (partial) {
+                note('⚠ Summary stopped — the text above is partial. The paper '
+                    + 'is still loaded; click Summarise to regenerate.');
+                announceStatus('Summary stopped; the partial text is kept.');
+            } else {
+                content.textContent = 'Summary cancelled. The paper is still loaded — click Summarise to try again.';
+                announceStatus('Summary cancelled.');
+            }
         } else {
-            content.textContent = '';
+            if (partial) {
+                note('⚠ Summary interrupted — the text above is partial.');
+            } else {
+                content.textContent = '';
+            }
             const el = document.getElementById('doc-error-boundary');
             showTaskError(el, 'Error: ' + e.message, [
                 { label: 'Retry', primary: true, onClick: () => { clearTaskError(el); summarisePDF(); } },
                 { label: 'Dismiss', onClick: () => clearTaskError(el) },
             ]);
         }
+        if (partial) {
+            // The kept text is the user's — exportable like a finished one.
+            exportBtn.disabled = false;
+            exportMdBtn.disabled = false;
+        }
     } finally {
+        renderer.cancel();
+        if (_summaryAbortController !== controller) return;
+        _summaryRenderer = null;
         btn.disabled = false;
         btn.textContent = 'Summarise';
         // The stage line is progress-only — clear it; NOTICES stay visible
@@ -311,9 +373,8 @@ export async function summarisePDF() {
 
 /** Copy the generated summary text to the clipboard. No-op when empty. */
 export function copySummary() {
-    const content = document.getElementById('document-summary-content');
     const btn = document.getElementById('summary-copy-btn');
-    const text = content ? content.textContent.trim() : '';
+    const text = _summaryText.trim();
     if (!text || !btn) return;
     copyToClipboard(text, btn);
 }
@@ -329,8 +390,7 @@ function parsePositiveInt(id, fallback) {
  * transient "Exporting…" / "Exported" feedback.
  */
 export async function exportSummary(format = 'txt') {
-    const content = document.getElementById('document-summary-content');
-    const text = content.textContent.trim();
+    const text = _summaryText.trim();
     if (!text) return;
 
     const btn = document.getElementById(format === 'md' ? 'export-summary-md-btn' : 'export-summary-btn');
@@ -344,7 +404,7 @@ export async function exportSummary(format = 'txt') {
     let exportText = text;
     if (_lastSummaryMeta) {
         const m = _lastSummaryMeta;
-        const bits = [`Generated by ChatEKLD — ${[m.provider, m.model].filter(Boolean).join(' / ')}`];
+        const bits = [`Generated by CHERQAiN — ${[m.provider, m.model].filter(Boolean).join(' / ')}`];
         if (typeof m.temperature === 'number') bits.push(`temperature ${m.temperature}`);
         const u = _lastSummaryUsage;
         if (u && (u.input_tokens || u.output_tokens)) {
@@ -384,18 +444,25 @@ export async function exportSummary(format = 'txt') {
  * and DOM stop touching the row the request still references.
  */
 export async function resetUpload() {
+    _summaryRenderer?.cancel();
+    _summaryRenderer = null;
+    _summaryText = '';
     const id = _currentUploadId;
     // Abort any in-flight summarisation so server and DOM stop updating
     // before we delete the upload row that the request is referencing.
     if (_summaryAbortController) {
         try { _summaryAbortController.abort(); } catch (_) {}
         _summaryAbortController = null;
+        taskUpdate('read-summary', {message: 'Read reset; generation cancelled.'});
+        taskEnd('read-summary', 'cancelled');
     }
     // C5/#47: also abort an in-flight UPLOAD so its late resolve can't re-enable
     // Summarise / cache an upload_id after we've reset to the empty overlay.
     if (_uploadAbortController) {
         try { _uploadAbortController.abort(); } catch (_) {}
         _uploadAbortController = null;
+        taskUpdate('read-upload', {message: 'Read reset; upload cancelled.'});
+        taskEnd('read-upload', 'cancelled');
     }
     _currentUploadId = null;
     _currentFilename = 'summary';
@@ -404,7 +471,16 @@ export async function resetUpload() {
     document.getElementById('upload-overlay').style.display = 'flex';
     document.getElementById('summary-view').style.display = 'none';
     document.getElementById('pdf-upload').value = '';
-    document.getElementById('summarise-btn').disabled = true;
+    const summaryBtn = document.getElementById('summarise-btn');
+    summaryBtn.disabled = true;
+    summaryBtn.textContent = 'Summarise';
+    // Reset owns the empty pane now: the invalidated stream's finally must
+    // stay inert, so it cannot clear these controls for us.
+    const stopBtn = document.getElementById('summarise-stop-btn');
+    if (stopBtn) { stopBtn.style.display = 'none'; stopBtn.textContent = 'Stop'; }
+    const stageEl = document.getElementById('summarise-stage');
+    if (stageEl) { stageEl.hidden = true; stageEl.textContent = ''; }
+    announceStatus('Ready for a new paper.');
     document.getElementById('export-summary-btn').disabled = true;
     document.getElementById('export-summary-md-btn').disabled = true;
     if (id) {

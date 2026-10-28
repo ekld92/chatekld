@@ -54,6 +54,20 @@ describe('modal machinery (Track 3.7)', () => {
         expect(document.getElementById('modal-a').classList.contains('open')).toBe(false);
     });
 
+    it('opening an earlier DOM sibling layers it above settings and hides the lower dialog from AT', () => {
+        openModal('modal-b');
+        openModal('modal-a');
+        const a = document.getElementById('modal-a');
+        const b = document.getElementById('modal-b');
+        expect(Number(a.style.zIndex)).toBeGreaterThan(Number(b.style.zIndex));
+        expect(b.inert).toBe(true);
+        expect(b.getAttribute('aria-hidden')).toBe('true');
+        closeModal('modal-a');
+        expect(b.inert).toBe(false);
+        expect(b.hasAttribute('aria-hidden')).toBe(false);
+        closeModal('modal-b');
+    });
+
     it('background inert clears only when the LAST modal closes; focus restores to the trigger', () => {
         const openerA = document.getElementById('opener-a');
         openerA.focus();

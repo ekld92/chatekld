@@ -325,6 +325,45 @@ def api_obsidian_materials():
     """List the files recorded in the current vault index manifest."""
     return jsonify(obsidian_manager.get_indexed_materials())
 
+
+@vault_bp.get("/api/obsidian/readiness")
+def api_obsidian_readiness():
+    """Observe saved evidence without manifest recovery or corpus discovery."""
+    from core.constants import OBSIDIAN_INDEX_DIR
+    from core.library_readiness import library_readiness
+
+    return jsonify(library_readiness(OBSIDIAN_INDEX_DIR, obsidian_manager.get_vault_path()))
+
+
+@vault_bp.post("/api/obsidian/index-preview")
+def api_obsidian_index_preview():
+    """Read-only store admission; no scan, model call or cache mutation."""
+    from core.config import resolve_embed_provider
+    from core.constants import OBSIDIAN_INDEX_DIR
+    from rag.index_admission import index_admission
+    cfg = load_config()
+    data = request.get_json(silent=True) or {}
+    provider = data.get("provider") or cfg.get("provider", "ollama")
+    embed = data.get("embed") or cfg.get("embed", DEFAULT_EMBED)
+    result = index_admission(obsidian_manager, OBSIDIAN_INDEX_DIR,
+                             obsidian_manager.get_vault_path() or "", embed,
+                             resolve_embed_provider(cfg, provider),
+                             force_fresh=data.get("force_fresh") is True)
+    counts = {}
+    if result["ready"]:
+        try:
+            from api.routes.online_ocr import _session_inventory
+            inventory = _session_inventory(Path(obsidian_manager.get_vault_path()).resolve(strict=True),
+                                           large_run=True, routine=True, preview_pages=False)
+            counts = {"selection_counts": inventory["selection_counts"], "reused_count": inventory["reused_count"],
+                      "source_count": inventory["source_count"], "update_token": inventory["session_token"]}
+        except (OSError, ValueError, TypeError) as exc:
+            return jsonify({"error": str(exc)}), 409
+    return jsonify({**result, **counts, "embed": embed, "embed_provider": resolve_embed_provider(cfg, provider),
+                    "scope": "Configured vault; successful caches reused. New local extraction may be required.",
+                    "library": "Audit and labels are not refreshed by indexing."})
+
+
 @vault_bp.route("/api/obsidian/index", methods=["POST"])
 def api_obsidian_index():
     """Admit exactly one background indexing run, then return immediately.
@@ -339,6 +378,9 @@ def api_obsidian_index():
     from core.config import resolve_chat_model
     data = request.get_json(silent=True) or {}
     cfg = load_config()
+    if cfg.get("vault_online_visual_enabled") is True and data.get("visual_mode") != "offline":
+        return jsonify({"error": "Online OCR/vision mode is selected. Start the previewed "
+                                 "online index run or explicitly select Offline."}), 409
     provider = data.get("provider") or cfg.get("provider", "ollama")
     llm = data.get("llm") or resolve_chat_model(cfg, provider)
     embed = data.get("embed") or cfg.get("embed", DEFAULT_EMBED)
@@ -358,6 +400,19 @@ def api_obsidian_index():
     # refactor Apply) overwrote it and this finally released the NEW holder's
     # lock mid-operation. Invariant: run_index can only release the
     # acquisition it was admitted under; a stale release is a no-op.
+    extraction_manifest = None
+    if data.get("update_token"):
+        try:
+            from api.routes.online_ocr import _session_inventory
+            inventory = _session_inventory(Path(obsidian_manager.get_vault_path()).resolve(strict=True),
+                                           large_run=True, routine=True, preview_pages=False)
+            if data["update_token"] != inventory["session_token"]:
+                raise ValueError("Inventory or settings changed since preview; preview again")
+            extraction_manifest = {"approved": {row["source"]: row["source_sha256"]
+                                   for row in inventory["sources"] + inventory["reused"]},
+                                   "allow_local_extraction": True}
+        except (OSError, ValueError, TypeError) as exc:
+            return jsonify({"error": str(exc)}), 409
     op_epoch = obsidian_manager.try_acquire_lock(ttl=3600)
     if not op_epoch:
         return jsonify({"error": "An indexing operation is already in progress"}), 503
@@ -369,17 +424,36 @@ def api_obsidian_index():
     # (never a raw truthiness test) so a garbage body value cannot trigger an
     # hours-long re-embed.
     force_fresh = coerce_bool(data.get("force_fresh")) or False
+    # Publish "a run is starting" BEFORE the 200 (2026-08-12). The state
+    # transition used to live on the spawned thread, and the client polls
+    # /api/obsidian/status with zero delay on the 200 — so that first poll read
+    # the PREVIOUS run's terminal state (served instantly: `get_status`'s lazy
+    # recovery materialises "done" into `_index_state`), declared "Indexing
+    # complete.", stopped polling and restored the idle buttons while this run
+    # carried on invisibly. Clicking Index again 503'd and re-attached, which is
+    # why starting an index appeared to need two clicks. `index_vault` skips its
+    # own (identical) preamble for this epoch, so a Cancel landing in the gap
+    # survives instead of being cleared out from under the user.
+    obsidian_manager.begin_index_run(op_epoch)
     def run_index():
         try:
             obsidian_manager.index_vault(
                 llm, embed, provider_name=provider, op_epoch=op_epoch,
                 force_fresh=force_fresh,
+                **({"extraction_manifest": extraction_manifest} if extraction_manifest is not None else {}),
             )
         finally:
             obsidian_manager.release_lock(op_epoch)
     t = threading.Thread(target=run_index, daemon=True)
     obsidian_manager.register_index_thread(t)
-    t.start()
+    try:
+        t.start()
+    except BaseException:
+        # Nothing will ever run or release: undo the admission so the status
+        # doesn't report a phantom run forever, and hand the lock back.
+        obsidian_manager.abort_index_run(op_epoch)
+        obsidian_manager.release_lock(op_epoch)
+        raise
     return jsonify({"ok": True})
 
 @vault_bp.route("/api/obsidian/chat", methods=["POST"])
@@ -473,12 +547,18 @@ def api_obsidian_chat():
 
                 if chunks:
                     retrieval_data = []
+                    from rag.paper_index import paper_field
                     for c in chunks:
-                        retrieval_data.append({
+                        row = {
                             "source": c.source,
                             "score": c.score,
                             "is_image": c.metadata.get("is_image", False),
-                        })
+                        }
+                        # Additive: {key, label} when the chunk was labelled.
+                        paper = paper_field(c.metadata)
+                        if paper:
+                            row["paper"] = paper
+                        retrieval_data.append(row)
                     _put({"retrieval": retrieval_data})
 
                 if hasattr(response, 'response_gen'):
@@ -608,13 +688,14 @@ def api_obsidian_chat():
                 if not cancel.is_set() and not errored:
                     # Best-effort real token/cost figures for the single-shot
                     # answer (the agent path emits its own budget-based frame).
-                    # Filtered by (provider, model) — the single-shot request
-                    # carries no workflow tag on the online path. Never fails
-                    # the stream.
+                    # Filter by workflow as well as provider/model: Read and
+                    # Create may use the same model while Ask is retrieving.
+                    # Concurrent Ask calls still share this approximate window.
                     try:
                         payload = usage_frame_payload(
                             usage_tracker.records_since(
-                                start_iso, provider=provider, model=llm
+                                start_iso, workflow="vault_rag",
+                                provider=provider, model=llm
                             )
                         )
                         if payload:

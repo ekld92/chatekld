@@ -1,5 +1,5 @@
 """
-test_concurrency.py — Concurrency regression tests for ChatEKLD 2026
+test_concurrency.py — Concurrency regression tests for CHERQAiN 2026
 ======================================================================
 Covers concurrency regressions in the core components:
 
@@ -16,7 +16,9 @@ import sys
 import io
 import threading
 import time
+import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 
@@ -583,9 +585,11 @@ class TestVisionCallBounds(unittest.TestCase):
         from services.vision import GLMOCRManager
         captured = {}
 
-        def fake(model, prompt, payload, *, timeout=None, max_tokens=None):
+        def fake(model, prompt, payload, *, timeout=None, max_tokens=None, meta=None, disable_reasoning=False):
+            meta["truncated"] = True
             captured["timeout"] = timeout
             captured["max_tokens"] = max_tokens
+            captured["disable_reasoning"] = disable_reasoning
             return "page text"
 
         mgr = GLMOCRManager(model="ocr", provider="lm_studio")
@@ -595,6 +599,8 @@ class TestVisionCallBounds(unittest.TestCase):
             out = mgr.extract_page_text("data")
 
         self.assertEqual(out, "page text")
+        self.assertTrue(out.truncated)
+        self.assertTrue(captured["disable_reasoning"])
         self.assertEqual(captured["timeout"], 90)
         self.assertEqual(captured["max_tokens"], 2048)      # ocr_max_tokens, not vision
 
@@ -999,3 +1005,120 @@ class TestHeartbeatLostLockAborts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOnlineClientCacheBound(unittest.TestCase):
+    """PERF (2026-09-02): the three ONLINE adapters' client caches were plain
+    dicts with no eviction, so a rotated API key stranded the previous
+    client's idle connection pool for the process lifetime. Bounded the way
+    the local adapters already are (core/providers/lms.py)."""
+
+    def _drained(self, mod):
+        with mod._client_cache_lock:
+            saved = dict(mod._client_cache)
+            mod._client_cache.clear()
+
+        def _restore():
+            with mod._client_cache_lock:
+                mod._client_cache.clear()
+                mod._client_cache.update(saved)
+
+        self.addCleanup(_restore)
+
+    def _cap(self, mod):
+        return getattr(mod, "_CLIENT_CACHE_MAX", 8)
+
+    def test_openai_cache_is_bounded_across_key_rotations(self):
+        import core.llm.adapters.openai as om
+        from core.llm.adapters.openai import OpenAIProvider
+        self._drained(om)
+        provider = OpenAIProvider()
+        with patch("openai.OpenAI", side_effect=lambda **kw: object()):
+            for i in range(40):
+                with patch.dict(os.environ, {"OPENAI_API_KEY": f"sk-rotated-{i}"}):
+                    provider._client()
+        with om._client_cache_lock:
+            self.assertLessEqual(len(om._client_cache), self._cap(om),
+                                 f"{len(om._client_cache)} cached clients")
+
+    def test_anthropic_cache_is_bounded(self):
+        import core.llm.adapters.anthropic as am
+        from core.llm.adapters.anthropic import AnthropicProvider
+        self._drained(am)
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-x"}), \
+                patch("httpx.Client", side_effect=lambda **kw: object()):
+            for t in range(1, 40):
+                provider = AnthropicProvider(timeout_s=float(t))
+                provider._client()
+        with am._client_cache_lock:
+            self.assertLessEqual(len(am._client_cache), self._cap(am),
+                                 f"{len(am._client_cache)} cached clients")
+
+    def test_google_cache_is_bounded(self):
+        import core.llm.adapters.google as gm
+        from core.llm.adapters.google import GoogleProvider
+        self._drained(gm)
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "g-x"}), \
+                patch("httpx.Client", side_effect=lambda **kw: object()):
+            for t in range(1, 40):
+                provider = GoogleProvider(timeout_s=float(t))
+                provider._client()
+        with gm._client_cache_lock:
+            self.assertLessEqual(len(gm._client_cache), self._cap(gm),
+                                 f"{len(gm._client_cache)} cached clients")
+
+    def test_a_repeated_key_still_reuses_one_client(self):
+        """Bounding must not turn every call into a fresh connection pool."""
+        import core.llm.adapters.openai as om
+        from core.llm.adapters.openai import OpenAIProvider
+        self._drained(om)
+        provider = OpenAIProvider()
+        made = []
+        with patch("openai.OpenAI", side_effect=lambda **kw: made.append(1) or object()), \
+                patch.dict(os.environ, {"OPENAI_API_KEY": "sk-stable"}):
+            first = provider._client()
+            second = provider._client()
+        self.assertIs(first, second)
+        self.assertEqual(len(made), 1)
+
+
+class TestResolverIndexCacheBound(unittest.TestCase):
+    """PERF (2026-09-02): refactor/resolver.py kept one full-vault index pair
+    per (root, exclusion set) EVER used. Bounded like its sibling in
+    refactor/archive.py (_REF_INDEX_MAX_ROOTS)."""
+
+    def test_cache_never_exceeds_the_cap(self):
+        import core.vault_resolver as rr
+        with rr._index_cache_lock:
+            saved = dict(rr._index_cache)
+            rr._index_cache.clear()
+        try:
+            with patch.object(rr, "build_file_index",
+                              side_effect=lambda root, excl: ({}, {})):
+                for i in range(20):
+                    rr.get_file_index(Path("/tmp/vault"), {f"excluded{i}"})
+            cap = getattr(rr, "_INDEX_CACHE_MAX", 2)
+            with rr._index_cache_lock:
+                self.assertLessEqual(len(rr._index_cache), cap,
+                                     f"{len(rr._index_cache)} cached indexes")
+        finally:
+            with rr._index_cache_lock:
+                rr._index_cache.clear()
+                rr._index_cache.update(saved)
+
+    def test_a_repeated_key_is_still_served_from_cache(self):
+        import core.vault_resolver as rr
+        with rr._index_cache_lock:
+            saved = dict(rr._index_cache)
+            rr._index_cache.clear()
+        try:
+            builds = []
+            with patch.object(rr, "build_file_index",
+                              side_effect=lambda root, excl: builds.append(1) or ({}, {})):
+                rr.get_file_index(Path("/tmp/vault"), {"a"})
+                rr.get_file_index(Path("/tmp/vault"), {"a"})
+            self.assertEqual(len(builds), 1)
+        finally:
+            with rr._index_cache_lock:
+                rr._index_cache.clear()
+                rr._index_cache.update(saved)

@@ -14,15 +14,29 @@ import os
 import sys
 import logging
 import logging.handlers
-from flask import Flask, render_template
+from pathlib import Path
+from flask import Blueprint, Flask, render_template
 
 from core.config import load_config
 # CONFIG_FILE and FEEDBACK_FILE are re-imported here intentionally: smoke_test
 # patches them at `app.CONFIG_FILE` / `app.FEEDBACK_FILE` via mock.patch.
-from core.constants import BASE_DIR, CONFIG_FILE, FEEDBACK_FILE, LOG_FILE  # noqa: F401
+from core.constants import (  # noqa: F401
+    BASE_DIR,
+    CONFIG_FILE,
+    DEFAULT_REQUEST_MAX_BYTES,
+    FEEDBACK_FILE,
+    LOG_FILE,
+    PDF_LIMIT_SIZE_MB,
+    UPLOAD_REQUEST_OVERHEAD_BYTES,
+    CHAT_ATTACHMENT_LIMIT_SIZE_MB,
+)
 from core.database import init_db
 from core.llm.usage import configure_default_usage_tracker, log_unpriced_curated_models
-from api.security import register_origin_guard
+from api.security import (
+    register_origin_guard,
+    register_request_limits,
+    register_security_headers,
+)
 from services.vision import vision_manager, glm_ocr_manager
 from rag.vault import obsidian_manager
 
@@ -31,17 +45,49 @@ from api.routes.status import status_bp
 from api.routes.config import config_bp
 from api.routes.paper import paper_bp
 from api.routes.vault import vault_bp
+from api.routes.online_ocr import online_ocr_bp
 from api.routes.about import about_bp
 from api.routes.usage import usage_bp
 from api.routes.audit import audit_bp
+from api.routes.accession import accession_bp
+from api.routes.pending import pending_bp
 from api.routes.deck import deck_bp
 from api.routes.docgen import docgen_bp
-from api.routes.refactor import refactor_bp
+from api.routes.history import history_bp
 from api.routes.plainchat import plainchat_bp
+from api.routes.chat_attachment import chat_attachment_bp
 from api.routes.prompts import prompts_bp
 from api.routes.open import open_bp
+from api.routes.notesync import notesync_bp
 from api.routes.tagging import tagging_bp
+from api.routes.zotcreate import zotcreate_bp
+from api.routes.zotrecord import zotrecord_bp
+from api.routes.zotlink import zotlink_bp
+from api.routes.library_workflow import library_workflow_bp
 from api.routes.widget import widget_bp
+
+def _load_optional_maintenance_blueprint() -> Blueprint | None:
+    """Load the private Maintenance capability or prove it was stripped.
+
+    The public artifact intentionally removes both the route module and the
+    private ``maintenance`` package. Those two exact absences mean “capability
+    unavailable.” A missing transitive dependency, a renamed symbol, or any
+    other import-time defect is a broken private build and must fail boot; if
+    swallowed, the UI merely hides Maintenance and turns a release regression
+    into a false-success public-strip state.
+    """
+    try:
+        from api.routes.maintenance import maintenance_bp as loaded_blueprint
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"api.routes.maintenance", "maintenance"}:
+            raise
+        return None
+    return loaded_blueprint
+
+
+# Maintenance is private-only (STRIP STEP 4). Its exact absence yields 404s,
+# which is the capability probe used to keep the public tab hidden.
+maintenance_bp = _load_optional_maintenance_blueprint()
 
 logger = logging.getLogger(__name__)
 
@@ -73,25 +119,39 @@ def create_app():
     else:
         app = Flask(__name__)
 
-    # Global request-body ceiling (improvement plan 0.4). Set ABOVE the 500 MB
-    # PDF upload cap so the streamed /api/upload path (which enforces its own
-    # hard byte cap while spooling to disk) is unaffected; everything else —
-    # JSON bodies included — now has a backstop instead of being unbounded.
-    # Werkzeug raises RequestEntityTooLarge (413) past this.
-    app.config["MAX_CONTENT_LENGTH"] = 550 * 1024 * 1024
+    # Enforced CSP and response hardening. Hashes are derived once from the
+    # trusted app-shell source so the existing exact inline handlers work
+    # without granting arbitrary inline-script execution.
+    template_path = Path(app.template_folder or "templates") / "index.html"
+    if not template_path.is_absolute():
+        template_path = Path(app.root_path) / template_path
+    register_security_headers(
+        app, template_path.read_text(encoding="utf-8"))
 
-    @app.errorhandler(413)
-    def _too_large(_e):
-        # JSON (not the default HTML page) so the fetch()-based UI surfaces a
-        # readable message.
-        from flask import jsonify
-        return jsonify({"error": "Request body too large."}), 413
+    register_request_limits(
+        app,
+        default_max_bytes=DEFAULT_REQUEST_MAX_BYTES,
+        upload_max_bytes=(
+            PDF_LIMIT_SIZE_MB * 1024 * 1024 + UPLOAD_REQUEST_OVERHEAD_BYTES
+        ),
+        # Plain Chat attachments get their OWN, much smaller envelope — see
+        # register_request_limits. Sharing /api/upload's would mean buffering up
+        # to 500 MB for a route that refuses anything over 64 MB.
+        extra_upload_limits={
+            "/api/chat-attachment": (
+                CHAT_ATTACHMENT_LIMIT_SIZE_MB * 1024 * 1024
+                + UPLOAD_REQUEST_OVERHEAD_BYTES
+            ),
+        },
+    )
 
     # Item 4.1 — single before_request hook replaces the 67 inline
     # origin_is_local() checks that lived in every route handler.
     # New blueprints are protected automatically; the hook is the single
     # location to patch in tests (api.security.origin_is_local).
     register_origin_guard(app)
+    from api.audit_context import register_context_guard
+    register_context_guard(app)
 
     # --- Initialization ---
     init_db()
@@ -123,17 +183,28 @@ def create_app():
     app.register_blueprint(config_bp)
     app.register_blueprint(paper_bp)
     app.register_blueprint(vault_bp)
+    app.register_blueprint(online_ocr_bp)
     app.register_blueprint(about_bp)
     app.register_blueprint(usage_bp)
     app.register_blueprint(audit_bp)
+    app.register_blueprint(accession_bp)
+    app.register_blueprint(pending_bp)
     app.register_blueprint(deck_bp)
     app.register_blueprint(docgen_bp)
-    app.register_blueprint(refactor_bp)
+    app.register_blueprint(history_bp)
     app.register_blueprint(plainchat_bp)
+    app.register_blueprint(chat_attachment_bp)
     app.register_blueprint(prompts_bp)
     app.register_blueprint(open_bp)
     app.register_blueprint(tagging_bp)
+    app.register_blueprint(notesync_bp)
+    app.register_blueprint(zotcreate_bp)
+    app.register_blueprint(zotrecord_bp)
+    app.register_blueprint(zotlink_bp)
+    app.register_blueprint(library_workflow_bp)
     app.register_blueprint(widget_bp)
+    if maintenance_bp is not None:  # private-only build (see the import above)
+        app.register_blueprint(maintenance_bp)
 
     # --- Main Index Route ---
     @app.route("/")

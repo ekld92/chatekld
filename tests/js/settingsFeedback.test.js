@@ -19,6 +19,7 @@ function modalMarkup() {
     return `
       <div id="sr-status-announcer" role="status"></div>
       <div id="sr-error-announcer" role="alert"></div>
+      <div id="settings-status" role="status"></div>
       <div id="settings-modal" class="modal-overlay">
         <input type="search" id="settings-filter">
         <span id="settings-filter-count"></span>
@@ -80,6 +81,31 @@ describe('settings dropped-key feedback (2026-07-26)', () => {
         expect(announcer.textContent).toContain('Request timeout');
         // The untouched control is not implicated.
         expect(document.getElementById('set-vision-timeout').getAttribute('aria-invalid')).toBe(null);
+    });
+
+    it('a clean save shows a visible Saved tick in #settings-status', async () => {
+        // 2026-08-18: the shipped #settings-status region was dead markup —
+        // no code ever wrote it — while the modal header promises "Changes
+        // save automatically" with zero visible confirmation.
+        state.dropped = [];
+        await settings.saveSettings();
+        expect(document.getElementById('settings-status').textContent)
+            .toContain('Saved');
+    });
+
+    it('a transport failure is VISIBLY reported, not only announced', async () => {
+        // Pre-fix a failed POST reached only the visually-hidden
+        // #sr-error-announcer — a sighted user got zero indication their
+        // change did not persist.
+        vi.stubGlobal('fetch', vi.fn((url, opts = {}) => {
+            if ((opts.method || 'GET') === 'POST') {
+                return Promise.reject(new TypeError('Failed to fetch'));
+            }
+            return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
+        }));
+        await settings.saveSettings();
+        const el = document.getElementById('settings-status');
+        expect(el.textContent).toMatch(/not persisted/i);
     });
 
     it('a subsequent clean save clears the stale marker', async () => {

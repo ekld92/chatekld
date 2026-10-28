@@ -80,6 +80,13 @@ class RedactingFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 — stdlib API name
         try:
+            if record.exc_info:
+                record.exc_text = redact(logging.Formatter().formatException(record.exc_info))
+                record.exc_info = None
+            elif record.exc_text:
+                record.exc_text = redact(record.exc_text)
+            if record.stack_info:
+                record.stack_info = redact(record.stack_info)
             msg = record.getMessage()
             redacted = redact(msg)
             if redacted != msg:

@@ -138,7 +138,7 @@ def start_ollama_server() -> Tuple[bool, str]:
                 return False, (
                     "Ollama executable not found. Install it (`brew install "
                     "ollama` or the Ollama.app) or start `ollama serve` "
-                    "manually before launching ChatEKLD."
+                    "manually before launching CHERQAiN."
                 )
             _ollama_process = subprocess.Popen(
                 [ollama_bin, "serve"],
@@ -230,7 +230,8 @@ def start_lm_studio_server() -> Tuple[bool, str]:
     
     if sys.platform == "darwin":
         try:
-            subprocess.Popen(["open", "-a", "LM Studio"])
+            from api.routes.open import run_open
+            run_open(["open", "-a", "LM Studio"])
         except Exception:
             pass
             

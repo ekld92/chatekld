@@ -564,6 +564,7 @@ class LocalLLMProvider(LLMProvider):
         def _iter() -> Iterator[str]:
             stream_error: LLMError | None = None
             cancelled = False
+            terminal_seen = False
             # Real token counts when the backend reports them (lot 6bis):
             # Ollama's FINAL streamed chunk (done=true) carries
             # prompt_eval_count / eval_count (github.com/ollama/ollama
@@ -575,6 +576,12 @@ class LocalLLMProvider(LLMProvider):
             counted_out = 0
             try:
                 for chunk in stream_iter:
+                    if self.name == "ollama":
+                        terminal_seen = terminal_seen or _ollama_attr(chunk, "done") is True
+                    else:
+                        terminal_seen = terminal_seen or any(
+                            getattr(choice, "finish_reason", None)
+                            for choice in (getattr(chunk, "choices", None) or []))
                     token = self._extract_token(chunk)
                     if token:
                         buf.append(token)
@@ -585,6 +592,10 @@ class LocalLLMProvider(LLMProvider):
                         counted_in = int(pe)
                     if ev:
                         counted_out = int(ev)
+                if not terminal_seen:
+                    raise LLMError(category=ErrorCategory.NETWORK,
+                                   message="Provider stream interrupted before its completion marker",
+                                   provider=self.name, model=request.model)
             except GeneratorExit:
                 # Consumer abandoned the stream (client disconnect) — marked,
                 # not failed. See CANCELLED_ERROR_CATEGORY. The estimate

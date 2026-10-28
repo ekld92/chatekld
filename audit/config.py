@@ -2,7 +2,7 @@
 
 Vendored from kb_harmonizer with the original ``Settings.load()`` removed
 in favour of :func:`load_settings`, which reads the audit-specific keys
-from ChatEKLD's ``config.json``. Every subpath that was hardcoded in the
+from CHERQAiN's ``config.json``. Every subpath that was hardcoded in the
 upstream version (``biblio_articles`` subfolder, ``Z_Zotero_Notes``
 subfolder, master bib path) is now exposed as a configurable key.
 
@@ -111,12 +111,26 @@ class Settings:
         return self.vault_root / self.zotero_notes_subdir
 
 
+def settings_context(settings: Settings) -> tuple:
+    """Canonical destination and selection identity; no filesystem writes."""
+    from dataclasses import fields
+
+    defaults = Settings(vault_root=settings.vault_root)
+    values = []
+    for field_info in fields(Settings):
+        value = getattr(settings, field_info.name, getattr(defaults, field_info.name))
+        if isinstance(value, Path):
+            value = value.expanduser().resolve()
+        values.append(value)
+    return tuple(values)
+
+
 class AuditConfigError(ValueError):
     """Raised when the audit config is incomplete (e.g. no vault path set)."""
 
 
 def load_settings() -> Settings:
-    """Build a :class:`Settings` from ChatEKLD's persisted config.
+    """Build a :class:`Settings` from CHERQAiN's persisted config.
 
     Raises :class:`AuditConfigError` when the Obsidian vault path is not
     configured, since every report depends on the vault root.

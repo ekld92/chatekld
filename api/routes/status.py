@@ -13,6 +13,7 @@ local backends only (online providers expose no vision interface here).
 All routes are gated by the app-level before_request origin guard
 (api.security.register_origin_guard).
 """
+import logging
 import threading
 import time
 
@@ -22,11 +23,106 @@ from core.providers import get_provider
 from api.validators import coerce_enum
 from core.providers.server import get_provider_warnings
 from core.llm.factory import get_llm_provider, is_online
+from core.server_info import ensure_server_info
+
+logger = logging.getLogger(__name__)
 
 _LOCAL_PROVIDERS = frozenset({"ollama", "lm_studio"})
 _VISION_KINDS = frozenset({"ocr", "vision"})
 
 status_bp = Blueprint('status', __name__)
+
+# PERF (2026-09-02): three polled probe routes with no collapse of concurrent
+# callers.
+#   Before:    /api/status probed the local backend on EVERY request (app.js
+#              polls it every 15 s) with the generation timeout, which defaults
+#              to 0 = unbounded; /api/models did the same on each provider
+#              switch; and /api/health had a TTL but computed OUTSIDE its lock,
+#              so N concurrent misses all probed. Two open windows doubled all
+#              of it.
+#   Change:    one small TTL + SINGLE-FLIGHT helper behind all three. A miss
+#              elects one caller to compute; every other caller of the same key
+#              waits on its Event and shares the answer. Probes are bounded at
+#              `PROBE_TIMEOUT_S` (see core/providers/ollama.py).
+#   Safe because:
+#              the payloads are already stale-tolerant by construction — the
+#              health route has advertised a TTL since it was written and the
+#              badge is a 15 s poll — and the elected caller computes exactly
+#              what the uncached path computed. A computation that RAISES is
+#              propagated to every waiter and caches nothing, so an error is
+#              never memoised.
+#   Preserves: "Never hold `_health_cache_lock` across a probe" — the lock is
+#              held only around dict/Event bookkeeping, never across `fn()`.
+#              `/api/health`'s server-discovery self-heal still runs on the
+#              cache-MISS path only, so a cached hit still costs nothing.
+#   Lock/thread contract:
+#              one module lock per cache, released before `fn()` runs. Waiters
+#              block on a threading.Event, not on the lock.
+#   Pinned by: test_status_routes.py::TestProbeCaching
+class _TtlSingleFlight:
+    """TTL cache that collapses concurrent misses onto ONE computation."""
+
+    def __init__(self, ttl_s: float):
+        self.ttl_s = ttl_s
+        self._lock = threading.Lock()
+        self._entries: dict = {}      # key -> {"at": float, "value": Any}
+        self._inflight: dict = {}     # key -> threading.Event
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+    def get(self, key, fn):
+        """Return ``(value, was_cached)``; ``fn()`` runs at most once per miss."""
+        while True:
+            with self._lock:
+                ent = self._entries.get(key)
+                if ent is not None and time.monotonic() - ent["at"] < self.ttl_s:
+                    return ent["value"], True
+                ev = self._inflight.get(key)
+                if ev is None:
+                    ev = threading.Event()
+                    self._inflight[key] = ev
+                    leader = True
+                else:
+                    leader = False
+            if leader:
+                try:
+                    value = fn()
+                except BaseException:
+                    # Never memoise a failure, and never leave waiters parked.
+                    with self._lock:
+                        self._inflight.pop(key, None)
+                    ev.set()
+                    raise
+                with self._lock:
+                    self._entries[key] = {"at": time.monotonic(), "value": value}
+                    self._inflight.pop(key, None)
+                ev.set()
+                return value, False
+            # A follower: wait for the leader, then re-read the cache. Bounded
+            # by the probe ceiling plus slack so a leader that dies without
+            # setting the Event cannot park a worker forever.
+            ev.wait(timeout=_PROBE_WAIT_S)
+            with self._lock:
+                ent = self._entries.get(key)
+                if ent is not None:
+                    return ent["value"], True
+            # The leader failed (its exception belongs to IT, not to us) — try
+            # again, which will elect a new leader.
+
+
+#: Ceiling on how long a follower waits for the elected caller. Comfortably
+#: above `PROBE_TIMEOUT_S` (3 s) so a healthy probe is never abandoned.
+_PROBE_WAIT_S = 10.0
+
+#: Short TTLs: /api/status backs a 15 s badge poll, /api/models a selector the
+#: user refreshes by switching provider. Both are keyed on the PROVIDER NAME,
+#: so switching provider is never served a stale other-provider answer.
+_STATUS_CACHE = _TtlSingleFlight(5.0)
+_MODELS_CACHE = _TtlSingleFlight(5.0)
+
+
 
 @status_bp.route("/api/status")
 def api_status():
@@ -43,12 +139,14 @@ def api_status():
     cfg = load_config()
     provider_name = cfg.get("provider", "ollama")
 
-    if is_online(provider_name):
-        provider = get_llm_provider(provider_name)
-        ok, err = provider.health_check()
-    else:
-        provider = get_provider(provider_name)
-        ok, err = provider.check_running()
+    def _probe():
+        if is_online(provider_name):
+            return get_llm_provider(provider_name).health_check()
+        # Bounded at PROBE_TIMEOUT_S, never the generation knob: this route is
+        # polled every 15 s and `local_request_timeout_s` defaults to 0.
+        return get_provider(provider_name).check_running()
+
+    (ok, err), _cached = _STATUS_CACHE.get(provider_name, _probe)
 
     return jsonify({
         "provider": provider_name,
@@ -56,27 +154,67 @@ def api_status():
         "ok": ok,
         "online": is_online(provider_name),
         "error": err,
+        # Deliberately OUTSIDE the cache: warnings accumulate in-process and
+        # cost nothing to read, so a fresh one must not wait out the TTL.
         "warnings": get_provider_warnings(),
     })
 
 @status_bp.route("/api/models")
 def api_models():
-    """List chat models for the active provider.
+    """List chat models for the active provider — or for ``?provider=``.
 
     Online providers return ``CURATED_MODELS`` merged with a best-effort,
     key-gated, short-TTL-cached live fetch (degrading to curated-only without a
-    key / offline); local providers return the installed model list. The active
-    provider name is echoed back so the UI can confirm what it queried.
+    key / offline); local providers return the installed model list. The
+    provider name is echoed back so the UI can confirm what it queried, with
+    ``configured`` — the chat model persisted for THAT provider
+    (``resolve_chat_model``), the prefill of a per-run model field.
+
+    ``?provider=`` (follow-ups lot 5, 2026-09-22) lists another provider
+    without touching the configuration — the "Update my library" run picks a
+    model for ONE run. A PRESENT-but-unknown name is a 400, never a silent
+    fallback to the configured provider (the ``--targets []`` rule): the
+    caller would be handed the wrong list and read it as the right one. The
+    cache stays keyed on the provider name, so the two never share an entry.
     """
-    from core.config import load_config
-    provider_name = load_config().get("provider", "ollama")
-    if is_online(provider_name):
-        provider = get_llm_provider(provider_name)
-        models, err = provider.list_models()
+    from core.config import load_config, resolve_chat_model
+    from core.llm.factory import ALL_PROVIDER_NAMES
+    from core.providers.ollama import PROBE_TIMEOUT_S
+    cfg = load_config()
+    requested = request.args.get("provider")
+    if requested is not None:
+        provider_name = str(requested).strip().lower()
+        if provider_name not in ALL_PROVIDER_NAMES:
+            return jsonify({"error": "Unknown provider. Known: "
+                            + ", ".join(sorted(ALL_PROVIDER_NAMES))}), 400
     else:
+        provider_name = cfg.get("provider", "ollama")
+
+    def _list():
+        if is_online(provider_name):
+            return get_llm_provider(provider_name).list_models()
         provider = get_provider(provider_name)
-        models, err = provider.get_models()
-    return jsonify({"models": models, "error": err, "provider": provider_name})
+        try:
+            # A listing nobody can render in three seconds is a dead backend.
+            # Keyword-only and optional, so a provider that has not adopted it
+            # (or a test double) still works.
+            return provider.get_models(timeout_s=PROBE_TIMEOUT_S)
+        except TypeError:
+            return provider.get_models()
+
+    (models, err), _cached = _MODELS_CACHE.get(provider_name, _list)
+    # `configured` (audit remediation 2026-09-23, N10, maintainer decision):
+    # the persisted model only when it is really THIS provider's. The local
+    # providers share one field (`llm`), which names the ACTIVE local
+    # provider's model — so asking for LM Studio while Ollama is active used
+    # to prefill an Ollama model id LM Studio does not have. A non-active
+    # local provider now gets "" (type or pick one); an online provider keeps
+    # its own persisted field (`openai_model`, …), which is its own.
+    active = str(cfg.get("provider", "ollama") or "ollama").strip().lower()
+    configured = ("" if not is_online(provider_name) and provider_name != active
+                  else resolve_chat_model(cfg, provider_name))
+    return jsonify({"models": models, "error": err, "provider": provider_name,
+                    "configured": configured})
 
 @status_bp.route("/api/vision-models")
 def api_vision_models():
@@ -126,8 +264,12 @@ def api_vision_models():
 # most one poll behind reality while collapsing concurrent/burst callers onto
 # one probe.
 _HEALTH_TTL_S = 10.0
-_health_cache: dict = {"at": 0.0, "payload": None}
-_health_cache_lock = threading.Lock()
+#: Since 2026-09-02 this is a ``_TtlSingleFlight`` rather than a plain
+#: ``{at, payload}`` dict + lock. The old shape computed the payload OUTSIDE
+#: its lock — correctly, since a lock must never span a probe — which meant N
+#: concurrent misses each probed both backends. The helper keeps that property
+#: (the lock spans bookkeeping only) and adds single-flight on top.
+_HEALTH_CACHE = _TtlSingleFlight(_HEALTH_TTL_S)
 
 
 def _compute_health() -> dict:
@@ -260,21 +402,30 @@ def _compute_health() -> dict:
 def api_health():
     """Grounded liveness/readiness probe (vector store + local LLM backends).
 
-    TTL-cached server-side (see ``_HEALTH_TTL_S``) so the UI's 15 s badge
-    poll cannot turn into a per-request probe storm against the local
-    backends.
+    TTL-cached and SINGLE-FLIGHTED server-side (see ``_HEALTH_TTL_S``) so the
+    UI's 15 s badge poll cannot turn into a per-request probe storm against the
+    local backends, and so concurrent misses share one probe rather than each
+    running their own.
+
+    This is also where the server-discovery record self-heals: a missing
+    ``server.json`` silently disables every CLI/MCP write while the app is
+    demonstrably up (observed 2026-08-12, cause unknown — CLAUDE.md § Known
+    Issues). Re-asserting it here piggybacks on a poll the UI already makes, so
+    the window shrinks from "the rest of the process's life" to one poll. It runs
+    on the cache-MISS path only: the UI's 15 s poll against a ~10 s TTL misses
+    almost every time, so the repair is prompt while costing a cached hit
+    nothing.
     """
 
-    now = time.monotonic()
-    with _health_cache_lock:
-        cached = _health_cache["payload"]
-        if cached is not None and now - _health_cache["at"] < _HEALTH_TTL_S:
-            return jsonify(cached)
+    def _miss():
+        # The self-heal stays on the MISS path (see the docstring): with the
+        # misses now collapsed, it runs once per TTL instead of once per
+        # concurrent caller, which is strictly closer to its own intent.
+        try:
+            ensure_server_info()
+        except Exception:  # noqa: BLE001 — discovery is best-effort, never fatal
+            logger.warning("server-discovery self-heal failed", exc_info=True)
+        return _compute_health()
 
-    payload = _compute_health()
-
-    with _health_cache_lock:
-        _health_cache["payload"] = payload
-        _health_cache["at"] = time.monotonic()
-
+    payload, _cached = _HEALTH_CACHE.get("health", _miss)
     return jsonify(payload)

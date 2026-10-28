@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# <xbar.title>ChatEKLD — paper of the day</xbar.title>
-# <xbar.desc>Menu-bar card fed by ChatEKLD's widget.json snapshot: one paper
+# <xbar.title>CHERQAiN — paper of the day</xbar.title>
+# <xbar.desc>Menu-bar card fed by CHERQAiN's widget.json snapshot: one paper
 # of the day + one completable suggestion + a notion of the day.</xbar.desc>
 # <xbar.dependencies>python3</xbar.dependencies>
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
-"""SwiftBar/xbar plugin for ChatEKLD. Stdlib only.
+"""SwiftBar/xbar plugin for CHERQAiN. Stdlib only.
 
 Data source: when ``BASE_DIR/server.json`` names a live server (pid alive), a
 fresh ``GET /api/widget`` is preferred (header ``X-Requested-With: ChatEKLD``
@@ -39,9 +39,9 @@ import textwrap
 import urllib.parse
 import urllib.request
 
-APP_NAME = "ChatEKLD"
+APP_NAME = "CHERQAiN"
 # The app installs under a DATED bundle name (ChatEKLD_2026-08-06.app), so
-# `open -a ChatEKLD` fails. The bundle id is hard-coded by
+# `open -a CHERQAiN` fails. The bundle id is hard-coded by
 # install_and_build.sh and is stable across builds.
 APP_BUNDLE_ID = "com.chatekld.app"
 TIMEOUT_S = 1.5
@@ -50,10 +50,10 @@ EXCERPT_MAX_LINES = 8   # submenu depth cap
 
 
 def base_dir() -> str:
-    env = os.environ.get("CHATEKLD_BASE_DIR", "").strip()
+    env = os.environ.get("CHERQAIN_BASE_DIR", os.environ.get("CHATEKLD_BASE_DIR", "")).strip()
     if env:
         return env
-    return os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
+    return os.path.expanduser("~/Library/Application Support/ChatEKLD")
 
 
 def load_json(path: str):

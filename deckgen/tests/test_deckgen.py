@@ -487,7 +487,7 @@ class TestSubstituteTitle:
         "\\usepackage{cress-style}\n"
         "\\title[Short title]{Your Presentation Title}\n"
         "\\subtitle{Optional subtitle}\n"
-        "\\author[E. D.]{Etienne}\n"
+        "\\author[A. B.]{Author}\n"
         "\\date{\\today}\n"
     )
 
@@ -499,7 +499,7 @@ class TestSubstituteTitle:
         assert "Your Presentation Title" not in out
         # Untouched neighbours.
         assert "\\subtitle{Optional subtitle}" in out
-        assert "\\author[E. D.]{Etienne}" in out
+        assert "\\author[A. B.]{Author}" in out
 
     def test_replaces_subtitle_when_given(self):
         from deckgen.assemble import substitute_title
@@ -636,3 +636,44 @@ def test_no_salvage_after_cancel():
     out = _gen(client, should_cancel=lambda: True)
     assert client.salvage_calls == 0
     assert out.placeholder
+
+
+class TestCheckpointTmpOrphans:
+    """DURABILITY (2026-09-02): a SIGKILL between mkstemp and os.replace left a
+    `.ckpt-*.tmp` behind, and prune only ever listed `.json` — so nothing could
+    ever remove one. They accumulated one per killed generation."""
+
+    @staticmethod
+    def _orphan(tmp_path, age_s):
+        import os
+        import time
+        p = tmp_path / ".ckpt-abc123.tmp"
+        p.write_text("{}", encoding="utf-8")
+        old = time.time() - age_s
+        os.utime(p, (old, old))
+        return p
+
+    def test_an_old_orphan_is_reclaimed(self, tmp_path):
+        from deckgen import checkpoint
+        orphan = self._orphan(tmp_path, 7200)
+        checkpoint.prune(str(tmp_path))
+        assert not orphan.exists()
+
+    def test_a_fresh_temp_file_is_left_alone(self, tmp_path):
+        """It may belong to a save in flight."""
+        from deckgen import checkpoint
+        fresh = self._orphan(tmp_path, 5)
+        checkpoint.prune(str(tmp_path))
+        assert fresh.exists()
+
+    def test_checkpoints_themselves_are_untouched_by_the_sweep(self, tmp_path):
+        from deckgen import checkpoint
+        import os
+        checkpoint.save(str(tmp_path), {"job_key": "k1",
+                                        "version": checkpoint._VERSION,
+                                        "context": {"vault_root": str(tmp_path), "embed_provider": "ollama"},
+                                        "outline": []})
+        self._orphan(tmp_path, 7200)
+        checkpoint.prune(str(tmp_path))
+        assert checkpoint.load(str(tmp_path), "k1") is not None
+        assert not [n for n in os.listdir(tmp_path) if n.endswith(".tmp")]

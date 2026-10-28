@@ -4,16 +4,17 @@
  * place the dependency graph converges and nothing imports from here. Wires the
  * DOMContentLoaded bootstrap: loads config once and fans it out to each feature
  * module's initialiser, then publishes the inline-handler entry points the HTML
- * references onto `window` (e.g. window.chatPlain, window.refactorRunPlan).
+ * references onto `window` (e.g. window.chatPlain, window.historyOpenRestore).
  */
 import * as UI from './ui.js';
+import { initStudio, initIndexWorkspace } from './studio.js';
 import * as Config from './config.js';
 import * as Vault from './vault.js';
 import * as Summarizer from './summarizer.js';
 import * as Audit from './audit.js';
 import * as Deck from './deck.js';
 import * as Docgen from './docgen.js';
-import * as Refactor from './refactor.js';
+import * as History from './history.js';
 import * as Settings from './settings.js';
 import * as PlainChat from './plainchat.js';
 import * as Prompts from './prompts.js';
@@ -32,7 +33,7 @@ import { updateProviderBadge } from './ui.js';
  * block is logged but non-fatal — event binding below still runs.
  */
 async function init() {
-    console.log('[ChatEKLD] Initializing...');
+    console.log('[CHERQAiN] Initializing...');
     
     // Item 3.8 (improvement plan 2026-07-04): each initialiser is isolated.
     // The old single try/catch meant ONE rejection (say, /api/models timing
@@ -50,6 +51,7 @@ async function init() {
     await step('loadModels', () => Config.loadModels());
     await step('loadVisionModels', () => Config.loadVisionModels());
     await step('renderExclusions', () => Vault.renderExclusions());
+    await step('onlineVisualSettings', () => Vault.applyOnlineVisualSettings(config));
     await step('vaultChatParams', () => {
         Vault.applyVaultChatParams(config);
         Vault.wireVaultChatParamControls();
@@ -58,14 +60,68 @@ async function init() {
     await step('refreshIndexState', () => Vault.refreshIndexState());
     await step('loadReportTypes', () => Summarizer.loadReportTypes());
     await step('initAuditTab', () => Audit.initAuditTab());
-    await step('initRefactorTab', () => Refactor.initRefactorTab(config));
     await step('initDeck', () => Deck.initDeck(config));
     await step('initDocgen', () => Docgen.initDocgen());
+    await step('initMaintenance', async () => {
+        // Private-only subsystem probe (Maintenance, STRIP STEP 4): on the
+        // public mirror the blueprint and static/js/maintenance.js are both
+        // stripped, this GET 404s, no import is attempted and the hidden tab
+        // stays hidden. The import MUST stay dynamic — a static import of
+        // maintenance.js would break the whole module graph where the file
+        // is absent (moduleHierarchy.test.js pins exactly this edge).
+        let maintenanceModulePromise = null;
+        const importMaintenance = () => {
+            if (!maintenanceModulePromise) {
+                maintenanceModulePromise = import('./maintenance.js');
+            }
+            return maintenanceModulePromise;
+        };
+        const loadMaintenance = async () => {
+            let res;
+            try {
+                res = await secureFetch('/api/maintenance/steps');
+            } catch (error) {
+                // On a private build the dynamic module exists and can expose
+                // a retryable visible boundary. On a public artifact it is
+                // intentionally absent; swallowing only that optional UI path
+                // keeps the capability hidden without masking app bootstrap.
+                try {
+                    const mod = await importMaintenance();
+                    mod.initMaintenanceError(
+                        'Maintenance registry request failed.', loadMaintenance);
+                } catch (_) { /* public artifact: capability intentionally absent */ }
+                return;
+            }
+            if (!res || res.status === 404) return;
+            const mod = await importMaintenance();
+            if (!res.ok) {
+                mod.initMaintenanceError(
+                    `Maintenance registry failed (HTTP ${res.status}).`,
+                    loadMaintenance);
+                return;
+            }
+            const data = await res.json().catch(() => null);
+            if (!data || !Array.isArray(data.steps)) {
+                mod.initMaintenanceError(
+                    'Maintenance registry returned an invalid response.',
+                    loadMaintenance);
+                return;
+            }
+            await mod.initMaintenance(data);
+        };
+        await loadMaintenance();
+    });
 
+    document.addEventListener('chatekld:navigate', event => {
+        if (event.detail.tabId !== 'maintenance') return;
+        event.preventDefault(); UI.showTab('audit'); Audit.selectAuditReport('library_maintenance');
+    });
     // Bind events
     window.onProviderChange = Config.onProviderChange;
     window.pullModel = Config.pullModel;
     window.cancelPull = Config.cancelPull;
+    window.historyOpenRestore = History.openRestore;
+    window.historyRevertAll = History.revertAll;
     window.showTab = UI.showTab;
     // Single help source (2026-08-05): the sidebar "How to Use" button routes
     // to the Help tab (guide.md) — the old modal duplicate guide is gone.
@@ -75,12 +131,30 @@ async function init() {
     window.openModal = UI.openModal;
     window.closeModal = UI.closeModal;
     window.pickVaultFolder = Vault.pickVaultFolder;
-    window.indexVault = Vault.indexVault;
+    window.previewOnlineOcr = Vault.previewOnlineOcr;
+    window.chooseOnlineSources = Vault.chooseOnlineSources;
+    window.refreshOnlineHistory = Vault.refreshOnlineHistory;
+    window.onlineOcrProviderChanged = Vault.onlineOcrProviderChanged;
+    window.onlineVisionProviderChanged = Vault.onlineVisionProviderChanged;
+    window.startOnlineOcr = Vault.startOnlineOcr;
+    window.cancelOnlineOcr = Vault.cancelOnlineOcr;
+    window.promoteOnlineOcr = Vault.promoteOnlineOcr;
+    window.indexVault = Vault.previewLocalIndex;
+    window.checkExtractionMemory = Vault.checkExtractionMemory;
+    window.advancedLocalIndex = Vault.advancedLocalIndex;
+    document.addEventListener('library-extraction-history', () => Vault.refreshOnlineHistory());
+    document.addEventListener('library-extraction-refresh', () => Vault.pollOnlineOcr());
+    document.addEventListener('library-index-preview', event => {
+        const pending = Vault.previewLocalIndex(event.detail?.anchor, event.detail?.prepareOnly === true, event.detail?.onPreview, event.detail?.onlineChoice ?? null, event.detail?.initiatingAction);
+        event.detail?.waitUntil?.(pending);
+    });
+    window.advancedOnlineIndex = Vault.advancedOnlineIndex;
     window.pauseVaultIndex = Vault.pauseVaultIndex;
     window.resumeVaultIndex = Vault.resumeVaultIndex;
     window.cancelVaultIndex = Vault.cancelVaultIndex;
     window.chatWithVault = Vault.chatWithVault;
     window.clearVaultChat = Vault.clearVaultChat;
+    window.stopVaultChat = Vault.stopChat;
     window.exportVaultConversation = Vault.exportVaultConversation;
     window.addExclusion = Vault.addExclusion;
     window.removeExclusion = Vault.removeExclusion;
@@ -121,18 +195,15 @@ async function init() {
     window.docgenLoadDocSections = Docgen.loadDocSections;
     window.docgenAugScopeChanged = Docgen.augScopeChanged;
     window.docgenAugmentPreview = Docgen.augmentPreview;
-    window.refactorRunPlan = Refactor.runPlan;
-    window.refactorPickScopeFolder = Refactor.pickScopeFolder;
-    window.refactorOpenApply = Refactor.openApply;
-    window.refactorOpenNormalize = Refactor.openNormalize;
-    window.refactorConfirmNormalize = Refactor.confirmNormalize;
-    window.refactorToggleStripDefault = Refactor.toggleStripDefault;
-    window.refactorOpenRestore = Refactor.openRestore;
-    window.refactorConfirmApply = Refactor.confirmApply;
-    window.refactorRevertAll = Refactor.revertAll;
     window.chatPlain = PlainChat.chatPlain;
+    window.stopPlainChat = PlainChat.stopChat;
     window.plainchatNew = PlainChat.newChat;
     window.exportPlainConversation = PlainChat.exportPlainConversation;
+    // Plain Chat attachments: Attach button, hidden file input, drag-and-drop.
+    // Wired here with addEventListener rather than as inline onclick attributes
+    // — the CSP already carries 111 hashes under 'unsafe-hashes', and each one
+    // authorises that exact handler string on ANY element.
+    PlainChat.initAttachments();
     window.promptsRefresh = Prompts.loadPrompts;
     window.setTheme = UI.setTheme;
 
@@ -152,6 +223,11 @@ async function init() {
     // reveal, everything else swallowed). A raw click on a relative link the
     // LLM emitted used to navigate the whole PyWebView window to a 404.
     UI.installLinkInterceptor();
+    // Installed app-wide, not per panel: an unhandled file drop navigates the
+    // PyWebView window to the file and replaces the app with a PDF viewer. The
+    // real drop zones preventDefault their own events first, so this only ever
+    // sees a drop that missed them.
+    UI.installGlobalDropGuard();
 
     // Arrow-key navigation for the ARIA tablists.
     UI.wireTablistKeys(
@@ -169,10 +245,11 @@ async function init() {
         (tab) => Audit.selectAuditReport(tab.dataset.report),
     );
 
+    initStudio();
+    initIndexWorkspace();
+
     // Click-to-insert example prompts (French, tuned to the maintainer's
-    // psychiatry / clinical-research vault). The refactor free-prompt field is
-    // wired in refactor.js because its textarea is created per-note at render
-    // time; these three live statically in the template.
+    // psychiatry / clinical-research vault).
     wireExamplePrompts();
 
     // Contextual help: "?" badges on settings (hover tooltip) and actions
@@ -221,47 +298,64 @@ async function init() {
 }
 
 // Static example-prompt chips. Each entry's `text` fills the field on click;
-// `label` is the short chip caption. Content is intentionally domain-specific.
+// `label` is the short chip caption.
 function wireExamplePrompts() {
     const deckEl = document.getElementById('deck-instructions');
     if (deckEl) {
         UI.renderExampleChips(deckEl, [
-            { label: 'Public internes',
-              text: "Public : internes de psychiatrie. Mets l'accent sur la démarche diagnostique et les pièges cliniques. 4 puces maximum par diapo." },
-            { label: 'Staff 15 min',
-              text: "Présentation de 15 minutes pour un staff. Structure : définition, épidémiologie, clinique, prise en charge. Reste fidèle aux notes du vault." },
-            { label: 'Synthèse + sources',
-              text: "Ton pédagogique. Ajoute une diapo de synthèse en fin de chaque section et cite les sources clés (auteur, année)." },
-            { label: 'Sources FR/DE/EN',
-              text: "Appuie-toi sur les notes du vault dans les trois langues (français, allemand, anglais), mais rédige les diapos en français. Cite les sources clés." },
-        ], { title: 'Examples:', lang: 'fr' });
+            { label: 'Graduate seminar',
+              text: 'Audience: graduate seminar. Emphasize research methodology, study design, and key limitations. Maximum 4 bullet points per slide.' },
+            { label: '15-min overview',
+              text: '15-minute research briefing. Structure: background, methodology, key findings, and practical implications. Stay strictly grounded in the vault notes.' },
+            { label: 'Synthesis + citations',
+              text: 'Pedagogical tone. Add a synthesis slide at the end of each section and cite key sources (author, year).' },
+            { label: 'Multilingual sources',
+              text: 'Draw on vault notes across all available languages, synthesize the evidence in English, and cite key primary sources.' },
+        ], { title: 'Examples:' });
+    }
+
+    // Deck AUGMENT instruction. Distilled from the maintainer's hand-written
+    // "Comprehensive LaTeX Beamer Audit" prompt: the workflow scaffolding it
+    // carried ("act as an expert", "ask for confirmation", "run make", "report
+    // in a table") is all provided by the app already — augment previews, the
+    // confirm gate, Compile & Auto-Fix — so only the task itself is kept.
+    const deckAugEl = document.getElementById('deck-aug-instruction');
+    if (deckAugEl) {
+        UI.renderExampleChips(deckAugEl, [
+            { label: 'Split dense slides',
+              text: 'Split overly dense slides across multiple frames with continued titles (1/2, 2/2). Preserve all content, ordering, and citations.' },
+            { label: 'Clean up artifacts',
+              text: 'Remove unfilled placeholders, empty sections without frames, and blank bullet points. Leave commented-out code and template comments intact.' },
+            { label: 'LaTeX typography',
+              text: 'Fix typography: escape special characters (% & _ # $), replace \\footnotesize{...} with {\\footnotesize ...}, and remove bare URLs.' },
+        ], { title: 'Examples:' });
     }
 
     const vaultSysEl = document.getElementById('vault-system-prompt');
     if (vaultSysEl) {
         UI.renderExampleChips(vaultSysEl, [
-            { label: 'Concis & clinique',
-              text: "Réponds en français, de façon concise et clinique. Utilise les abréviations du vault (TS, atcd, EI…) sans les redéfinir." },
-            { label: 'Étayé vs avis',
-              text: "Adopte le point de vue d'un psychiatre hospitalier. Distingue clairement ce qui est étayé par les sources de ce qui relève de l'avis." },
-            { label: 'Plan structuré',
-              text: "Structure tes réponses : définition, mécanismes, prise en charge. Signale les contre-indications et effets indésirables importants." },
-            { label: 'Sources trilingues',
-              text: "Réponds en français, mais exploite les sources du vault dans les trois langues — français, allemand, anglais — et cite les passages allemands ou anglais au même titre que les français." },
-        ], { title: 'Examples:', lang: 'fr' });
+            { label: 'Concise & analytical',
+              text: 'Respond concisely with an analytical academic tone. Cite retrieved notes and papers directly and preserve domain terminology.' },
+            { label: 'Evidence vs interpretation',
+              text: 'Clearly distinguish between findings directly supported by retrieved sources and broader methodological interpretation or commentary.' },
+            { label: 'Structured synthesis',
+              text: 'Structure responses into: background/definitions, methodology and mechanisms, and key findings or limitations.' },
+            { label: 'Cross-lingual sources',
+              text: 'Synthesize evidence across all languages present in the vault (e.g., English, French, German) and cite non-English passages on equal footing.' },
+        ], { title: 'Examples:' });
     }
 
     const plainEl = document.getElementById('plainchat-input');
     const plainMount = document.getElementById('plainchat-examples');
     if (plainEl && plainMount) {
         UI.renderExampleChips(plainEl, [
-            { label: 'Comparer 2 tableaux',
-              text: "Explique la différence entre catatonie et stupeur dépressive, avec un tableau comparatif." },
-            { label: 'Paragraphe discussion',
-              text: "Rédige un paragraphe de discussion pour un article sur les psychothérapies numériques dans la dépression." },
-            { label: 'Traduction académique',
-              text: "Traduis le passage suivant en anglais académique en conservant la terminologie psychiatrique : " },
-        ], { mountEl: plainMount, title: 'Examples:', lang: 'fr' });
+            { label: 'Compare methodologies',
+              text: 'Compare randomized controlled trials and observational cohort studies for causal inference, using a structured comparison table.' },
+            { label: 'Discussion paragraph',
+              text: 'Draft a discussion paragraph examining study limitations, generalizability, and future research directions for a systematic review.' },
+            { label: 'Academic translation',
+              text: 'Translate the following passage into clear academic English while preserving technical terminology: ' },
+        ], { mountEl: plainMount, title: 'Examples:' });
     }
 }
 
@@ -293,6 +387,7 @@ async function fetchRuntimeStatus() {
     // (likely green) state and the empty-warnings fall-through below actively
     // HID the banner. The UI asserted health exactly when everything was dead.
     let serverUnreachable = false;
+    let serverBusy = false;
 
     try {
         const res = await secureFetch('/api/status');
@@ -314,7 +409,11 @@ async function fetchRuntimeStatus() {
         }
     } catch (e) {
         console.error('Status check failed:', e);
-        serverUnreachable = true;
+        // Only a failed fetch (TypeError) means the server is gone. A reply
+        // that is slow, non-JSON or a 5xx means it is up but busy — a scan
+        // or an index run — and reporting "unreachable" then was false
+        // (2026-09-19 UI review).
+        if (e instanceof TypeError) serverUnreachable = true; else serverBusy = true;
     }
 
     let healthDetails = null;
@@ -341,7 +440,7 @@ async function fetchRuntimeStatus() {
         }
     } catch (e) {
         console.error('Health check failed:', e);
-        serverUnreachable = true;
+        if (e instanceof TypeError) serverUnreachable = true; else serverBusy = true;
     }
 
     if (!isCurrent()) return;
@@ -355,6 +454,10 @@ async function fetchRuntimeStatus() {
             warnings.push('App server unreachable — the backend process may '
                 + 'have stopped. Actions will fail until it is back; try '
                 + 'relaunching the app.');
+        } else if (serverBusy) {
+            warnings.push('App server busy — it answered, but not normally '
+                + '(a scan or an index run may be in progress). Status will '
+                + 'refresh on its own.');
         }
         if (providerError) warnings.push(providerError);
         warnings.push(...providerWarnings);
@@ -419,7 +522,7 @@ async function resetAppData() {
 
 // Global error handlers
 window.addEventListener('unhandledrejection', (event) => {
-    console.error('[ChatEKLD] Unhandled rejection:', event.reason);
+    console.error('[CHERQAiN] Unhandled rejection:', event.reason);
 });
 
 /**
@@ -434,12 +537,11 @@ function _paletteActions() {
         run: () => UI.showTab(id),
     });
     return [
-        tab('obsidian', 'Obsidian Agent'),
-        tab('document', 'Single Paper'),
-        tab('audit', 'Library Audit'),
-        tab('deck', 'Deck Generator'),
-        tab('docgen', 'Report / Article'),
-        tab('refactor', 'Note Refactor'),
+        tab('obsidian', 'Ask · vault questions'),
+        tab('document', 'Read · single paper'),
+        tab('audit', 'Library · update search'),
+        tab('deck', 'Create · Studio'),
+        tab('docgen', 'Studio · Report / Article'),
         tab('chat', 'Plain Chat'),
         tab('prompts', 'Prompt Hub'),
         {
@@ -447,8 +549,12 @@ function _paletteActions() {
             run: () => { UI.showTab('help'); Help.loadHelpTab(); },
         },
         {
-            label: 'Open LLM Settings', hint: 'modal',
+            label: 'Open Settings', hint: 'modal',
             run: () => UI.openModal('settings-modal'),
+        },
+        {
+            label: 'Open History and Restore', hint: 'modal',
+            run: () => History.openRestore(),
         },
         {
             label: 'Start the guided tour', hint: 'help',

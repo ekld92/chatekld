@@ -103,8 +103,37 @@ describe('summarizer abort-controller identity (Track 3.3)', () => {
     });
     afterEach(() => vi.unstubAllGlobals());
 
-    it("an old run's finally does not clobber the new run's controller", async () => {
+    it('keeps Activity running after tokens until stream completion', async () => {
+        document.body.insertAdjacentHTML('beforeend', '<aside id="activity-bar"><span id="activity-label-text"></span><div id="activity-tasks"></div></aside>');
+        let stream;
+        vi.stubGlobal('fetch', vi.fn(async url => {
+            if (String(url).includes('/api/upload')) return {
+                ok: true, json: async () => ({upload_id: 'u1'})
+            };
+            return {ok: true, headers: new Headers({'content-type': 'text/event-stream'}),
+                body: new ReadableStream({start(controller) { stream = controller; }})};
+        }));
+        const summarizer = await import('../../static/js/summarizer.js');
+        Object.defineProperty(document.getElementById('pdf-upload'), 'files', {
+            value: [new File(['fixture'], 'fixture.pdf', {type: 'application/pdf'})]
+        });
+        await summarizer.uploadPDF();
+        const run = summarizer.summarisePDF();
+        await vi.waitFor(() => expect(stream).toBeDefined());
+        stream.enqueue(new TextEncoder().encode('data: {"token":"partial"}\n\n'));
+        await vi.waitFor(() => expect(document.getElementById('document-summary-content').textContent).toBe('partial'));
+        expect(document.getElementById('activity-label-text').textContent).toContain('generating summary');
+        expect(document.getElementById('activity-tasks').textContent).not.toContain('No summary was generated');
+        stream.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        stream.close();
+        await run;
+        expect(document.getElementById('activity-label-text').textContent).not.toContain('generating summary');
+        expect(document.getElementById('activity-tasks').textContent).toContain('Summary ready.');
+    });
+
+    it("repeated launches are ignored and reset cannot re-enable a cleared paper", async () => {
         const signals = [];   // one entry per /api/summarise call
+        const rejectSummaries = [];
         const fetchMock = vi.fn((url, opts = {}) => {
             const u = String(url);
             if (u.includes('/api/upload')) {
@@ -117,6 +146,7 @@ describe('summarizer abort-controller identity (Track 3.3)', () => {
                 signals.push(opts.signal);
                 // Hang until aborted; reject with AbortError like real fetch.
                 return new Promise((_res, rej) => {
+                    rejectSummaries.push(rej);
                     opts.signal.addEventListener('abort', () =>
                         rej(Object.assign(new Error('aborted'), { name: 'AbortError' })));
                 });
@@ -135,23 +165,22 @@ describe('summarizer abort-controller identity (Track 3.3)', () => {
 
         const runA = summarizer.summarisePDF();   // parks on its fetch
         await new Promise((r) => setTimeout(r, 0));
-        const runB = summarizer.summarisePDF();   // aborts A, parks
-        await new Promise((r) => setTimeout(r, 0));
-        await runA;                               // A's finally has now run
+        await summarizer.summarisePDF();  // repeated launch is ignored
+        expect(signals).toHaveLength(1);
+        expect(signals[0].aborted).toBe(false);
+        await summarizer.resetUpload();
+        await runA;
         expect(signals[0].aborted).toBe(true);
+        expect(document.getElementById('summarise-btn').disabled).toBe(true);
+        expect(document.getElementById('summarise-btn').textContent).toBe('Summarise');
+        expect(document.getElementById('summarise-stop-btn').style.display).toBe('none');
 
-        const runC = summarizer.summarisePDF();   // must be able to abort B
-        await new Promise((r) => setTimeout(r, 0));
-        // Pre-fix, A's finally nulled the module field, so C found no
-        // controller to abort and B kept streaming alongside C.
-        expect(signals[1].aborted).toBe(true);
-
-        // Cleanup: end C.
-        const summariseCalls = fetchMock.mock.calls.filter(([u]) =>
-            String(u).includes('/api/summarise'));
-        expect(summariseCalls.length).toBe(3);
-        signals[2].dispatchEvent(new Event('abort'));   // settle C's promise
+        await summarizer.uploadPDF();
+        const runB = summarizer.summarisePDF();
+        await new Promise(r => setTimeout(r, 0));
+        document.getElementById('summarise-stop-btn').click();
         await runB;
-        await runC.catch(() => {});
+        expect(signals).toHaveLength(2);
+        expect(signals[1].aborted).toBe(true);
     });
 });

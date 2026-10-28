@@ -12,11 +12,12 @@ import json
 import logging
 import os
 import threading
+from collections import OrderedDict
 import time
 from typing import Iterator, Optional
 
 from core.llm.base import LLMProvider, StreamingResponse, looks_like_quota
-from core.llm.retry import parse_retry_after_s, retry_with_backoff
+from core.llm.retry import check_request_dispatch, parse_retry_after_s, retry_with_backoff
 from core.llm.tool_schema import (
     build_gemini_contents,
     jsonschema_to_gemini_tool,
@@ -31,6 +32,7 @@ from core.llm.types import (
     LLMUsage,
 )
 from core.llm.usage import CANCELLED_ERROR_CATEGORY, usage_tracker
+from core.llm.parameter_cache import is_rejected, remember_rejected
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +42,31 @@ logger = logging.getLogger(__name__)
 # deck section). Auth is a per-request query param (``_params()``), so the client
 # is key-agnostic and a rotated key applies on the next request; the key is never
 # stored. The listing call keeps its own short-lived client (different timeout).
-_client_cache: dict = {}
+# PERF (2026-09-02): bounded LRU, mirroring core/providers/lms.py.
+# Before: a plain dict with no eviction. The keyspace is small in normal use,
+#   but a rotated API key mints a new entry whose predecessor is never
+#   dropped, stranding that client's idle httpx/openai connection pool for
+#   the process lifetime.
+# Change: an OrderedDict capped at _CLIENT_CACHE_MAX (8), LRU-evicted.
+# Safe because: an evicted client is not closed here — a concurrent call may
+#   still be streaming on it; dropping the reference lets GC close it once the
+#   in-flight call ends (the lms.py rule, quoted). A cache miss constructs
+#   exactly the client the miss path constructed before.
+# Preserves: key-rotation safety — the key composition is untouched, so a new
+#   key still yields a new client rather than reusing stale auth.
+# Lock/thread contract: unchanged; every read/write stays inside
+#   _client_cache_lock.
+# Pinned by: test_llm.py::TestOnlineClientCacheBound.
+_CLIENT_CACHE_MAX = 8
+_client_cache: OrderedDict = OrderedDict()
 _client_cache_lock = threading.Lock()
 
 CURATED_MODELS: list[str] = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-exp",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
 ]
 
 _DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com"
@@ -60,6 +76,9 @@ _FINISH_REASONS: dict[str, FinishReason] = {
     "MAX_TOKENS": FinishReason.LENGTH,
     "SAFETY": FinishReason.CONTENT_FILTER,
     "RECITATION": FinishReason.CONTENT_FILTER,
+    "PROHIBITED_CONTENT": FinishReason.CONTENT_FILTER,
+    "BLOCKLIST": FinishReason.CONTENT_FILTER,
+    "SPII": FinishReason.CONTENT_FILTER,
     "OTHER": FinishReason.OTHER,
 }
 
@@ -78,9 +97,9 @@ class GoogleProvider(LLMProvider):
       ``generationConfig`` with Gemini's own names (``topP``,
       ``maxOutputTokens``, ``stopSequences``).
     * Tools are ``function_declarations`` and tool-calling mode is set via
-      ``toolConfig.functionCallingConfig.mode`` (AUTO/ANY/NONE). Gemini ties a
-      response to a call by *name*, not id, so the adapter synthesises ids (see
-      :func:`parse_gemini_function_call`).
+      ``toolConfig.functionCallingConfig.mode`` (AUTO/ANY/NONE). The adapter
+      echoes a provider-assigned function-call id when present; older calls
+      without one retain a local synthetic id for agent bookkeeping.
     * Usage comes from ``usageMetadata`` (``promptTokenCount`` /
       ``candidatesTokenCount`` / ``cachedContentTokenCount``).
     """
@@ -161,6 +180,10 @@ class GoogleProvider(LLMProvider):
             if client is None:
                 client = httpx.Client(timeout=self.timeout_s)
                 _client_cache[key] = client
+                while len(_client_cache) > _CLIENT_CACHE_MAX:
+                    _client_cache.popitem(last=False)  # evict LRU; GC closes it
+            else:
+                _client_cache.move_to_end(key)
             return client
 
     def supports_embeddings(self) -> bool:
@@ -238,14 +261,41 @@ class GoogleProvider(LLMProvider):
         payload: dict = {"contents": build_gemini_contents(request)}
 
         generation_config: dict = {}
-        if request.temperature is not None:
+        model = request.model.lower()
+        gemini3 = model.startswith("gemini-3")
+        # Gemini 3.x is tuned for its default sampling values.  The 2.5
+        # contract still honours the caller's sampling settings.
+        if request.temperature is not None and not gemini3:
             generation_config["temperature"] = request.temperature
-        if request.top_p is not None:
+        if request.top_p is not None and not gemini3:
             generation_config["topP"] = request.top_p
         if request.max_tokens is not None:
             generation_config["maxOutputTokens"] = request.max_tokens
+        if request.reasoning_effort:
+            if model.startswith("gemini-2.5-pro"):
+                generation_config["thinkingConfig"] = {
+                    "thinkingBudget": 128 if request.reasoning_effort == "minimal" else 1024,
+                }
+            elif model.startswith("gemini-2.5-flash"):
+                generation_config["thinkingConfig"] = {
+                    "thinkingBudget": 0 if request.reasoning_effort == "minimal" else 1024,
+                }
+            elif model.startswith("gemini-3"):
+                level = request.reasoning_effort
+                # These families reject `minimal`; keep the low-effort intent
+                # while using a supported level. 3.6 Flash accepts minimal.
+                if level == "minimal" and model.startswith((
+                    "gemini-3.7", "gemini-3.8", "gemini-3.1-pro",
+                    "gemini-3-pro",
+                )):
+                    level = "low"
+                generation_config["thinkingConfig"] = {"thinkingLevel": level}
         if request.stop:
             generation_config["stopSequences"] = request.stop
+        if generation_config:
+            for param in ("temperature", "topP", "thinkingConfig"):
+                if is_rejected(self.name, self._base_url(), request.model, param):
+                    generation_config.pop(param, None)
         if generation_config:
             payload["generationConfig"] = generation_config
 
@@ -285,6 +335,45 @@ class GoogleProvider(LLMProvider):
             params["alt"] = "sse"
         return params
 
+    @staticmethod
+    def _heal_generation_config(payload: dict, message: str, healed: set) -> bool:
+        config = payload.get("generationConfig") or {}
+        lower = (message or "").lower()
+        for key in ("temperature", "topP", "thinkingConfig"):
+            if key in config and key not in healed and key.lower() in lower:
+                healed.add(key)
+                config.pop(key)
+                return True
+        return False
+
+    @contextlib.contextmanager
+    def _stream_with_heal(self, client, request: LLMRequest, payload: dict, started: float | None = None):
+        healed: set = set()
+        started = time.monotonic() if started is None else started
+        while True:
+            check_request_dispatch(request, started)
+            with client.stream(
+                "POST", self._build_url(request.model, stream=True),
+                params=self._params(stream=True), json=payload,
+            ) as resp:
+                if resp.status_code >= 400:
+                    try:
+                        body_text = resp.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        body_text = ""
+                    err = _http_error_to_llm_error(
+                        resp, self.name, request.model, body_text=body_text,
+                    )
+                    before = set(healed)
+                    if (err.category == ErrorCategory.INVALID_REQUEST
+                            and self._heal_generation_config(payload, err.message, healed)):
+                        for param in healed - before:
+                            remember_rejected(self.name, self._base_url(), request.model, param)
+                        continue
+                    raise err
+                yield resp
+                return
+
     def generate(self, request: LLMRequest) -> LLMResponse:
         """Non-streaming completion via a single POST to ``:generateContent``.
 
@@ -295,15 +384,18 @@ class GoogleProvider(LLMProvider):
         """
         httpx = self._httpx()
         start = time.monotonic()
+        payload = self._build_payload(request)
+        healed: set = set()
 
         def _do_call() -> LLMResponse:
+            check_request_dispatch(request, start)
             try:
                 # Cached shared client (keep-alive) instead of a per-call pool.
                 client = self._client()
                 resp = client.post(
                     self._build_url(request.model, stream=False),
                     params=self._params(stream=False),
-                    json=self._build_payload(request),
+                    json=payload,
                 )
             except httpx.TimeoutException as exc:
                 raise LLMError(
@@ -316,7 +408,14 @@ class GoogleProvider(LLMProvider):
                     provider=self.name, model=request.model, retryable=True,
                 )
             if resp.status_code >= 400:
-                raise _http_error_to_llm_error(resp, self.name, request.model)
+                err = _http_error_to_llm_error(resp, self.name, request.model)
+                before = set(healed)
+                if (err.category == ErrorCategory.INVALID_REQUEST
+                        and self._heal_generation_config(payload, err.message, healed)):
+                    for param in healed - before:
+                        remember_rejected(self.name, self._base_url(), request.model, param)
+                    return _do_call()
+                raise err
 
             try:
                 body = resp.json()
@@ -392,25 +491,13 @@ class GoogleProvider(LLMProvider):
             finish_reason = FinishReason.STOP
             stream_error: LLMError | None = None
             cancelled = False
+            terminal_seen = False
             try:
                 # nullcontext wraps the CACHED client so the streaming block is
                 # unchanged but the shared client is NOT closed on exit (only the
                 # inner client.stream(...) response is) — keep-alive survives.
                 with contextlib.nullcontext(self._client()) as client:
-                    with client.stream(
-                        "POST",
-                        self._build_url(request.model, stream=True),
-                        params=self._params(stream=True),
-                        json=self._build_payload(request),
-                    ) as resp:
-                        if resp.status_code >= 400:
-                            try:
-                                body_text = resp.read().decode("utf-8", errors="replace")
-                            except Exception:
-                                body_text = ""
-                            raise _http_error_to_llm_error(
-                                resp, self.name, request.model, body_text=body_text,
-                            )
+                    with self._stream_with_heal(client, request, self._build_payload(request), start) as resp:
                         for line in resp.iter_lines():
                             if not line or not line.startswith("data:"):
                                 continue
@@ -421,6 +508,8 @@ class GoogleProvider(LLMProvider):
                                 data = json.loads(raw)
                             except json.JSONDecodeError:
                                 continue
+                            terminal_seen = terminal_seen or bool(_prompt_block_reason(data)) or any(
+                                c.get("finishReason") for c in (data.get("candidates") or []) if isinstance(c, dict))
                             text, partial_finish = _extract_text_and_finish(data)
                             if text:
                                 buf.append(text)
@@ -432,6 +521,10 @@ class GoogleProvider(LLMProvider):
                                 usage_in = int(usage_meta.get("promptTokenCount", usage_in) or usage_in)
                                 usage_out = int(usage_meta.get("candidatesTokenCount", usage_out) or usage_out)
                                 cached_in = int(usage_meta.get("cachedContentTokenCount", cached_in) or cached_in)
+                if not terminal_seen:
+                    raise LLMError(category=ErrorCategory.NETWORK,
+                                   message="Provider stream interrupted before its completion marker",
+                                   provider=self.name, model=request.model)
             except GeneratorExit:
                 # Consumer abandoned the stream (client disconnect) — marked,
                 # not failed. See CANCELLED_ERROR_CATEGORY. Gemini reports
@@ -540,6 +633,9 @@ def _extract_text_finish_and_calls(body: dict) -> tuple[str, FinishReason, list]
         raw_finish = candidate.get("finishReason")
         if raw_finish:
             finish = _FINISH_REASONS.get(raw_finish, FinishReason.OTHER)
+            if raw_finish in {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL",
+                              "TOO_MANY_TOOL_CALLS"}:
+                logger.warning("Gemini returned malformed tool use: %s", raw_finish)
     return "".join(text_parts), finish, tool_calls
 
 
@@ -582,10 +678,16 @@ def _http_error_to_llm_error(
         except Exception:
             text = ""
     message = text or f"HTTP {status}"
+    invalid_api_key = False
     try:
         body = json.loads(text)
         if isinstance(body, dict) and isinstance(body.get("error"), dict):
-            message = body["error"].get("message", message)
+            error = body["error"]
+            message = error.get("message", message)
+            invalid_api_key = any(
+                isinstance(detail, dict) and detail.get("reason") == "API_KEY_INVALID"
+                for detail in (error.get("details") or [])
+            )
     except Exception:
         pass
     category = ErrorCategory.UNKNOWN
@@ -601,6 +703,8 @@ def _http_error_to_llm_error(
         category = ErrorCategory.INVALID_REQUEST
     elif 500 <= status < 600:
         category = ErrorCategory.SERVER_ERROR
+    if invalid_api_key:
+        category = ErrorCategory.AUTH
     # Terminal billing/quota exhaustion surfaces immediately.  The signals
     # in ``looks_like_quota`` are specific enough that a Gemini per-minute
     # "Quota exceeded for quota metric …" 429 stays RATE_LIMIT (retryable).

@@ -3,12 +3,12 @@ pydantic>=2.10,<3.0
 flask>=3.1,<4.0
 PyMuPDF>=1.25.2,<2.0
 ollama>=0.4,<1.0
-pywebview>=5.3,<6.0
-Pillow>=11.1,<12.0
+pywebview>=5.3,<6.0; sys_platform == "darwin"
+Pillow>=13.0,<14.0
 # HEIF/HEIC decoder for PIL — lets the vision path describe .heic images (the
 # default macOS screenshot/photo format). Optional at runtime (vision.py guards
 # the import), but declared so a fresh install supports HEIC out of the box.
-pillow-heif>=0.18,<1.0
+pillow-heif>=1.3,<2.0
 
 # LlamaIndex (RAG)
 # Pinned to compatible versions to prevent pip resolver from backtracking through
@@ -91,18 +91,18 @@ httpx>=0.27,<1.0
 tenacity>=8.0,<10.0
 
 # macOS Bundle requirements
-pyobjc-framework-Cocoa>=11.1,<12.0
-pyobjc-framework-WebKit>=11.1,<12.0
+pyobjc-framework-Cocoa>=11.1,<12.0; sys_platform == "darwin"
+pyobjc-framework-WebKit>=11.1,<12.0; sys_platform == "darwin"
 # Pin core + transitives to the same major/minor line as Cocoa/WebKit to
 # reduce pip resolver backtracking across 11.x/12.x variants during install.
-pyobjc-core>=11.1,<12.0
-pyobjc-framework-Quartz>=11.1,<12.0
-pyobjc-framework-security>=11.1,<12.0
-pyinstaller>=6.11,<7.0
+pyobjc-core>=11.1,<12.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=11.1,<12.0; sys_platform == "darwin"
+pyobjc-framework-security>=11.1,<12.0; sys_platform == "darwin"
+pyinstaller>=6.11,<7.0; sys_platform == "darwin"
 
 # Phase 3 Enhancements
 waitress>=3.0.0,<4.0
-setuptools>=70.0,<81
+setuptools>=84.1,<85
 
 # MarkItDown: Microsoft's Markdown conversion library, used as a text-extraction
 # tier in pdf_extractor.py (pdfminer.six backend for .pdf). The app indexes only
@@ -129,6 +129,14 @@ pikepdf>=8.15,<10.0
 ruamel.yaml>=0.18,<0.19
 bibtexparser>=1.4,<2.0
 beautifulsoup4>=4.12,<5.0
+# Zotero-note sync (notesync/convert.py, 2026-09-04): markdownify renders a
+# Zotero child note's HTML to Markdown the way the vault's existing notes were
+# written, and markdown-it-py renders the region back to HTML for a push.
+# Both had been reaching the tree only TRANSITIVELY through markitdown; a
+# markitdown bump could have dropped them and taken the sync comparison with
+# it. Pinned first-class for the same reason beautifulsoup4 is.
+markdownify>=1.2,<2.0
+markdown-it-py>=3.0,<5.0
 # rapidfuzz scores the near-duplicate report's content-similarity tier
 # (plan 2026-08-05/6).  The audit engine imports it lazily and degrades to
 # the deterministic tiers with a disclosed meta note when it is absent, so

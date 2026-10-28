@@ -223,20 +223,42 @@ def build_compile_env(deck_path: str, latexmk_path: Optional[str] = None) -> dic
 
     suite_root = find_suite_root(deck_path)
     if suite_root:
-        common_dir = os.path.join(suite_root, "common")
-        fig_dir = os.path.join(common_dir, "fig")
-        env["TEXINPUTS"] = (
-            f"{deck_dir}:{common_dir}:{fig_dir}:{env.get('TEXINPUTS', '')}"
-        )
-        env["BIBINPUTS"] = f"{deck_dir}:{suite_root}:{env.get('BIBINPUTS', '')}"
+        env.update(suite_search_paths(suite_root, deck_dir, env))
+    return with_tex_bin_on_path(env, latexmk_path or find_latexmk())
 
-    latexmk = latexmk_path or find_latexmk()
+
+def suite_search_paths(suite_root: str, doc_dir: str, base_env: dict) -> dict:
+    """``TEXINPUTS``/``BIBINPUTS`` exactly as the suite's own build sets them.
+
+    The ONE copy of ``common/latex-build.mk:75-76`` / ``.latexmkrc:34-35``,
+    shared by compile-fix/preview and the Maintenance ``latex`` sweep — held
+    here as DATA, never by reading or running the suite's Makefile or rc file
+    (the sweep's ``-norc`` trust boundary, 2026-08-24)::
+
+        TEXINPUTS := .:$(SUITE_ROOT)/common:$(SUITE_ROOT)/common/fig:$(SUITE_ROOT)/letters/common:$(TEXINPUTS):
+        BIBINPUTS := .:$(SUITE_ROOT):$(BIBINPUTS):
+
+    *doc_dir* stands in for ``.``. ``letters/common`` and the trailing
+    separator after an inherited value were both missing until the
+    2026-09-23 CLI proof run (C2); the empty last component is what keeps
+    kpathsea's default search paths when a value is inherited.
+    """
+    common_dir = os.path.join(suite_root, "common")
+    tex = [doc_dir, common_dir, os.path.join(common_dir, "fig"),
+           os.path.join(suite_root, "letters", "common")]
+    return {
+        "TEXINPUTS": ":".join([*tex, base_env.get("TEXINPUTS", "")]) + ":",
+        "BIBINPUTS": ":".join([doc_dir, suite_root, base_env.get("BIBINPUTS", "")]) + ":",
+    }
+
+
+def with_tex_bin_on_path(env: dict, latexmk: Optional[str]) -> dict:
+    """Prefix ``PATH`` with latexmk's own directory (once)."""
     if latexmk:
         tex_bin_dir = os.path.dirname(os.path.abspath(latexmk))
         path_parts = env.get("PATH", "").split(os.pathsep)
         if tex_bin_dir not in path_parts:
             env["PATH"] = f"{tex_bin_dir}{os.pathsep}{env.get('PATH', '')}"
-
     return env
 
 
@@ -244,6 +266,7 @@ def compile_latex(
     deck_path: str,
     engine: str = "pdflatex",
     timeout: int = 180,
+    should_cancel=None,
 ) -> tuple[bool, str]:
     """Run latexmk on *deck_path*, returning ``(success, log_contents)``.
 
@@ -252,9 +275,43 @@ def compile_latex(
     latexmk (what a bare ``subprocess.run(timeout=…)`` does) orphans a wedged
     pdflatex that keeps burning CPU and holding the ``.log`` open. TERM →
     5 s grace → KILL, mirroring ``services/pdf_service.py``'s escalation.
+
+    *should_cancel* (optional, called with no arguments) is polled every 200 ms
+    while the compile runs; a truthy answer kills the process group the same
+    way a timeout does and returns ``(False, "Compilation cancelled.")``.
+    Omitting it is the historical behaviour exactly.
+
+    # PERF (2026-09-02): a compile was uninterruptible for its whole pass.
+    #   Before:    `proc.communicate(timeout=…)` blocked with no path from the
+    #              user's Stop to the process-group kill, so Cancel was
+    #              invisible for up to `deck_compile_timeout_s` (max 600 s) per
+    #              pass — with the LaTeX lease and one of its two global slots
+    #              held throughout, and up to 2*iters+1 passes in a compile-fix
+    #              run. The maintenance `latex` step already polls; this one
+    #              did not.
+    #   Change:    the maintenance `run_command` poll loop: 200 ms `proc.wait`
+    #              slices, `should_cancel()` checked each time, the SAME
+    #              TERM -> 5 s -> KILL escalation on either exit.
+    #   Safe because:
+    #              a caller passing no `should_cancel` gets byte-identical
+    #              behaviour (the poll simply never fires), the returned tuple
+    #              shape is unchanged, and the pipes became temporary FILES
+    #              rather than PIPEs — polling a live process while holding
+    #              unread PIPEs would deadlock on a log big enough to fill the
+    #              OS buffer, which a failing LaTeX run reliably produces.
+    #              stdout/stderr are a fallback used only when the .log is
+    #              missing, and they are still decoded with errors="replace".
+    #   Preserves: "Never kill latexmk alone" — the cancel path uses the same
+    #              `os.killpg` escalation as the timeout path.
+    #   Lock/thread contract:
+    #              unchanged; the caller's lease is held across this call
+    #              exactly as before, but can now be released promptly on Stop.
+    #   Pinned by: test_compile.py::TestCompileCancel
     """
     import signal
     import subprocess
+    import tempfile
+    import time
 
     latexmk = find_latexmk()
     if not latexmk:
@@ -278,36 +335,59 @@ def compile_latex(
         deck_name,
     ]
 
+    def _kill_group(proc) -> None:
+        """TERM the whole process group, then KILL — never latexmk alone."""
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
     stdout_text = ""
     stderr_text = ""
     try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=deck_dir,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",   # TeX logs are not reliably UTF-8
-            start_new_session=True,
-        )
-        try:
-            stdout_text, stderr_text = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Kill the whole process group, not just latexmk (see docstring).
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.communicate(timeout=5)
-            except Exception:
+        # Temporary FILES, not PIPEs: the loop below polls a live process, and
+        # polling while holding unread pipes deadlocks once the OS buffer fills
+        # — which a failing LaTeX run reliably manages.
+        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=deck_dir,
+                env=env,
+                stdout=out_f,
+                stderr=err_f,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + timeout
+            while True:
+                if should_cancel is not None and should_cancel():
+                    _kill_group(proc)
+                    return False, "Compilation cancelled."
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _kill_group(proc)
+                    return False, f"Compilation timed out after {timeout} seconds."
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    pass
+                    proc.wait(timeout=min(0.2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            def _drain(fh) -> str:
                 try:
-                    proc.communicate(timeout=5)
+                    fh.seek(0)
+                    return fh.read().decode("utf-8", errors="replace")
                 except Exception:
-                    pass
-            return False, f"Compilation timed out after {timeout} seconds."
+                    return ""
+
+            stdout_text = _drain(out_f)
+            stderr_text = _drain(err_f)
         success = proc.returncode == 0
     except Exception as exc:
         return False, f"Subprocess compilation error: {exc}"

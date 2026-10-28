@@ -118,19 +118,6 @@ WORKFLOWS: tuple[dict, ...] = (
         "role": ROLE_SYSTEM,
     },
     {
-        "id": "refactor_review",
-        "label": "Note Refactor · prose review",
-        "description": "Static, shorthand-aware advisory review prompt (writes nothing).",
-        "role": ROLE_SYSTEM,
-    },
-    {
-        "id": "refactor_edit",
-        "label": "Note Refactor · LLM edits",
-        "description": "The rewrite / custom-edit / PDF-summary / chart prompt for the "
-        "requested action (the note rides as untrusted source).",
-        "role": ROLE_SYSTEM,
-    },
-    {
         "id": "tagging_propose",
         "label": "Biblio Tagging · tag proposal",
         "description": "Vocabulary-constrained classification prompt: the paper's cached PDF "

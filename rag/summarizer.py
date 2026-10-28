@@ -386,7 +386,14 @@ def _map_reduce_stream(
                 # Explicit close so an early return tears down the provider
                 # stream now, not at some later GC pass.
                 gen.close()
-            partials.append("".join(buf).strip())
+            notes = "".join(buf).strip()
+            if not notes:
+                raise ValueError(
+                    f"No usable summary notes were returned for part {i}/{n}; "
+                    "final synthesis was not started. Review the output budget "
+                    "and provider settings before deliberately trying again."
+                )
+            partials.append(notes)
 
         if _stopped():
             return
@@ -636,11 +643,30 @@ def _stream_online(
         _emit(f"primary provider {provider_name} failed ({cat}); falling back to {fallback}")
 
     from core.llm.factory import stream_with_fallback
-    yield from stream_with_fallback(
+    received_text = False
+    stream = stream_with_fallback(
         provider_name=provider_name,
         request=request,
         policy=policy,
         cfg=cfg,
         on_fallback=on_fallback,
+        on_truncation=_emit,
         log_context="online summary fallback"
     )
+    try:
+        for token in stream:
+            received_text = received_text or bool(token.strip())
+            yield token
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
+    # This is a workflow failure, not a transport failure. Check only after
+    # the provider/fallback generator has finished, so an empty billed reply
+    # cannot trigger an automatic provider replay or erase its usage record.
+    if not received_text:
+        raise ValueError(
+            "The provider returned no usable summary text. Recorded token usage "
+            "and estimated cost still apply. Review any output-limit warning "
+            "and the generation settings before deliberately trying again."
+        )

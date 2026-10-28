@@ -49,7 +49,7 @@ function deckFetch(overrides = {}) {
         }
         if (u.includes('/api/tagging/inventory')) return Promise.resolve(okJson(DECK_SAMPLE));
         if (u.includes('/api/tagging/vocab')) return Promise.resolve(okJson({ vocab: [] }));
-        if (u.includes('/api/tagging/zotero-available')) return Promise.resolve(okJson({ available: true }));
+        if (u.includes('/api/tagging/zotero-available')) return Promise.resolve(okJson({ available: true, writable: true }));
         if (u.includes('/api/tagging/snippet')) return Promise.resolve(okJson({ snippet: 'excerpt', chars: 7 }));
         return Promise.resolve(okJson({}));
     };

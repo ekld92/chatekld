@@ -10,10 +10,10 @@
 #   * hygiene     — trailing whitespace / final newline / merge-conflict / YAML /
 #                   accidental large-file or case-collision guards.
 #
-# mypy is deliberately NOT a hook here (the plan is "pre-commit (ruff, gitleaks)"):
-# it is a PERMISSIVE, ADVISORY standalone tool (config in pyproject [tool.mypy]).
-# Run it on demand from the venv: `mypy` (checks the app source; ~60 findings today,
-# mostly false positives from untyped third-party libs — informational, not a gate).
+# mypy is deliberately NOT a commit-time hook: CI runs
+# `python scripts/check_mypy_ratchet.py`, holding remediation files to zero and
+# every legacy file to its explicit per-file ceiling. Keeping that ~35 s graph
+# out of staged-file hooks avoids duplicate latency without making it advisory.
 minimum_pre_commit_version: "4.0.0"
 
 repos:

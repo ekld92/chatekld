@@ -21,7 +21,6 @@ GUI; ``/api/health`` is the only sanctioned liveness probe.
 from __future__ import annotations
 
 import logging
-import subprocess
 import sys
 import threading
 from datetime import datetime, timezone
@@ -129,12 +128,75 @@ def _poke_swiftbar() -> None:
     if sys.platform != "darwin":
         return
     try:
-        subprocess.Popen(
-            ["open", "-g", "swiftbar://refreshplugin?name=chatekld"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        from api.routes.open import run_open
+        run_open(["open", "-g", "swiftbar://refreshplugin?name=chatekld"])
     except Exception:  # noqa: BLE001
         pass
+
+
+# PERF (2026-09-02): the snapshot build leaves the SCAN thread.
+# Before: the result listener ran _build_and_write inline, so a scan that had
+#   already reported `done` kept its worker thread busy building the widget
+#   payload — which reaches a PDF text extraction for the excerpt. The audit
+#   status says the scan is finished while its thread is still working, and
+#   the listener runs under the manager's own result path.
+# Change: the listener enqueues onto ONE coalescing daemon. A second request
+#   arriving while a build runs is collapsed into a single follow-up build
+#   (the payload is derived from whatever the CURRENT cached scan is, so
+#   coalescing cannot skip a state — the last build always reflects the
+#   latest result).
+# Safe because:
+#   _build_and_write already never raises, is already serialised by
+#   _BUILD_LOCK, and already reads the manager's cached inventory rather than
+#   any argument — so running it a moment later on another thread produces the
+#   same payload. The manual POST /api/widget/refresh path is unchanged and
+#   still synchronous, because its caller wants the result in its response.
+# Preserves: "no scheduler, no auto-scan; the audit manual-only invariant is
+#   untouched" — the daemon only ever runs the same build the listener ran,
+#   and only in response to a scan result the user asked for.
+# Lock/thread contract: the listener no longer holds the scan thread; the
+#   daemon takes _BUILD_LOCK exactly as the inline call did.
+# Pinned by: test_widget.py::TestSnapshotOffScanThread.
+_REFRESH_LOCK = threading.Lock()
+_refresh_pending = False
+_refresh_thread: threading.Thread | None = None
+
+
+def _refresh_loop() -> None:
+    global _refresh_pending, _refresh_thread
+    while True:
+        with _REFRESH_LOCK:
+            if not _refresh_pending:
+                _refresh_thread = None
+                return
+            _refresh_pending = False
+        _build_and_write()
+
+
+def _request_snapshot_refresh() -> None:
+    """Coalesce a snapshot rebuild onto the single refresh daemon."""
+    global _refresh_pending, _refresh_thread
+    with _REFRESH_LOCK:
+        _refresh_pending = True
+        if _refresh_thread is not None and _refresh_thread.is_alive():
+            return
+        _refresh_thread = threading.Thread(
+            target=_refresh_loop, name="widget-snapshot", daemon=True)
+        _refresh_thread.start()
+
+
+def join_snapshot_refresh(timeout: float = 15.0) -> None:
+    """Wait for a queued snapshot rebuild to finish (tests / shutdown).
+
+    Production never needs this — the daemon is fire-and-forget — but a test
+    that patches the build's inputs must be able to join INSIDE its patch
+    scope, or the daemon runs against the real singletons (the SSE-drain trap,
+    one subsystem over).
+    """
+    with _REFRESH_LOCK:
+        t = _refresh_thread
+    if t is not None and t.is_alive():
+        t.join(timeout=timeout)
 
 
 def _on_scan_result() -> None:
@@ -145,8 +207,11 @@ def _on_scan_result() -> None:
     reset; widgets show its ``generated_at`` age rather than losing their
     card). A cancelled scan that still produced a partial inventory writes a
     partial-but-honest snapshot. NEVER starts a scan.
+
+    The build itself runs on the coalescing daemon above, not on the caller's
+    (scan) thread.
     """
-    _build_and_write()
+    _request_snapshot_refresh()
 
 
 audit_manager.register_result_listener(_on_scan_result)

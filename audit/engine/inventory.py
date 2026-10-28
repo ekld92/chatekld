@@ -2,7 +2,8 @@
 
 For each BBT citation key, we collect everything we know:
 - bib_entry        — from _master.bib (incl. parent keywords)
-- zotero_item      — from zotero.sqlite, matched by normalized title
+- zotero_item      — from zotero.sqlite, matched by BBT citation key, with
+                     normalized title as a fallback for key-less items
                      (parent tags via .tags, child_notes incl. their tags)
 - obsidian_note    — Z_Zotero_Notes/<bbtkey>.md, YAML tags + body
 - pdf_paths        — resolved via engine.bridge
@@ -15,9 +16,13 @@ reports can answer the "is this PDF in Zotero at all?" question.
 
 from __future__ import annotations
 
+from ..core.pdf_paths import pdf_files
+
 import os
 import re
+import time
 import unicodedata
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -57,7 +62,61 @@ def _walk_biblio_pdfs(root: Path) -> list[Path]:
     """List every ``*.pdf`` file under ``root`` (empty if the dir is absent)."""
     if not root.exists():
         return []
-    return [p for p in root.rglob("*.pdf") if p.is_file()]
+    return [p for p in pdf_files(root) if p.is_file()]
+
+
+def _path_key(raw: str) -> str:
+    """Scan-side alias of :func:`audit.core.zotero.linked_path_key`.
+
+    The renamer looks up the same form (2026-09-19 review A1). Keep this name
+    so the inventory module's call sites stay local; do not fork the recipe.
+    """
+    return zotero.linked_path_key(raw)
+
+
+class ZoteroLinkIndex(dict[Path, list[str]]):
+    """Observed links plus paths whose normalized identity is ambiguous."""
+    def __init__(self):
+        super().__init__()
+        self.ambiguous_paths: set[Path] = set()
+
+
+def zotero_link_index(
+    items: list[zotero.ZoteroItem], pdfs: list[Path]
+) -> dict[Path, list[str]]:
+    """``{pdf: [citation key of every item linking it]}`` over *pdfs*.
+
+    Only ``linked_file`` attachments count: an imported copy lives in Zotero's
+    own storage and is not a vault file. An ``attachments:``-relative path is
+    skipped (the base directory is deliberately unset, so it resolves to
+    nothing). A linked item without a citation key is retained as an empty
+    key so it is disclosed as unexported, never mistaken for an orphan.
+    Exact paths win before normalization. A non-exact attachment path folding
+    to several PDFs retains an ambiguity marker; it cannot establish absence
+    or authorize a heuristic pairing.
+    Trashed items and their attachments never reach here: ``read_items``
+    excludes them.
+    """
+    by_key: dict[str, list[Path]] = {}
+    exact = {str(p): p for p in pdfs}
+    for p in pdfs:
+        by_key.setdefault(_path_key(str(p)), []).append(p)
+    links = ZoteroLinkIndex()
+    for item in items:
+        for att in item.attachments:
+            raw = att.raw_path or ""
+            if att.link_mode != "linked_file" or not raw or raw.startswith("attachments:"):
+                continue
+            candidates = by_key.get(_path_key(raw), [])
+            pdf = exact.get(raw)
+            if pdf is None and len(candidates) > 1:
+                links.ambiguous_paths.update(candidates)
+                continue
+            if pdf is None and candidates:
+                pdf = candidates[0]
+            if pdf is not None:
+                links.setdefault(pdf, []).append(item.citation_key or "")
+    return links
 
 
 def _index_obsidian_notes_by_stem(settings: Settings) -> dict[str, obsidian.NoteInfo]:
@@ -81,21 +140,88 @@ def _index_obsidian_notes_by_stem(settings: Settings) -> dict[str, obsidian.Note
     return index
 
 
-def _index_zotero_by_title(
+def _index_zotero_by_citation_key(
     items: list[zotero.ZoteroItem],
 ) -> dict[str, zotero.ZoteroItem]:
-    """Index Zotero parents by normalized title; first occurrence wins.
+    """Index Zotero parents by Better BibTeX citation key; first occurrence wins.
 
-    Keeping the *first* item for a colliding normalized title is deliberate —
-    duplicate-titled Zotero entries are rare, and a stable first-wins choice
-    keeps the join deterministic. Empty-title items are skipped.
+    This is the PRIMARY join (2026-08-12). BBT derives the ``_master.bib`` entry
+    key from this exact field, so the link is authoritative where the title join
+    below is a heuristic — and the heuristic was actively wrong: measured on the
+    maintainer's library, 23 Zotero items were claimed by 2+ bib keys, affecting
+    51 records. Four different papers titled "Schizophrenia" (Owen 2016, Marder
+    2019, Leucht 2025, Jauhar 2022) all resolved to ONE item, so
+    ``apply-zotero-tags`` wrote three of them onto the wrong item.
+
+    First-wins is an explicit policy, not an accident: a Zotero library CAN hold
+    two items with the same BBT key (two exist in the maintainer's — BBT only
+    guarantees uniqueness at export time, and a duplicated item keeps the pinned
+    key). Deterministic first-wins matches ``_index_zotero_by_title`` and keeps
+    the scan reproducible; the loser is simply unjoined, never mis-joined.
     """
     idx: dict[str, zotero.ZoteroItem] = {}
     for it in items:
-        n = _norm_title(it.title)
-        if n and n not in idx:
-            idx[n] = it
+        k = (it.citation_key or "").strip()
+        if k and k not in idx:
+            idx[k] = it
     return idx
+
+
+def _index_zotero_by_title(
+    items: list[zotero.ZoteroItem],
+) -> dict[str, list[zotero.ZoteroItem]]:
+    """Index Zotero parents by normalized title, keeping EVERY colliding item.
+
+    The FALLBACK join, used only for a record whose citation key matched no
+    Zotero item (an item predating BBT, or one whose key was never generated).
+    Empty-title items are skipped.
+
+    Collisions are kept rather than collapsed (2026-08-12). First-wins made a
+    duplicate title indistinguishable from a unique one at the call site, so
+    the fallback silently picked an arbitrary paper — the same failure the
+    citation-key join was introduced to end ("Schizophrenia" matching four
+    different papers). :func:`_resolve_title_fallback` refuses an ambiguous
+    title outright; leaving the record unjoined is recoverable, writing tags
+    onto the wrong paper is not.
+    """
+    idx: dict[str, list[zotero.ZoteroItem]] = {}
+    for it in items:
+        n = _norm_title(it.title)
+        if n:
+            idx.setdefault(n, []).append(it)
+    return idx
+
+
+def _resolve_title_fallback(
+    norm_title: str,
+    by_title: dict[str, list[zotero.ZoteroItem]],
+    claimed_item_keys: set[str],
+) -> zotero.ZoteroItem | None:
+    """Return the one unambiguous, unclaimed item for *norm_title*, else None.
+
+    Two refusals, both of which used to be silent mis-joins:
+
+    * **Ambiguous** — the title names more than one Zotero item, so no evidence
+      picks between them.
+    * **Claimed** — the single candidate already belongs to another record via
+      the authoritative citation-key join. A keyed item is spoken for; letting a
+      title heuristic re-claim it is exactly how one item ended up owned by
+      several bib keys, and it is reachable today whenever ``_master.bib`` holds
+      a STALE key (the item was re-keyed in BBT after the last export) whose
+      title collides with a keyed item.
+
+    Refusing leaves ``rec.zotero_item`` None, which every consumer already
+    handles as "no Zotero item for this record" (the tagging writers report
+    ``skipped: no_item``). That is the safe direction: a missing join is
+    visible and fixable, a wrong one writes tags onto someone else's paper.
+    """
+    candidates = by_title.get(norm_title) or []
+    if len(candidates) != 1:
+        return None
+    item = candidates[0]
+    if item.item_key in claimed_item_keys:
+        return None
+    return item
 
 
 @dataclass
@@ -148,6 +274,66 @@ class Record:
 
 
 @dataclass
+class OrphanZoteroItem:
+    """A Zotero parent no record claimed, reduced to display fields.
+
+    Deliberately NOT the ``ZoteroItem`` itself: that object carries
+    ``child_notes``, each holding a full ``body_plain``, so retaining the
+    unjoined items verbatim would pin every orphan's note text in memory for
+    the lifetime of the cached scan. These five small fields are everything a
+    report or a dashboard needs, and ``tags`` is the one that matters — an
+    orphan item's tags are invisible to every per-record surface.
+    """
+
+    item_key: str
+    item_type: str | None = None
+    title: str | None = None
+    citation_key: str | None = None
+    tags: list[str] = field(default_factory=list)
+    # Library routing (2026-08-18, additive): a group-library orphan needs
+    # ``zotero://select/groups/<id>/items/<key>`` — the personal-library form
+    # selects nothing for it, so dropping these fields made the UI's [Zotero]
+    # verb silently dead for every group item. An entire group library whose
+    # items carry no BBT keys presents as a wall of orphans; the deep link is
+    # how the user goes and looks.
+    library_type: str | None = None
+    group_id: int | None = None
+
+
+@dataclass
+class ZoteroAttachmentRow:
+    """One Zotero attachment, flattened with just enough of its parent.
+
+    Collected across EVERY Zotero item, joined or not (2026-08-28). Two reasons
+    it is a flat list on the inventory rather than something read off
+    ``records``: an attachment on an item no record claimed would otherwise be
+    invisible (``OrphanZoteroItem`` deliberately keeps only display fields), and
+    the question "what does Zotero hold files for?" is not a per-citation-key
+    question at all.
+
+    ``file_owned_by_zotero`` is carried rather than re-derived downstream so the
+    report, the confirm text and the route cannot disagree about which side owns
+    the bytes.
+    """
+
+    item_key: str                 # the ATTACHMENT's key — the API write target
+    parent_key: str | None
+    parent_title: str | None = None
+    parent_citation_key: str | None = None
+    parent_item_type: str | None = None
+    link_mode: str | None = None
+    content_type: str | None = None
+    filename: str = ""
+    raw_path: str | None = None
+    annotation_count: int = 0
+    file_owned_by_zotero: bool = False
+    library_type: str | None = None
+    group_id: int | None = None
+    #: The attachment's own display title (additive, 2026-09-18).
+    title: str | None = None
+
+
+@dataclass
 class Inventory:
     """The full cross-source join plus the side data the reports need.
 
@@ -156,21 +342,66 @@ class Inventory:
     from ``unmapped_pdfs``/``ambiguous_pdfs`` without rerunning resolution.
     ``zotero_error`` is non-None when the Zotero read failed — reports must not
     silently trust an inventory with zero Zotero rows as "nothing is in Zotero".
+
+    ``notes_without_record`` / ``zotero_items_without_record`` are the two
+    orphan buckets (2026-08-13). Before them, a reference note whose stem is in
+    neither the bib nor the bridge, and a Zotero item no record claimed, were
+    dropped in local variables during the build — producing no record, landing
+    in no bucket and not even being counted, so "what does the vault hold that
+    the audit cannot see?" was unanswerable from a completed scan.
     """
 
     records: dict[str, Record]
     bridge: eng_bridge.BridgeResult
     pdfs_skipped: list[Path]  # z_item* PDFs (exempt from everything except duplicates)
-    zotero_matched_by_title: int  # diagnostic
+    zotero_matched_by_title: int  # diagnostic — the FALLBACK join's hit count (RECORDS)
     zotero_error: str | None = (
         None  # diagnostic; reports should not silently trust zero Zotero rows
     )
+    # Diagnostic — the PRIMARY join's hit count (2026-08-12). Read together
+    # with ``zotero_matched_by_title``: a healthy library is nearly all key,
+    # and a title count that starts climbing means BBT keys are going missing.
+    zotero_matched_by_key: int = 0
+    # Diagnostic — records whose key missed AND whose title fallback was
+    # REFUSED (2026-08-12): the title named several items, the one item was
+    # already claimed by the key join, or two records contended for it. Each
+    # refusal is a record left with no Zotero item that a first-wins fallback
+    # would have joined to an arbitrary paper.
+    zotero_title_refused: int = 0
     # Annotation counts for the bridge's *unmapped* PDFs, precomputed during
     # the scan so the unread_unzoterod / read_unzoterod reports serve from
     # memory instead of opening ~thousands of PDFs on the request thread.
     # Empty when count_annotations was False or the scan was cancelled before
     # this phase; in that case the reports fall back to a lazy disk read.
     unmapped_annotations: dict[Path, AnnotationsResult] = field(default_factory=dict)
+    # Orphan bucket — reference notes under ``zotero_notes_dir`` whose stem
+    # matched no record (neither a bib entry nor a bridge-resolved key). Their
+    # tags are invisible to every drift report, since a report iterates records.
+    notes_without_record: list[Path] = field(default_factory=list)
+    # Every attachment Zotero holds, flattened (2026-08-28). Populated from the
+    # full item list before the citation-key join, so it is complete regardless
+    # of which items became records. Read by the ``zotero_attachments`` report
+    # and by the de-link route's candidate check; the audit itself never writes.
+    zotero_attachments: list[ZoteroAttachmentRow] = field(default_factory=list)
+    # ``attachments:``-relative linked_file paths the pairing index skipped
+    # (Zotero's Linked Attachment Base Directory is unset). Counted during
+    # the flatten so the summary can disclose them without changing
+    # ``zotero_link_index``'s return type.
+    zotero_relative_links: int = 0
+    # Orphan bucket — Zotero parents no record claimed: items predating BBT,
+    # the deterministic first-wins losers of a duplicated citation key, and
+    # every item left unjoined by a REFUSED title fallback (the refusals are
+    # counted by ``zotero_title_refused``, which keeps no identities).
+    zotero_items_without_record: list[OrphanZoteroItem] = field(default_factory=list)
+    # Build timestamp (2026-08-18): stamped at construction, so serving it
+    # beside the records is ONE atomic read of one object. The manager's
+    # get_scan_times() is the wrong source for "how old is THIS snapshot":
+    # start_scan zeroes _finished_at while deliberately keeping the previous
+    # inventory live (mid-scan the old data read as scanned_at 0), and
+    # _finalise stamps it even on an errored scan that kept the old inventory
+    # (a stale snapshot read as freshly scanned — silencing the CLI staleness
+    # warning in exactly the case it was built for).
+    built_at: float = 0.0
 
 
 def _annotations_for(paths: list[Path]) -> int:
@@ -247,6 +478,7 @@ def build_inventory(
     count_annotations: bool = True,
     cancel_fn: Callable[[], bool] | None = None,
     progress_fn: Callable[[str], None] | None = None,
+    pdf_text_provider: Callable[[Path], str | None] | None = None,
 ) -> Inventory:
     """Build the cross-source inventory.
 
@@ -254,6 +486,8 @@ def build_inventory(
     aborted by the manager — the per-PDF pikepdf open is not interruptible.
     ``progress_fn`` (if given) receives human-readable progress lines for the
     unmapped-PDF annotation phase, surfaced in the scan's status feed.
+    ``pdf_text_provider`` is forwarded to the bridge's DOI rung; omitting it
+    restricts that rung to embedded PDF metadata (see ``build_bridge``).
     """
 
     def _cancelled() -> bool:
@@ -282,10 +516,6 @@ def build_inventory(
         pdfs_skipped = []
         pdfs_active = list(all_pdfs)
 
-    bridge_result = eng_bridge.build_bridge(settings, entries, pdfs_active)
-
-    notes_by_stem = _index_obsidian_notes_by_stem(settings)
-
     zot_items: list[zotero.ZoteroItem] = []
     zotero_error: str | None = None
     if settings.zotero_sqlite.exists():
@@ -307,30 +537,151 @@ def build_inventory(
             f"Zotero, set its path in Library Audit settings; otherwise the "
             f"Zotero reports stay empty (this is not an error)."
         )
+
+    # Zotero is read BEFORE the bridge (2026-09-19) because the file Zotero
+    # links under an item is the bridge's first rung. A Zotero read failure
+    # leaves the observation unavailable (None), not successfully empty.
+    bridge_result = eng_bridge.build_bridge(
+        settings, entries, pdfs_active, pdf_text_provider=pdf_text_provider,
+        zotero_links=(zotero_link_index(zot_items, pdfs_active)
+                      if zotero_error is None else None),
+    )
+
+    notes_by_stem = _index_obsidian_notes_by_stem(settings)
+    # Flatten every attachment before the join runs. Built here rather than
+    # from ``records`` so an attachment on an item no record claimed is still
+    # visible, and so a cancelled join cannot silently shorten the list.
+    zotero_attachments = [
+        ZoteroAttachmentRow(
+            item_key=att.item_key,
+            parent_key=att.parent_key,
+            parent_title=item.title,
+            parent_citation_key=item.citation_key,
+            parent_item_type=item.item_type,
+            link_mode=att.link_mode,
+            content_type=att.content_type,
+            filename=att.filename,
+            raw_path=att.raw_path,
+            annotation_count=att.annotation_count,
+            file_owned_by_zotero=att.file_owned_by_zotero,
+            library_type=item.library_type,
+            group_id=item.group_id,
+            title=getattr(att, "title", None),
+        )
+        for item in zot_items
+        for att in item.attachments
+    ]
+    zotero_relative_links = sum(
+        1 for att in zotero_attachments
+        if att.link_mode == "linked_file"
+        and (att.raw_path or "").startswith("attachments:")
+    )
+
+    zot_by_key = _index_zotero_by_citation_key(zot_items)
     zot_by_title = _index_zotero_by_title(zot_items)
-    matched_zot_titles: set[str] = set()
+    # Counted in RECORDS, like `matched_by_key` — the old title figure counted
+    # distinct normalized titles, so the two diagnostics the docstring tells you
+    # to read as a ratio had different denominators.
+    matched_by_title = 0
+    matched_by_key = 0
+    title_refused = 0
 
     records: dict[str, Record] = {}
     all_keys = set(bib_by_key) | set(bridge_result.bib_to_pdfs)
+    # The title fallback runs in a SECOND pass because it must know which items
+    # the authoritative key join claimed — and that is only complete once every
+    # record has been visited. Parked here as (record, normalized title).
+    pending_title: list[tuple[Record, str]] = []
+    claimed_item_keys: set[str] = set()
     for key in all_keys:
         rec = Record(citation_key=key, bib_entry=bib_by_key.get(key))
         rec.obsidian_note = notes_by_stem.get(key)
         rec.pdf_paths = list(bridge_result.bib_to_pdfs.get(key, []))
-        if rec.bib_entry:
-            zt = zot_by_title.get(_norm_title(rec.bib_entry.title))
-            if zt is not None:
-                rec.zotero_item = zt
-                matched_zot_titles.add(_norm_title(rec.bib_entry.title))
+        # Citation key first (authoritative), normalized title only as a
+        # fallback for an item Zotero has no BBT key for. The key join needs no
+        # bib_entry — the record's own key IS the BBT key — so a PDF-derived
+        # record with no `.bib` row can still reach its Zotero item.
+        zk = zot_by_key.get(key)
+        if zk is not None:
+            rec.zotero_item = zk
+            claimed_item_keys.add(zk.item_key)
+            matched_by_key += 1
+        elif rec.bib_entry:
+            nt = _norm_title(rec.bib_entry.title)
+            if nt:
+                pending_title.append((rec, nt))
         for p in rec.pdf_paths:
             rec.finder_tag_set |= finder_tags.read_tag_names(p)
             src = bridge_result.source_per_pdf.get(p)
             if src:
                 rec.match_sources.add(src)
-        if count_annotations and rec.pdf_paths:
-            if _cancelled():
-                break
+        # A cancel used to `break` here, which dropped every REMAINING citation
+        # key from `records` — and since `all_keys` is a set, WHICH keys
+        # survived was hash-order-arbitrary. The manager stores a cancelled
+        # scan's inventory (`_finalise(STATE_CANCELLED, inv=inv)`) and every
+        # consumer gates on presence, never state, so reports, the tagging
+        # inventory, tag_coverage and the widget all served an arbitrary
+        # subset as the whole library (2026-08-12 adjudicated finding, fixed
+        # 2026-08-13). The joins are cheap; only the per-record pikepdf
+        # annotation reads are worth cancelling — so a cancel now skips those
+        # (the default -1 renders as "unknown") and keeps building records.
+        if count_annotations and rec.pdf_paths and not _cancelled():
             rec.annotations_count_max = _annotations_for(rec.pdf_paths)
         records[key] = rec
+
+    # Pass 2: the title fallback, now that `claimed_item_keys` is complete.
+    # Only records whose citation key matched NOTHING get here, and each still
+    # has to clear both refusals in _resolve_title_fallback.
+    #
+    # Contention on the RECORD side is refused the same way: when two unjoined
+    # records normalize to one title, whichever ran first would take the item
+    # and the other be refused as "claimed" — and `all_keys` is a set, so which
+    # one won could change between runs of the same library. Refusing both is
+    # deterministic and keeps the failure visible.
+    contested = {nt for nt, n in Counter(nt for _r, nt in pending_title).items() if n > 1}
+    for rec, nt in pending_title:
+        zt = (None if nt in contested
+              else _resolve_title_fallback(nt, zot_by_title, claimed_item_keys))
+        if zt is not None:
+            rec.zotero_item = zt
+            claimed_item_keys.add(zt.item_key)
+            matched_by_title += 1
+        else:
+            title_refused += 1
+
+    # The two orphan buckets, both computed against the FULL intended universe.
+    #
+    # `notes_without_record` is exactly cancel-safe: `all_keys` is built before
+    # the records loop, so a cancel cannot change it.
+    #
+    # The BBT-key recompute below is belt-and-braces since 2026-08-13: the
+    # records loop no longer breaks on cancel (a cancel only skips annotation
+    # reads), so `claimed_item_keys` and pass 2's input are complete on every
+    # exit path. The recompute is kept because it is a pure function of
+    # `all_keys` and `zot_by_key` — cheap insurance that a future early exit
+    # from the loop cannot silently turn unvisited records' items into
+    # phantom orphans again.
+    claimed = set(claimed_item_keys)
+    for k in all_keys:
+        it = zot_by_key.get(k)
+        if it is not None:
+            claimed.add(it.item_key)
+    notes_without_record = [
+        notes_by_stem[stem].path for stem in sorted(set(notes_by_stem) - all_keys)
+    ]
+    zotero_items_without_record = [
+        OrphanZoteroItem(
+            item_key=it.item_key,
+            item_type=it.item_type,
+            title=it.title,
+            citation_key=it.citation_key,
+            tags=list(it.tags),
+            library_type=getattr(it, "library_type", None),
+            group_id=getattr(it, "group_id", None),
+        )
+        for it in zot_items
+        if it.item_key not in claimed
+    ]
 
     # Precompute annotation counts for the *unmapped* PDFs (the set the
     # records loop above never touches) so unread_unzoterod / read_unzoterod
@@ -354,7 +705,14 @@ def build_inventory(
         records=records,
         bridge=bridge_result,
         pdfs_skipped=pdfs_skipped,
-        zotero_matched_by_title=len(matched_zot_titles),
+        zotero_matched_by_title=matched_by_title,
+        zotero_matched_by_key=matched_by_key,
+        zotero_title_refused=title_refused,
         zotero_error=zotero_error,
         unmapped_annotations=unmapped_annotations,
+        notes_without_record=notes_without_record,
+        zotero_items_without_record=zotero_items_without_record,
+        zotero_attachments=zotero_attachments,
+        zotero_relative_links=zotero_relative_links,
+        built_at=time.time(),
     )

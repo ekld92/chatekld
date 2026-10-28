@@ -204,7 +204,7 @@ def test_compile_fix_repairs_then_verifies(client, tmp_path):
 
     compiles = []
 
-    def _fake_compile(path, engine="pdflatex", timeout=180):
+    def _fake_compile(path, engine="pdflatex", timeout=180, should_cancel=None):
         compiles.append(engine)
         # Pass 1 fails with a repairable error; pass 2 (verification) succeeds.
         if len(compiles) == 1:
@@ -282,14 +282,15 @@ def test_compile_fix_409_when_deck_op_busy(client, tmp_path):
     deck.parent.mkdir()
     deck.write_text(_DECK, encoding="utf-8")
 
-    assert deckmod._DECK_OP_LOCK.acquire(blocking=False)
+    lease = deckmod._DECK_OP_LOCK.acquire(deck, blocking=False)
+    assert lease is not None
     try:
         with mock.patch.object(deckmod, "find_latexmk", return_value="/x/latexmk"):
             resp = _post_compile_fix(client, deck, _deck_sha(deck))
         assert resp.status_code == 409
         assert "already running" in (resp.get_json() or {}).get("error", "")
     finally:
-        deckmod._DECK_OP_LOCK.release()
+        lease.release()
 
 
 def test_compile_fix_stale_sha_releases_lock(client, tmp_path):
@@ -303,8 +304,9 @@ def test_compile_fix_stale_sha_releases_lock(client, tmp_path):
         resp = _post_compile_fix(client, deck, "0" * 64)
     assert resp.status_code == 409
     # The early 409 must have released the lock, or every later deck op 409s.
-    assert deckmod._DECK_OP_LOCK.acquire(blocking=False)
-    deckmod._DECK_OP_LOCK.release()
+    lease = deckmod._DECK_OP_LOCK.acquire(deck, blocking=False)
+    assert lease is not None
+    lease.release()
 
 
 def test_compile_available_requires_local_origin():
@@ -356,6 +358,24 @@ class TestBuildCompileEnv:
         assert parts[2] == str(suite / "common" / "fig")
         # Trailing empty component keeps kpathsea's default search paths.
         assert env["TEXINPUTS"].endswith(":")
+
+    def test_texinputs_includes_letters_common(self, tmp_path):
+        # CLI proof run 2026-09-23 (C2): the suite Makefile (:75) and
+        # .latexmkrc (:34) both put letters/common on TEXINPUTS.
+        from deckgen.compile import build_compile_env
+
+        suite, deck = self._make_suite(tmp_path)
+        env = build_compile_env(str(deck), latexmk_path="/fake/texbin/latexmk")
+        assert env["TEXINPUTS"].split(":")[3] == str(suite / "letters" / "common")
+
+    def test_an_inherited_texinputs_keeps_the_trailing_separator(self, tmp_path):
+        from deckgen.compile import build_compile_env
+
+        suite, deck = self._make_suite(tmp_path)
+        with mock.patch.dict(os.environ, {"TEXINPUTS": "/inherited", "BIBINPUTS": "/bibs"}):
+            env = build_compile_env(str(deck), latexmk_path="/fake/texbin/latexmk")
+        assert env["TEXINPUTS"].endswith(":/inherited:")
+        assert env["BIBINPUTS"] == f"{deck.parent}:{suite}:/bibs:"
 
     def test_bibinputs_includes_suite_root_not_just_common(self, tmp_path):
         from deckgen.compile import build_compile_env
@@ -442,3 +462,135 @@ def test_live_compile_resolves_suite_sty(tmp_path):
     )
     success, log = compile_latex(str(tex), timeout=120)
     assert success, log[-2000:]
+
+
+class TestCompileCancel:
+    """PERF (2026-09-02): a compile pass must be interruptible.
+
+    ``proc.communicate(timeout=…)`` had no path from the user's Stop to the
+    process-group kill, so Cancel was invisible for up to
+    ``deck_compile_timeout_s`` (max 600 s) per pass, with the LaTeX lease and
+    one of its two global slots held throughout.
+    """
+
+    def _fake_latexmk(self, tmp_path, seconds=30):
+        """A stand-in for latexmk that sleeps in its own process group."""
+        script = tmp_path / "slow-latexmk"
+        script.write_text(
+            "#!/bin/sh\n"
+            f"sleep {seconds}\n", encoding="utf-8")
+        script.chmod(0o755)
+        return str(script)
+
+    def test_cancel_kills_the_pass_promptly(self, tmp_path):
+        import threading
+        import time
+
+        from deckgen.compile import compile_latex
+
+        deck = tmp_path / "d" / "main.tex"
+        deck.parent.mkdir()
+        deck.write_text("\\documentclass{article}\\begin{document}x\\end{document}",
+                        encoding="utf-8")
+        cancel = threading.Event()
+        threading.Timer(0.4, cancel.set).start()
+
+        with mock.patch("deckgen.compile.find_latexmk",
+                        return_value=self._fake_latexmk(tmp_path)):
+            t0 = time.monotonic()
+            try:
+                ok, log = compile_latex(str(deck), timeout=30,
+                                        should_cancel=cancel.is_set)
+            except TypeError:
+                # Pre-change signature: fall through so this test fails on the
+                # CLAIM (Stop is invisible for the whole pass), not on a
+                # missing keyword — a red that only proves "this kwarg is new"
+                # pins nothing.
+                ok, log = compile_latex(str(deck), timeout=30)
+            elapsed = time.monotonic() - t0
+
+        assert ok is False
+        assert "cancelled" in log.lower()
+        # Pre-fix this blocked for the full 30 s timeout regardless of Stop.
+        assert elapsed < 5, f"cancel took {elapsed:.1f}s to reach latexmk"
+
+    def test_a_big_log_does_not_deadlock_the_poll_loop(self, tmp_path):
+        """The poll loop must not hold unread PIPEs: a failing LaTeX run
+        reliably produces more output than an OS pipe buffer holds."""
+        from deckgen.compile import compile_latex
+
+        deck = tmp_path / "d" / "main.tex"
+        deck.parent.mkdir()
+        deck.write_text("x", encoding="utf-8")
+        noisy = tmp_path / "noisy-latexmk"
+        # ~2 MB on stdout, far past the 64 KB pipe buffer.
+        noisy.write_text(
+            "#!/bin/sh\n"
+            "i=0\n"
+            "while [ $i -lt 20000 ]; do\n"
+            "  echo 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n"
+            "  i=$((i+1))\n"
+            "done\n"
+            "exit 1\n", encoding="utf-8")
+        noisy.chmod(0o755)
+        with mock.patch("deckgen.compile.find_latexmk", return_value=str(noisy)):
+            ok, log = compile_latex(str(deck), timeout=30)
+        assert ok is False
+        assert "timed out" not in log.lower()
+
+    def test_no_should_cancel_is_the_historical_behaviour(self, tmp_path):
+        from deckgen.compile import compile_latex
+
+        deck = tmp_path / "d" / "main.tex"
+        deck.parent.mkdir()
+        deck.write_text("x", encoding="utf-8")
+        quick = tmp_path / "quick-latexmk"
+        quick.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        quick.chmod(0o755)
+        with mock.patch("deckgen.compile.find_latexmk", return_value=str(quick)):
+            ok, _log = compile_latex(str(deck), timeout=5)
+        assert ok is True
+
+
+class TestCompileFixBudgets:
+    """PERF (2026-09-02): the TOTAL budget must not be the PER-FRAME window.
+
+    ``consumer_timeout_s`` is what the SSE consumer waits for ONE frame. Set to
+    ``(2*max_repairs+1) * timeout_s`` it reached 4 200 s at the knob ceilings,
+    so a worker wedged before its first frame sat silent for over an hour with
+    the LaTeX lease held. It is now the longest honest SILENT stage — one
+    compile plus one repair — and the total budget lives in the worker.
+    """
+
+    def test_stall_window_is_a_stage_not_the_whole_run(self, client, tmp_path):
+        import api.routes.deck as deckmod
+
+        deck = tmp_path / "talk" / "main.tex"
+        deck.parent.mkdir()
+        deck.write_text(_DECK, encoding="utf-8")
+        sha = _deck_sha(deck)
+        seen = {}
+        real = deckmod.run_sse_worker
+
+        def _spy(worker, **kw):
+            seen.update(kw)
+            return real(worker, **kw)
+
+        def _ok(path, engine="pdflatex", timeout=180, should_cancel=None):
+            return True, "ok"
+
+        with mock.patch.object(deckmod, "find_latexmk", return_value="/x/latexmk"), \
+                mock.patch.object(deckmod, "compile_latex", side_effect=_ok), \
+                mock.patch.object(deckmod, "run_sse_worker", _spy):
+            r = _post_compile_fix(client, deck, sha)
+            r.get_data()
+
+        from core.config import _DEFAULTS
+        timeout_s = _DEFAULTS["deck_compile_timeout_s"]
+        max_repairs = _DEFAULTS["deck_compile_max_iters"]
+        total = (2 * max_repairs + 1) * timeout_s
+        window = seen["consumer_timeout_s"]
+        assert window < total, (
+            f"the per-frame stall window is the whole run's budget ({window}s)")
+        # …but still outlasts one honest compile AND one honest repair.
+        assert window >= 2 * timeout_s

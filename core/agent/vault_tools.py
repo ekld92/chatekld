@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from core.agent.tools import ToolSpec
 from core.llm.types import ToolSchema
+from rag.paper_index import paper_field
 
 
 # Per-result snippet cap for vault_search — keeps each chunk small so a
@@ -137,6 +138,11 @@ def _build_search_tool(manager: Any, ctx: VaultToolContext) -> ToolSpec:
                 # surfaces stay consistent.
                 "is_image": bool(chunk.metadata.get("is_image", False)),
             })
+            # Additive (2026-09-23): the paper this chunk belongs to, from the
+            # audit's join. Absent when unlabelled — the result is unchanged.
+            paper = paper_field(chunk.metadata)
+            if paper:
+                results[-1]["paper"] = paper
         return json.dumps({
             "results": results,
             "result_count": len(results),
@@ -183,9 +189,12 @@ def _build_read_note_tool(manager: Any, ctx: VaultToolContext) -> ToolSpec:
         time_budget_s = None
         if ctx.deadline_monotonic_s is not None:
             time_budget_s = max(0.0, ctx.deadline_monotonic_s - time.monotonic())
-        text, truncated = manager.read_note(
+        result = manager.read_note(
             rel_path, max_chars=_READ_NOTE_MAX_CHARS, time_budget_s=time_budget_s)
+        from core.extraction_status import status_of
+        text, truncated = result
         return json.dumps({
+            "extraction_status": status_of(result).to_dict(),
             "rel_path": rel_path,
             "text": text,
             "truncated": bool(truncated),

@@ -2,6 +2,8 @@
 // for the 84-control monolith. Pins: matching rows stay visible, non-matching
 // sections hide, matching sections auto-open, and clearing restores each
 // section's pre-filter open state.
+import { readFileSync } from 'node:fs';
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 function modalMarkup() {
@@ -12,6 +14,8 @@ function modalMarkup() {
           <input type="search" id="settings-filter">
           <span id="settings-filter-count"></span>
         </div>
+        <p id="settings-filter-empty" hidden>No setting here matches. …
+           <strong>Library Audit &rarr; Settings</strong>…</p>
         <details class="settings-section" open>
           <summary>Global</summary>
           <div class="control-grid">
@@ -46,6 +50,16 @@ function modalMarkup() {
               <input id="set-reranker-model">
             </div>
           </details>
+        </details>
+        <!-- Mirrors #maintenance-settings-section: a capability-gated section
+             that ships hidden (private-only subsystem). The filter must
+             neither reveal nor count it until its owner module drops the
+             data-gated marker. -->
+        <details class="settings-section" id="gated-section" hidden data-gated="1">
+          <summary>Vault maintenance</summary>
+          <div class="control-grid">
+            <div class="control-group"><label>Max drift timeout rows</label></div>
+          </div>
         </details>
       </div>`;
 }
@@ -88,7 +102,7 @@ describe('settings filter (2026-07-22 G4)', () => {
     it('clearing restores rows and each section pre-filter open state', () => {
         type('timeout');
         type('');
-        const sections = document.querySelectorAll('.settings-section');
+        const sections = document.querySelectorAll('.settings-section:not([data-gated])');
         sections.forEach((sec) => expect(sec.hidden).toBe(false));
         expect(sections[0].open).toBe(true);       // was open before filtering
         expect(sections[1].open).toBe(false);      // restored to closed
@@ -120,5 +134,65 @@ describe('settings filter (2026-07-22 G4)', () => {
         type('');
         expect(inner.hidden).toBe(false);
         expect(inner.open, 'nested open state must be restored, not left forced open').toBe(false);
+    });
+
+    // RATCHET (2026-08-21, Maintenance Phase 1): a data-gated section (the
+    // private-only Maintenance block, hidden on the public build) must never
+    // be revealed OR counted by the filter — before this rule, the clear-path
+    // `d.hidden = false` sweep unhid it after any filter use, exposing a
+    // dead settings section on the public mirror.
+    it('a data-gated hidden section survives filter + clear unrevealed and uncounted', () => {
+        const gated = document.getElementById('gated-section');
+        type('timeout');   // matches the gated row's text too — must not count it
+        expect(gated.hidden, 'filter must not reveal a gated section').toBe(true);
+        expect(document.getElementById('settings-filter-count').textContent)
+            .toContain('2'); // Global + Vision only — the gated row is not counted
+        type('');
+        expect(gated.hidden, 'filter clear must not reveal a gated section').toBe(true);
+        // Once the owner module drops the marker (probe succeeded), it
+        // participates like any other section.
+        gated.hidden = false;
+        delete gated.dataset.gated;
+        type('drift');
+        expect(gated.hidden).toBe(false);
+        expect(gated.open).toBe(true);
+    });
+
+    /* 2026-09-03 UI review. A query matching nothing emptied the modal and left
+     * "0 match(es)" — a dead end on the one surface a user searches when they
+     * cannot find a setting. The app has THREE settings surfaces (this modal,
+     * the Library Audit's own Settings modal for the `audit_*` paths and
+     * thresholds, and per-panel toggles), and the recorded complaint is exactly
+     * that "where does the near-duplicate cutoff live?" has no single answer.
+     * A zero-result query is where that answer belongs. */
+    it('a query matching nothing points at the other settings surfaces', () => {
+        type('zzzznothingmatchesthis');
+        const hint = document.getElementById('settings-filter-empty');
+        expect(hint).not.toBeNull();
+        expect(hint.hidden).toBe(false);
+        expect(hint.textContent).toMatch(/Library Audit/);
+        expect(document.getElementById('settings-filter-count').textContent)
+            .toContain('0');
+    });
+
+    it('the hint is hidden again as soon as something matches, and when cleared', () => {
+        type('zzzznothingmatchesthis');
+        expect(document.getElementById('settings-filter-empty').hidden).toBe(false);
+        type('timeout');
+        expect(document.getElementById('settings-filter-empty').hidden).toBe(true);
+        type('');
+        expect(document.getElementById('settings-filter-empty').hidden).toBe(true);
+    });
+
+    /* Source ratchet: the hint element is STATIC markup, per the liveRegions
+     * rule that anything a user may need to hear exists at markup time rather
+     * than being minted by JS. A test fixture that declares it while
+     * index.html does not would pass while the shipped modal kept its dead
+     * end. */
+    it('index.html ships the hint element, not just the fixture', () => {
+        const html = readFileSync('templates/index.html', 'utf8');
+        expect(html).toContain('id="settings-filter-empty"');
+        expect(html).toMatch(/settings-filter-empty[^>]*hidden/);
+        expect(html).toContain('Library Audit');
     });
 });

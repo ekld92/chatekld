@@ -15,12 +15,23 @@ import { dirname, join } from 'node:path';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const AUDIT_JS = readFileSync(join(ROOT, 'static/js/audit.js'), 'utf8');
 
-/** The undo onConfirm block, from its opening to the closing `finally`. */
+/**
+ * The RETIRE undo's onConfirm block.
+ *
+ * Anchored on `_retireTag` first, then on the restore call inside it. It used
+ * to search the whole file for the first `'/api/tagging/restore'`, which broke
+ * the moment a second batch-undo existed (Tag Harmony's, 2026-08-13): the
+ * ratchet silently retargeted onto the new code and would have stopped
+ * guarding retire entirely while still passing. A ratchet that can drift onto
+ * a different function is not pinning anything.
+ */
 function undoBlock() {
-    const start = AUDIT_JS.indexOf("'/api/tagging/restore'");
+    const fn = AUDIT_JS.indexOf('async function _retireTag(');
+    expect(fn, '_retireTag not found — update this ratchet').toBeGreaterThan(-1);
+    const start = AUDIT_JS.indexOf("'/api/tagging/restore'", fn);
     expect(start).toBeGreaterThan(-1);
     // Wide window: the whole confirm handler around the restore call.
-    return AUDIT_JS.slice(Math.max(0, start - 2000), start + 4000);
+    return AUDIT_JS.slice(Math.max(fn, start - 2000), start + 4000);
 }
 
 describe('retire undo: partial revert keeps its retry affordance', () => {

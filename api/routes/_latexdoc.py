@@ -17,6 +17,8 @@ import os
 import sys
 import shutil
 import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from api.validators import coerce_string_max_len
@@ -27,7 +29,7 @@ from deckgen.template import find_suite_root
 from rag.vault import obsidian_manager
 # The one documented docgen→refactor edge (mirrors deck.py): the resolver's
 # cached basename→paths index backs figure resolution without a per-call rglob.
-from refactor.resolver import get_file_index
+from core.vault_resolver import get_file_index
 
 logger = logging.getLogger(__name__)
 
@@ -196,16 +198,200 @@ def read_doc_strict(path: str) -> tuple[str, str]:
     return text, hashlib.sha256(raw).hexdigest()
 
 
-# ONE process-wide LaTeX-document operation lock, shared by the deck AND
-# docgen blueprints (2026-07-20 audit H1). Both route families accept any
-# absolute .tex — and a Beamer deck passes docgen's structural screens — so
-# two per-panel locks let deck compile-fix and docgen apply-augment interleave
-# check-then-write on the SAME file: a lost update the sha guards exist to
-# prevent, plus mutual .tex.bak clobbering. deck.py's _DECK_OP_LOCK and
-# docgen.py's _DOCGEN_OP_LOCK are aliases of this object (names kept for the
-# existing test patch targets); one LaTeX op at a time process-wide is an
-# acceptable cost for a single-user app.
-LATEX_OP_LOCK = threading.Lock()
+_LATEX_GLOBAL_CAP = 2
+
+#: How long silence proves a lease's owner is dead.
+#:
+#: PERF (2026-09-02): the lease had NO TTL at all — release fired only when the
+#: worker exited, and with `local_request_timeout_s` defaulting to 0 a worker
+#: wedged in `client.chat()` never returns, so one lease AND one of the two
+#: global slots were consumed until the process restarted. `RagOperationLock`
+#: exists precisely because a zombie must not keep a lock forever, and this is
+#: its model: an epoch bumped on every acquire, passive expiry at the TTL, and
+#: a heartbeat that pushes the deadline out for anyone still alive.
+#:
+#: 1800 s is chosen against the longest honest SILENT stage, not the longest
+#: run — a live run heartbeats. The widest stall window in the file is
+#: compile-fix's (2 x `deck_compile_timeout_s`, ≤ 1230 s with the margin), and
+#: every SSE worker emits an `{"info"}` frame per stage, which is what beats.
+_LATEX_LEASE_TTL_S = 1800.0
+
+
+@dataclass
+class _PathLockEntry:
+    lock: threading.Lock
+    references: int = 0
+    #: Bumped on every acquire; the anti-zombie token. A lease carrying an old
+    #: epoch can neither heartbeat nor release the current acquisition.
+    epoch: int = 0
+    #: Monotonic time of the last acquire/heartbeat; None = free.
+    holder_since: float | None = None
+    ttl: float = 0.0
+    #: Whether a global slot is currently charged to this entry. A STEAL
+    #: inherits it rather than taking a second one — otherwise two steals would
+    #: exhaust the semaphore permanently, which is the same leak one level down.
+    slot_held: bool = False
+
+
+class _LatexLease:
+    """Exactly-once release handle safe to pass to the SSE lifecycle guard.
+
+    Carries the epoch of ITS acquisition: after a TTL steal, ``release`` and
+    ``heartbeat`` become no-ops and :attr:`valid` goes False, so a zombie can
+    neither free nor extend the lock a newer holder now owns.
+    """
+
+    def __init__(self, registry, key: str, entry: _PathLockEntry,
+                 epoch: int) -> None:
+        self._registry = registry
+        self._key = key
+        self._entry = entry
+        self._epoch = epoch
+        self._released = False
+        self._release_guard = threading.Lock()
+
+    @property
+    def valid(self) -> bool:
+        """False once this acquisition has been released or stolen."""
+        return (not self._released
+                and self._registry._epoch_of(self._key) == self._epoch)
+
+    def heartbeat(self) -> bool:
+        """Push the expiry out. False if this acquisition is no longer current."""
+        return self._registry._heartbeat(self._key, self._entry, self._epoch)
+
+    def release(self) -> None:
+        with self._release_guard:
+            if self._released:
+                return
+            self._released = True
+        self._registry._release(self._key, self._entry, self._epoch)
+
+
+class LatexPathLockRegistry:
+    """Canonical-path serialization plus a bounded cross-path operation cap.
+
+    State/lock invariant: deck and docgen resolve to one canonical key, so every
+    read→stale-check→backup→write sequence for the same file remains mutually
+    exclusive across both route families. Distinct files may proceed together,
+    but the bounded semaphore caps aggregate compile/model/file work at two.
+    Path-lock acquisition precedes the global slot so a same-path contender can
+    never consume capacity while waiting. Non-blocking acquisition preserves the
+    routes' 409 behavior.
+
+    Cancellation and partial failure release through an exactly-once lease: SSE
+    disconnect/error paths hand ``lease.release`` to the shared stream guard and
+    synchronous routes use ``finally``. Reference counts cover owners plus
+    contenders, allowing entries to be removed as soon as the final reference
+    leaves without racing a new acquirer. This registry is process-local like the
+    lock it replaces and changes no persisted state, backup, or migration format.
+    The optimization permits unrelated files to progress while preserving every
+    same-file recovery/stale-diff invariant.
+
+    Since 2026-09-02 ownership is EPOCH + TTL, ``RagOperationLock``'s model,
+    rather than a bare ``threading.Lock``: a lease that has neither released nor
+    heartbeated within ``_LATEX_LEASE_TTL_S`` is stolen, the stealer INHERITS
+    its global slot, and the victim's later ``release``/``heartbeat`` no-op.
+    ``run_sse_worker`` beats on every frame a worker emits and sets the worker's
+    cancel event when a beat is refused, so every existing
+    ``if cancel.is_set(): return`` gate before a write covers the steal case too
+    — the zombie-writer rule is enforced through the mechanism already there.
+    """
+
+    def __init__(self, global_cap: int = _LATEX_GLOBAL_CAP) -> None:
+        self._guard = threading.Lock()
+        self._entries: dict[str, _PathLockEntry] = {}
+        self._slots = threading.BoundedSemaphore(global_cap)
+
+    @staticmethod
+    def canonical_key(path: str | os.PathLike[str]) -> str:
+        return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
+
+    def acquire(
+        self, path: str | os.PathLike[str], *, blocking: bool = False,
+        ttl_s: float = _LATEX_LEASE_TTL_S,
+    ) -> _LatexLease | None:
+        key = self.canonical_key(path)
+        with self._guard:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _PathLockEntry(threading.Lock())
+                self._entries[key] = entry
+            now = time.monotonic()
+            if (entry.holder_since is not None
+                    and (now - entry.holder_since) < entry.ttl):
+                return None                      # a LIVE holder — the 409 path
+            # Free, or the previous holder's TTL lapsed: take it and bump the
+            # epoch, which invalidates the dead worker's lease token.
+            inherit_slot = entry.slot_held
+            entry.epoch += 1
+            entry.holder_since = now
+            entry.ttl = ttl_s
+            entry.references += 1
+            epoch = entry.epoch
+        if not inherit_slot:
+            if not self._slots.acquire(blocking=blocking):
+                with self._guard:
+                    if entry.epoch == epoch:
+                        entry.holder_since = None
+                        entry.ttl = 0.0
+                self._drop_reference(key, entry)
+                return None
+            with self._guard:
+                entry.slot_held = True
+        return _LatexLease(self, key, entry, epoch)
+
+    def _epoch_of(self, key: str) -> int:
+        with self._guard:
+            entry = self._entries.get(key)
+            return entry.epoch if entry is not None else -1
+
+    def _heartbeat(self, key: str, entry: _PathLockEntry, epoch: int) -> bool:
+        with self._guard:
+            if entry.holder_since is None or entry.epoch != epoch:
+                return False
+            entry.holder_since = time.monotonic()
+            return True
+
+    def _release(self, key: str, entry: _PathLockEntry, epoch: int) -> None:
+        with self._guard:
+            stale = entry.epoch != epoch
+            if not stale:
+                entry.holder_since = None
+                entry.ttl = 0.0
+                free_slot = entry.slot_held
+                entry.slot_held = False
+            else:
+                # Stolen: the CURRENT holder owns both the path and the slot
+                # this lease was charged. Releasing either here would hand a
+                # live operation's lock away and over-release the semaphore.
+                free_slot = False
+        if free_slot:
+            self._slots.release()
+        self._drop_reference(key, entry)
+
+    def _drop_reference(self, key: str, entry: _PathLockEntry) -> None:
+        with self._guard:
+            entry.references -= 1
+            if (entry.references <= 0 and entry.holder_since is None
+                    and self._entries.get(key) is entry):
+                del self._entries[key]
+
+    def active_key_count(self) -> int:
+        """Live entry count — a diagnostic/test seam, not a routing input.
+
+        Reference-counted entry removal is the part of this registry most likely
+        to leak, and it is invisible from the outside; exposing the count lets
+        the lifecycle tests assert it rather than reach into ``_entries``.
+        """
+        with self._guard:
+            return len(self._entries)
+
+
+# Shared by deck and docgen. Keeping the historical exported name preserves a
+# single cross-blueprint authority while its value is now a registry, not a
+# process-global mutex.
+LATEX_OP_LOCK = LatexPathLockRegistry()
 
 
 def preserve_original_once(doc_path: str) -> str | None:
@@ -263,7 +449,7 @@ def provenance_comment(
 
     label = "deckgen" if kind == "deck" else "docgen"
     lines = [
-        f"% Generated by ChatEKLD ({label}) — provider: {provider}, "
+        f"% Generated by CHERQAiN ({label}) — provider: {provider}, "
         f"model: {model}, date: {date.today().isoformat()}.",
         "% RAG-grounded draft from the user's Obsidian vault — verify content before use.",
     ]
@@ -277,6 +463,25 @@ def provenance_comment(
             "content of this publication.",
         ]
     return "\n".join(lines) + "\n"
+
+
+def load_paper_index():
+    """The paper-label index for the configured vault, or ``None``.
+
+    Loaded once per deck/article operation (``rag/paper_index.py`` caches the
+    parse on the file's stat) and handed to ``rewrite_source_tags`` so a PDF or
+    note path resolves to its citation key. Absent, stale-vault or unreadable
+    ⇒ ``None``, which keeps the citation pass byte-identical to before.
+    """
+    try:
+        from core.config import load_config
+        from rag import paper_index
+
+        return paper_index.load(load_config().get("obsidian_vault_path") or "")
+    except Exception:  # noqa: BLE001 — an enrichment, never a failure
+        logger.debug("Paper index unavailable for the citation pass.",
+                     exc_info=True)
+        return None
 
 
 def index_preflight_msgs(in_progress_msg: str, no_index_msg: str) -> list[str]:
@@ -370,7 +575,7 @@ def resolve_and_copy_figures(
 
         rel_src = resolve_under_root(
             str(candidates[0]), str(vault_root),
-            must_exist=True, must_be_file=True, exts=VAULT_IMAGE_EXTS,
+            must_exist=True, must_be_file=True, exts=set(VAULT_IMAGE_EXTS),
         )
         if not rel_src:
             continue

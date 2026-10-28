@@ -1,5 +1,5 @@
 """
-smoke_test.py — Smoke tests for ChatEKLD Flask API
+smoke_test.py — Smoke tests for CHERQAiN Flask API
 ====================================================
 Validates core API endpoints (status, models, config, uploads, CSRF protection)
 without requiring a live Ollama server.  Requires the real
@@ -15,7 +15,7 @@ import unittest
 from app import app
 
 
-class ChatEKLDSmokeTest(unittest.TestCase):
+class CHERQAiNSmokeTest(unittest.TestCase):
     """Integration tests exercising Flask routes via the Werkzeug test client.
 
     Each test sets the ``X-Requested-With: ChatEKLD`` header required by the
@@ -363,12 +363,13 @@ class ChatEKLDSmokeTest(unittest.TestCase):
 
     def test_08_upload(self):
         """Upload a minimal valid-looking PDF byte sequence."""
-        if not os.path.exists('test_article.pdf'):
-            self.skipTest('test_article.pdf not present — skipping upload test')
-        with open('test_article.pdf', 'rb') as f:
-            resp = self.client.post('/api/upload',
-                                    data={'file': (f, 'test_article.pdf')},
-                                    headers=self.headers)
+        import fitz
+        with fitz.open() as document:
+            document.new_page().insert_text((72, 72), 'Disposable upload fixture')
+            raw = document.tobytes()
+        resp = self.client.post('/api/upload',
+                                data={'file': (io.BytesIO(raw), 'fixture.pdf')},
+                                headers=self.headers)
         self.assertEqual(resp.status_code, 200)
         data = json.loads(resp.data)
         self.assertIn('upload_id', data)
@@ -737,6 +738,10 @@ class ChatEKLDSmokeTest(unittest.TestCase):
                 mock.patch.object(obsidian_manager, "release_lock"),
                 mock.patch.object(obsidian_manager, "register_index_thread"),
                 mock.patch.object(obsidian_manager, "index_vault") as iv,
+                # Patched so this stays a pure force_fresh-threading test: the
+                # real one mutates the manager singleton's status, which would
+                # leak "scanning" into every later test in the file.
+                mock.patch.object(obsidian_manager, "begin_index_run"),
                 mock.patch("threading.Thread") as thread_cls,
             ):
                 # Run the "background" thread synchronously so the mock call
@@ -755,6 +760,83 @@ class ChatEKLDSmokeTest(unittest.TestCase):
                     iv.call_args.kwargs.get("force_fresh"), expected,
                     f"body {body_value!r} must thread as {expected}",
                 )
+
+    def test_30d_index_route_publishes_running_state_before_returning(self):
+        """(2026-08-12) The 200 from POST /api/obsidian/index must not be
+        observable while the status is still the PREVIOUS run's terminal state.
+
+        The transition used to live on the spawned thread, and the client polls
+        /api/obsidian/status with zero delay on the 200 — so that first poll
+        read the leftover 'done' (served instantly: get_status's lazy recovery
+        materialises it into _index_state), flashed "Indexing complete.",
+        stopped polling and restored the idle buttons while the run it had just
+        started carried on invisibly. Two assertions, both of which fail on the
+        pre-fix route: the state is already non-terminal when `t.start()` runs,
+        and a real status GET after the POST reports the run.
+        """
+        import unittest.mock as mock
+        from rag.vault import obsidian_manager
+
+        # The manager is a process-wide singleton and this test drives its REAL
+        # status machine, so snapshot/restore everything the route touches.
+        saved = (
+            obsidian_manager._index_state,
+            obsidian_manager._current_phase,
+            obsidian_manager._index_op_epoch,
+            obsidian_manager._index_run_begun_epoch,
+            obsidian_manager._index_error_code,
+            obsidian_manager._index_error_detail,
+        )
+
+        def _restore():
+            (obsidian_manager._index_state,
+             obsidian_manager._current_phase,
+             obsidian_manager._index_op_epoch,
+             obsidian_manager._index_run_begun_epoch,
+             obsidian_manager._index_error_code,
+             obsidian_manager._index_error_detail) = saved
+        self.addCleanup(_restore)
+
+        # Pre-fix precondition: the previous run left a terminal state behind.
+        obsidian_manager._index_state = "done"
+        obsidian_manager._index_error_code = "index_failed"
+        obsidian_manager._index_error_detail = "stale reason from the last run"
+
+        state_at_thread_start = []
+        with (
+            mock.patch.object(obsidian_manager, "get_vault_path",
+                              return_value="/tmp/vault"),
+            mock.patch.object(obsidian_manager, "wait_for_indexing",
+                              return_value=True),
+            mock.patch.object(obsidian_manager, "try_acquire_lock",
+                              return_value=11),
+            mock.patch.object(obsidian_manager, "release_lock"),
+            mock.patch.object(obsidian_manager, "register_index_thread"),
+            mock.patch.object(obsidian_manager, "index_vault"),
+            mock.patch("threading.Thread") as thread_cls,
+        ):
+            # The daemon never runs: the point is that the ROUTE published the
+            # state, not the thread. `start` only records what a caller would
+            # have seen at that instant.
+            thread_cls.side_effect = lambda target=None, daemon=None: mock.Mock(
+                start=lambda: state_at_thread_start.append(
+                    obsidian_manager.get_status()),
+                name="fake-thread")
+            resp = self.client.post(
+                "/api/obsidian/index", json={},
+                content_type="application/json", headers=self.headers,
+            )
+            self.assertEqual(resp.status_code, 200, resp.data)
+            self.assertEqual(state_at_thread_start, ["scanning"])
+
+            status = self.client.get("/api/obsidian/status", headers=self.headers)
+            payload = json.loads(status.data)
+
+        self.assertEqual(payload["state"], "scanning")
+        # The stale error record must not ride the new run either — the client
+        # keys its recovery affordances on these two fields.
+        self.assertEqual(payload["error_code"], "")
+        self.assertEqual(payload["error_detail"], "")
 
     def test_26_reset_wipe_feedback_and_config(self):
         """POST /api/reset with wipe_feedback=true and wipe_config=true deletes
@@ -1229,6 +1311,30 @@ class TestConfigVersionMigration(unittest.TestCase):
         self._write_raw({"config_version": 3, "deepseek_model": "deepseek-v4-pro"})
         self.assertEqual(load_config().get("deepseek_model"), "deepseek-v4-pro")
 
+    def test_version_4_resets_only_retired_model_selections(self):
+        from core.config import CONFIG_VERSION, _DEFAULTS, load_config
+        self._write_raw({
+            "config_version": 4,
+            "openai_model": "o1-mini",
+            "google_model": "gemini-2.0-flash",
+            "deepseek_model": "deepseek-v4-flash",
+            "anthropic_model": "claude-haiku-4-5",
+            "fallback_provider": "google",
+            "deck_review_model": "o1-preview",
+            "refactor_extract_model": "gemini-1.5-pro",
+            "refactor_review_model": "gemini-2.0-flash-exp",
+            "tagging_propose_model": "deepseek-v4-flash",
+        })
+        cfg = load_config()
+        self.assertEqual(CONFIG_VERSION, 5)
+        for key in ("openai_model", "google_model", "deepseek_model"):
+            self.assertEqual(cfg[key], _DEFAULTS[key])
+        self.assertEqual(cfg["anthropic_model"], "claude-haiku-4-5")
+        self.assertEqual(cfg["fallback_provider"], "google")
+        for key in ("deck_review_model", "tagging_propose_model"):
+            self.assertEqual(cfg[key], _DEFAULTS[key])
+        self.assertEqual(self._read_raw()["config_version"], 5)
+
     def test_migrate_3_to_4_resets_both_aliases(self):
         from core.config import _DEFAULTS, _migrate_3_to_4
         for alias in ("deepseek-chat", "deepseek-reasoner"):
@@ -1362,28 +1468,11 @@ class Plan3CorrectnessFixesTest(unittest.TestCase):
         with self.assertRaises(TypeError):   # still read-only
             proxy["provider"] = "x"
 
-    # ---- P3.9: the pandoc Lua filter gets maintain.sh's trust check -------
-
-    def test_check_tex_file_trust_matches_the_gui_contract(self):
-        import importlib
-        import sys
-        import tempfile as _tempfile
-        from pathlib import Path
-        script_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  "scripts", "vault_maintain")
-        if script_dir not in sys.path:
-            sys.path.insert(0, script_dir)
-        check_tex = importlib.import_module("check_tex")
-        with _tempfile.TemporaryDirectory() as d:
-            lua = os.path.join(d, "beamer_frames.lua")
-            with open(lua, "w", encoding="utf-8") as fh:
-                fh.write("-- filter")
-            os.chmod(lua, 0o644)
-            self.assertEqual(check_tex._check_file_trust(Path(lua)), "")
-            os.chmod(lua, 0o666)               # group/world-writable
-            self.assertIn("writable", check_tex._check_file_trust(Path(lua)))
-            missing = check_tex._check_file_trust(Path(d) / "absent.lua")
-            self.assertIn("cannot stat", missing)
+    # The P3.9 trust-contract test (check_tex vs the GUI copy) moved to
+    # maintenance/tests/test_steps_phase3.py::TestLatexSweep when
+    # scripts/vault_maintain/ was decommissioned (2026-08-21): the GUI no
+    # longer exists, and the surviving copy is
+    # maintenance/steps/latex.py::_check_file_trust.
 
 
 class SaveFeedbackNoStallTest(unittest.TestCase):

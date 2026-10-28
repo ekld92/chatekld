@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ChatEKLD — offline model seed helper (ships inside the .dmg).
+# CHERQAiN — offline model seed helper (ships inside the .dmg).
 #
 # WHY: the tiktoken / NLTK / cross-encoder-reranker caches live OUTSIDE the .app
 # bundle (under ~/Library/Application Support/ChatEKLD and ~/.cache/huggingface).
@@ -13,24 +13,26 @@
 # from an unsigned .dmg), or run it from Terminal.
 set -euo pipefail
 
-# Locate the ChatEKLD app: prefer an installed copy in /Applications, else look
+# Locate the CHERQAiN app: prefer an installed copy in /Applications, else look
 # next to this script (e.g. run straight from the mounted .dmg). If several dated
 # bundles exist, take the newest by name (ChatEKLD_YYYY-MM-DD sorts chronologically).
 find_app() {
-    local dir hit
+    local dir hit brand
     for dir in "/Applications" "$(cd "$(dirname "$0")" && pwd)"; do
-        hit=$(ls -d "$dir"/ChatEKLD_*.app 2>/dev/null | sort | tail -1 || true)
-        if [[ -n "$hit" && -d "$hit" ]]; then
-            printf '%s\n' "$hit"
-            return 0
-        fi
+        for brand in CHERQAiN ChatEKLD; do
+            hit=$(ls -d "$dir"/"${brand}"_*.app 2>/dev/null | sort | tail -1 || true)
+            if [[ -n "$hit" && -d "$hit" ]]; then
+                printf '%s\n' "$hit"
+                return 0
+            fi
+        done
     done
     return 1
 }
 
 APP="$(find_app || true)"
 if [[ -z "${APP:-}" ]]; then
-    echo "Could not find ChatEKLD_*.app in /Applications or next to this file."
+    echo "Could not find CHERQAiN_*.app or ChatEKLD_*.app in /Applications or next to this file."
     echo "Drag the app to your Applications folder first, then run this again."
     read -r -p "Press Return to close." _ || true
     exit 1
@@ -62,7 +64,7 @@ STATUS=0
 
 echo
 if [[ "$STATUS" -eq 0 ]]; then
-    echo "Done. ChatEKLD can now index and chat fully offline."
+    echo "Done. CHERQAiN can now index and chat fully offline."
 else
     echo "Finished with errors (exit $STATUS). Re-run while online; details are in the app log"
     echo "at ~/Library/Application Support/ChatEKLD/chatekld.log."

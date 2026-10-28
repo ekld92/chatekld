@@ -13,6 +13,7 @@ from pathlib import Path
 from ...config import Settings
 from ...core import pdf_annotations
 from ...core.pdf_annotations import AnnotationsResult, ErrorKind
+from ..bridge import zotero_unclaimed
 from ..inventory import Inventory
 
 
@@ -47,7 +48,14 @@ class ReadUnzoterodReport:
     # Excluded from `rows` — disclosed, never listed:
     ambiguous_count: int = 0            # bridge matched >1 bib key (triage deck)
     confirmed_no_match_count: int = 0   # user curated "not in the bib"
+    pending_count: int = 0              # user curated "add to Zotero later"
     skipped_count: int = 0              # biblio_skip_prefix files
+    # Zotero links the file but the rung could not claim it (unexported key,
+    # or two items link it). It is on `unmapped_pdfs`, so it used to be LISTED
+    # here — on the tab named "PDFs Without Zotero", carrying [identify] and
+    # [create in Zotero…] verbs the routes then refused (2026-09-20).
+    zotero_unclaimed_count: int = 0
+    error: str | None = None
 
 
 def find(
@@ -78,10 +86,19 @@ def find(
     # "every un-Zotero'd PDF appears". Count what is left out so the UI can say
     # so; deliberately counts only — the confirmed-no-match files are ones the
     # user already triaged and listing them would re-clutter the queue.
+    if inv.zotero_error:
+        rep.error = "Zotero observation is unavailable; absence cannot be established. Refresh the configured Zotero source and run a new scan."
+        return rep
     rep.ambiguous_count = len(inv.bridge.ambiguous_pdfs)
     rep.confirmed_no_match_count = len(inv.bridge.confirmed_no_match_pdfs)
+    rep.pending_count = len(getattr(inv.bridge, "pending_pdfs", None) or [])
     rep.skipped_count = len(inv.pdfs_skipped)
     for p in inv.bridge.unmapped_pdfs:
+        if zotero_unclaimed(inv.bridge, p):
+            # In Zotero, just not paired. Disclosed, never listed: this tab's
+            # whole claim is "no Zotero entry".
+            rep.zotero_unclaimed_count += 1
+            continue
         res = annotations.get(p) if annotations else None
         if res is None:
             res = pdf_annotations.read_annotations(p)

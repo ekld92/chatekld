@@ -24,9 +24,11 @@ server.
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 import threading
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -629,6 +631,47 @@ _ADDBIB_RE = re.compile(r"\\(?:addbibresource|bibliography)\s*\{([^}]*)\}")
 _BIB_ENTRY_RE = re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,", re.IGNORECASE)
 _BIB_NONENTRY = frozenset({"comment", "string", "preamble", "set"})
 
+# Display bounds for the parsed author/title (2026-08-13). These are NOT
+# cosmetic: the parsed values feed BOTH the relevance haystack in
+# relevant_bib_keys AND the prompt block rendered by bib_candidates_block, and a
+# consortium paper's author list is unbounded in practice. Measured on the
+# maintainer's 6,141-entry _master.bib: 30 entries (0.5%) held 29% of ALL author
+# characters, the largest being 45,344 chars — and one such entry selected into a
+# 12-key candidate block made that block 42,871 chars (~10.7k tokens), of which
+# 94% was surnames. Because the agent loop re-sends the section message on every
+# iteration, that was billed several times per section.
+#
+# Shortening at PARSE time (rather than at render time) fixes both halves with
+# one change: the haystack shrinks too, which removes the "token sponge" effect
+# where a 40k-char surname list matched arbitrary query tokens by chance and so
+# was *preferentially* selected. Safe because relevant_bib_keys and
+# bib_candidates_block are the only consumers of these values — every other
+# caller uses keys only (TemplateParts.bib_keys, len(bib_index)).
+_MAX_AUTHOR_NAMES = 3
+_MAX_TITLE_CHARS = 200
+
+# BibTeX separates author names with a bare " and " (case-insensitive). Note
+# _clean_bib_value has already stripped the protective braces upstream, so a
+# corporate name like "{Centers for Disease Control and Prevention}" DOES split
+# here — acceptable for this display-only bound, wrong for anything else.
+_BIB_AND_RE = re.compile(r"\s+and\s+", re.IGNORECASE)
+
+
+def _short_authors(raw: str, max_names: int = _MAX_AUTHOR_NAMES) -> str:
+    """Collapse an over-*max_names* BibTeX author list to its lead name + "et al.".
+
+    Returns the list unchanged when it holds at most *max_names* names, so the
+    common case (median 93 chars in the measured library) is byte-identical.
+    """
+    if not raw:
+        return ""
+    names = [n.strip() for n in _BIB_AND_RE.split(raw) if n.strip()]
+    if not names:
+        return ""
+    if len(names) <= max_names:
+        return " and ".join(names)
+    return f"{names[0]} et al."
+
 
 def resolve_bib(preamble: str, base_dir: str = "", suite_root: str = "") -> dict:
     """Parse the bibliography referenced by *preamble* into ``key -> (author, year, title)``.
@@ -638,6 +681,11 @@ def resolve_bib(preamble: str, base_dir: str = "", suite_root: str = "") -> dict
     even though the template lives in a sibling ``template/`` folder — matching
     how the suite's ``BIBINPUTS`` finds it at compile time. Absolute paths are
     still rejected (see :func:`_resolve_local`).
+
+    The author/title values are display-shortened at parse time (see
+    :data:`_MAX_AUTHOR_NAMES`); consumers wanting the raw fields must re-read the
+    ``.bib``. Only :func:`relevant_bib_keys` and :func:`bib_candidates_block` read
+    these values at all — every other caller uses the keys.
     """
     index: dict[str, tuple] = {}
     dirs = _search_dirs(base_dir, suite_root)
@@ -659,6 +707,10 @@ def _parse_bib_into(text: str, index: dict) -> None:
     Skips ``@comment``/``@string``/``@preamble``/``@set`` non-entry blocks. Each
     entry body is delimited as "from this entry header to the next", so the field
     scan never bleeds into the following entry.
+
+    The author and title are stored in **display-shortened** form
+    (:data:`_MAX_AUTHOR_NAMES` / :data:`_MAX_TITLE_CHARS`) — see those constants
+    for why the bound belongs here rather than at render time.
     """
     for m in _BIB_ENTRY_RE.finditer(text):
         etype = m.group(1).lower()
@@ -671,10 +723,13 @@ def _parse_bib_into(text: str, index: dict) -> None:
         body_start = m.end()
         nxt = _BIB_ENTRY_RE.search(text, body_start)
         body = text[body_start: nxt.start() if nxt else len(text)]
+        title = _bib_field(body, "title")
+        if len(title) > _MAX_TITLE_CHARS:
+            title = title[:_MAX_TITLE_CHARS].rstrip() + "…"
         index[key] = (
-            _bib_field(body, "author"),
+            _short_authors(_bib_field(body, "author")),
             _bib_field(body, "year") or _bib_field(body, "date"),
-            _bib_field(body, "title"),
+            title,
         )
 
 
@@ -722,22 +777,87 @@ def _clean_bib_value(value: str) -> str:
     return value
 
 
+def _fold_accents(value: str) -> str:
+    """NFD, drop combining marks, casefold — the app's accent-folding recipe
+    (``audit/search.py::fold`` / the eval harness's ``norm_source``)."""
+    nfd = unicodedata.normalize("NFD", value)
+    return "".join(ch for ch in nfd if not unicodedata.combining(ch)).casefold()
+
+
+# PERF (2026-09-02): the per-entry accent fold is memoised across sections.
+# Before: relevant_bib_keys folded every entry's key AND its "author title"
+#   prose on every call. The .bib PARSE is cached on (path, size, mtime_ns),
+#   but the folded haystacks were not part of the cached value, so each
+#   section re-did 2 x len(bib_index) pure-Python NFD passes. Measured on a
+#   synthetic 6 000-entry index (the maintainer's _master.bib is 6 141):
+#   73.0 ms per section, of which the fold pass alone is 37.7 ms.
+# Change: _fold_cached is an LRU-bounded memo over the SAME pure function.
+#   Entries are the bib strings, which are identical from section to section,
+#   so every section after the first folds nothing. Same bench: 73.0 -> 35.3 ms
+#   per section warm (52% removed, i.e. the whole fold pass); the first
+#   section still pays 73.0 ms.
+# Safe because:
+#   _fold_accents is a pure function of its argument; the memo returns the
+#   value it would have computed, so the scoring, the ordering and the
+#   returned key list are byte-identical. Nothing mutates a folded string.
+#   The QUERY text is deliberately folded through the uncached function —
+#   it is different on every call, so memoising it would only fill the LRU.
+# Preserves: "folding stays byte-identical to audit/search.py::fold" — the
+#   recipe itself is untouched; only its results are remembered.
+# Lock/thread contract: functools.lru_cache is atomic under the GIL for the
+#   dict operations it performs; no project lock is taken. Pure function, any
+#   thread.
+# Pinned by: deckgen/tests/test_template.py::TestBibFoldMemo (red before the
+#   change: "entry folds on the second section: 400").
+#: Sized for two folded strings per entry of a large library bib, so a whole
+#: deck's sections share one warm memo.
+_FOLD_CACHE_MAX = 32768
+_fold_cached = functools.lru_cache(maxsize=_FOLD_CACHE_MAX)(_fold_accents)
+
+
 def relevant_bib_keys(bib_index: dict, text: str, limit: int = 12) -> list:
     """Pick bib keys whose key/author/title overlaps *text* tokens (bounded).
 
     Used to hand the model a small, relevant candidate set per section instead
     of the whole library (which would blow the token budget and invite cites of
     irrelevant papers).
+
+    Matching treats the citation key and the prose fields differently, because
+    they are differently shaped:
+
+    * **key** — a Better BibTeX key is a run-together camelCase compound
+      (``bouyerRegressionLogistiqueEpidemiologie2024``), so a token can only ever
+      appear mid-string. Substring matching is the *correct* test here.
+    * **author / title** — ordinary words, where an unanchored test scores
+      fragments buried inside unrelated ones. Measured live, a
+      Global-Burden-of-Disease paper entered a regression lecture's candidate set
+      on ``aire`` and ``ratio`` alone, both matched inside surnames. Anchoring at
+      a word boundary makes a match mean the token actually starts a word.
+
+    The parse-time author bound (:data:`_MAX_AUTHOR_NAMES`) removes most of the
+    opportunity for such false hits; the anchor removes the rest.
+
+    Both sides are accent-folded before tokenizing/matching (the vault is
+    bilingual FR/EN): an ASCII ``[a-z]`` tokenizer over the raw text split
+    ``dépression`` into ``pression``, which the word-boundary anchor then
+    rightly rejected inside ``dépression`` — so French queries matched nothing.
+    Folding first keeps the token whole AND lets ``depression`` match
+    ``dépression`` across spellings.
     """
     if not bib_index or not text:
         return []
-    tokens = {t for t in re.findall(r"[a-z]{4,}", text.lower())}
+    tokens = {t for t in re.findall(r"[a-z]{4,}", _fold_accents(text))}
     if not tokens:
         return []
+    # Compiled once per call, reused across every entry in the loop below.
+    matchers = [(t, re.compile(rf"\b{re.escape(t)}")) for t in tokens]
     scored = []
     for key, (author, year, title) in bib_index.items():
-        hay = f"{key} {author} {title}".lower()
-        score = sum(1 for t in tokens if t in hay)
+        key_hay = _fold_cached(key)
+        prose_hay = _fold_cached(f"{author} {title}")
+        score = sum(
+            1 for tok, rx in matchers if tok in key_hay or rx.search(prose_hay)
+        )
         if score > 0:
             scored.append((score, key))
     scored.sort(key=lambda kv: (-kv[0], kv[1]))

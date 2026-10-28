@@ -267,6 +267,15 @@ def test_augment_system_prompt_within_limit_and_op_specific():
     assert "WITHOUT changing its content" in reformat
 
 
+def test_augment_prompt_never_leaks_doubled_brace_escapes():
+    """The op rules are appended AFTER .format(), so braces in them are literal:
+    a doubled {{...}} escape reaches the model verbatim and teaches it broken
+    LaTeX like \\begin{{frame}} (Known Issues item 9, fixed 2026-08-18)."""
+    for op in ("deepen", "table", "new_section", "reformat"):
+        p = augment_system_prompt("x", operation=op)
+        assert "{{" not in p and "}}" not in p, f"doubled braces leaked in {op!r}"
+
+
 def test_build_augment_message_wraps_existing_as_source():
     msg = build_augment_message(
         topic="Schizophrenia",

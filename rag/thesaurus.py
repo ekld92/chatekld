@@ -266,10 +266,12 @@ _PRIMER_HEADER = (
     "interpreting the retrieved notes:"
 )
 
-# App-curated core glossary, ordered by usefulness for *reading* the notes:
-# prose shorthand first (it is what an LLM most often misreads), then the
-# high-frequency clinical / drug-class / methodology acronyms. Compared against
-# each row's surfaces by normalised form, so accents/case do not matter.
+# App-curated core glossary seed, ordered by usefulness for *reading* notes:
+# prose shorthand first (what an LLM most often misreads), then high-frequency
+# biomedical / clinical-research / methodology acronyms. These built-in seed
+# terms are only included in the primer when matched against the active vault's
+# own abbreviation and tag files (regenerated/customized per vault). Compared
+# against each row's surfaces by normalised form, so accents/case do not matter.
 _CORE_PRIMER_TERMS: tuple[str, ...] = (
     # prose shorthand
     "rsq", "svt", "ds", "qd", "pdt", "pt", "clnq", "ttt", "ATCD", "PEC",

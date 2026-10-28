@@ -365,6 +365,7 @@ class TestVaultTools(unittest.TestCase):
         payload = json.loads(raw)
         self.assertEqual(payload["rel_path"], "notes/x.md")
         self.assertEqual(payload["text"], "body text")
+        self.assertEqual(payload["extraction_status"]["completeness"], "unknown")
         self.assertEqual(payload["char_count"], len("body text"))
         self.assertFalse(payload["truncated"])
 
@@ -376,6 +377,7 @@ class TestVaultTools(unittest.TestCase):
         read = next(s for s in specs if s.schema.name == "vault_read_note")
         payload = json.loads(read.runner({"rel_path": "x.md"}))
         self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["extraction_status"]["completeness"], "partial")
 
     def test_read_note_propagates_manager_exception(self):
         """Read errors from the manager (FileNotFoundError, ValueError,
@@ -649,6 +651,20 @@ class TestAgentLoop(unittest.TestCase):
             "LENGTH finish should emit a truncation info event",
         )
         self.assertEqual(len(self._events_of(events, DoneEvent)), 1)
+
+    def test_empty_length_is_not_malformed_or_fallback(self):
+        from core.agent.protocol import DoneEvent, InfoEvent
+        from core.llm.types import FinishReason
+        called = []
+        events, _ = self._run(
+            _llm_response(finish_reason=FinishReason.LENGTH, text=""),
+            cfg={"online_max_tokens": 1024},
+            rag_fallback_fn=lambda: called.append(True) or iter([]),
+        )
+        self.assertFalse(called)
+        self.assertEqual(len(self._events_of(events, DoneEvent)), 1)
+        self.assertTrue(any("online_max_tokens" in e.text for e in
+                            self._events_of(events, InfoEvent)))
 
     def test_content_filter_ends_turn_without_fallback(self):
         from core.agent.protocol import DoneEvent, InfoEvent, TokenEvent
@@ -1299,3 +1315,114 @@ class TestWebSearchTool(unittest.TestCase):
         from core.llm.redact import redact
         self.assertNotIn("tvly-abcdefghij1234567890",
                          redact("leak tvly-abcdefghij1234567890 end"))
+
+
+class TestToolHistoryBudget(unittest.TestCase):
+    """The tool history a REQUEST carries is character-bounded (perf plan
+    Phase 3 item 1). Asserted on ``LLMRequest.tool_history`` — the level both
+    the pre- and post-change code reach — never on the budget helper itself.
+    """
+
+    BIG = "y" * 30000
+
+    def _registry(self):
+        from core.agent.tools import ToolRegistry, ToolSpec
+        from core.llm.types import ToolSchema
+        big = self.BIG
+        spec = ToolSpec(
+            schema=ToolSchema(
+                name="vault_search", description="d",
+                parameters={"type": "object",
+                            "properties": {"q": {"type": "string"}},
+                            "required": ["q"]},
+            ),
+            runner=lambda args: big,
+            max_output_chars=40000,
+        )
+        return ToolRegistry([spec])
+
+    def _run(self, n_iterations):
+        """Script *n_iterations* - 1 tool turns then a final answer, and
+        return one snapshot of ``LLMRequest.tool_history`` per provider call."""
+        from unittest.mock import patch
+        from core.agent.loop import run_agent_loop
+        from core.llm.types import FinishReason, ToolTurn
+
+        responses = [
+            _llm_response(finish_reason=FinishReason.TOOL_USE,
+                          tool_calls=[_tool_call(call_id=f"c{i}")])
+            for i in range(n_iterations - 1)
+        ]
+        responses.append(_llm_response(finish_reason=FinishReason.STOP,
+                                       text="done"))
+        it = iter(responses)
+        seen = []
+
+        def _capture(policy=None, *, request, stream, cfg):
+            # Snapshot AT CALL TIME: under budget the loop hands the provider
+            # its own live list (both before and after the change), so reading
+            # it afterwards would report the final state for every request.
+            seen.append([
+                ToolTurn(calls=list(t.calls), results=list(t.results))
+                for t in request.tool_history
+            ])
+            return (next(it), "ollama")
+
+        with patch("core.agent.loop.resolve_chat_provider", side_effect=_capture):
+            run_agent_loop(
+                user_message="hi", provider_name="ollama", model="m",
+                user_system_prompt="", tools=self._registry(),
+                cfg={"online_timeout_s": 60, "online_max_tokens": 4096},
+                on_event=lambda e: None, max_iterations=n_iterations,
+            )
+        return seen
+
+    @staticmethod
+    def _history_chars(history):
+        return sum(len(r.content) for turn in history for r in turn.results)
+
+    def test_history_chars_stop_growing_with_iteration_count(self):
+        import core.agent.loop as loop_mod
+        # getattr with a fallback so the ASSERTION carries the red against
+        # pre-change code, not an ImportError on a name that is merely new.
+        budget = getattr(loop_mod, "_HISTORY_CHAR_BUDGET", 70000)
+        histories = self._run(6)
+        self.assertEqual(len(histories), 6)
+        chars = [self._history_chars(h) for h in histories]
+        # Ceiling: the budget plus one oversized keep_verbatim window. Before
+        # the change the last request carried 151 230 characters.
+        ceiling = budget + 2 * 40000
+        self.assertLessEqual(max(chars), ceiling, f"per-request chars: {chars}")
+        # And it is genuinely flat, not merely capped: the last two requests
+        # differ only by the stub lines, never by a whole 30 000-char result.
+        self.assertLess(chars[-1] - chars[-2], 1000, f"per-request chars: {chars}")
+
+    def test_every_call_keeps_its_paired_result_and_signature(self):
+        """Elision never drops a tool_use, a tool_result, or a signature."""
+        final = self._run(6)[-1]
+        self.assertEqual(len(final), 5)
+        for turn in final:
+            self.assertEqual(len(turn.calls), len(turn.results))
+            self.assertEqual([c.id for c in turn.calls],
+                             [r.tool_call_id for r in turn.results])
+        # Call ordering is unchanged and no turn was reordered.
+        self.assertEqual([t.calls[0].id for t in final],
+                         [f"c{i}" for i in range(5)])
+
+    def test_the_newest_turns_are_verbatim_and_older_ones_are_stubbed(self):
+        import core.agent.loop as loop_mod
+        keep = getattr(loop_mod, "_HISTORY_KEEP_VERBATIM", 2)
+        final = self._run(6)[-1]
+        newest = final[-keep:]
+        for turn in newest:
+            self.assertIn(self.BIG, turn.results[0].content)
+        for turn in final[:-keep]:
+            self.assertNotIn(self.BIG, turn.results[0].content)
+            self.assertIn("elided", turn.results[0].content)
+
+    def test_a_history_under_budget_is_passed_through_untouched(self):
+        """Byte-identical to the pre-budget behaviour for a short turn."""
+        histories = self._run(3)
+        for history in histories[1:]:
+            for turn in history:
+                self.assertIn(self.BIG, turn.results[0].content)

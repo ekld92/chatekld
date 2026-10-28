@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..core.pdf_paths import pdf_files
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,7 +47,7 @@ def candidate_pdfs(settings: Settings) -> list[Path]:
         return []
     ignored = set(settings.ignored_dirs)
     out: list[Path] = []
-    for p in root.rglob("*.pdf"):
+    for p in pdf_files(root):
         if not p.is_file():
             continue
         try:

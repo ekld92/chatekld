@@ -32,7 +32,7 @@ class TestDriverEndpointContracts(unittest.TestCase):
         check asserted rule membership only, so a driver POST to a GET-only
         route passed. Body-key drift is covered by test_driver_replay.py."""
         from app import create_app
-        from core.driver import ENDPOINTS
+        from core.driver import ENDPOINTS, _OPTIONAL_ENDPOINT_KEYS
 
         app = create_app()
         # One path can be served by SEVERAL rules (GET and POST /api/config are
@@ -44,6 +44,11 @@ class TestDriverEndpointContracts(unittest.TestCase):
         for key, (path, method) in ENDPOINTS.items():
             allowed = methods_by_path.get(path)
             if allowed is None:
+                if key in _OPTIONAL_ENDPOINT_KEYS:
+                    # Private-only subsystem (Maintenance, STRIP STEP 4): the
+                    # route is legitimately absent on the public mirror. When
+                    # PRESENT, the method check below still applies.
+                    continue
                 problems.append(f"{key}: {path} not registered")
             elif method not in allowed:
                 problems.append(f"{key}: {method} not allowed on {path} "
